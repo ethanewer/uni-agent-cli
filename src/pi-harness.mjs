@@ -4,21 +4,20 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
-import chalk from "chalk";
-import { CombinedAutocompleteProvider } from "@mariozechner/pi-tui/dist/autocomplete.js";
-import { Box } from "@mariozechner/pi-tui/dist/components/box.js";
+import { pathToFileURL } from "node:url";
 import { Editor } from "@mariozechner/pi-tui/dist/components/editor.js";
 import { Spacer } from "@mariozechner/pi-tui/dist/components/spacer.js";
 import { Text } from "@mariozechner/pi-tui/dist/components/text.js";
 import { isKeyRelease, matchesKey } from "@mariozechner/pi-tui/dist/keys.js";
 import { ProcessTerminal } from "@mariozechner/pi-tui/dist/terminal.js";
 import { Container, TUI } from "@mariozechner/pi-tui/dist/tui.js";
-import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui/dist/utils.js";
+import { applyBackgroundToLine, normalizeTerminalOutput, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui/dist/utils.js";
 
 const HARNESS = "/harness";
 const OSC133_ZONE_START = "\x1b]133;A\x07";
 const OSC133_ZONE_END = "\x1b]133;B\x07";
 const OSC133_ZONE_FINAL = "\x1b]133;C\x07";
+const chalk = createAnsiStyles();
 
 const MARKDOWN_THEME = {
 	heading: (text) => chalk.bold(text),
@@ -58,8 +57,11 @@ const UI_COLORS = {
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const DEFAULT_TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe";
 const BACKGROUND_CONNECT_DELAY_MS = parseDelay(process.env.CC_BACKGROUND_CONNECT_DELAY_MS, 250);
+const MARKDOWN_PRELOAD_DELAY_MS = parseDelay(process.env.CC_MARKDOWN_PRELOAD_DELAY_MS, 750);
 let MarkdownComponent;
 let markdownLoadPromise;
+let CombinedAutocompleteProviderClass;
+let autocompleteLoadPromise;
 
 const DEFAULT_CONFIG = {
 	defaultAgent: "codex",
@@ -880,6 +882,7 @@ class HarnessApp {
 		this.markdownPreloadTimer = undefined;
 
 		this.ui = new TUI(createHarnessTerminal(), true);
+		this.ui.queryCellSize = () => {};
 		this.chat = new Container();
 		this.commandPanel = new Container();
 		this.editor = new VoiceEditor(this.ui, EDITOR_THEME, { paddingX: 0, autocompleteMaxVisible: 8 });
@@ -896,6 +899,7 @@ class HarnessApp {
 		this.ui.setFocus(this.editor);
 		this.updateAutocomplete();
 		this.initVoiceInput();
+		this.adoptPrepaintedFrame();
 
 		this.editor.onSubmit = (text) => {
 			void this.handleSubmit(text);
@@ -905,17 +909,36 @@ class HarnessApp {
 
 	async start() {
 		this.ui.start();
-		this.markdownPreloadTimer = setTimeout(() => {
-			this.markdownPreloadTimer = undefined;
-			loadMarkdownRenderer(() => this.ui.requestRender());
-		}, 0);
-		this.markdownPreloadTimer.unref?.();
+		if (MARKDOWN_PRELOAD_DELAY_MS >= 0) {
+			this.markdownPreloadTimer = setTimeout(() => {
+				this.markdownPreloadTimer = undefined;
+				loadMarkdownRenderer(() => this.ui.requestRender());
+			}, MARKDOWN_PRELOAD_DELAY_MS);
+			this.markdownPreloadTimer.unref?.();
+		}
 		if (BACKGROUND_CONNECT_DELAY_MS < 0) return;
 		this.startupConnectTimer = setTimeout(() => {
 			this.startupConnectTimer = undefined;
 			if (!this.client) void this.switchAgent(this.activeKey, this.transport, { quiet: true });
 		}, BACKGROUND_CONNECT_DELAY_MS);
 		this.startupConnectTimer.unref?.();
+	}
+
+	adoptPrepaintedFrame() {
+		if (process.env.CC_PREPAINTED !== "1") return;
+		if (process.env.CC_PREPAINT_AGENT !== this.activeKey || this.transport !== "acp") return;
+		const width = this.ui.terminal.columns;
+		const height = this.ui.terminal.rows;
+		const rendered = this.ui.render(width).map((line) => `${normalizeTerminalOutput(line)}${TUI.SEGMENT_RESET}`);
+		if (rendered.length === 0) return;
+		this.ui.previousLines = rendered;
+		this.ui.previousWidth = width;
+		this.ui.previousHeight = height;
+		this.ui.cursorRow = rendered.length - 1;
+		this.ui.hardwareCursorRow = rendered.length - 1;
+		this.ui.maxLinesRendered = rendered.length;
+		this.ui.previousViewportTop = Math.max(0, Math.max(height, rendered.length) - height);
+		process.env.CC_ADOPTED_PREPAINT = "1";
 	}
 
 	async switchAgent(key, transport = "acp", options = {}) {
@@ -993,7 +1016,8 @@ class HarnessApp {
 		}
 		const voiceWasRecording = this.voiceController?.isRecording();
 		const voiceConsumed = this.handleVoiceKey(data, {
-			isSpace: matchesKey(data, "space"),
+			isSpace: isPlainSpaceInput(data),
+			isModifiedSpace: isModifiedSpaceInput(data),
 			isCtrlSpace: matchesKey(data, "ctrl+space"),
 		});
 		if (voiceConsumed) return { consume: true };
@@ -1115,7 +1139,7 @@ class HarnessApp {
 		}
 
 		if (controller.isTranscribing()) {
-			if (keyInfo.isSpace || keyInfo.isCtrlSpace) return true;
+			if (keyInfo.isSpace || keyInfo.isModifiedSpace || keyInfo.isCtrlSpace) return true;
 			return false;
 		}
 
@@ -1135,6 +1159,8 @@ class HarnessApp {
 			controller.toggle();
 			return true;
 		}
+
+		if (keyInfo.isModifiedSpace && !controller.isRecording()) return true;
 
 		if (controller.isRecording()) {
 			this.beginVoiceSession();
@@ -1629,7 +1655,7 @@ class HarnessApp {
 			...localSlashCommands(this),
 			...(this.availableCommands.get(this.activeKey) ?? []),
 		];
-		this.editor.setAutocompleteProvider(new CombinedAutocompleteProvider(dedupeCommands(commands), process.cwd(), null));
+		this.editor.setAutocompleteProvider(new LazyCombinedAutocompleteProvider(dedupeCommands(commands), process.cwd(), null));
 	}
 
 	addUserMessage(text) {
@@ -1719,55 +1745,61 @@ class HarnessApp {
 class MutableMarkdown {
 	constructor(text) {
 		this.text = text;
+		this.cache = undefined;
 	}
 
 	append(text) {
 		this.text += text;
+		this.cache = undefined;
 	}
 
-	invalidate() {}
+	invalidate() {
+		this.cache = undefined;
+	}
 
 	render(width) {
-		return renderMarkdown(this.text.trimEnd(), width);
+		const text = this.text.trimEnd();
+		if (this.cache?.width === width && this.cache.text === text) return this.cache.lines.slice();
+		const lines = renderMarkdown(text, width);
+		this.cache = { width, text, lines };
+		return lines.slice();
 	}
 }
 
 class MutableUserMessage {
 	constructor(text) {
 		this.text = text;
+		this.cache = undefined;
 	}
 
 	append(text) {
 		this.text += text;
+		this.cache = undefined;
 	}
 
-	invalidate() {}
+	invalidate() {
+		this.cache = undefined;
+	}
 
 	render(width) {
-		const box = new Box(1, 1, bgHex(UI_COLORS.userMessageBg));
-		box.addChild(new LazyMarkdown(this.text, 0, 0, { color: (content) => content }));
-		const lines = box.render(width);
+		if (this.cache?.width === width && this.cache.text === this.text) return this.cache.lines.slice();
+		const contentWidth = Math.max(1, width - 2);
+		const bg = bgHex(UI_COLORS.userMessageBg);
+		const body = renderMarkdown(this.text, contentWidth, 0, 0, { color: (content) => content });
+		const lines = [
+			applyBackgroundToLine("", width, bg),
+			...body.map((line) => applyBackgroundToLine(` ${line}`, width, bg)),
+			applyBackgroundToLine("", width, bg),
+		];
 		if (lines.length === 0) return lines;
 		lines[0] = OSC133_ZONE_START + lines[0];
 		lines[lines.length - 1] = OSC133_ZONE_END + OSC133_ZONE_FINAL + lines[lines.length - 1];
-		return lines;
+		this.cache = { width, text: this.text, lines };
+		return lines.slice();
 	}
 }
 
 class UserMessage extends MutableUserMessage {}
-
-class LazyMarkdown {
-	constructor(text, paddingX = 0, paddingY = 0, defaultTextStyle) {
-		this.text = text;
-		this.paddingX = paddingX;
-		this.paddingY = paddingY;
-		this.defaultTextStyle = defaultTextStyle;
-	}
-
-	render(width) {
-		return renderMarkdown(this.text, width, this.paddingX, this.paddingY, this.defaultTextStyle);
-	}
-}
 
 class ToolSummary {
 	constructor(getSpinner) {
@@ -1805,6 +1837,25 @@ class CtrlCExitHint {
 
 	render(width) {
 		return [chalk.dim(truncateVisual("  • Press Ctrl-D to exit", width))];
+	}
+}
+
+class LazyCombinedAutocompleteProvider {
+	constructor(commands, basePath, fdPath = null) {
+		this.commands = commands;
+		this.basePath = basePath;
+		this.fdPath = fdPath;
+		this.delegate = undefined;
+	}
+
+	async getSuggestions(lines, cursorLine, cursorCol, options) {
+		const Provider = await loadAutocompleteProvider();
+		this.delegate ??= new Provider(this.commands, this.basePath, this.fdPath);
+		return this.delegate.getSuggestions(lines, cursorLine, cursorCol, options);
+	}
+
+	applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
+		return this.delegate?.applyCompletion(lines, cursorLine, cursorCol, item, prefix);
 	}
 }
 
@@ -1891,6 +1942,34 @@ function normalizeToolTitle(title) {
 
 function bgHex(color) {
 	return (text) => chalk.bgHex(color)(text);
+}
+
+function createAnsiStyles() {
+	const style = (open, close) => (text) => `${open}${text}${close}`;
+	const black = Object.assign(style("\x1b[30m", "\x1b[39m"), {
+		bgBlue: style("\x1b[30m\x1b[44m", "\x1b[39m\x1b[49m"),
+	});
+	return {
+		black,
+		blue: style("\x1b[34m", "\x1b[39m"),
+		bold: style("\x1b[1m", "\x1b[22m"),
+		cyan: style("\x1b[36m", "\x1b[39m"),
+		dim: style("\x1b[2m", "\x1b[22m"),
+		italic: style("\x1b[3m", "\x1b[23m"),
+		red: style("\x1b[31m", "\x1b[39m"),
+		strikethrough: style("\x1b[9m", "\x1b[29m"),
+		underline: style("\x1b[4m", "\x1b[24m"),
+		yellow: style("\x1b[33m", "\x1b[39m"),
+		bgHex: (color) => {
+			const match = /^#?([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i.exec(color);
+			if (!match) return (text) => text;
+			const [, r, g, b] = match;
+			return style(
+				`\x1b[48;2;${Number.parseInt(r, 16)};${Number.parseInt(g, 16)};${Number.parseInt(b, 16)}m`,
+				"\x1b[49m",
+			);
+		},
+	};
 }
 
 function localSlashCommands(app) {
@@ -2013,6 +2092,21 @@ function loadMarkdownRenderer(onLoaded) {
 		.finally(() => {
 			markdownLoadPromise = undefined;
 		});
+}
+
+async function loadAutocompleteProvider() {
+	if (CombinedAutocompleteProviderClass) return CombinedAutocompleteProviderClass;
+	if (!autocompleteLoadPromise) {
+		autocompleteLoadPromise = import("@mariozechner/pi-tui/dist/autocomplete.js")
+			.then((module) => {
+				CombinedAutocompleteProviderClass = module.CombinedAutocompleteProvider;
+				return CombinedAutocompleteProviderClass;
+			})
+			.finally(() => {
+				autocompleteLoadPromise = undefined;
+			});
+	}
+	return autocompleteLoadPromise;
 }
 
 function renderPlainText(text, width, paddingX = 0, paddingY = 0, defaultTextStyle) {
@@ -2217,13 +2311,28 @@ function isPrintableInput(data) {
 	return typeof data === "string" && data.length === 1 && data >= " " && data !== "\x7f";
 }
 
+function isPlainSpaceInput(data) {
+	return matchesKey(data, "space") && !isModifiedSpaceInput(data);
+}
+
+function isModifiedSpaceInput(data) {
+	return matchesKey(data, "shift+space") || matchesKey(data, "alt+space") || matchesKey(data, "super+space");
+}
+
 function createHarnessTerminal() {
 	const terminal = new ProcessTerminal();
 	const start = terminal.start.bind(terminal);
 	const write = terminal.write.bind(terminal);
 	terminal.start = (onInput, onResize) => {
 		start(onInput, onResize);
-		write("\x1b7");
+		if (process.env.CC_PREPAINTED === "1") {
+			if (process.env.CC_ADOPTED_PREPAINT !== "1") write("\x1b8\x1b[J\x1b7");
+			delete process.env.CC_PREPAINTED;
+			delete process.env.CC_PREPAINT_AGENT;
+			delete process.env.CC_ADOPTED_PREPAINT;
+		} else {
+			write("\x1b7");
+		}
 	};
 	terminal.write = (data) => write(rewriteFullScreenClear(data));
 	return terminal;
@@ -2352,29 +2461,38 @@ Inside the TUI:
 `);
 }
 
-const args = process.argv.slice(2);
-if (args.includes("--help") || args.includes("-h")) {
-	printHelp();
-	process.exit(0);
-}
-
-const config = loadConfig();
-if (args.includes("--list")) {
-	for (const [key, agent] of Object.entries(config.agents)) {
-		const acp = agent.acp ? `${agent.acp.command} ${(agent.acp.args ?? []).join(" ")}` : "(none)";
-		console.log(`${key}\t${agent.label ?? key}\tdefault=${agent.transport}\tacp=${acp}`);
+export async function runCli(args = process.argv.slice(2)) {
+	if (args.includes("--help") || args.includes("-h")) {
+		printHelp();
+		process.exit(0);
 	}
-	process.exit(0);
+
+	const config = loadConfig();
+	if (args.includes("--list")) {
+		for (const [key, agent] of Object.entries(config.agents)) {
+			const acp = agent.acp ? `${agent.acp.command} ${(agent.acp.args ?? []).join(" ")}` : "(none)";
+			console.log(`${key}\t${agent.label ?? key}\tdefault=${agent.transport}\tacp=${acp}`);
+		}
+		process.exit(0);
+	}
+
+	const initialAgent = args.find((arg) => !arg.startsWith("-") && config.agents[arg]) ?? config.defaultAgent;
+
+	const app = new HarnessApp(config, initialAgent);
+	process.on("SIGINT", () => app.handleInterrupt("signal"));
+	for (const signal of ["SIGTERM", "SIGHUP"]) {
+		process.once(signal, () => app.stop());
+	}
+	await app.start();
 }
 
-const initialAgent = args.find((arg) => !arg.startsWith("-") && config.agents[arg]) ?? config.defaultAgent;
-
-const app = new HarnessApp(config, initialAgent);
-process.on("SIGINT", () => app.handleInterrupt("signal"));
-for (const signal of ["SIGTERM", "SIGHUP"]) {
-	process.once(signal, () => app.stop());
+if (isDirectRun()) {
+	runCli().catch((error) => {
+		console.error(`cc: ${error.message ?? error}`);
+		process.exit(1);
+	});
 }
-app.start().catch((error) => {
-	console.error(`cc: ${error.message ?? error}`);
-	process.exit(1);
-});
+
+function isDirectRun() {
+	return process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+}

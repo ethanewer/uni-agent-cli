@@ -4,9 +4,11 @@
   "description": "A fast cc CLI for switching between Claude Code, Codex, and Cursor Agent.",
   "type": "module",
   "bin": {
-    "cc": "src/pi-harness.mjs"
+    "cc": "src/cc"
   },
   "files": [
+    "src/cc",
+    "src/cc.mjs",
     "src/pi-harness.mjs",
     "README.md"
   ],
@@ -14,14 +16,13 @@
     "test": "tests"
   },
   "scripts": {
-    "check": "node --check src/pi-harness.mjs",
+    "check": "node --check src/cc.mjs && node --check src/pi-harness.mjs",
     "test": "npm run check && python3 -m py_compile tests/fake_acp.py && bash tests/tui_smoke.sh"
   },
   "keywords": [],
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "@mariozechner/pi-tui": "^0.73.0",
-    "chalk": "^5.6.2"
+    "@mariozechner/pi-tui": "^0.73.0"
   }
 }

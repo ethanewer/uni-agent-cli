@@ -1,0 +1,58 @@
+#!/bin/sh
+
+skip_prepaint=0
+agent=codex
+for arg do
+	case "$arg" in
+		--help|-h|--list)
+			skip_prepaint=1
+			break
+			;;
+		-*)
+			;;
+		*)
+			agent=$arg
+			break
+			;;
+	esac
+done
+
+if [ "$skip_prepaint" -eq 0 ] && [ -t 1 ]; then
+	width=${COLUMNS:-80}
+	case "$width" in
+		''|*[!0-9]*)
+			width=80
+			;;
+	esac
+	size=$(stty size 2>/dev/null)
+	case "$size" in
+		*" "*)
+			width=${size#* }
+			;;
+	esac
+	rule=$(printf '%*s' "$width" '' | tr ' ' '─')
+	cwd=${PWD:-}
+	case "$cwd" in
+		"$HOME"*)
+			cwd="~${cwd#"$HOME"}"
+			;;
+	esac
+	printf '\0337\033[?2026h\033[34m%s\033[39m\n\033[36m●\033[39m \033[2mvoice: space record · ctrl+space text input\033[22m\n\033[34m%s\033[39m\n\033[2m  %s acp · %s\033[22m\033[?2026l\033[?25l' "$rule" "$rule" "$agent" "$cwd"
+	export CC_PREPAINTED=1
+	export CC_PREPAINT_AGENT=$agent
+fi
+
+script=$0
+while [ -L "$script" ]; do
+	link=$(readlink "$script") || exit 1
+	case "$link" in
+		/*)
+			script=$link
+			;;
+		*)
+			script=$(dirname "$script")/$link
+			;;
+	esac
+done
+
+exec node "$(dirname "$script")/cc.mjs" "$@"
