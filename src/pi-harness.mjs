@@ -58,6 +58,7 @@ const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", 
 const DEFAULT_TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe";
 const BACKGROUND_CONNECT_DELAY_MS = parseDelay(process.env.CC_BACKGROUND_CONNECT_DELAY_MS, 250);
 const MARKDOWN_PRELOAD_DELAY_MS = parseDelay(process.env.CC_MARKDOWN_PRELOAD_DELAY_MS, 750);
+const RESIZE_SETTLE_DELAY_MS = parseDelay(process.env.CC_RESIZE_SETTLE_DELAY_MS, 90);
 let MarkdownComponent;
 let markdownLoadPromise;
 let CombinedAutocompleteProviderClass;
@@ -880,9 +881,15 @@ class HarnessApp {
 		this.voiceTargetEditor = undefined;
 		this.startupConnectTimer = undefined;
 		this.markdownPreloadTimer = undefined;
+		this.resizeActive = false;
 
-		this.ui = new TUI(createHarnessTerminal(), true);
+		const terminal = createHarnessTerminal({
+			onResizeStart: () => this.beginResize(),
+			onResizeEnd: () => this.endResize(),
+		});
+		this.ui = new TUI(terminal, true);
 		this.ui.queryCellSize = () => {};
+		this.installResizeRenderGate();
 		this.chat = new Container();
 		this.commandPanel = new Container();
 		this.editor = new VoiceEditor(this.ui, EDITOR_THEME, { paddingX: 0, autocompleteMaxVisible: 8 });
@@ -922,6 +929,30 @@ class HarnessApp {
 			if (!this.client) void this.switchAgent(this.activeKey, this.transport, { quiet: true });
 		}, BACKGROUND_CONNECT_DELAY_MS);
 		this.startupConnectTimer.unref?.();
+	}
+
+	installResizeRenderGate() {
+		const requestRender = this.ui.requestRender.bind(this.ui);
+		this.ui.requestRender = (force = false) => {
+			if (this.resizeActive && !force) return;
+			requestRender(force);
+		};
+	}
+
+	beginResize() {
+		if (this.resizeActive) return;
+		this.resizeActive = true;
+		if (this.ui.renderTimer) {
+			clearTimeout(this.ui.renderTimer);
+			this.ui.renderTimer = undefined;
+		}
+		if (this.ui.renderRequested) {
+			this.ui.renderRequested = false;
+		}
+	}
+
+	endResize() {
+		this.resizeActive = false;
 	}
 
 	adoptPrepaintedFrame() {
@@ -2319,12 +2350,27 @@ function isModifiedSpaceInput(data) {
 	return matchesKey(data, "shift+space") || matchesKey(data, "alt+space") || matchesKey(data, "super+space");
 }
 
-function createHarnessTerminal() {
+function createHarnessTerminal(resizeHooks = {}) {
 	const terminal = new ProcessTerminal();
 	const start = terminal.start.bind(terminal);
+	const stop = terminal.stop.bind(terminal);
 	const write = terminal.write.bind(terminal);
+	let resizeTimer;
 	terminal.start = (onInput, onResize) => {
-		start(onInput, onResize);
+		start(onInput, () => {
+			if (RESIZE_SETTLE_DELAY_MS <= 0) {
+				onResize();
+				return;
+			}
+			resizeHooks.onResizeStart?.();
+			if (resizeTimer) clearTimeout(resizeTimer);
+			resizeTimer = setTimeout(() => {
+				resizeTimer = undefined;
+				resizeHooks.onResizeEnd?.();
+				onResize();
+			}, RESIZE_SETTLE_DELAY_MS);
+			resizeTimer.unref?.();
+		});
 		if (process.env.CC_PREPAINTED === "1") {
 			if (process.env.CC_ADOPTED_PREPAINT !== "1") write("\x1b8\x1b[J\x1b7");
 			delete process.env.CC_PREPAINTED;
@@ -2333,6 +2379,12 @@ function createHarnessTerminal() {
 		} else {
 			write("\x1b7");
 		}
+	};
+	terminal.stop = () => {
+		if (resizeTimer) clearTimeout(resizeTimer);
+		resizeTimer = undefined;
+		resizeHooks.onResizeEnd?.();
+		stop();
 	};
 	terminal.write = (data) => write(rewriteFullScreenClear(data));
 	return terminal;

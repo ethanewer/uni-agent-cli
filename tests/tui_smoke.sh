@@ -49,6 +49,12 @@ tmux new-session -d -s "$SESSION" -x 100 -y 30 "cd $ROOT_Q && HARNESS_CONFIG=tes
 
 wait_for_text "voice: space record"
 
+tmux resize-window -t "$SESSION" -x 74 -y 26
+wait_for_text "voice: space record"
+
+tmux resize-window -t "$SESSION" -x 110 -y 32
+wait_for_text "voice: space record"
+
 tmux send-keys -l -t "$SESSION" "$(printf '\033[6;18;9t')"
 wait_for_text "voice: space record"
 
