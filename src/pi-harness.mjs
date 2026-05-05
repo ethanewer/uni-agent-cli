@@ -5,21 +5,15 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
 import chalk from "chalk";
-import {
-	Box,
-	CombinedAutocompleteProvider,
-	Container,
-	Editor,
-	Markdown,
-	ProcessTerminal,
-	Spacer,
-	Text,
-	TUI,
-	isKeyRelease,
-	matchesKey,
-	truncateToWidth,
-	visibleWidth,
-} from "@mariozechner/pi-tui";
+import { CombinedAutocompleteProvider } from "@mariozechner/pi-tui/dist/autocomplete.js";
+import { Box } from "@mariozechner/pi-tui/dist/components/box.js";
+import { Editor } from "@mariozechner/pi-tui/dist/components/editor.js";
+import { Spacer } from "@mariozechner/pi-tui/dist/components/spacer.js";
+import { Text } from "@mariozechner/pi-tui/dist/components/text.js";
+import { isKeyRelease, matchesKey } from "@mariozechner/pi-tui/dist/keys.js";
+import { ProcessTerminal } from "@mariozechner/pi-tui/dist/terminal.js";
+import { Container, TUI } from "@mariozechner/pi-tui/dist/tui.js";
+import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui/dist/utils.js";
 
 const HARNESS = "/harness";
 const OSC133_ZONE_START = "\x1b]133;A\x07";
@@ -63,6 +57,9 @@ const UI_COLORS = {
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const DEFAULT_TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe";
+const BACKGROUND_CONNECT_DELAY_MS = parseDelay(process.env.CC_BACKGROUND_CONNECT_DELAY_MS, 250);
+let MarkdownComponent;
+let markdownLoadPromise;
 
 const DEFAULT_CONFIG = {
 	defaultAgent: "codex",
@@ -232,7 +229,7 @@ class SelectionPanel {
 		}
 
 		const position = entries.length > 0 ? `${this.selected + 1}/${entries.length}` : "0/0";
-		lines.push("", chalk.dim(position), chalk.dim("type in filter box · enter select · esc cancel"));
+		lines.push("", chalk.dim(position), chalk.dim("type to filter · enter select · esc cancel"));
 		return lines.map((line) => truncateVisual(line, width));
 	}
 
@@ -879,6 +876,8 @@ class HarnessApp {
 		this.voiceOriginalOnSubmit = undefined;
 		this.voicePendingSubmit = undefined;
 		this.voiceTargetEditor = undefined;
+		this.startupConnectTimer = undefined;
+		this.markdownPreloadTimer = undefined;
 
 		this.ui = new TUI(createHarnessTerminal(), true);
 		this.chat = new Container();
@@ -906,10 +905,24 @@ class HarnessApp {
 
 	async start() {
 		this.ui.start();
-		await this.switchAgent(this.activeKey, this.transport, { quiet: true });
+		this.markdownPreloadTimer = setTimeout(() => {
+			this.markdownPreloadTimer = undefined;
+			loadMarkdownRenderer(() => this.ui.requestRender());
+		}, 0);
+		this.markdownPreloadTimer.unref?.();
+		if (BACKGROUND_CONNECT_DELAY_MS < 0) return;
+		this.startupConnectTimer = setTimeout(() => {
+			this.startupConnectTimer = undefined;
+			if (!this.client) void this.switchAgent(this.activeKey, this.transport, { quiet: true });
+		}, BACKGROUND_CONNECT_DELAY_MS);
+		this.startupConnectTimer.unref?.();
 	}
 
 	async switchAgent(key, transport = "acp", options = {}) {
+		if (this.startupConnectTimer) {
+			clearTimeout(this.startupConnectTimer);
+			this.startupConnectTimer = undefined;
+		}
 		const agent = this.config.agents[key];
 		if (!agent) {
 			this.addNotice(`unknown agent: ${key}`);
@@ -924,7 +937,7 @@ class HarnessApp {
 		this.currentAssistantText = undefined;
 		this.currentUserText = undefined;
 		this.currentToolSummary = undefined;
-		this.statusState = this.pendingPrompts.length > 0 ? "connecting" : "";
+		this.statusState = options.statusState ?? (this.pendingPrompts.length > 0 ? "connecting" : "");
 		this.updateSpinner();
 		this.updateAutocomplete();
 		if (!options.quiet) this.addNotice(`Switched to ${agent.label ?? key}`);
@@ -1076,7 +1089,7 @@ class HarnessApp {
 		if (controller.isRecording()) {
 			const frame = SPINNER_FRAMES[controller.getTick() % SPINNER_FRAMES.length];
 			const elapsed = formatDuration(controller.getElapsedSeconds());
-			return `${chalk.red("●")} ${chalk.red(frame)} ${chalk.red(`Rec ${elapsed}`)}  ${chalk.dim("voice: space send · ctrl+space or type to edit")}`;
+			return `${chalk.cyan("●")} ${chalk.cyan(frame)} ${chalk.cyan(`Rec ${elapsed}`)}  ${chalk.dim("voice: space send · ctrl+space or type to edit")}`;
 		}
 		return `${chalk.cyan("●")} ${chalk.dim("voice: space record · ctrl+space text input")}`;
 	}
@@ -1228,6 +1241,7 @@ class HarnessApp {
 			this.pendingPrompts.push(text);
 			this.statusState = "connecting";
 			this.updateSpinner();
+			if (!this.client) void this.switchAgent(this.activeKey, this.transport, { quiet: true });
 			this.ui.requestRender();
 			return;
 		}
@@ -1357,6 +1371,12 @@ class HarnessApp {
 		}
 	}
 
+	async ensureConnected() {
+		if (this.ready) return true;
+		await this.switchAgent(this.activeKey, this.transport, { quiet: true, statusState: "connecting" });
+		return this.ready;
+	}
+
 	showHelp() {
 		const commands = dedupeCommands([
 			...localSlashCommands(this),
@@ -1387,8 +1407,8 @@ class HarnessApp {
 
 	async openResumeDialog() {
 		if (!this.client || !this.ready) {
-			this.addNotice("Session list is available after the agent connects");
-			return;
+			const connected = await this.ensureConnected();
+			if (!connected) return;
 		}
 		if (!supportsSessionList(this.sessionStates.get(this.activeKey))) {
 			this.addNotice("This agent does not advertise session listing");
@@ -1453,8 +1473,8 @@ class HarnessApp {
 
 	async openConfigDialog(category, title, argument = "") {
 		if (!this.client || !this.ready) {
-			this.addNotice(`${title} is available after the agent connects`);
-			return;
+			const connected = await this.ensureConnected();
+			if (!connected) return;
 		}
 		const state = this.sessionStates.get(this.activeKey);
 		const option = findConfigOption(state, category);
@@ -1515,6 +1535,10 @@ class HarnessApp {
 	}
 
 	async setPlanMode() {
+		if (!this.ready) {
+			const connected = await this.ensureConnected();
+			if (!connected) return;
+		}
 		const state = this.sessionStates.get(this.activeKey);
 		const option = findConfigOption(state, "mode");
 		const value = flattenConfigOptions(option).find((entry) => entry.value === "plan" || entry.name.toLowerCase() === "plan");
@@ -1684,6 +1708,7 @@ class HarnessApp {
 
 	stop() {
 		if (this.spinnerTimer) clearInterval(this.spinnerTimer);
+		if (this.markdownPreloadTimer) clearTimeout(this.markdownPreloadTimer);
 		this.voiceController?.dispose();
 		if (this.client) this.client.stop();
 		this.ui.stop();
@@ -1703,7 +1728,7 @@ class MutableMarkdown {
 	invalidate() {}
 
 	render(width) {
-		return new Markdown(this.text.trimEnd(), 0, 0, MARKDOWN_THEME).render(width);
+		return renderMarkdown(this.text.trimEnd(), width);
 	}
 }
 
@@ -1720,11 +1745,7 @@ class MutableUserMessage {
 
 	render(width) {
 		const box = new Box(1, 1, bgHex(UI_COLORS.userMessageBg));
-		box.addChild(
-			new Markdown(this.text, 0, 0, MARKDOWN_THEME, {
-				color: (content) => content,
-			}),
-		);
+		box.addChild(new LazyMarkdown(this.text, 0, 0, { color: (content) => content }));
 		const lines = box.render(width);
 		if (lines.length === 0) return lines;
 		lines[0] = OSC133_ZONE_START + lines[0];
@@ -1734,6 +1755,19 @@ class MutableUserMessage {
 }
 
 class UserMessage extends MutableUserMessage {}
+
+class LazyMarkdown {
+	constructor(text, paddingX = 0, paddingY = 0, defaultTextStyle) {
+		this.text = text;
+		this.paddingX = paddingX;
+		this.paddingY = paddingY;
+		this.defaultTextStyle = defaultTextStyle;
+	}
+
+	render(width) {
+		return renderMarkdown(this.text, width, this.paddingX, this.paddingY, this.defaultTextStyle);
+	}
+}
 
 class ToolSummary {
 	constructor(getSpinner) {
@@ -1884,27 +1918,46 @@ function localSlashCommands(app) {
 		{ name: "clear", description: "Clear the conversation" },
 		{ name: "voice", description: "Enter voice input mode" },
 	];
+	const addIfMissing = (command) => {
+		if (!commands.some((existing) => existing.name === command.name)) commands.push(command);
+	};
+
+	addIfMissing({ name: "resume", description: "Resume a previous ACP session" });
+	addIfMissing({ name: "model", description: "Change model" });
+	addIfMissing({ name: "mode", description: "Change agent mode" });
+	addIfMissing({ name: "effort", description: "Change reasoning effort" });
+	addIfMissing({ name: "reasoning", description: "Change reasoning effort" });
+	addIfMissing({ name: "thinking", description: "Change reasoning effort" });
+	addIfMissing({ name: "plan", description: "Switch to plan mode" });
 
 	if (supportsSessionList(state)) {
-		commands.push({ name: "resume", description: "Resume a previous ACP session" });
+		addIfMissing({ name: "resume", description: "Resume a previous ACP session" });
 	}
 
 	const modelOption = findConfigOption(state, "model");
-	if (modelOption) commands.push(configSlashCommand("model", "Change model", modelOption));
+	if (modelOption) replaceCommand(commands, configSlashCommand("model", "Change model", modelOption));
 
 	const modeOption = findConfigOption(state, "mode");
-	if (modeOption) commands.push(configSlashCommand("mode", "Change agent mode", modeOption));
+	if (modeOption) replaceCommand(commands, configSlashCommand("mode", "Change agent mode", modeOption));
 
 	const effortOption = findConfigOption(state, "thought_level");
 	if (effortOption) {
 		const effortCommand = configSlashCommand("effort", "Change reasoning effort", effortOption);
-		commands.push(effortCommand, { ...effortCommand, name: "reasoning" }, { ...effortCommand, name: "thinking" });
+		replaceCommand(commands, effortCommand);
+		replaceCommand(commands, { ...effortCommand, name: "reasoning" });
+		replaceCommand(commands, { ...effortCommand, name: "thinking" });
 	}
 
 	const hasPlanMode = flattenConfigOptions(modeOption).some((entry) => entry.value === "plan" || entry.name.toLowerCase() === "plan");
-	if (hasPlanMode) commands.push({ name: "plan", description: "Switch to plan mode" });
+	if (hasPlanMode) addIfMissing({ name: "plan", description: "Switch to plan mode" });
 
 	return commands;
+}
+
+function replaceCommand(commands, command) {
+	const index = commands.findIndex((entry) => entry.name === command.name);
+	if (index >= 0) commands[index] = command;
+	else commands.push(command);
 }
 
 function configSlashCommand(name, description, option) {
@@ -1935,9 +1988,59 @@ function dedupeCommands(commands) {
 	return result;
 }
 
+function renderMarkdown(text, width, paddingX = 0, paddingY = 0, defaultTextStyle) {
+	const Markdown = MarkdownComponent;
+	if (Markdown) return new Markdown(text, paddingX, paddingY, MARKDOWN_THEME, defaultTextStyle).render(width);
+	loadMarkdownRenderer();
+	return renderPlainText(text, width, paddingX, paddingY, defaultTextStyle);
+}
+
+function loadMarkdownRenderer(onLoaded) {
+	if (MarkdownComponent) {
+		onLoaded?.();
+		return;
+	}
+	if (markdownLoadPromise) {
+		if (onLoaded) void markdownLoadPromise.then(onLoaded);
+		return;
+	}
+	markdownLoadPromise = import("@mariozechner/pi-tui/dist/components/markdown.js")
+		.then((module) => {
+			MarkdownComponent = module.Markdown;
+			onLoaded?.();
+		})
+		.catch(() => {})
+		.finally(() => {
+			markdownLoadPromise = undefined;
+		});
+}
+
+function renderPlainText(text, width, paddingX = 0, paddingY = 0, defaultTextStyle) {
+	const contentWidth = Math.max(1, width - paddingX * 2);
+	const pad = " ".repeat(Math.max(0, paddingX));
+	const vertical = Array(Math.max(0, paddingY)).fill("");
+	const color = defaultTextStyle?.color ?? ((content) => content);
+	const body = [];
+	for (const line of String(text || "").split("\n")) {
+		const wrapped = wrapTextWithAnsi(line, contentWidth);
+		body.push(...(wrapped.length ? wrapped : [""]));
+	}
+	return [
+		...vertical,
+		...body.map((line) => `${pad}${color(line)}${pad}`),
+		...vertical,
+	];
+}
+
 function parseSlashCommand(text) {
 	const match = text.match(/^\/([^\s/]+)(?:\s+([\s\S]*))?$/);
 	return { name: match?.[1] ?? "", argument: match?.[2]?.trim() ?? "" };
+}
+
+function parseDelay(value, fallback) {
+	if (value === undefined || value === "") return fallback;
+	const parsed = Number(value);
+	return Number.isFinite(parsed) ? parsed : fallback;
 }
 
 function isTerminalResponse(data) {
@@ -2128,6 +2231,7 @@ function createHarnessTerminal() {
 
 function rewriteFullScreenClear(data) {
 	const fullClear = "\x1b[2J\x1b[H\x1b[3J";
+	if (!data.includes("\x1b[3J")) return data;
 	if (!data.includes(fullClear)) return data.replaceAll("\x1b[3J", "");
 	return data.replaceAll(fullClear, "\x1b8\x1b[J");
 }
