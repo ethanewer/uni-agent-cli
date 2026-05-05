@@ -24,8 +24,8 @@ function prepaint(args) {
 	process.env.CC_PREPAINT_AGENT = agent;
 	const cwd = compactCwd(process.cwd());
 	const rule = "─".repeat(Math.max(1, width));
-	const voice = `\x1b[36m●\x1b[39m \x1b[2mvoice: space record · ctrl+space text input\x1b[22m`;
-	const status = `\x1b[2m  ${agent} acp · ${cwd}\x1b[22m`;
+	const voice = `\x1b[36m⦁\x1b[39m \x1b[2mvoice: space record · ctrl+space text input\x1b[22m`;
+	const status = `\x1b[2m${agent} acp · ${cwd}\x1b[22m`;
 	process.stdout.write(`\x1b7\x1b[?2026h\x1b[34m${rule}\x1b[39m\n${truncate(voice, width)}\n\x1b[34m${rule}\x1b[39m\n${truncate(status, width)}\x1b[?2026l\x1b[?25l`);
 }
 

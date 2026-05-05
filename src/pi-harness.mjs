@@ -100,7 +100,7 @@ class StatusLine extends Text {
 	render(width) {
 		const status = this.getStatus();
 		const state = status.state ? `${status.spinner ? `${status.spinner} ` : ""}${status.state} · ` : "";
-		const line = `  ${state}${status.agent} ${status.transport} · ${compactCwd(process.cwd())}`;
+		const line = `${state}${status.agent} ${status.transport} · ${compactCwd(process.cwd())}`;
 		return [chalk.dim(truncateVisual(line, width))];
 	}
 }
@@ -1140,13 +1140,13 @@ class HarnessApp {
 		const controller = this.voiceController;
 		if (!controller) return undefined;
 		if (!this.voiceModeEnabled && !controller.isRecording() && !controller.isTranscribing()) return undefined;
-		if (controller.isTranscribing()) return `${chalk.cyan("●")} ${chalk.dim("Transcribing…")}`;
+		if (controller.isTranscribing()) return `${chalk.cyan("⦁")} ${chalk.dim("Transcribing…")}`;
 		if (controller.isRecording()) {
 			const frame = SPINNER_FRAMES[controller.getTick() % SPINNER_FRAMES.length];
 			const elapsed = formatDuration(controller.getElapsedSeconds());
-			return `${chalk.cyan("●")} ${chalk.cyan(frame)} ${chalk.cyan(`Rec ${elapsed}`)}  ${chalk.dim("voice: space send · ctrl+space or type to edit")}`;
+			return `${chalk.cyan("⦁")} ${chalk.cyan(frame)} ${chalk.cyan(`Rec ${elapsed}`)}  ${chalk.dim("voice: space send · ctrl+space or type to edit")}`;
 		}
-		return `${chalk.cyan("●")} ${chalk.dim("voice: space record · ctrl+space text input")}`;
+		return `${chalk.cyan("⦁")} ${chalk.dim("voice: space record · ctrl+space text input")}`;
 	}
 
 	enterVoiceMode() {
@@ -1814,12 +1814,12 @@ class MutableUserMessage {
 
 	render(width) {
 		if (this.cache?.width === width && this.cache.text === this.text) return this.cache.lines.slice();
-		const contentWidth = Math.max(1, width - 2);
+		const contentWidth = Math.max(1, width);
 		const bg = bgHex(UI_COLORS.userMessageBg);
 		const body = renderMarkdown(this.text, contentWidth, 0, 0, { color: (content) => content });
 		const lines = [
 			applyBackgroundToLine("", width, bg),
-			...body.map((line) => applyBackgroundToLine(` ${line}`, width, bg)),
+			...body.map((line) => applyBackgroundToLine(line, width, bg)),
 			applyBackgroundToLine("", width, bg),
 		];
 		if (lines.length === 0) return lines;
@@ -1858,7 +1858,7 @@ class ToolSummary {
 
 	render(width) {
 		if (this.tools.length === 0) return [];
-		const lines = this.tools.map((tool) => `  ${toolGlyph(tool.status, this.getSpinner)} ${tool.title}`);
+		const lines = this.tools.map((tool) => `${toolGlyph(tool.status, this.getSpinner)} ${tool.title}`);
 		return lines.map((line) => chalk.dim(truncateVisual(line, width)));
 	}
 }
@@ -1867,7 +1867,7 @@ class CtrlCExitHint {
 	invalidate() {}
 
 	render(width) {
-		return [chalk.dim(truncateVisual("  • Press Ctrl-D to exit", width))];
+		return [chalk.dim(truncateVisual("• Press Ctrl-D to exit", width))];
 	}
 }
 
