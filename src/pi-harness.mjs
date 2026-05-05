@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -15,6 +15,7 @@ import {
 	Spacer,
 	Text,
 	TUI,
+	isKeyRelease,
 	matchesKey,
 	truncateToWidth,
 	visibleWidth,
@@ -61,6 +62,7 @@ const UI_COLORS = {
 };
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const DEFAULT_TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe";
 
 const DEFAULT_CONFIG = {
 	defaultAgent: "codex",
@@ -100,6 +102,48 @@ class StatusLine extends Text {
 		const state = status.state ? `${status.spinner ? `${status.spinner} ` : ""}${status.state} · ` : "";
 		const line = `  ${state}${status.agent} ${status.transport} · ${compactCwd(process.cwd())}`;
 		return [chalk.dim(truncateVisual(line, width))];
+	}
+}
+
+class VoiceEditor extends Editor {
+	placeholderLine = undefined;
+
+	render(width) {
+		const lines = super.render(width);
+		if (lines.length === 0) return lines;
+		const placeholder = this.placeholderLine?.();
+		if (placeholder !== undefined && this.getText().length === 0 && lines.length >= 2) {
+			lines[1] = this.renderPlaceholderLine(placeholder, width);
+		}
+		return lines;
+	}
+
+	renderPlaceholderLine(text, width) {
+		const paddingX = this.getPaddingX();
+		const maxPadding = Math.max(0, Math.floor((width - 1) / 2));
+		const effectivePad = Math.min(paddingX, maxPadding);
+		const left = " ".repeat(effectivePad);
+		const right = " ".repeat(effectivePad);
+		const contentWidth = Math.max(1, width - effectivePad * 2);
+		const truncated = visibleWidth(text) > contentWidth ? truncateToWidth(text, contentWidth) : text;
+		const fill = " ".repeat(Math.max(0, contentWidth - visibleWidth(truncated)));
+		return `${left}${truncated}${fill}${right}`;
+	}
+
+	prependText(text) {
+		if (!text) return;
+		const normalized = this.normalizeText ? this.normalizeText(text) : text.replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(/\t/g, "    ");
+		if (normalized.includes("\n")) {
+			this.setText(normalized + this.getText());
+			return;
+		}
+		this.cancelAutocomplete?.();
+		this.pushUndoSnapshot?.();
+		this.lastAction = null;
+		this.historyIndex = -1;
+		this.state.lines[0] = normalized + (this.state.lines[0] || "");
+		if (this.state.cursorLine === 0) this.state.cursorCol += normalized.length;
+		this.onChange?.(this.getText());
 	}
 }
 
@@ -650,6 +694,164 @@ class AcpClient {
 	}
 }
 
+class VoiceController {
+	constructor(options) {
+		this.options = options;
+		this.state = "idle";
+		this.recording = undefined;
+		this.recordingStartMs = 0;
+		this.tickTimer = undefined;
+		this.tick = 0;
+		this.abortController = undefined;
+		this.disposed = false;
+	}
+
+	isRecording() {
+		return this.state === "recording";
+	}
+
+	isTranscribing() {
+		return this.state === "transcribing";
+	}
+
+	getElapsedSeconds() {
+		if (this.state !== "recording" || !this.recordingStartMs) return 0;
+		return Math.floor((Date.now() - this.recordingStartMs) / 1000);
+	}
+
+	getTick() {
+		return this.tick;
+	}
+
+	toggle() {
+		if (this.state === "transcribing") return;
+		if (this.state === "recording") {
+			this.stopAndTranscribe({ intent: "send" });
+			return;
+		}
+		this.startRecording();
+	}
+
+	finish() {
+		if (this.state !== "recording") return;
+		this.stopAndTranscribe({ intent: "edit" });
+	}
+
+	cancel() {
+		if (this.abortController) {
+			this.abortController.abort();
+			this.abortController = undefined;
+		}
+		if (this.recording) {
+			void this.recording.stop().catch(() => {});
+			this.recording = undefined;
+		}
+		this.stopTickTimer();
+		this.setState("idle");
+	}
+
+	dispose() {
+		this.disposed = true;
+		this.cancel();
+	}
+
+	startRecording() {
+		try {
+			this.recording = recordAudio();
+		} catch (error) {
+			this.emitError(error instanceof Error ? error.message : "Failed to start recording");
+			return;
+		}
+		this.recordingStartMs = Date.now();
+		this.tick = 0;
+		this.startTickTimer();
+		this.setState("recording");
+	}
+
+	stopAndTranscribe({ intent }) {
+		const recording = this.recording;
+		if (!recording) return;
+		this.recording = undefined;
+		this.stopTickTimer();
+		this.setState("transcribing");
+
+		const abort = new AbortController();
+		this.abortController = abort;
+		const timer = setTimeout(() => abort.abort(), 120_000);
+		let outcome = "empty";
+
+		(async () => {
+			const audio = await recording.stop();
+			if (abort.signal.aborted) throw new Error("Transcription cancelled");
+			if (audio.length === 0) return "";
+			const apiKey = await this.options.getApiKey();
+			if (!apiKey) throw new Error("OpenAI API key not configured. Set OPENAI_API_KEY.");
+			const baseUrl = this.options.getBaseUrl ? await this.options.getBaseUrl() : undefined;
+			return await transcribeAudio({
+				apiKey,
+				audio,
+				model: this.options.model ?? DEFAULT_TRANSCRIPTION_MODEL,
+				baseUrl: baseUrl || undefined,
+				abortSignal: abort.signal,
+			});
+		})()
+			.then((text) => {
+				if (this.disposed || abort.signal.aborted) {
+					outcome = "cancelled";
+					return;
+				}
+				if (intent === "edit") {
+					outcome = "finish";
+					this.options.onFinish(text ?? "");
+				} else if (text?.trim()) {
+					outcome = "result";
+					this.options.onResult(text);
+				} else {
+					outcome = "empty";
+				}
+			})
+			.catch((error) => {
+				if (this.disposed || abort.signal.aborted) {
+					outcome = "cancelled";
+					return;
+				}
+				outcome = "error";
+				this.emitError(error instanceof Error ? error.message : "Transcription failed");
+				if (intent === "edit") this.options.onFinish("");
+			})
+			.finally(() => {
+				clearTimeout(timer);
+				if (this.abortController === abort) this.abortController = undefined;
+				if (this.state === "transcribing") this.setState("idle");
+				if (!this.disposed) this.options.onTranscriptionEnd?.(outcome);
+			});
+	}
+
+	startTickTimer() {
+		this.stopTickTimer();
+		this.tickTimer = setInterval(() => {
+			this.tick += 1;
+			this.options.onStateChange?.();
+		}, 80);
+		this.tickTimer.unref?.();
+	}
+
+	stopTickTimer() {
+		if (this.tickTimer) clearInterval(this.tickTimer);
+		this.tickTimer = undefined;
+	}
+
+	setState(state) {
+		if (this.state === state) return;
+		this.state = state;
+		this.options.onStateChange?.();
+	}
+
+	emitError(message) {
+		this.options.onError?.(message);
+	}
+}
+
 class HarnessApp {
 	constructor(config, initialAgent, initialTransport) {
 		this.config = config;
@@ -672,11 +874,16 @@ class HarnessApp {
 		this.pendingPrompts = [];
 		this.availableCommands = new Map();
 		this.sessionStates = new Map();
+		this.voiceController = undefined;
+		this.voiceModeEnabled = true;
+		this.voiceOriginalOnSubmit = undefined;
+		this.voicePendingSubmit = undefined;
+		this.voiceTargetEditor = undefined;
 
 		this.ui = new TUI(createHarnessTerminal(), true);
 		this.chat = new Container();
 		this.commandPanel = new Container();
-		this.editor = new Editor(this.ui, EDITOR_THEME, { paddingX: 0, autocompleteMaxVisible: 8 });
+		this.editor = new VoiceEditor(this.ui, EDITOR_THEME, { paddingX: 0, autocompleteMaxVisible: 8 });
 		this.status = new StatusLine(() => ({
 			agent: this.activeKey,
 			state: this.statusState,
@@ -689,6 +896,7 @@ class HarnessApp {
 		this.ui.addChild(this.status);
 		this.ui.setFocus(this.editor);
 		this.updateAutocomplete();
+		this.initVoiceInput();
 
 		this.editor.onSubmit = (text) => {
 			void this.handleSubmit(text);
@@ -750,6 +958,8 @@ class HarnessApp {
 	}
 
 	handleGlobalInput(data) {
+		if (isTerminalResponse(data)) return undefined;
+		if (isKeyRelease(data)) return undefined;
 		const control = splitControlInput(data);
 		if (control) {
 			this.applyInputPrefix(control.prefix);
@@ -768,11 +978,21 @@ class HarnessApp {
 			this.ui.requestRender();
 			return { consume: true };
 		}
+		const voiceWasRecording = this.voiceController?.isRecording();
+		const voiceConsumed = this.handleVoiceKey(data, {
+			isSpace: matchesKey(data, "space"),
+			isCtrlSpace: matchesKey(data, "ctrl+space"),
+		});
+		if (voiceConsumed) return { consume: true };
 		if (isCtrlD(data)) {
 			this.stop();
 			return { consume: true };
 		}
 		if (isCtrlC(data)) {
+			if (voiceWasRecording && !this.editor.getText() && !this.lastKnownEditorText) {
+				this.ui.requestRender();
+				return { consume: true };
+			}
 			this.handleInterrupt("input");
 			return { consume: true };
 		}
@@ -832,6 +1052,157 @@ class HarnessApp {
 		queueMicrotask(() => {
 			if (!this.menuHandle) this.lastKnownEditorText = this.editor.getText();
 		});
+	}
+
+	initVoiceInput() {
+		this.voiceController = new VoiceController({
+			getApiKey: async () => process.env.OPENAI_API_KEY?.trim(),
+			getBaseUrl: async () => process.env.OPENAI_BASE_URL?.trim() || process.env.OPENAI_API_BASE?.trim(),
+			model: process.env.CC_TRANSCRIPTION_MODEL?.trim() || process.env.OPENAI_TRANSCRIPTION_MODEL?.trim() || undefined,
+			onResult: (text) => this.handleVoiceResult(text),
+			onFinish: (text) => this.handleVoiceFinish(text),
+			onTranscriptionEnd: () => this.finalizeVoiceSession(),
+			onStateChange: () => this.ui.requestRender(),
+			onError: (message) => this.addError(message),
+		});
+		this.editor.placeholderLine = () => this.voicePlaceholderLine();
+	}
+
+	voicePlaceholderLine() {
+		const controller = this.voiceController;
+		if (!controller) return undefined;
+		if (!this.voiceModeEnabled && !controller.isRecording() && !controller.isTranscribing()) return undefined;
+		if (controller.isTranscribing()) return `${chalk.cyan("●")} ${chalk.dim("Transcribing…")}`;
+		if (controller.isRecording()) {
+			const frame = SPINNER_FRAMES[controller.getTick() % SPINNER_FRAMES.length];
+			const elapsed = formatDuration(controller.getElapsedSeconds());
+			return `${chalk.red("●")} ${chalk.red(frame)} ${chalk.red(`Rec ${elapsed}`)}  ${chalk.dim("voice: space send · ctrl+space or type to edit")}`;
+		}
+		return `${chalk.cyan("●")} ${chalk.dim("voice: space record · ctrl+space text input")}`;
+	}
+
+	enterVoiceMode() {
+		if (this.voiceModeEnabled) return;
+		this.voiceModeEnabled = true;
+		this.ui.requestRender();
+	}
+
+	exitVoiceMode() {
+		if (!this.voiceModeEnabled) return;
+		this.voiceModeEnabled = false;
+		this.ui.requestRender();
+	}
+
+	handleVoiceKey(_data, keyInfo) {
+		const controller = this.voiceController;
+		if (!controller) return false;
+
+		if (!this.voiceModeEnabled) {
+			return keyInfo.isCtrlSpace;
+		}
+
+		if (controller.isTranscribing()) {
+			if (keyInfo.isSpace || keyInfo.isCtrlSpace) return true;
+			return false;
+		}
+
+		if (keyInfo.isCtrlSpace) {
+			if (controller.isRecording()) {
+				this.beginVoiceSession();
+				controller.finish();
+				this.exitVoiceMode();
+			} else {
+				this.exitVoiceMode();
+			}
+			return true;
+		}
+
+		if (keyInfo.isSpace) {
+			if (controller.isRecording()) this.beginVoiceSession();
+			controller.toggle();
+			return true;
+		}
+
+		if (controller.isRecording()) {
+			this.beginVoiceSession();
+			controller.finish();
+		}
+		this.exitVoiceMode();
+		return false;
+	}
+
+	beginVoiceSession() {
+		const target = this.editor;
+		this.voiceTargetEditor = target;
+		this.voicePendingSubmit = undefined;
+		this.voiceOriginalOnSubmit = target.onSubmit;
+		target.onSubmit = (text) => {
+			this.voicePendingSubmit = text;
+		};
+	}
+
+	finalizeVoiceSession() {
+		const target = this.voiceTargetEditor;
+		if (target && this.voiceOriginalOnSubmit !== undefined) target.onSubmit = this.voiceOriginalOnSubmit;
+		this.voiceOriginalOnSubmit = undefined;
+		this.voiceTargetEditor = undefined;
+		const pending = this.voicePendingSubmit;
+		this.voicePendingSubmit = undefined;
+		if (pending !== undefined) {
+			const submit = target?.onSubmit ?? this.editor.onSubmit;
+			if (submit && pending.trim()) submit(pending);
+		}
+	}
+
+	getVoiceTargetEditor() {
+		return this.voiceTargetEditor ?? this.editor;
+	}
+
+	handleVoiceResult(text) {
+		const trimmed = text.trim();
+		if (!trimmed) return;
+		const submit = this.voiceOriginalOnSubmit ?? this.editor.onSubmit;
+		if (!submit) return;
+		const pending = this.voicePendingSubmit;
+		this.voicePendingSubmit = undefined;
+		const combined = pending?.trim() ? `${trimmed} ${pending}` : trimmed;
+		submit(combined);
+	}
+
+	handleVoiceFinish(text) {
+		const target = this.getVoiceTargetEditor();
+		this.exitVoiceMode();
+		const trimmed = text.trim();
+		const pending = this.voicePendingSubmit;
+		if (pending !== undefined) {
+			this.voicePendingSubmit = undefined;
+			const submit = this.voiceOriginalOnSubmit ?? this.editor.onSubmit;
+			if (submit) {
+				const sep = pending.startsWith(" ") || pending.startsWith("\n") || !pending ? "" : " ";
+				const combined = trimmed ? `${trimmed}${sep}${pending}` : pending;
+				if (combined.trim()) submit(combined);
+			}
+			this.ui.requestRender();
+			return;
+		}
+
+		if (!trimmed) {
+			this.ui.requestRender();
+			return;
+		}
+
+		const current = target.getText();
+		if (!current) {
+			target.setText(trimmed);
+			this.ui.requestRender();
+			return;
+		}
+
+		const sep = current.startsWith(" ") || current.startsWith("\n") ? "" : " ";
+		const prefix = `${trimmed}${sep}`;
+		if (target.prependText) target.prependText(prefix);
+		else target.setText(prefix + current);
+		this.ui.requestRender();
 	}
 
 	async handleSubmit(rawText) {
@@ -950,6 +1321,19 @@ class HarnessApp {
 			this.currentUserText = undefined;
 			this.currentToolSummary = undefined;
 			this.ui.requestRender();
+			return;
+		}
+		if (name === "voice") {
+			if (argument) {
+				this.addNotice("/voice only works by itself in an empty input box");
+				return;
+			}
+			if (this.voiceController?.isRecording() || this.voiceController?.isTranscribing()) {
+				this.addNotice("/voice is available after the current voice action finishes");
+				return;
+			}
+			this.editor.setText("");
+			this.enterVoiceMode();
 			return;
 		}
 		if (name === "resume") {
@@ -1300,6 +1684,7 @@ class HarnessApp {
 
 	stop() {
 		if (this.spinnerTimer) clearInterval(this.spinnerTimer);
+		this.voiceController?.dispose();
 		if (this.client) this.client.stop();
 		this.ui.stop();
 		process.exit(0);
@@ -1497,6 +1882,7 @@ function localSlashCommands(app) {
 		{ name: "help", description: "Show available commands" },
 		{ name: "status", description: "Show current session status" },
 		{ name: "clear", description: "Clear the conversation" },
+		{ name: "voice", description: "Enter voice input mode" },
 	];
 
 	if (supportsSessionList(state)) {
@@ -1552,6 +1938,176 @@ function dedupeCommands(commands) {
 function parseSlashCommand(text) {
 	const match = text.match(/^\/([^\s/]+)(?:\s+([\s\S]*))?$/);
 	return { name: match?.[1] ?? "", argument: match?.[2]?.trim() ?? "" };
+}
+
+function isTerminalResponse(data) {
+	return (
+		/^\x1b\[6;\d+;\d+t$/.test(data) ||
+		/^\x1b\[\?\d+u$/.test(data) ||
+		/^\x1bP[^\x1b]*(?:\x1b\\)?$/.test(data) ||
+		/^\x1b\][\s\S]*(?:\x07|\x1b\\)$/.test(data)
+	);
+}
+
+function formatDuration(seconds) {
+	const mins = Math.floor(seconds / 60);
+	const secs = seconds % 60;
+	return `${mins}:${String(secs).padStart(2, "0")}`;
+}
+
+function which(bin) {
+	const paths = (process.env.PATH ?? "").split(process.platform === "win32" ? ";" : ":");
+	const exts = process.platform === "win32" ? [".exe", ".cmd", ".bat", ""] : [""];
+	for (const dir of paths) {
+		if (!dir) continue;
+		for (const ext of exts) {
+			try {
+				if (fs.existsSync(path.join(dir, `${bin}${ext}`))) return true;
+			} catch {}
+		}
+	}
+	return false;
+}
+
+function enumerateWindowsAudioDevice() {
+	try {
+		const result = spawnSync("ffmpeg", ["-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"], {
+			stdio: ["ignore", "ignore", "pipe"],
+			timeout: 5_000,
+			encoding: "utf8",
+		});
+		const stderr = typeof result.stderr === "string" ? result.stderr : "";
+		const audioHeaderIndex = stderr.search(/DirectShow audio devices|audio devices/i);
+		if (audioHeaderIndex < 0) return undefined;
+		const match = stderr.slice(audioHeaderIndex).match(/"([^"]+)"/);
+		return match?.[1];
+	} catch {
+		return undefined;
+	}
+}
+
+function hasPulseSocket() {
+	const candidates = [];
+	const pulseServer = process.env.PULSE_SERVER?.trim();
+	if (pulseServer) candidates.push(pulseServer.startsWith("unix:") ? pulseServer.slice("unix:".length) : pulseServer);
+	const xdg = process.env.XDG_RUNTIME_DIR?.trim();
+	if (xdg) candidates.push(`${xdg}/pulse/native`);
+	if (typeof process.getuid === "function") candidates.push(`/run/user/${process.getuid()}/pulse/native`);
+	for (const candidate of candidates) {
+		try {
+			if (fs.existsSync(candidate)) return true;
+		} catch {}
+	}
+	return false;
+}
+
+function audioCommand() {
+	const deviceOverride = process.env.CC_AUDIO_DEVICE?.trim() || process.env.PI_AUDIO_DEVICE?.trim();
+
+	if (which("rec")) return ["rec", "-q", "-t", "wav", "-"];
+	if (which("ffmpeg")) {
+		const base = ["-loglevel", "quiet", "-f"];
+		const tail = ["-f", "wav", "-ac", "1", "-ar", "16000", "pipe:1"];
+
+		if (process.platform === "darwin") {
+			return ["ffmpeg", ...base, "avfoundation", "-i", deviceOverride || ":default", ...tail];
+		}
+
+		if (process.platform === "win32") {
+			const deviceName = deviceOverride || enumerateWindowsAudioDevice();
+			if (!deviceName) {
+				throw new Error(
+					'No DirectShow audio capture device found. Plug in a microphone, or set CC_AUDIO_DEVICE="<device name>".',
+				);
+			}
+			return ["ffmpeg", ...base, "dshow", "-i", `audio=${deviceName}`, ...tail];
+		}
+
+		const match = deviceOverride?.match(/^(pulse|alsa):(.+)$/);
+		const forcedBackend = match?.[1];
+		const forcedDevice = match?.[2];
+		const backend = forcedBackend ?? (hasPulseSocket() ? "pulse" : "alsa");
+		const device = forcedDevice ?? deviceOverride ?? "default";
+		return ["ffmpeg", ...base, backend, "-i", device, ...tail];
+	}
+
+	const installHint =
+		process.platform === "darwin"
+			? "Install with: brew install ffmpeg"
+			: process.platform === "win32"
+				? "Install with: winget install ffmpeg"
+				: "Install ffmpeg or sox with your package manager.";
+	throw new Error(`ffmpeg or sox is required for voice recording. ${installHint}`);
+}
+
+function recordAudio() {
+	const [bin, ...args] = audioCommand();
+	const child = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
+	const chunks = [];
+	child.stdout?.on("data", (data) => chunks.push(data));
+	child.stderr?.on("data", () => {});
+
+	let startError;
+	child.on("error", (error) => {
+		startError = error;
+	});
+
+	let stopped = false;
+	const closed = new Promise((resolve) => {
+		child.once("close", () => resolve());
+	});
+
+	return {
+		async stop() {
+			if (startError) throw startError;
+			if (!stopped) {
+				stopped = true;
+				try {
+					child.kill("SIGTERM");
+				} catch {}
+			}
+			await closed;
+			if (startError) throw startError;
+			let total = 0;
+			for (const chunk of chunks) total += chunk.length;
+			const out = new Uint8Array(total);
+			let offset = 0;
+			for (const chunk of chunks) {
+				out.set(chunk, offset);
+				offset += chunk.length;
+			}
+			return out;
+		},
+	};
+}
+
+async function transcribeAudio({
+	apiKey,
+	audio,
+	model = DEFAULT_TRANSCRIPTION_MODEL,
+	baseUrl = "https://api.openai.com/v1",
+	abortSignal,
+	filename = "recording.wav",
+	mimeType = "audio/wav",
+}) {
+	if (!apiKey) throw new Error("OPENAI_API_KEY is required for voice transcription");
+
+	const form = new FormData();
+	form.append("file", new Blob([audio.slice()], { type: mimeType }), filename);
+	form.append("model", model);
+	form.append("response_format", "text");
+
+	const response = await fetch(`${baseUrl.replace(/\/$/, "")}/audio/transcriptions`, {
+		method: "POST",
+		headers: { Authorization: `Bearer ${apiKey}` },
+		body: form,
+		signal: abortSignal,
+	});
+	if (!response.ok) {
+		const body = await response.text().catch(() => "");
+		throw new Error(`Transcription request failed (${response.status}): ${body || response.statusText}`);
+	}
+	return (await response.text()).trim();
 }
 
 function isPrintableInput(data) {

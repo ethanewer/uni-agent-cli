@@ -38,7 +38,14 @@ Agent-advertised ACP commands are shown in autocomplete and forwarded to that ba
 
 - `/resume` opens the ACP session picker when `session/list` is supported.
 - `/model`, `/mode`, and `/effort` open ACP config selectors when the backend advertises those config options.
+- `/voice` returns the empty input box to voice mode.
 - `/help`, `/status`, and `/clear` are handled locally.
+
+## Voice Input
+
+When the input box is empty, press `space` to start recording and `space` again to transcribe and send. Press `ctrl+space` to switch from voice mode to normal text input without inserting a character. If recording is active, typing or pressing `ctrl+space` stops recording, transcribes, and keeps the transcript in the input box for editing.
+
+Voice recording uses `rec` from sox when available, otherwise `ffmpeg`. Transcription uses OpenAI's audio transcription endpoint with `OPENAI_API_KEY`; set `OPENAI_BASE_URL` for a compatible proxy, `CC_TRANSCRIPTION_MODEL` to override the model, and `CC_AUDIO_DEVICE` to select a microphone.
 
 ## ACP
 
