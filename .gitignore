@@ -1,0 +1,11 @@
+node_modules/
+target/
+.DS_Store
+
+# Local agent/editor state
+.claude/
+
+# Logs and temporary files
+*.log
+*.tmp
+__pycache__/
