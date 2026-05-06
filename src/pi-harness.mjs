@@ -873,6 +873,7 @@ class HarnessApp {
 		this.statusState = "";
 		this.promptQueue = [];
 		this.flushingPromptQueue = false;
+		this.promptQueueDrainScheduled = false;
 		this.cancelRequested = false;
 		this.afterToolCancelPending = false;
 		this.activeToolIds = new Set();
@@ -1026,7 +1027,7 @@ class HarnessApp {
 			this.ready = true;
 			this.statusState = "";
 			this.updateSpinner();
-			void this.flushPromptQueue();
+			this.schedulePromptQueueDrain();
 			this.ui.requestRender();
 		} catch (error) {
 			if (this.client !== client) return;
@@ -1360,6 +1361,7 @@ class HarnessApp {
 			this.statusState = this.promptQueue.length > 0 ? "working" : "";
 			this.updateSpinner();
 			this.ui.requestRender();
+			this.schedulePromptQueueDrain();
 		}
 	}
 
@@ -1387,6 +1389,17 @@ class HarnessApp {
 		this.promptQueue.push({ text, timing });
 		this.updateSpinner();
 		this.ui.requestRender();
+		this.schedulePromptQueueDrain();
+	}
+
+	schedulePromptQueueDrain() {
+		if (this.promptQueueDrainScheduled || this.promptQueue.length === 0) return;
+		this.promptQueueDrainScheduled = true;
+		const timer = setTimeout(() => {
+			this.promptQueueDrainScheduled = false;
+			void this.flushPromptQueue();
+		}, 0);
+		timer.unref?.();
 	}
 
 	promoteNextQueuedPromptToAfterTool() {
