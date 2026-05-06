@@ -67,6 +67,27 @@ wait_for_text "voice: space record"
 tmux send-keys -t "$SESSION" C-Space
 wait_without_text "voice: space record"
 
+tmux send-keys -t "$SESSION" / r e v i e w Enter
+wait_for_text "Select a review preset"
+wait_for_text "Review against a base branch"
+tmux send-keys -t "$SESSION" Down Enter
+wait_for_text "/review (Review uncommitted changes)"
+wait_for_text "review prompt: /review"
+
+tmux send-keys -t "$SESSION" / c l e a r Enter
+wait_without_text "review prompt: /review"
+
+tmux send-keys -t "$SESSION" / r e v i e w Enter
+wait_for_text "Select a review preset"
+tmux send-keys -t "$SESSION" Enter
+wait_for_text "/review-branch"
+tmux send-keys -t "$SESSION" m a i n Enter
+wait_for_text "/review-branch main (Review against a base branch)"
+wait_for_text "review prompt: /review-branch main"
+
+tmux send-keys -t "$SESSION" / c l e a r Enter
+wait_without_text "review prompt: /review-branch main"
+
 tmux send-keys -t "$SESSION" s l o w Space t o o l Enter
 wait_for_text "Slow Tool"
 

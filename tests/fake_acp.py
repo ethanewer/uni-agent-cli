@@ -128,6 +128,8 @@ def handle_message(message):
                         "availableCommands": [
                             {"name": "fake", "description": "Fake backend command"},
                             {"name": "review", "description": "Review current changes"},
+                            {"name": "review-branch", "description": "Review against a branch"},
+                            {"name": "review-commit", "description": "Review a commit"},
                             {"name": "permission-test", "description": "Exercise ACP permission requests"},
                             {"name": "rpc-parse-error", "description": "Return a structured JSON-RPC parse error"},
                             {"name": "terminal-test", "description": "Exercise ACP terminal requests"},
@@ -241,6 +243,10 @@ def handle_prompt(message):
         send_slow_tool_turn(request_id)
         return
 
+    if prompt.startswith("/review"):
+        send_review_response(request_id, prompt)
+        return
+
     if prompt == "/rpc-parse-error":
         send(
             {
@@ -319,6 +325,23 @@ def handle_prompt(message):
         return
 
     send_default_prompt_response(request_id, prompt)
+
+
+def send_review_response(request_id, prompt):
+    send(
+        {
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "fake-session",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "review prompt: " + prompt},
+                },
+            },
+        }
+    )
+    send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "end_turn"}})
 
 
 def send_slow_tool_turn(request_id):

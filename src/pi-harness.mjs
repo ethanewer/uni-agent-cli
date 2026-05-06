@@ -878,6 +878,7 @@ class HarnessApp {
 		this.afterToolCancelPending = false;
 		this.activeToolIds = new Set();
 		this.seenToolThisTurn = false;
+		this.pendingPromptDisplay = undefined;
 		this.availableCommands = new Map();
 		this.sessionStates = new Map();
 		this.voiceController = undefined;
@@ -1305,6 +1306,7 @@ class HarnessApp {
 		this.lastKnownEditorText = "";
 		const text = rawText.trim();
 		if (!text) return;
+		const displayText = this.consumePromptDisplay(text);
 		this.editor.addToHistory(text);
 		this.editor.onSubmit = undefined;
 		queueMicrotask(() => {
@@ -1319,8 +1321,13 @@ class HarnessApp {
 			const handled = await this.handleSlashCommand(text);
 			if (handled) return;
 		}
+		await this.submitBackendPrompt(text, { displayText });
+	}
+
+	async submitBackendPrompt(text, options = {}) {
+		const displayText = options.displayText ?? text;
 		if (!this.ready) {
-			this.enqueuePrompt(text);
+			this.enqueuePrompt(text, "afterTurn", { displayText });
 			this.statusState = "connecting";
 			this.updateSpinner();
 			if (!this.client) void this.switchAgent(this.activeKey, this.transport, { quiet: true });
@@ -1328,10 +1335,10 @@ class HarnessApp {
 			return;
 		}
 		if (this.busy) {
-			this.enqueuePrompt(text);
+			this.enqueuePrompt(text, "afterTurn", { displayText });
 			return;
 		}
-		this.addUserMessage(text);
+		this.addUserMessage(displayText);
 		await this.sendPrompt(text);
 		await this.flushPromptQueue();
 	}
@@ -1371,7 +1378,7 @@ class HarnessApp {
 		try {
 			while (this.ready && !this.busy && this.promptQueue.length > 0) {
 				const prompt = this.promptQueue.shift();
-				this.addUserMessage(prompt.text);
+				this.addUserMessage(prompt.displayText ?? prompt.text);
 				this.ui.requestRender();
 				await this.sendPrompt(prompt.text);
 			}
@@ -1385,8 +1392,8 @@ class HarnessApp {
 		}
 	}
 
-	enqueuePrompt(text, timing = "afterTurn") {
-		this.promptQueue.push({ text, timing });
+	enqueuePrompt(text, timing = "afterTurn", options = {}) {
+		this.promptQueue.push({ text, timing, displayText: options.displayText });
 		this.updateSpinner();
 		this.ui.requestRender();
 		this.schedulePromptQueueDrain();
@@ -1414,6 +1421,7 @@ class HarnessApp {
 		if (this.promptQueue.length === 0) return false;
 		const prompt = this.promptQueue.pop();
 		this.editor.setText(prompt.text);
+		this.pendingPromptDisplay = prompt.displayText ? { text: prompt.text, displayText: prompt.displayText } : undefined;
 		this.lastKnownEditorText = prompt.text;
 		this.updateSpinner();
 		this.ui.requestRender();
@@ -1463,13 +1471,64 @@ class HarnessApp {
 		const localNames = new Set(localSlashCommands(this).map((command) => command.name));
 		const backendNames = new Set(available.map((command) => command.name));
 
+		if (this.shouldOpenCodexReviewDialog(name, argument, backendNames)) {
+			this.openCodexReviewDialog();
+			return true;
+		}
 		if (localNames.has(name)) {
 			await this.runLocalSlashCommand(name, argument);
 			return true;
 		}
+		if (this.isKnownCodexReviewCommand(name)) return false;
 		if (backendNames.has(name)) return false;
 		this.addNotice(`Unknown command: /${name}`);
 		return true;
+	}
+
+	shouldOpenCodexReviewDialog(name, argument, backendNames) {
+		if (name !== "review" || argument) return false;
+		if (this.activeKey === "codex") return true;
+		return backendNames.has("review") && backendNames.has("review-branch") && backendNames.has("review-commit");
+	}
+
+	isKnownCodexReviewCommand(name) {
+		return this.activeKey === "codex" && (name === "review" || name === "review-branch" || name === "review-commit");
+	}
+
+	openCodexReviewDialog() {
+		const entries = [
+			{ value: "branch", label: "Review against a base branch", description: "PR Style" },
+			{ value: "uncommitted", label: "Review uncommitted changes" },
+			{ value: "commit", label: "Review a commit" },
+			{ value: "custom", label: "Custom review instructions" },
+		];
+		this.openSelection("Select a review preset", entries, async (entry) => {
+			this.closeMenu();
+			if (!entry) return;
+			if (entry.value === "uncommitted") {
+				await this.submitBackendPrompt("/review", { displayText: reviewPromptDisplay("/review", entry.label) });
+				return;
+			}
+			const prefixes = {
+				branch: "/review-branch ",
+				commit: "/review-commit ",
+				custom: "/review ",
+			};
+			const prefix = prefixes[entry.value] ?? "/review ";
+			this.editor.setText(prefix);
+			this.pendingPromptDisplay = { prefix, label: entry.label };
+			this.lastKnownEditorText = this.editor.getText();
+			this.ui.requestRender();
+		});
+	}
+
+	consumePromptDisplay(text) {
+		const display = this.pendingPromptDisplay;
+		this.pendingPromptDisplay = undefined;
+		if (!display) return undefined;
+		if (display.displayText && display.text === text) return display.displayText;
+		if (display.prefix && text.startsWith(display.prefix.trimEnd())) return reviewPromptDisplay(text, display.label);
+		return undefined;
 	}
 
 	async runLocalSlashCommand(name, argument) {
@@ -1989,7 +2048,7 @@ class PromptQueueSummary {
 		if (queue.length === 0) return [];
 		return ["", ...queue.map((entry) => {
 			const prefix = entry.timing === "afterTool" ? `${this.getSpinner()} after tool` : "↵ queued";
-			return chalk.dim(truncateVisual(`${prefix}: ${oneLine(entry.text)}`, width));
+			return chalk.dim(truncateVisual(`${prefix}: ${oneLine(entry.displayText ?? entry.text)}`, width));
 		})];
 	}
 }
@@ -2283,6 +2342,10 @@ function renderPlainText(text, width, paddingX = 0, paddingY = 0, defaultTextSty
 function parseSlashCommand(text) {
 	const match = text.match(/^\/([^\s/]+)(?:\s+([\s\S]*))?$/);
 	return { name: match?.[1] ?? "", argument: match?.[2]?.trim() ?? "" };
+}
+
+function reviewPromptDisplay(prompt, label) {
+	return `${prompt} (${label})`;
 }
 
 function parseDelay(value, fallback) {
