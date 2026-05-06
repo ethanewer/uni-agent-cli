@@ -64,25 +64,25 @@ assert_next_line_blank() {
 
 tmux new-session -d -s "$SESSION" -x 100 -y 30 "cd $ROOT_Q && HARNESS_CONFIG=tests/fake_config.json CC_BACKGROUND_CONNECT_DELAY_MS=0 ./src/cc fake"
 
-wait_for_text "voice: space record"
+wait_for_text "Space to record"
 
 tmux resize-window -t "$SESSION" -x 74 -y 26
-wait_for_text "voice: space record"
+wait_for_text "Space to record"
 
 tmux resize-window -t "$SESSION" -x 110 -y 32
-wait_for_text "voice: space record"
+wait_for_text "Space to record"
 
 tmux send-keys -l -t "$SESSION" "$(printf '\033[6;18;9t')"
-wait_for_text "voice: space record"
+wait_for_text "Space to record"
 
 tmux send-keys -l -t "$SESSION" "$(printf '\033[13;1:3u')"
-wait_for_text "voice: space record"
+wait_for_text "Space to record"
 
 tmux send-keys -l -t "$SESSION" "$(printf '\033[32;2u')"
-wait_for_text "voice: space record"
+wait_for_text "Space to record"
 
 tmux send-keys -t "$SESSION" C-Space
-wait_without_text "voice: space record"
+wait_without_text "Space to record"
 
 tmux send-keys -t "$SESSION" / t m p / f o o / b a r Enter
 wait_for_text "echo: /tmp/foo/bar"
@@ -189,7 +189,7 @@ wait_for_text "after tool: pre-tool-queue"
 wait_for_text "echo: pre-tool-queue"
 
 tmux send-keys -t "$SESSION" / v o i c e Enter
-wait_for_text "voice: space record"
+wait_for_text "Space to record"
 
 tmux send-keys -t "$SESSION" C-Space
 tmux send-keys -t "$SESSION" / p e r m i s s i o n - e x i t Enter

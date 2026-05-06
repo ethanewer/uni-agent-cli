@@ -55,6 +55,7 @@ const UI_COLORS = {
 };
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const VOICE_RECORDING_BLINK_INTERVAL_MS = 500;
 const DEFAULT_TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe";
 const BACKGROUND_CONNECT_DELAY_MS = parseDelay(process.env.CC_BACKGROUND_CONNECT_DELAY_MS, 250);
 const MARKDOWN_PRELOAD_DELAY_MS = parseDelay(process.env.CC_MARKDOWN_PRELOAD_DELAY_MS, 750);
@@ -859,7 +860,7 @@ class VoiceController {
 		this.tickTimer = setInterval(() => {
 			this.tick += 1;
 			this.options.onStateChange?.();
-		}, 80);
+		}, VOICE_RECORDING_BLINK_INTERVAL_MS);
 		this.tickTimer.unref?.();
 	}
 
@@ -1204,13 +1205,13 @@ class HarnessApp {
 		const controller = this.voiceController;
 		if (!controller) return undefined;
 		if (!this.voiceModeEnabled && !controller.isRecording() && !controller.isTranscribing()) return undefined;
-		if (controller.isTranscribing()) return `${chalk.cyan("⦁")} ${chalk.dim("Transcribing…")}`;
+		if (controller.isTranscribing()) return `${chalk.cyan("○")}   ${chalk.dim("Transcribing…")}`;
 		if (controller.isRecording()) {
-			const frame = SPINNER_FRAMES[controller.getTick() % SPINNER_FRAMES.length];
+			const circle = controller.getTick() % 2 === 0 ? "●" : "○";
 			const elapsed = formatDuration(controller.getElapsedSeconds());
-			return `${chalk.cyan("⦁")} ${chalk.cyan(frame)} ${chalk.cyan(`Rec ${elapsed}`)}  ${chalk.dim("voice: space send · ctrl+space or type to edit")}`;
+			return `${chalk.cyan(circle)} ${chalk.cyan(elapsed)}   ${chalk.dim("Space to send · type to edit")}`;
 		}
-		return `${chalk.cyan("⦁")} ${chalk.dim("voice: space record · ctrl+space text input")}`;
+		return `${chalk.cyan("○")}   ${chalk.dim("Space to record · Ctrl+Space for text")}`;
 	}
 
 	enterVoiceMode() {
@@ -1858,7 +1859,7 @@ class HarnessApp {
 	}
 
 	updateFilterEditor(query) {
-		this.editor.setText(`filter: ${query}`);
+		this.editor.setText(query);
 	}
 
 	requestPermission(params = {}) {
