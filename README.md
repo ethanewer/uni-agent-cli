@@ -69,6 +69,7 @@ Then use:
 
 PTY fallback is not part of the Pi-TUI path; the shared UI talks to ACP backends.
 The client advertises ACP terminal support and implements `terminal/*` requests so backend slash commands that need shell execution can run inside the shared UI.
+ACP permission requests are shown as TUI selection prompts. `cc` waits for the user to approve or reject instead of silently choosing an allow option.
 
 ## Development
 

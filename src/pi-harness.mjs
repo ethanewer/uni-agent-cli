@@ -238,7 +238,7 @@ class SelectionPanel {
 
 	handleInput(data) {
 		if (matchesKey(data, "escape") || data === "\x03") {
-			this.onSelect(undefined);
+			this.cancel();
 			return;
 		}
 		if (matchesKey(data, "backspace") || data === "\x7f" || data === "\b") {
@@ -280,6 +280,10 @@ class SelectionPanel {
 		this.selected = 0;
 		this.onQueryChange(this.query);
 		return true;
+	}
+
+	cancel() {
+		this.onSelect(undefined);
 	}
 
 	filteredEntries() {
@@ -358,9 +362,10 @@ class ManagedTerminal {
 }
 
 class AcpClient {
-	constructor(agent, onEvent) {
+	constructor(agent, onEvent, options = {}) {
 		this.agent = agent;
 		this.onEvent = onEvent;
+		this.onPermissionRequest = options.onPermissionRequest;
 		this.nextId = 1;
 		this.pending = new Map();
 		this.sessionId = undefined;
@@ -397,6 +402,7 @@ class AcpClient {
 			const stderr = this.lastStderr ? `: ${this.lastStderr}` : "";
 			const hadPending = this.pending.size > 0;
 			this.rejectPending(new Error(`backend exited (${reason})${stderr}`));
+			if (!this.stopping) this.onEvent({ type: "backend_exit" });
 			if (!this.stopping && !hadPending) this.onEvent({ type: "line", text: `• backend exited (${reason})${stderr}` });
 		});
 		this.child.stderr.on("data", (chunk) => {
@@ -587,8 +593,29 @@ class AcpClient {
 			return;
 		}
 		if (message.id !== undefined && message.method === "session/request_permission") {
-			this.write({ jsonrpc: "2.0", id: message.id, result: { outcome: selectedPermissionOutcome(message.params) } });
+			void this.handlePermissionRequest(message);
 			return;
+		}
+	}
+
+	async handlePermissionRequest(message) {
+		try {
+			const outcome = this.onPermissionRequest
+				? await this.onPermissionRequest(message.params)
+				: { outcome: "cancelled" };
+			this.replyPermissionRequest(message.id, outcome);
+		} catch {
+			this.replyPermissionRequest(message.id, { outcome: "cancelled" });
+		}
+	}
+
+	replyPermissionRequest(id, outcome) {
+		if (!this.child || this.exited || this.stopping) return;
+		try {
+			this.write({ jsonrpc: "2.0", id, result: { outcome } });
+		} catch {
+			// The backend may exit while the user is answering the permission
+			// prompt. Permission replies are best-effort at that point.
 		}
 	}
 
@@ -874,6 +901,8 @@ class HarnessApp {
 		this.promptQueue = [];
 		this.flushingPromptQueue = false;
 		this.promptQueueDrainScheduled = false;
+		this.permissionQueue = [];
+		this.permissionPromptActive = false;
 		this.cancelRequested = false;
 		this.afterToolCancelPending = false;
 		this.activeToolIds = new Set();
@@ -994,6 +1023,7 @@ class HarnessApp {
 			this.addNotice(`unknown agent: ${key}`);
 			return;
 		}
+		this.cancelPermissionPrompts();
 		this.closeMenu();
 		if (this.client) this.client.stop();
 		this.activeKey = key;
@@ -1020,6 +1050,9 @@ class HarnessApp {
 		let client;
 		client = new AcpClient(agent, (event) => {
 			if (this.client === client) this.handleBackendEvent(event);
+		}, {
+			onPermissionRequest: (params) =>
+				this.client === client ? this.requestPermission(params) : { outcome: "cancelled" },
 		});
 		this.client = client;
 		try {
@@ -1099,6 +1132,10 @@ class HarnessApp {
 		if (this.menuHandle) {
 			if (this.menuHandle.clearInput?.()) {
 				this.ui.requestRender();
+				return;
+			}
+			if (this.menuHandle.cancel) {
+				this.menuHandle.cancel();
 				return;
 			}
 			this.closeMenu();
@@ -1769,7 +1806,7 @@ class HarnessApp {
 	}
 
 	openSelection(title, entries, onSelect, options = {}) {
-		this.closeMenu();
+		this.closeMenu({ cancelSelection: true });
 		this.menuEditorText = this.editor.getText();
 		this.updateFilterEditor("");
 		this.menuHandle = new SelectionPanel(title, entries, onSelect, {
@@ -1781,7 +1818,8 @@ class HarnessApp {
 		this.ui.requestRender();
 	}
 
-	closeMenu() {
+	closeMenu(options = {}) {
+		const handle = this.menuHandle;
 		if (this.menuHandle) {
 			this.commandPanel.clear();
 			this.menuHandle = undefined;
@@ -1792,10 +1830,60 @@ class HarnessApp {
 		}
 		this.ui.setFocus(this.editor);
 		this.ui.requestRender();
+		if (options.cancelSelection) handle?.cancel?.();
 	}
 
 	updateFilterEditor(query) {
 		this.editor.setText(`filter: ${query}`);
+	}
+
+	requestPermission(params = {}) {
+		return new Promise((resolve) => {
+			this.permissionQueue.push({ params, resolve });
+			this.drainPermissionQueue();
+		});
+	}
+
+	drainPermissionQueue() {
+		if (this.permissionPromptActive) return;
+		const request = this.permissionQueue.shift();
+		if (!request) return;
+		this.permissionPromptActive = true;
+		this.openPermissionRequest(request);
+	}
+
+	openPermissionRequest({ params, resolve }) {
+		const options = Array.isArray(params.options) ? params.options : [];
+		if (options.length === 0) {
+			resolve({ outcome: "cancelled" });
+			this.permissionPromptActive = false;
+			this.drainPermissionQueue();
+			return;
+		}
+		const entries = options.map((option, index) => ({
+			value: option,
+			label: permissionOptionLabel(option, index),
+			description: permissionOptionDescription(option),
+		}));
+		let settled = false;
+		const finish = (entry) => {
+			if (settled) return;
+			settled = true;
+			this.closeMenu();
+			const option = entry?.value;
+			resolve(option?.optionId ? { outcome: "selected", optionId: option.optionId } : { outcome: "cancelled" });
+			this.permissionPromptActive = false;
+			this.drainPermissionQueue();
+		};
+		this.openSelection(permissionTitle(params), entries, finish, { emptyText: "No permission options" });
+	}
+
+	cancelPermissionPrompts() {
+		const queued = this.permissionQueue.splice(0);
+		for (const request of queued) request.resolve({ outcome: "cancelled" });
+		if (!this.permissionPromptActive) return;
+		this.permissionPromptActive = false;
+		this.closeMenu({ cancelSelection: true });
 	}
 
 	handleBackendEvent(event) {
@@ -1813,6 +1901,8 @@ class HarnessApp {
 			this.updateTool(event.status, event.id, event.title);
 		} else if (event.type === "error") {
 			this.addError(event.message);
+		} else if (event.type === "backend_exit") {
+			this.cancelPermissionPrompts();
 		} else if (event.type === "commands") {
 			this.availableCommands.set(this.activeKey, event.commands);
 			this.updateAutocomplete();
@@ -1930,6 +2020,7 @@ class HarnessApp {
 	stop() {
 		if (this.spinnerTimer) clearInterval(this.spinnerTimer);
 		if (this.markdownPreloadTimer) clearTimeout(this.markdownPreloadTimer);
+		this.cancelPermissionPrompts();
 		this.voiceController?.dispose();
 		if (this.client) this.client.stop();
 		this.ui.stop();
@@ -2120,15 +2211,29 @@ function terminateChild(child) {
 	child.kill();
 }
 
-function selectedPermissionOutcome(params = {}) {
-	const options = Array.isArray(params.options) ? params.options : [];
-	const selected =
-		options.find((option) => option?.kind === "allow_once") ??
-		options.find((option) => option?.kind === "allow_always") ??
-		options.find((option) => String(option?.kind ?? "").startsWith("allow")) ??
-		options[0];
-	if (!selected?.optionId) return { outcome: "cancelled" };
-	return { outcome: "selected", optionId: selected.optionId };
+function permissionTitle(params = {}) {
+	const toolCall = params.toolCall ?? params.tool_call ?? {};
+	const title = toolCall.title ?? toolCall.name ?? params.title;
+	return title ? `Permission: ${oneLine(title)}` : "Permission request";
+}
+
+function permissionOptionLabel(option = {}, index = 0) {
+	return oneLine(option.name ?? option.label ?? humanizePermissionKind(option.kind) ?? `Option ${index + 1}`);
+}
+
+function permissionOptionDescription(option = {}) {
+	const parts = [
+		option.description,
+		option.kind ? humanizePermissionKind(option.kind) : undefined,
+	].filter(Boolean);
+	return parts.length > 0 ? parts.map(oneLine).join(" · ") : undefined;
+}
+
+function humanizePermissionKind(kind) {
+	if (!kind) return undefined;
+	return String(kind)
+		.replace(/_/g, " ")
+		.replace(/\b\w/g, (char) => char.toUpperCase());
 }
 
 function normalizedToolStatus(status) {

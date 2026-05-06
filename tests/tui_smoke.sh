@@ -88,6 +88,27 @@ wait_for_text "review prompt: /review-branch main"
 tmux send-keys -t "$SESSION" / c l e a r Enter
 wait_without_text "review prompt: /review-branch main"
 
+tmux send-keys -t "$SESSION" / p e r m i s s i o n - t e s t Enter
+wait_for_text "Permission: Permission Test"
+wait_for_text "Reject"
+wait_for_text "Allow"
+tmux send-keys -t "$SESSION" Down Enter
+wait_for_text '"optionId": "allow"'
+
+tmux send-keys -t "$SESSION" / c l e a r Enter
+wait_without_text '"optionId": "allow"'
+
+tmux send-keys -t "$SESSION" / p e r m i s s i o n - o v e r l a p Enter
+wait_for_text "Permission: Permission One"
+tmux send-keys -t "$SESSION" Down Enter
+wait_for_text "Permission: Permission Two"
+tmux send-keys -t "$SESSION" Down Enter
+wait_for_text '"optionId": "allow-one"'
+wait_for_text '"optionId": "allow-two"'
+
+tmux send-keys -t "$SESSION" / c l e a r Enter
+wait_without_text '"optionId": "allow-one"'
+
 tmux send-keys -t "$SESSION" s l o w Space t o o l Enter
 wait_for_text "Slow Tool"
 
@@ -119,3 +140,8 @@ wait_for_text "echo: pre-tool-queue"
 
 tmux send-keys -t "$SESSION" / v o i c e Enter
 wait_for_text "voice: space record"
+
+tmux send-keys -t "$SESSION" C-Space
+tmux send-keys -t "$SESSION" / p e r m i s s i o n - e x i t Enter
+wait_for_text "backend exited"
+wait_without_text "Permission: Permission Exit"

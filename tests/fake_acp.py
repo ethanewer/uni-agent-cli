@@ -54,6 +54,29 @@ def request(method, params):
     raise RuntimeError("stdin closed")
 
 
+def request_many(requests):
+    global next_client_request_id
+    pending = {}
+    results = {}
+    for method, params in requests:
+        request_id = next_client_request_id
+        next_client_request_id += 1
+        pending[request_id] = method
+        send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+    for raw in sys.stdin:
+        message = json.loads(raw)
+        request_id = message.get("id")
+        if request_id in pending:
+            if "error" in message:
+                raise RuntimeError(message["error"].get("message", "client request failed"))
+            results[request_id] = message.get("result", {})
+            if len(results) == len(pending):
+                return [results[request_id] for request_id in pending]
+            continue
+        handle_message(message)
+    raise RuntimeError("stdin closed")
+
+
 def poll_cancel(duration):
     deadline = time.monotonic() + duration
     while time.monotonic() < deadline:
@@ -131,6 +154,8 @@ def handle_message(message):
                             {"name": "review-branch", "description": "Review against a branch"},
                             {"name": "review-commit", "description": "Review a commit"},
                             {"name": "permission-test", "description": "Exercise ACP permission requests"},
+                            {"name": "permission-overlap", "description": "Exercise overlapping ACP permission requests"},
+                            {"name": "permission-exit", "description": "Exit while a permission request is open"},
                             {"name": "rpc-parse-error", "description": "Return a structured JSON-RPC parse error"},
                             {"name": "terminal-test", "description": "Exercise ACP terminal requests"},
                         ],
@@ -292,6 +317,79 @@ def handle_prompt(message):
         )
         send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "end_turn"}})
         return
+
+    if prompt == "/permission-overlap":
+        permissions = request_many(
+            [
+                (
+                    "session/request_permission",
+                    {
+                        "sessionId": "fake-session",
+                        "toolCall": {
+                            "toolCallId": "permission-1",
+                            "title": "Permission One",
+                            "status": "pending",
+                        },
+                        "options": [
+                            {"kind": "reject_once", "name": "Reject", "optionId": "reject-one"},
+                            {"kind": "allow_once", "name": "Allow", "optionId": "allow-one"},
+                        ],
+                    },
+                ),
+                (
+                    "session/request_permission",
+                    {
+                        "sessionId": "fake-session",
+                        "toolCall": {
+                            "toolCallId": "permission-2",
+                            "title": "Permission Two",
+                            "status": "pending",
+                        },
+                        "options": [
+                            {"kind": "reject_once", "name": "Reject", "optionId": "reject-two"},
+                            {"kind": "allow_once", "name": "Allow", "optionId": "allow-two"},
+                        ],
+                    },
+                ),
+            ]
+        )
+        send(
+            {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "fake-session",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": json.dumps(permissions, sort_keys=True)},
+                    },
+                },
+            }
+        )
+        send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "end_turn"}})
+        return
+
+    if prompt == "/permission-exit":
+        send(
+            {
+                "jsonrpc": "2.0",
+                "id": next_client_request_id,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "fake-session",
+                    "toolCall": {
+                        "toolCallId": "permission-exit",
+                        "title": "Permission Exit",
+                        "status": "pending",
+                    },
+                    "options": [
+                        {"kind": "reject_once", "name": "Reject", "optionId": "reject-exit"},
+                        {"kind": "allow_once", "name": "Allow", "optionId": "allow-exit"},
+                    ],
+                },
+            }
+        )
+        sys.exit(7)
 
     if prompt == "/terminal-test":
         terminal = request(
