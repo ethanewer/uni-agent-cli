@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 import json
 import os
+import select
 import sys
+import time
 
 next_client_request_id = 1000
+SLOW_DELAY = float(os.environ.get("FAKE_ACP_SLOW_DELAY", "0.8"))
 
 CONFIG_OPTIONS = [
     {
@@ -49,6 +52,23 @@ def request(method, params):
             return message.get("result", {})
         handle_message(message)
     raise RuntimeError("stdin closed")
+
+
+def poll_cancel(duration):
+    deadline = time.monotonic() + duration
+    while time.monotonic() < deadline:
+        timeout = min(0.05, max(0, deadline - time.monotonic()))
+        readable, _, _ = select.select([sys.stdin], [], [], timeout)
+        if not readable:
+            continue
+        raw = sys.stdin.readline()
+        if not raw:
+            return False
+        message = json.loads(raw)
+        if message.get("method") == "session/cancel":
+            return True
+        handle_message(message)
+    return False
 
 
 def handle_message(message):
@@ -194,7 +214,7 @@ def handle_message(message):
     elif method == "session/prompt":
         handle_prompt(message)
     elif method == "session/cancel":
-        continue_message = False
+        continue_message = True
         return continue_message
     else:
         send(
@@ -210,6 +230,17 @@ def handle_message(message):
 def handle_prompt(message):
     request_id = message.get("id")
     prompt = message["params"]["prompt"][0]["text"]
+    if prompt == "delayed tool":
+        if poll_cancel(SLOW_DELAY):
+            send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "cancelled"}})
+            return
+        send_slow_tool_turn(request_id)
+        return
+
+    if prompt == "slow tool":
+        send_slow_tool_turn(request_id)
+        return
+
     if prompt == "/rpc-parse-error":
         send(
             {
@@ -287,6 +318,61 @@ def handle_prompt(message):
         send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "end_turn"}})
         return
 
+    send_default_prompt_response(request_id, prompt)
+
+
+def send_slow_tool_turn(request_id):
+    send(
+        {
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "fake-session",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "slow-1",
+                    "title": "Slow Tool",
+                },
+            },
+        }
+    )
+    if poll_cancel(SLOW_DELAY):
+        send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "cancelled"}})
+        return
+    send(
+        {
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "fake-session",
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "slow-1",
+                    "status": "completed",
+                },
+            },
+        }
+    )
+    if poll_cancel(SLOW_DELAY):
+        send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "cancelled"}})
+        return
+    send(
+        {
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "fake-session",
+                "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "slow done"},
+                },
+            },
+        }
+    )
+    send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "end_turn"}})
+
+
+def send_default_prompt_response(request_id, prompt):
     send(
         {
             "jsonrpc": "2.0",

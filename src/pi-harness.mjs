@@ -871,7 +871,12 @@ class HarnessApp {
 		this.spinnerTimer = undefined;
 		this.spinnerIndex = 0;
 		this.statusState = "";
-		this.pendingPrompts = [];
+		this.promptQueue = [];
+		this.flushingPromptQueue = false;
+		this.cancelRequested = false;
+		this.afterToolCancelPending = false;
+		this.activeToolIds = new Set();
+		this.seenToolThisTurn = false;
 		this.availableCommands = new Map();
 		this.sessionStates = new Map();
 		this.voiceController = undefined;
@@ -901,6 +906,11 @@ class HarnessApp {
 		}));
 		this.ui.addChild(this.chat);
 		this.ui.addChild(this.commandPanel);
+		this.queueSummary = new PromptQueueSummary(
+			() => this.promptQueue,
+			() => SPINNER_FRAMES[this.spinnerIndex % SPINNER_FRAMES.length],
+		);
+		this.ui.addChild(this.queueSummary);
 		this.ui.addChild(this.editor);
 		this.ui.addChild(this.status);
 		this.ui.setFocus(this.editor);
@@ -988,10 +998,14 @@ class HarnessApp {
 		this.transport = transport;
 		this.ready = false;
 		this.busy = false;
+		this.cancelRequested = false;
+		this.afterToolCancelPending = false;
+		this.activeToolIds.clear();
+		this.seenToolThisTurn = false;
 		this.currentAssistantText = undefined;
 		this.currentUserText = undefined;
 		this.currentToolSummary = undefined;
-		this.statusState = options.statusState ?? (this.pendingPrompts.length > 0 ? "connecting" : "");
+		this.statusState = options.statusState ?? (this.promptQueue.length > 0 ? "connecting" : "");
 		this.updateSpinner();
 		this.updateAutocomplete();
 		if (!options.quiet) this.addNotice(`Switched to ${agent.label ?? key}`);
@@ -1012,7 +1026,7 @@ class HarnessApp {
 			this.ready = true;
 			this.statusState = "";
 			this.updateSpinner();
-			void this.flushPendingPrompts();
+			void this.flushPromptQueue();
 			this.ui.requestRender();
 		} catch (error) {
 			if (this.client !== client) return;
@@ -1045,6 +1059,10 @@ class HarnessApp {
 			this.ui.requestRender();
 			return { consume: true };
 		}
+		if (this.busy && isEscape(data)) {
+			this.interruptTurn();
+			return { consume: true };
+		}
 		const voiceWasRecording = this.voiceController?.isRecording();
 		const voiceConsumed = this.handleVoiceKey(data, {
 			isSpace: isPlainSpaceInput(data),
@@ -1062,6 +1080,13 @@ class HarnessApp {
 				return { consume: true };
 			}
 			this.handleInterrupt("input");
+			return { consume: true };
+		}
+		if (this.busy && isSubmitInput(data) && !this.editor.getText().trim()) {
+			this.promoteNextQueuedPromptToAfterTool();
+			return { consume: true };
+		}
+		if (isArrowUp(data) && !this.editor.getText() && this.unqueuePromptForEditing()) {
 			return { consume: true };
 		}
 		this.rememberEditorTextAfterInput();
@@ -1294,8 +1319,7 @@ class HarnessApp {
 			if (handled) return;
 		}
 		if (!this.ready) {
-			this.addUserMessage(text);
-			this.pendingPrompts.push(text);
+			this.enqueuePrompt(text);
 			this.statusState = "connecting";
 			this.updateSpinner();
 			if (!this.client) void this.switchAgent(this.activeKey, this.transport, { quiet: true });
@@ -1303,16 +1327,21 @@ class HarnessApp {
 			return;
 		}
 		if (this.busy) {
-			this.addNotice("Wait for the current turn or press Ctrl-C to cancel");
+			this.enqueuePrompt(text);
 			return;
 		}
 		this.addUserMessage(text);
 		await this.sendPrompt(text);
+		await this.flushPromptQueue();
 	}
 
 	async sendPrompt(text) {
 		if (!this.client || !this.ready) return;
 		this.busy = true;
+		this.cancelRequested = false;
+		this.afterToolCancelPending = false;
+		this.activeToolIds.clear();
+		this.seenToolThisTurn = false;
 		this.currentAssistantText = undefined;
 		this.statusState = "working";
 		this.updateSpinner();
@@ -1322,25 +1351,78 @@ class HarnessApp {
 		} catch (error) {
 			this.addError(error.message ?? String(error));
 		} finally {
+			if (this.cancelRequested) {
+				for (const id of this.activeToolIds) this.updateTool("canceled", id);
+			}
+			this.activeToolIds.clear();
 			this.busy = false;
 			this.currentAssistantText = undefined;
-			this.statusState = this.pendingPrompts.length > 0 ? "working" : "";
+			this.statusState = this.promptQueue.length > 0 ? "working" : "";
 			this.updateSpinner();
 			this.ui.requestRender();
 		}
 	}
 
-	async flushPendingPrompts() {
-		if (!this.ready || this.busy) return;
-		while (this.ready && this.pendingPrompts.length > 0) {
-			const prompt = this.pendingPrompts.shift();
-			await this.sendPrompt(prompt);
+	async flushPromptQueue() {
+		if (!this.ready || this.busy || this.flushingPromptQueue) return;
+		this.flushingPromptQueue = true;
+		try {
+			while (this.ready && !this.busy && this.promptQueue.length > 0) {
+				const prompt = this.promptQueue.shift();
+				this.addUserMessage(prompt.text);
+				this.ui.requestRender();
+				await this.sendPrompt(prompt.text);
+			}
+		} finally {
+			this.flushingPromptQueue = false;
 		}
-		if (this.pendingPrompts.length === 0) {
+		if (this.promptQueue.length === 0 && !this.busy) {
 			this.statusState = "";
 			this.updateSpinner();
 			this.ui.requestRender();
 		}
+	}
+
+	enqueuePrompt(text, timing = "afterTurn") {
+		this.promptQueue.push({ text, timing });
+		this.updateSpinner();
+		this.ui.requestRender();
+	}
+
+	promoteNextQueuedPromptToAfterTool() {
+		const prompt = this.promptQueue.find((entry) => entry.timing !== "afterTool");
+		if (!prompt) return;
+		prompt.timing = "afterTool";
+		this.maybeCancelAfterTool();
+		this.ui.requestRender();
+	}
+
+	unqueuePromptForEditing() {
+		if (this.promptQueue.length === 0) return false;
+		const prompt = this.promptQueue.pop();
+		this.editor.setText(prompt.text);
+		this.lastKnownEditorText = prompt.text;
+		this.updateSpinner();
+		this.ui.requestRender();
+		return true;
+	}
+
+	interruptTurn() {
+		if (!this.busy || !this.client || this.cancelRequested) return;
+		this.cancelRequested = true;
+		this.statusState = "canceling";
+		this.updateSpinner();
+		this.client.cancel();
+		this.ui.requestRender();
+	}
+
+	maybeCancelAfterTool() {
+		if (!this.busy || this.afterToolCancelPending || this.cancelRequested) return;
+		if (!this.promptQueue.some((entry) => entry.timing === "afterTool")) return;
+		if (!this.seenToolThisTurn) return;
+		if (this.activeToolIds.size > 0) return;
+		this.afterToolCancelPending = true;
+		this.interruptTurn();
 	}
 
 	async handleHarnessCommand(command) {
@@ -1652,8 +1734,10 @@ class HarnessApp {
 		} else if (event.type === "user_text") {
 			this.appendUserText(event.text);
 		} else if (event.type === "tool") {
+			this.trackToolStatus(event.id, event.status);
 			this.addTool(event.title, event.status, event.id);
 		} else if (event.type === "tool_update") {
+			this.trackToolStatus(event.id, event.status);
 			this.updateTool(event.status, event.id, event.title);
 		} else if (event.type === "error") {
 			this.addError(event.message);
@@ -1665,6 +1749,14 @@ class HarnessApp {
 			this.updateAutocomplete();
 		}
 		this.ui.requestRender();
+	}
+
+	trackToolStatus(id, status) {
+		if (!id) return;
+		this.seenToolThisTurn = true;
+		if (status === "running") this.activeToolIds.add(id);
+		else this.activeToolIds.delete(id);
+		this.maybeCancelAfterTool();
 	}
 
 	updateSpinner() {
@@ -1868,6 +1960,24 @@ class CtrlCExitHint {
 
 	render(width) {
 		return [chalk.dim(truncateVisual("• Press Ctrl-D to exit", width))];
+	}
+}
+
+class PromptQueueSummary {
+	constructor(getQueue, getSpinner) {
+		this.getQueue = getQueue;
+		this.getSpinner = getSpinner;
+	}
+
+	invalidate() {}
+
+	render(width) {
+		const queue = this.getQueue();
+		if (queue.length === 0) return [];
+		return ["", ...queue.map((entry) => {
+			const prefix = entry.timing === "afterTool" ? `${this.getSpinner()} after tool` : "↵ queued";
+			return chalk.dim(truncateVisual(`${prefix}: ${oneLine(entry.text)}`, width));
+		})];
 	}
 }
 
@@ -2348,6 +2458,18 @@ function isPlainSpaceInput(data) {
 
 function isModifiedSpaceInput(data) {
 	return matchesKey(data, "shift+space") || matchesKey(data, "alt+space") || matchesKey(data, "super+space");
+}
+
+function isSubmitInput(data) {
+	return matchesKey(data, "enter") || matchesKey(data, "return");
+}
+
+function isEscape(data) {
+	return matchesKey(data, "escape") || matchesKey(data, "esc");
+}
+
+function isArrowUp(data) {
+	return matchesKey(data, "up");
 }
 
 function createHarnessTerminal(resizeHooks = {}) {
