@@ -31,6 +31,17 @@ CONFIG_OPTIONS = [
             {"value": "plan", "name": "Plan"},
         ],
     },
+    {
+        "id": "thought_level",
+        "name": "Reasoning Effort",
+        "category": "thought_level",
+        "type": "select",
+        "currentValue": "high",
+        "options": [
+            {"value": "low", "name": "Low"},
+            {"value": "high", "name": "High"},
+        ],
+    },
 ]
 
 

@@ -184,12 +184,12 @@ class AgentMenu {
 		}
 		if (data >= "1" && data <= "9") {
 			const key = keys[Number(data) - 1];
-			if (key) void this.app.switchAgent(key);
+			if (key) void this.app.switchAgent(key, "acp", { displayText: slashPromptDisplay("/harness", this.app.config.agents[key]?.label ?? key) });
 			return;
 		}
 		if (matchesKey(data, "enter") || data === "\r" || data === "\n") {
 			const key = keys[this.selected];
-			if (key) void this.app.switchAgent(key);
+			if (key) void this.app.switchAgent(key, "acp", { displayText: slashPromptDisplay("/harness", this.app.config.agents[key]?.label ?? key) });
 		}
 	}
 }
@@ -1040,7 +1040,7 @@ class HarnessApp {
 		this.statusState = options.statusState ?? (this.promptQueue.length > 0 ? "connecting" : "");
 		this.updateSpinner();
 		this.updateAutocomplete();
-		if (!options.quiet) this.addNotice(`Switched to ${agent.label ?? key}`);
+		if (!options.quiet) this.addCommandMessage(options.displayText ?? slashPromptDisplay("/harness", agent.label ?? key));
 		this.ui.requestRender();
 
 		if (transport !== "acp") {
@@ -1350,21 +1350,23 @@ class HarnessApp {
 			this.editor.onSubmit = (next) => void this.handleSubmit(next);
 		});
 
-		if (text.startsWith(HARNESS)) {
+		if (isHarnessCommandText(text)) {
 			await this.handleHarnessCommand(text);
 			return;
 		}
+		let compactCommand = false;
 		if (text.startsWith("/")) {
 			const handled = await this.handleSlashCommand(text);
-			if (handled) return;
+			compactCommand = handled === "backend";
+			if (handled === true) return;
 		}
-		await this.submitBackendPrompt(text, { displayText });
+		await this.submitBackendPrompt(text, { displayText, compactCommand });
 	}
 
 	async submitBackendPrompt(text, options = {}) {
 		const displayText = options.displayText ?? text;
 		if (!this.ready) {
-			this.enqueuePrompt(text, "afterTurn", { displayText });
+			this.enqueuePrompt(text, "afterTurn", { displayText, compactCommand: options.compactCommand });
 			this.statusState = "connecting";
 			this.updateSpinner();
 			if (!this.client) void this.switchAgent(this.activeKey, this.transport, { quiet: true });
@@ -1372,10 +1374,10 @@ class HarnessApp {
 			return;
 		}
 		if (this.busy) {
-			this.enqueuePrompt(text, "afterTurn", { displayText });
+			this.enqueuePrompt(text, "afterTurn", { displayText, compactCommand: options.compactCommand });
 			return;
 		}
-		this.addUserMessage(displayText);
+		this.addUserMessage(displayText, { compactCommand: options.compactCommand });
 		await this.sendPrompt(text);
 		await this.flushPromptQueue();
 	}
@@ -1415,7 +1417,7 @@ class HarnessApp {
 		try {
 			while (this.ready && !this.busy && this.promptQueue.length > 0) {
 				const prompt = this.promptQueue.shift();
-				this.addUserMessage(prompt.displayText ?? prompt.text);
+				this.addUserMessage(prompt.displayText ?? prompt.text, { compactCommand: prompt.compactCommand });
 				this.ui.requestRender();
 				await this.sendPrompt(prompt.text);
 			}
@@ -1430,7 +1432,7 @@ class HarnessApp {
 	}
 
 	enqueuePrompt(text, timing = "afterTurn", options = {}) {
-		this.promptQueue.push({ text, timing, displayText: options.displayText });
+		this.promptQueue.push({ text, timing, displayText: options.displayText, compactCommand: options.compactCommand });
 		this.updateSpinner();
 		this.ui.requestRender();
 		this.schedulePromptQueueDrain();
@@ -1495,10 +1497,11 @@ class HarnessApp {
 		}
 		const agentKey = parts.find((part) => this.config.agents[part]);
 		if (!agentKey) {
+			this.addCommandMessage(command);
 			this.addNotice(`usage: /harness [${Object.keys(this.config.agents).join("|")}]`);
 			return;
 		}
-		await this.switchAgent(agentKey);
+		await this.switchAgent(agentKey, "acp", { displayText: slashPromptDisplay("/harness", this.config.agents[agentKey]?.label ?? agentKey) });
 	}
 
 	async handleSlashCommand(text) {
@@ -1516,8 +1519,9 @@ class HarnessApp {
 			await this.runLocalSlashCommand(name, argument);
 			return true;
 		}
-		if (this.isKnownCodexReviewCommand(name)) return false;
-		if (backendNames.has(name)) return false;
+		if (this.isKnownCodexReviewCommand(name)) return "backend";
+		if (backendNames.has(name)) return "backend";
+		this.addCommandMessage(text);
 		this.addNotice(`Unknown command: /${name}`);
 		return true;
 	}
@@ -1543,7 +1547,7 @@ class HarnessApp {
 			this.closeMenu();
 			if (!entry) return;
 			if (entry.value === "uncommitted") {
-				await this.submitBackendPrompt("/review", { displayText: reviewPromptDisplay("/review", entry.label) });
+				await this.submitBackendPrompt("/review", { displayText: reviewPromptDisplay("/review", entry.label), compactCommand: true });
 				return;
 			}
 			const prefixes = {
@@ -1570,10 +1574,12 @@ class HarnessApp {
 
 	async runLocalSlashCommand(name, argument) {
 		if (name === "help") {
+			this.addCommandMessage(slashCommandText(name, argument));
 			this.showHelp();
 			return;
 		}
 		if (name === "status") {
+			this.addCommandMessage(slashCommandText(name, argument));
 			this.showStatus();
 			return;
 		}
@@ -1587,35 +1593,38 @@ class HarnessApp {
 		}
 		if (name === "voice") {
 			if (argument) {
+				this.addCommandMessage(slashCommandText(name, argument));
 				this.addNotice("/voice only works by itself in an empty input box");
 				return;
 			}
 			if (this.voiceController?.isRecording() || this.voiceController?.isTranscribing()) {
+				this.addCommandMessage(slashCommandText(name, argument));
 				this.addNotice("/voice is available after the current voice action finishes");
 				return;
 			}
+			this.addCommandMessage(slashCommandText(name, argument));
 			this.editor.setText("");
 			this.enterVoiceMode();
 			return;
 		}
 		if (name === "resume") {
-			await this.openResumeDialog();
+			await this.openResumeDialog(name);
 			return;
 		}
 		if (name === "model") {
-			await this.openConfigDialog("model", "Model", argument);
+			await this.openConfigDialog("model", "Model", argument, name);
 			return;
 		}
 		if (name === "mode") {
-			await this.openConfigDialog("mode", "Mode", argument);
+			await this.openConfigDialog("mode", "Mode", argument, name);
 			return;
 		}
 		if (name === "effort" || name === "reasoning" || name === "thinking") {
-			await this.openConfigDialog("thought_level", "Reasoning", argument);
+			await this.openConfigDialog("thought_level", "Reasoning", argument, name);
 			return;
 		}
 		if (name === "plan") {
-			await this.setPlanMode();
+			await this.setPlanMode(name);
 		}
 	}
 
@@ -1653,12 +1662,13 @@ class HarnessApp {
 		this.addNotice(parts.join(" · "));
 	}
 
-	async openResumeDialog() {
+	async openResumeDialog(commandName = "resume") {
 		if (!this.client || !this.ready) {
 			const connected = await this.ensureConnected();
 			if (!connected) return;
 		}
 		if (!supportsSessionList(this.sessionStates.get(this.activeKey))) {
+			this.addCommandMessage(`/${commandName}`);
 			this.addNotice("This agent does not advertise session listing");
 			return;
 		}
@@ -1677,7 +1687,9 @@ class HarnessApp {
 			this.openSelection("Resume session", entries, async (entry) => {
 				this.closeMenu();
 				if (!entry) return;
-				await this.resumeSelectedSession(entry.session);
+				await this.resumeSelectedSession(entry.session, {
+					displayText: slashPromptDisplay(`/${commandName}`, entry.label),
+				});
 			});
 		} catch (error) {
 			this.addError(error.message ?? String(error));
@@ -1688,9 +1700,11 @@ class HarnessApp {
 		}
 	}
 
-	async resumeSelectedSession(session) {
+	async resumeSelectedSession(session, options = {}) {
 		if (!this.client) return;
+		const displayText = options.displayText ?? slashPromptDisplay("/resume", session.title || session.sessionId);
 		if (session.sessionId === this.client.sessionId) {
+			this.addCommandMessage(displayText);
 			this.addNotice(`Already using ${session.title || session.sessionId}`);
 			return;
 		}
@@ -1706,9 +1720,9 @@ class HarnessApp {
 			if (loadsHistory) await this.client.loadSession(session.sessionId);
 			else {
 				await this.client.resumeSession(session.sessionId);
-				this.addNotice(`Resumed ${session.title || session.sessionId}`);
+				this.addCommandMessage(displayText);
 			}
-			if (loadsHistory && this.chat.children.length === 0) this.addNotice(`Resumed ${session.title || session.sessionId}`);
+			if (loadsHistory) this.addCommandMessage(displayText);
 			this.updateAutocomplete();
 		} catch (error) {
 			this.addError(error.message ?? String(error));
@@ -1719,7 +1733,7 @@ class HarnessApp {
 		}
 	}
 
-	async openConfigDialog(category, title, argument = "") {
+	async openConfigDialog(category, title, argument = "", commandName = title.toLowerCase()) {
 		if (!this.client || !this.ready) {
 			const connected = await this.ensureConnected();
 			if (!connected) return;
@@ -1727,6 +1741,7 @@ class HarnessApp {
 		const state = this.sessionStates.get(this.activeKey);
 		const option = findConfigOption(state, category);
 		if (!option) {
+			this.addCommandMessage(slashCommandText(commandName, argument));
 			this.addNotice(`${title} selection is not advertised by this agent`);
 			return;
 		}
@@ -1734,10 +1749,13 @@ class HarnessApp {
 		if (argument) {
 			const match = values.find((entry) => entry.value === argument || entry.name === argument);
 			if (!match) {
+				this.addCommandMessage(slashCommandText(commandName, argument));
 				this.addNotice(`Unknown ${title.toLowerCase()}: ${argument}`);
 				return;
 			}
-			await this.setConfigValue(option, match.value, match.name);
+			await this.setConfigValue(option, match.value, match.name, {
+				displayText: slashPromptDisplay(slashCommandText(commandName, argument), match.name),
+			});
 			return;
 		}
 		const entries = values.map((value) => ({
@@ -1749,24 +1767,27 @@ class HarnessApp {
 		this.openSelection(title, entries, async (entry) => {
 			this.closeMenu();
 			if (!entry) return;
-			await this.setConfigValue(option, entry.value, entry.label);
+			await this.setConfigValue(option, entry.value, entry.label, {
+				displayText: slashPromptDisplay(`/${commandName}`, entry.label),
+			});
 		});
 	}
 
-	async setConfigValue(option, value, label = value) {
+	async setConfigValue(option, value, label = value, options = {}) {
 		if (!this.client) return;
+		const displayText = options.displayText ?? slashPromptDisplay(`/${option.category ?? option.id ?? "config"}`, label);
 		this.statusState = "updating";
 		this.updateSpinner();
 		this.ui.requestRender();
 		try {
 			await this.client.setConfigOption(option.id, value);
-			this.addNotice(`${option.name}: ${label}`);
+			this.addCommandMessage(displayText);
 			this.updateAutocomplete();
 		} catch (error) {
 			if (option.category === "mode" || option.id === "mode") {
 				try {
 					await this.client.setMode(value);
-					this.addNotice(`${option.name}: ${label}`);
+					this.addCommandMessage(displayText);
 					this.updateAutocomplete();
 					return;
 				} catch (modeError) {
@@ -1782,7 +1803,7 @@ class HarnessApp {
 		}
 	}
 
-	async setPlanMode() {
+	async setPlanMode(commandName = "plan") {
 		if (!this.ready) {
 			const connected = await this.ensureConnected();
 			if (!connected) return;
@@ -1791,10 +1812,13 @@ class HarnessApp {
 		const option = findConfigOption(state, "mode");
 		const value = flattenConfigOptions(option).find((entry) => entry.value === "plan" || entry.name.toLowerCase() === "plan");
 		if (!option || !value) {
+			this.addCommandMessage(`/${commandName}`);
 			this.addNotice("Plan mode is not advertised by this agent");
 			return;
 		}
-		await this.setConfigValue(option, value.value, value.name);
+		await this.setConfigValue(option, value.value, value.name, {
+			displayText: slashPromptDisplay(`/${commandName}`, value.name),
+		});
 	}
 
 	openMenu() {
@@ -1943,10 +1967,14 @@ class HarnessApp {
 		this.editor.setAutocompleteProvider(new LazyCombinedAutocompleteProvider(dedupeCommands(commands), process.cwd(), null));
 	}
 
-	addUserMessage(text) {
+	addUserMessage(text, options = {}) {
+		if (options.compactCommand) {
+			this.addCommandMessage(text);
+			return;
+		}
 		this.currentUserText = undefined;
 		this.currentToolSummary = undefined;
-		if (this.chat.children.length > 0) this.chat.addChild(new Spacer(1));
+		this.addHistorySpacer("user");
 		this.chat.addChild(new UserMessage(text));
 	}
 
@@ -1954,7 +1982,7 @@ class HarnessApp {
 		this.currentAssistantText = undefined;
 		this.currentToolSummary = undefined;
 		if (!this.currentUserText) {
-			if (this.chat.children.length > 0) this.chat.addChild(new Spacer(1));
+			this.addHistorySpacer("user");
 			this.currentUserText = new MutableUserMessage("");
 			this.chat.addChild(this.currentUserText);
 		}
@@ -1965,18 +1993,26 @@ class HarnessApp {
 		this.currentUserText = undefined;
 		this.currentToolSummary = undefined;
 		if (!this.currentAssistantText) {
-			if (this.chat.children.length > 0) this.chat.addChild(new Spacer(1));
+			this.addHistorySpacer("assistant");
 			this.currentAssistantText = new MutableMarkdown("");
 			this.chat.addChild(this.currentAssistantText);
 		}
 		this.currentAssistantText.append(text);
 	}
 
+	addCommandMessage(text) {
+		this.currentAssistantText = undefined;
+		this.currentUserText = undefined;
+		this.currentToolSummary = undefined;
+		this.addHistorySpacer("command");
+		this.chat.addChild(new CommandMessage(text));
+	}
+
 	addNotice(text) {
 		this.currentAssistantText = undefined;
 		this.currentUserText = undefined;
 		this.currentToolSummary = undefined;
-		if (this.chat.children.length > 0) this.chat.addChild(new Spacer(1));
+		this.addHistorySpacer("notice");
 		this.chat.addChild(new Text(chalk.dim(text), 0, 0));
 	}
 
@@ -1984,7 +2020,7 @@ class HarnessApp {
 		this.currentAssistantText = undefined;
 		this.currentUserText = undefined;
 		if (!this.currentToolSummary) {
-			if (this.chat.children.length > 0) this.chat.addChild(new Spacer(1));
+			this.addHistorySpacer("tool");
 			this.currentToolSummary = new ToolSummary(() => SPINNER_FRAMES[this.spinnerIndex % SPINNER_FRAMES.length]);
 			this.chat.addChild(this.currentToolSummary);
 		}
@@ -2005,7 +2041,7 @@ class HarnessApp {
 		this.currentAssistantText = undefined;
 		this.currentUserText = undefined;
 		this.currentToolSummary = undefined;
-		if (this.chat.children.length > 0) this.chat.addChild(new Spacer(1));
+		this.addHistorySpacer("notice");
 		this.chat.addChild(new CtrlCExitHint());
 	}
 
@@ -2013,8 +2049,17 @@ class HarnessApp {
 		this.currentAssistantText = undefined;
 		this.currentUserText = undefined;
 		this.currentToolSummary = undefined;
-		if (this.chat.children.length > 0) this.chat.addChild(new Spacer(1));
+		this.addHistorySpacer("error");
 		this.chat.addChild(new Text(chalk.red(`! ${text}`), 0, 0));
+	}
+
+	addHistorySpacer(kind) {
+		const last = lastRenderableChild(this.chat);
+		if (!last) return;
+		if (last instanceof CommandMessage) {
+			if (kind === "command" || kind === "assistant" || kind === "notice" || kind === "tool") return;
+		}
+		this.chat.addChild(new Spacer(1));
 	}
 
 	stop() {
@@ -2086,6 +2131,24 @@ class MutableUserMessage {
 }
 
 class UserMessage extends MutableUserMessage {}
+
+class MutableCommandMessage {
+	constructor(text) {
+		this.text = text;
+	}
+
+	append(text) {
+		this.text += text;
+	}
+
+	invalidate() {}
+
+	render(width) {
+		return [chalk.dim(truncateVisual(oneLine(this.text), width))];
+	}
+}
+
+class CommandMessage extends MutableCommandMessage {}
 
 class ToolSummary {
 	constructor(getSpinner) {
@@ -2449,8 +2512,26 @@ function parseSlashCommand(text) {
 	return { name: match?.[1] ?? "", argument: match?.[2]?.trim() ?? "" };
 }
 
-function reviewPromptDisplay(prompt, label) {
+function isHarnessCommandText(text) {
+	return new RegExp(`^${escapeRegExp(HARNESS)}(?:\\s|$)`).test(text);
+}
+
+function slashCommandText(name, argument = "") {
+	const command = String(name ?? "").startsWith("/") ? String(name ?? "") : `/${name ?? ""}`;
+	const suffix = oneLine(argument);
+	return suffix ? `${command} ${suffix}` : command;
+}
+
+function slashPromptDisplay(prompt, label) {
 	return `${prompt} (${label})`;
+}
+
+function reviewPromptDisplay(prompt, label) {
+	return slashPromptDisplay(prompt, label);
+}
+
+function escapeRegExp(value) {
+	return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function parseDelay(value, fallback) {
