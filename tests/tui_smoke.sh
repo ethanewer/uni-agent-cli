@@ -62,6 +62,23 @@ assert_next_line_blank() {
 	fi
 }
 
+assert_next_line_rule() {
+	local needle="$1"
+	if ! capture | awk -v needle="$needle" '
+		$0 == needle {
+			found = 1
+			if (getline next_line <= 0) exit 1
+			gsub(/[[:space:]]/, "", next_line)
+			exit next_line ~ /^─+$/ ? 0 : 1
+		}
+		END { if (!found) exit 1 }
+	'; then
+		echo "Expected horizontal rule after: $needle" >&2
+		capture >&2
+		exit 1
+	fi
+}
+
 tmux new-session -d -s "$SESSION" -x 100 -y 30 "cd $ROOT_Q && HARNESS_CONFIG=tests/fake_config.json CC_BACKGROUND_CONNECT_DELAY_MS=0 ./src/cc fake"
 
 wait_for_text "Space to record"
@@ -87,7 +104,7 @@ wait_without_text "Space to record"
 tmux send-keys -t "$SESSION" / t m p / f o o / b a r Enter
 wait_for_text "echo: /tmp/foo/bar"
 wait_without_text "Unknown command: /tmp"
-assert_next_line_blank "/tmp/foo/bar"
+assert_next_line_rule "/tmp/foo/bar"
 
 tmux send-keys -t "$SESSION" / h a r n e s s x Enter
 wait_for_text "Unknown command: /harnessx"

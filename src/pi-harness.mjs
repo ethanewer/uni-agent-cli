@@ -11,7 +11,7 @@ import { Text } from "@mariozechner/pi-tui/dist/components/text.js";
 import { isKeyRelease, matchesKey } from "@mariozechner/pi-tui/dist/keys.js";
 import { ProcessTerminal } from "@mariozechner/pi-tui/dist/terminal.js";
 import { Container, TUI } from "@mariozechner/pi-tui/dist/tui.js";
-import { applyBackgroundToLine, normalizeTerminalOutput, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui/dist/utils.js";
+import { normalizeTerminalOutput, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui/dist/utils.js";
 
 const HARNESS = "/harness";
 const OSC133_ZONE_START = "\x1b]133;A\x07";
@@ -48,10 +48,6 @@ const SELECT_LIST_THEME = {
 const EDITOR_THEME = {
 	borderColor: (text) => chalk.blue(text),
 	selectList: SELECT_LIST_THEME,
-};
-
-const UI_COLORS = {
-	userMessageBg: "#343541",
 };
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -91,6 +87,17 @@ const DEFAULT_CONFIG = {
 		},
 	},
 };
+
+const DEFAULT_SETTINGS = {
+	agents: {},
+};
+
+const DANGEROUS_CODEX_CONFIG = {
+	approval_policy: "never",
+	sandbox_mode: "danger-full-access",
+};
+
+const DANGEROUS_CURSOR_ARGS = ["--force", "--sandbox", "disabled"];
 
 class StatusLine extends Text {
 	constructor(getStatus) {
@@ -362,7 +369,7 @@ class ManagedTerminal {
 	}
 }
 
-class AcpClient {
+export class AcpClient {
 	constructor(agent, onEvent, options = {}) {
 		this.agent = agent;
 		this.onEvent = onEvent;
@@ -387,9 +394,10 @@ class AcpClient {
 
 	start() {
 		const command = this.agent.acp ?? this.agent;
+		const env = { ...process.env, ...(this.agent.env ?? {}), ...(command.env ?? {}) };
 		this.child = spawn(command.command, command.args ?? [], {
 			cwd: process.cwd(),
-			env: process.env,
+			env,
 			detached: process.platform !== "win32",
 			stdio: ["pipe", "pipe", "pipe"],
 		});
@@ -430,13 +438,11 @@ class AcpClient {
 		this.capabilities = initialized?.agentCapabilities ?? {};
 		this.agentInfo = initialized?.agentInfo ?? {};
 		this.authMethods = initialized?.authMethods ?? [];
-		const session = await this.request("session/new", {
-			cwd: process.cwd(),
-			mcpServers: [],
-		});
+		const session = await this.request("session/new", this.sessionRequestParams());
 		this.sessionId = session?.sessionId ?? session?.id;
 		if (!this.sessionId) throw new Error("ACP session/new did not return a session id");
 		this.applySessionState(session);
+		await this.applyStartupMode();
 	}
 
 	async prompt(text) {
@@ -462,24 +468,35 @@ class AcpClient {
 	}
 
 	async loadSession(sessionId) {
-		const params = { sessionId, cwd: process.cwd(), mcpServers: [] };
+		const params = this.sessionRequestParams({ sessionId });
 		const result = this.capabilities?.loadSession
 			? await this.request("session/load", params)
 			: await this.request("session/resume", params);
 		this.sessionId = sessionId;
 		this.applySessionState(result);
+		await this.applyStartupMode();
 		return result;
 	}
 
 	async resumeSession(sessionId) {
-		const result = await this.request("session/resume", {
-			sessionId,
-			cwd: process.cwd(),
-			mcpServers: [],
-		});
+		const result = await this.request("session/resume", this.sessionRequestParams({ sessionId }));
 		this.sessionId = sessionId;
 		this.applySessionState(result);
+		await this.applyStartupMode();
 		return result;
+	}
+
+	sessionRequestParams(params = {}) {
+		return {
+			...params,
+			cwd: process.cwd(),
+			mcpServers: [],
+			...(this.agent._sessionMeta ? { _meta: this.agent._sessionMeta } : {}),
+		};
+	}
+
+	async applyStartupMode() {
+		if (this.agent._startupMode) await this.setMode(this.agent._startupMode);
 	}
 
 	async setConfigOption(configId, value) {
@@ -1603,7 +1620,6 @@ class HarnessApp {
 				this.addNotice("/voice is available after the current voice action finishes");
 				return;
 			}
-			this.addCommandMessage(slashCommandText(name, argument));
 			this.editor.setText("");
 			this.enterVoiceMode();
 			return;
@@ -2116,12 +2132,12 @@ class MutableUserMessage {
 	render(width) {
 		if (this.cache?.width === width && this.cache.text === this.text) return this.cache.lines.slice();
 		const contentWidth = Math.max(1, width);
-		const bg = bgHex(UI_COLORS.userMessageBg);
 		const body = renderMarkdown(this.text, contentWidth, 0, 0, { color: (content) => content });
+		const rail = chalk.dim("─".repeat(Math.max(1, width)));
 		const lines = [
-			applyBackgroundToLine("", width, bg),
-			...body.map((line) => applyBackgroundToLine(line, width, bg)),
-			applyBackgroundToLine("", width, bg),
+			rail,
+			...body,
+			rail,
 		];
 		if (lines.length === 0) return lines;
 		lines[0] = OSC133_ZONE_START + lines[0];
@@ -2322,10 +2338,6 @@ function normalizeToolTitle(title) {
 	return value === value.toLowerCase() ? value.replace(/^\w/, (char) => char.toUpperCase()) : value;
 }
 
-function bgHex(color) {
-	return (text) => chalk.bgHex(color)(text);
-}
-
 function createAnsiStyles() {
 	const style = (open, close) => (text) => `${open}${text}${close}`;
 	const black = Object.assign(style("\x1b[30m", "\x1b[39m"), {
@@ -2342,15 +2354,6 @@ function createAnsiStyles() {
 		strikethrough: style("\x1b[9m", "\x1b[29m"),
 		underline: style("\x1b[4m", "\x1b[24m"),
 		yellow: style("\x1b[33m", "\x1b[39m"),
-		bgHex: (color) => {
-			const match = /^#?([\da-f]{2})([\da-f]{2})([\da-f]{2})$/i.exec(color);
-			if (!match) return (text) => text;
-			const [, r, g, b] = match;
-			return style(
-				`\x1b[48;2;${Number.parseInt(r, 16)};${Number.parseInt(g, 16)};${Number.parseInt(b, 16)}m`,
-				"\x1b[49m",
-			);
-		},
 	};
 }
 
@@ -2849,11 +2852,12 @@ function compactPath(value) {
 	return value ? compactCwd(value) : "";
 }
 
-function loadConfig() {
+export function loadConfig() {
 	const file = configPath();
-	if (!fs.existsSync(file)) return DEFAULT_CONFIG;
-	const user = JSON.parse(fs.readFileSync(file, "utf8"));
-	return deepMerge(DEFAULT_CONFIG, user);
+	const user = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : {};
+	const config = deepMerge(DEFAULT_CONFIG, user);
+	const settings = deepMerge(config.settings ?? DEFAULT_SETTINGS, loadSettings());
+	return applyHarnessSettings(config, settings);
 }
 
 function configPath() {
@@ -2862,6 +2866,134 @@ function configPath() {
 	const current = path.join(os.homedir(), ".config", "cc", "config.json");
 	if (fs.existsSync(current)) return current;
 	return path.join(os.homedir(), ".config", "uni-agent-cli", "config.json");
+}
+
+function loadSettings() {
+	const file = settingsPath();
+	if (!fs.existsSync(file)) return DEFAULT_SETTINGS;
+	return deepMerge(DEFAULT_SETTINGS, JSON.parse(fs.readFileSync(file, "utf8")));
+}
+
+function settingsPath() {
+	if (process.env.CC_SETTINGS) return process.env.CC_SETTINGS;
+	if (process.env.HARNESS_SETTINGS) return process.env.HARNESS_SETTINGS;
+	const current = path.join(os.homedir(), ".config", "cc", "settings.json");
+	if (fs.existsSync(current)) return current;
+	return path.join(os.homedir(), ".config", "uni-agent-cli", "settings.json");
+}
+
+export function applyHarnessSettings(config, settings = DEFAULT_SETTINGS) {
+	const normalized = normalizeHarnessSettings(settings, config.agents);
+	const agents = {};
+	for (const [key, agent] of Object.entries(config.agents ?? {})) {
+		agents[key] = applyAgentSettings(key, agent, normalized[key] ?? {});
+	}
+	return { ...config, settings, agents };
+}
+
+function normalizeHarnessSettings(settings, agents = {}) {
+	if (!settings || typeof settings !== "object" || Array.isArray(settings)) return {};
+	if (isPlainObject(settings.agents) && Object.keys(settings.agents).length > 0) return settings.agents;
+	if (isPlainObject(settings.harnesses)) return settings.harnesses;
+	const keys = new Set(Object.keys(agents));
+	return Object.fromEntries(Object.entries(settings).filter(([key, value]) => keys.has(key) && isPlainObject(value)));
+}
+
+function applyAgentSettings(key, agent, settings) {
+	const applied = clonePlain(agent);
+	if (!isPlainObject(settings)) return applied;
+	applied.env = { ...(applied.env ?? {}), ...(settings.env ?? {}) };
+	if (applied.acp) applied.acp = clonePlain(applied.acp);
+
+	const command = applied.acp ?? applied;
+	const nativeArgs = stringArray(settings.args ?? settings.nativeArgs);
+	if (nativeArgs.length > 0) command.args = applyNativeArgs(key, command.args ?? [], nativeArgs);
+
+	const acpArgs = stringArray(settings.acpArgs);
+	if (acpArgs.length > 0) command.args = [...(command.args ?? []), ...acpArgs];
+
+	if (isPlainObject(settings.config)) command.args = applyConfigSettings(key, command.args ?? [], settings.config);
+	if (isPlainObject(settings.settings)) applyNativeSettings(key, applied, settings.settings);
+	if (settings.dangerouslySkipPermissions === true) applyDangerousPermissionSetting(key, applied);
+	return applied;
+}
+
+function applyNativeArgs(key, baseArgs, nativeArgs) {
+	if (key === "cursor") return insertArgsBefore(baseArgs, "acp", nativeArgs);
+	return [...baseArgs, ...nativeArgs];
+}
+
+function applyConfigSettings(key, baseArgs, config) {
+	if (key !== "codex") return baseArgs;
+	const args = [...baseArgs];
+	for (const [name, value] of Object.entries(config)) {
+		args.push("-c", `${name}=${tomlValue(value)}`);
+	}
+	return args;
+}
+
+function applyNativeSettings(key, agent, settings) {
+	if (key !== "claude") return;
+	const options = agent._sessionMeta?.claudeCode?.options ?? {};
+	const currentSettings = isPlainObject(options.settings) ? options.settings : {};
+	agent._sessionMeta = deepMerge(agent._sessionMeta ?? {}, {
+		claudeCode: {
+			options: {
+				settings: deepMerge(currentSettings, settings),
+			},
+		},
+	});
+}
+
+function applyDangerousPermissionSetting(key, agent) {
+	if (key === "claude") {
+		agent._startupMode = "bypassPermissions";
+		return;
+	}
+	const command = agent.acp ?? agent;
+	if (key === "codex") {
+		command.args = applyConfigSettings("codex", command.args ?? [], DANGEROUS_CODEX_CONFIG);
+		return;
+	}
+	if (key === "cursor") {
+		command.args = applyNativeArgs("cursor", command.args ?? [], DANGEROUS_CURSOR_ARGS);
+	}
+}
+
+function insertArgsBefore(baseArgs, marker, inserted) {
+	const index = baseArgs.indexOf(marker);
+	if (index === -1) return [...baseArgs, ...inserted];
+	return [...baseArgs.slice(0, index), ...inserted, ...baseArgs.slice(index)];
+}
+
+function tomlValue(value) {
+	if (typeof value === "string") return JSON.stringify(value);
+	if (typeof value === "number" || typeof value === "boolean") return String(value);
+	if (Array.isArray(value)) return `[${value.map(tomlValue).join(", ")}]`;
+	if (value === null) return "null";
+	if (isPlainObject(value)) {
+		const entries = Object.entries(value).map(([key, entry]) => `${tomlKey(key)} = ${tomlValue(entry)}`);
+		return `{ ${entries.join(", ")} }`;
+	}
+	return JSON.stringify(value);
+}
+
+function tomlKey(key) {
+	return /^[A-Za-z0-9_-]+$/.test(key) ? key : JSON.stringify(key);
+}
+
+function stringArray(value) {
+	if (value === undefined) return [];
+	if (!Array.isArray(value)) return [];
+	return value.filter((entry) => typeof entry === "string");
+}
+
+function isPlainObject(value) {
+	return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function clonePlain(value) {
+	return JSON.parse(JSON.stringify(value));
 }
 
 function deepMerge(base, override) {

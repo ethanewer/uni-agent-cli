@@ -99,6 +99,52 @@ Create `~/.config/cc/config.json` to override commands:
 
 You can also point `CC_CONFIG` at a different JSON file. `HARNESS_CONFIG` and `~/.config/uni-agent-cli/config.json` are still supported for existing installs.
 
+## Settings
+
+Create `~/.config/cc/settings.json` to apply default native settings per harness:
+
+```json
+{
+  "agents": {
+    "claude": {
+      "dangerouslySkipPermissions": true
+    },
+    "codex": {
+      "dangerouslySkipPermissions": true
+    },
+    "cursor": {
+      "dangerouslySkipPermissions": true
+    }
+  }
+}
+```
+
+`dangerouslySkipPermissions` maps to each backend's closest native dangerous mode: Claude starts the session in `bypassPermissions` mode, Codex uses `approval_policy=never` and `sandbox_mode=danger-full-access`, and Cursor uses `--force --sandbox disabled`.
+
+You can also set native defaults that the ACP backends expose:
+
+```json
+{
+  "agents": {
+    "codex": {
+      "config": {
+        "model": "gpt-5"
+      }
+    },
+    "cursor": {
+      "args": ["--model", "gpt-5"]
+    },
+    "claude": {
+      "settings": {
+        "model": "sonnet"
+      }
+    }
+  }
+}
+```
+
+`args` are appended to the backend command, except Cursor args are inserted before the `acp` subcommand. `config` becomes Codex `-c key=value` overrides. `settings` is passed to Claude as native `--settings`-equivalent session settings. You can point `CC_SETTINGS` at a different JSON file; `HARNESS_SETTINGS` and `~/.config/uni-agent-cli/settings.json` are also supported.
+
 ## Notes
 
 T3 Code takes a richer web-app approach around provider sessions and currently uses `codex app-server` for structured Codex integration. `cc` uses the same product model in a smaller terminal form: backend events are normalized into shared UI state, and `/harness` stays in the wrapper input layer instead of being forwarded to an agent.
