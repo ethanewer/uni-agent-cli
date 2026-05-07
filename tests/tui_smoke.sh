@@ -79,7 +79,7 @@ assert_next_line_rule() {
 	fi
 }
 
-tmux new-session -d -s "$SESSION" -x 100 -y 30 "cd $ROOT_Q && HARNESS_CONFIG=tests/fake_config.json CC_BACKGROUND_CONNECT_DELAY_MS=0 ./src/cc fake"
+tmux new-session -d -s "$SESSION" -x 100 -y 30 "cd $ROOT_Q && CC_CONFIG=tests/fake_config.json CC_BACKGROUND_CONNECT_DELAY_MS=0 ./src/cc fake"
 
 wait_for_text "Space to record"
 

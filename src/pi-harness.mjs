@@ -92,13 +92,6 @@ const DEFAULT_SETTINGS = {
 	agents: {},
 };
 
-const DANGEROUS_CODEX_CONFIG = {
-	approval_policy: "never",
-	sandbox_mode: "danger-full-access",
-};
-
-const DANGEROUS_CURSOR_ARGS = ["--force", "--sandbox", "disabled", "--approve-mcps"];
-
 class StatusLine extends Text {
 	constructor(getStatus) {
 		super("", 0, 0);
@@ -2887,10 +2880,7 @@ export function loadConfig() {
 
 function configPath() {
 	if (process.env.CC_CONFIG) return process.env.CC_CONFIG;
-	if (process.env.HARNESS_CONFIG) return process.env.HARNESS_CONFIG;
-	const current = path.join(os.homedir(), ".config", "cc", "config.json");
-	if (fs.existsSync(current)) return current;
-	return path.join(os.homedir(), ".config", "uni-agent-cli", "config.json");
+	return path.join(os.homedir(), ".config", "cc", "config.json");
 }
 
 function loadSettings() {
@@ -2901,14 +2891,11 @@ function loadSettings() {
 
 function settingsPath() {
 	if (process.env.CC_SETTINGS) return process.env.CC_SETTINGS;
-	if (process.env.HARNESS_SETTINGS) return process.env.HARNESS_SETTINGS;
-	const current = path.join(os.homedir(), ".config", "cc", "settings.json");
-	if (fs.existsSync(current)) return current;
-	return path.join(os.homedir(), ".config", "uni-agent-cli", "settings.json");
+	return path.join(os.homedir(), ".config", "cc", "settings.json");
 }
 
 export function applyHarnessSettings(config, settings = DEFAULT_SETTINGS) {
-	const normalized = normalizeHarnessSettings(settings, config.agents);
+	const normalized = normalizeHarnessSettings(settings);
 	const agents = {};
 	for (const [key, agent] of Object.entries(config.agents ?? {})) {
 		agents[key] = applyAgentSettings(key, agent, normalized[key] ?? {});
@@ -2916,12 +2903,8 @@ export function applyHarnessSettings(config, settings = DEFAULT_SETTINGS) {
 	return { ...config, settings, agents };
 }
 
-function normalizeHarnessSettings(settings, agents = {}) {
-	if (!settings || typeof settings !== "object" || Array.isArray(settings)) return {};
-	if (isPlainObject(settings.agents) && Object.keys(settings.agents).length > 0) return settings.agents;
-	if (isPlainObject(settings.harnesses)) return settings.harnesses;
-	const keys = new Set(Object.keys(agents));
-	return Object.fromEntries(Object.entries(settings).filter(([key, value]) => keys.has(key) && isPlainObject(value)));
+function normalizeHarnessSettings(settings) {
+	return isPlainObject(settings?.agents) ? settings.agents : {};
 }
 
 function applyAgentSettings(key, agent, settings) {
@@ -2939,7 +2922,7 @@ function applyAgentSettings(key, agent, settings) {
 
 	if (isPlainObject(settings.config)) command.args = applyConfigSettings(key, command.args ?? [], settings.config);
 	if (isPlainObject(settings.settings)) applyNativeSettings(key, applied, settings.settings);
-	if (settings.dangerouslySkipPermissions === true) applyDangerousPermissionSetting(key, applied);
+	applyNativePermissionSetting(key, applied, settings);
 	return applied;
 }
 
@@ -2970,20 +2953,32 @@ function applyNativeSettings(key, agent, settings) {
 	});
 }
 
-function applyDangerousPermissionSetting(key, agent) {
-	agent._autoPermissionRequests = true;
+function applyNativePermissionSetting(key, agent, settings) {
 	if (key === "claude") {
-		agent._startupMode = "bypassPermissions";
+		const mode = settings.settings?.permissions?.defaultMode;
+		if (isBypassPermissionMode(mode)) {
+			agent._startupMode = "bypassPermissions";
+			agent._autoPermissionRequests = true;
+		}
 		return;
 	}
-	const command = agent.acp ?? agent;
 	if (key === "codex") {
-		command.args = applyConfigSettings("codex", command.args ?? [], DANGEROUS_CODEX_CONFIG);
+		const config = settings.config;
+		if (config?.approval_policy === "never" && config?.sandbox_mode === "danger-full-access") {
+			agent._autoPermissionRequests = true;
+		}
 		return;
 	}
 	if (key === "cursor") {
-		command.args = applyNativeArgs("cursor", command.args ?? [], DANGEROUS_CURSOR_ARGS);
+		const args = (agent.acp ?? agent).args ?? [];
+		if (args.includes("--force") || args.includes("-f") || args.includes("--yolo")) {
+			agent._autoPermissionRequests = true;
+		}
 	}
+}
+
+function isBypassPermissionMode(mode) {
+	return typeof mode === "string" && ["bypasspermissions", "bypass"].includes(mode.trim().toLowerCase());
 }
 
 function insertArgsBefore(baseArgs, marker, inserted) {

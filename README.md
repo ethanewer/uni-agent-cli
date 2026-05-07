@@ -69,7 +69,7 @@ Then use:
 
 PTY fallback is not part of the Pi-TUI path; the shared UI talks to ACP backends.
 The client advertises ACP terminal support and implements `terminal/*` requests so backend slash commands that need shell execution can run inside the shared UI.
-ACP permission requests are shown as TUI selection prompts. `cc` waits for the user to approve or reject instead of silently choosing an allow option unless `dangerouslySkipPermissions` is enabled for the active agent.
+ACP permission requests are shown as TUI selection prompts. `cc` waits for the user to approve or reject unless the active agent's native settings imply bypass/force mode.
 
 ## Development
 
@@ -97,7 +97,7 @@ Create `~/.config/cc/config.json` to override commands:
 }
 ```
 
-You can also point `CC_CONFIG` at a different JSON file. `HARNESS_CONFIG` and `~/.config/uni-agent-cli/config.json` are still supported for existing installs.
+You can also point `CC_CONFIG` at a different JSON file.
 
 ## Settings
 
@@ -107,19 +107,26 @@ Create `~/.config/cc/settings.json` to apply default native settings per harness
 {
   "agents": {
     "claude": {
-      "dangerouslySkipPermissions": true
+      "settings": {
+        "permissions": {
+          "defaultMode": "bypassPermissions"
+        }
+      }
     },
     "codex": {
-      "dangerouslySkipPermissions": true
+      "config": {
+        "approval_policy": "never",
+        "sandbox_mode": "danger-full-access"
+      }
     },
     "cursor": {
-      "dangerouslySkipPermissions": true
+      "args": ["--force", "--sandbox", "disabled", "--approve-mcps"]
     }
   }
 }
 ```
 
-`dangerouslySkipPermissions` maps to each backend's closest native dangerous mode and auto-accepts ACP permission requests that the backend still emits: Claude starts the session in `bypassPermissions` mode, Codex ACP uses `-c approval_policy="never"` and `-c sandbox_mode="danger-full-access"`, and Cursor uses `--force --sandbox disabled --approve-mcps`.
+These settings mirror each backend as closely as the ACP wrapper allows: Claude uses its `settings.permissions.defaultMode`, Codex uses `-c key=value` config overrides, and Cursor uses command-line args before the `acp` subcommand. When these native settings imply bypass/force mode, `cc` also auto-accepts ACP permission requests that the backend still emits.
 
 You can also set native defaults that the ACP backends expose:
 
@@ -143,7 +150,7 @@ You can also set native defaults that the ACP backends expose:
 }
 ```
 
-`args` are appended to the backend command, except Cursor args are inserted before the `acp` subcommand. `config` becomes Codex `-c key=value` overrides. `settings` is passed to Claude as native `--settings`-equivalent session settings. You can point `CC_SETTINGS` at a different JSON file; `HARNESS_SETTINGS` and `~/.config/uni-agent-cli/settings.json` are also supported.
+`args` are appended to the backend command, except Cursor args are inserted before the `acp` subcommand. `config` becomes Codex `-c key=value` overrides. `settings` is passed to Claude as native `--settings`-equivalent session settings. You can point `CC_SETTINGS` at a different JSON file.
 
 ## Notes
 

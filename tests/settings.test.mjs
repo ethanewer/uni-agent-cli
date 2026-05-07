@@ -25,16 +25,20 @@ const config = {
 const applied = applyHarnessSettings(config, {
 	agents: {
 		claude: {
-			dangerouslySkipPermissions: true,
-			settings: { model: "sonnet" },
+			settings: {
+				model: "sonnet",
+				permissions: { defaultMode: "bypassPermissions" },
+			},
 		},
 		codex: {
-			dangerouslySkipPermissions: true,
-			config: { model: "gpt-5" },
+			config: {
+				model: "gpt-5",
+				approval_policy: "never",
+				sandbox_mode: "danger-full-access",
+			},
 		},
 		cursor: {
-			dangerouslySkipPermissions: true,
-			args: ["--model", "gpt-5"],
+			args: ["--model", "gpt-5", "--force", "--sandbox", "disabled", "--approve-mcps"],
 		},
 	},
 });
@@ -44,7 +48,10 @@ assert.equal(applied.agents.claude._autoPermissionRequests, true);
 assert.deepEqual(applied.agents.claude._sessionMeta, {
 	claudeCode: {
 		options: {
-			settings: { model: "sonnet" },
+			settings: {
+				model: "sonnet",
+				permissions: { defaultMode: "bypassPermissions" },
+			},
 		},
 	},
 });
@@ -98,34 +105,6 @@ assert.deepEqual(
 	}),
 	{ outcome: "cancelled" },
 );
-
-const harnessesSettings = applyHarnessSettings(config, {
-	agents: {},
-	harnesses: {
-		codex: {
-			config: {
-				model: "gpt-5-mini",
-				"shell_environment_policy.set": { CI: "1", "DEBUG-FLAG": "false" },
-			},
-		},
-	},
-});
-
-assert.deepEqual(harnessesSettings.agents.codex.acp.args, [
-	"-c",
-	"model=\"gpt-5-mini\"",
-	"-c",
-	"shell_environment_policy.set={ CI = \"1\", DEBUG-FLAG = \"false\" }",
-]);
-
-const flatSettings = applyHarnessSettings(config, {
-	agents: {},
-	cursor: {
-		args: ["--model", "gpt-5-mini"],
-	},
-});
-
-assert.deepEqual(flatSettings.agents.cursor.acp.args, ["--model", "gpt-5-mini", "acp"]);
 
 async function captureSessionRequests(methodName) {
 	const requests = [];

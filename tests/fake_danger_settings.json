@@ -1,0 +1,7 @@
+{
+  "agents": {
+    "cursor": {
+      "args": ["--force", "--sandbox", "disabled", "--approve-mcps"]
+    }
+  }
+}
