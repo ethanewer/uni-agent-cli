@@ -79,13 +79,50 @@ assert_next_line_rule() {
 	fi
 }
 
-tmux new-session -d -s "$SESSION" -x 100 -y 30 "cd $ROOT_Q && CC_CONFIG=tests/fake_config.json CC_BACKGROUND_CONNECT_DELAY_MS=0 ./src/cc fake"
+assert_exact_line_count() {
+	local needle="$1"
+	local expected="$2"
+	local actual
+	actual="$(capture | awk -v needle="$needle" '$0 == needle { count++ } END { print count + 0 }')"
+	if [ "$actual" != "$expected" ]; then
+		echo "Expected $expected visible line(s) matching: $needle; got $actual" >&2
+		capture >&2
+		exit 1
+	fi
+}
 
+tmux new-session -d -s "$SESSION" -x 100 -y 30 "cd $ROOT_Q && printf 'outside-before-cc\n' && CC_CONFIG=tests/fake_config.json CC_BACKGROUND_CONNECT_DELAY_MS=0 ./src/cc fake"
+
+wait_for_text "outside-before-cc"
+wait_for_text "Space to record"
+
+tmux resize-window -t "$SESSION" -x 100 -y 32
+wait_for_text "outside-before-cc"
 wait_for_text "Space to record"
 
 tmux resize-window -t "$SESSION" -x 74 -y 26
 wait_for_text "Space to record"
 
+tmux resize-window -t "$SESSION" -x 110 -y 32
+wait_for_text "Space to record"
+
+tmux resize-window -t "$SESSION" -x 74 -y 12
+wait_for_text "Space to record"
+tmux send-keys -t "$SESSION" e c h o Enter
+wait_for_text "echo: echo"
+tmux send-keys -t "$SESSION" e c h o - u s e r - c h u n k Enter
+wait_for_text "echo: echo-user-chunk"
+tmux resize-window -t "$SESSION" -x 74 -y 28
+sleep 0.2
+assert_exact_line_count "echo-user-chunk" 1
+assert_exact_line_count "-user-chunk" 0
+assert_exact_line_count "echo: echo-user-chunk" 1
+
+tmux send-keys -t "$SESSION" / c l e a r Enter
+wait_without_text "echo-user-chunk"
+wait_without_text "echo: echo"
+tmux send-keys -t "$SESSION" / v o i c e Enter
+wait_for_text "Space to record"
 tmux resize-window -t "$SESSION" -x 110 -y 32
 wait_for_text "Space to record"
 

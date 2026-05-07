@@ -433,6 +433,36 @@ def handle_prompt(message):
         send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "end_turn"}})
         return
 
+    if prompt == "echo-user-chunk":
+        send(
+            {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "fake-session",
+                    "update": {
+                        "sessionUpdate": "user_message_chunk",
+                        "content": {"type": "text", "text": prompt},
+                    },
+                },
+            }
+        )
+        send(
+            {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "fake-session",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "echo: " + prompt},
+                    },
+                },
+            }
+        )
+        send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "end_turn"}})
+        return
+
     send_default_prompt_response(request_id, prompt)
 
 

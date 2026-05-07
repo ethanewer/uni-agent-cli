@@ -903,6 +903,7 @@ class HarnessApp {
 		this.currentAssistantText = undefined;
 		this.currentUserText = undefined;
 		this.currentToolSummary = undefined;
+		this.pendingUserEchoes = [];
 		this.lastInputClearSource = undefined;
 		this.lastKnownEditorText = "";
 		this.suppressNextPairedEmptyInterrupt = false;
@@ -1048,6 +1049,7 @@ class HarnessApp {
 		this.currentAssistantText = undefined;
 		this.currentUserText = undefined;
 		this.currentToolSummary = undefined;
+		this.pendingUserEchoes = [];
 		this.statusState = options.statusState ?? (this.promptQueue.length > 0 ? "connecting" : "");
 		this.updateSpinner();
 		this.updateAutocomplete();
@@ -1391,13 +1393,17 @@ class HarnessApp {
 			this.enqueuePrompt(text, "afterTurn", { displayText, compactCommand: options.compactCommand });
 			return;
 		}
+		const pendingUserEcho = this.trackPendingUserEcho(text);
 		this.addUserMessage(displayText, { compactCommand: options.compactCommand });
-		await this.sendPrompt(text);
+		await this.sendPrompt(text, { pendingUserEcho });
 		await this.flushPromptQueue();
 	}
 
-	async sendPrompt(text) {
-		if (!this.client || !this.ready) return;
+	async sendPrompt(text, options = {}) {
+		if (!this.client || !this.ready) {
+			this.expirePendingUserEcho(options.pendingUserEcho);
+			return;
+		}
 		this.busy = true;
 		this.cancelRequested = false;
 		this.afterToolCancelPending = false;
@@ -1412,6 +1418,7 @@ class HarnessApp {
 		} catch (error) {
 			this.addError(error.message ?? String(error));
 		} finally {
+			this.expirePendingUserEcho(options.pendingUserEcho);
 			if (this.cancelRequested) {
 				for (const id of this.activeToolIds) this.updateTool("canceled", id);
 			}
@@ -1431,9 +1438,10 @@ class HarnessApp {
 		try {
 			while (this.ready && !this.busy && this.promptQueue.length > 0) {
 				const prompt = this.promptQueue.shift();
+				const pendingUserEcho = this.trackPendingUserEcho(prompt.text);
 				this.addUserMessage(prompt.displayText ?? prompt.text, { compactCommand: prompt.compactCommand });
 				this.ui.requestRender();
-				await this.sendPrompt(prompt.text);
+				await this.sendPrompt(prompt.text, { pendingUserEcho });
 			}
 		} finally {
 			this.flushingPromptQueue = false;
@@ -1602,6 +1610,7 @@ class HarnessApp {
 			this.currentAssistantText = undefined;
 			this.currentUserText = undefined;
 			this.currentToolSummary = undefined;
+			this.pendingUserEchoes = [];
 			this.ui.requestRender();
 			return;
 		}
@@ -1730,6 +1739,7 @@ class HarnessApp {
 			this.currentAssistantText = undefined;
 			this.currentToolSummary = undefined;
 			this.currentUserText = undefined;
+			this.pendingUserEchoes = [];
 			if (loadsHistory) await this.client.loadSession(session.sessionId);
 			else {
 				await this.client.resumeSession(session.sessionId);
@@ -1929,7 +1939,8 @@ class HarnessApp {
 		} else if (event.type === "line") {
 			this.addNotice(event.text);
 		} else if (event.type === "user_text") {
-			this.appendUserText(event.text);
+			const text = this.consumePendingUserEcho(event.text);
+			if (text) this.appendUserText(text);
 		} else if (event.type === "tool") {
 			this.trackToolStatus(event.id, event.status);
 			this.addTool(event.title, event.status, event.id);
@@ -1948,6 +1959,38 @@ class HarnessApp {
 			this.updateAutocomplete();
 		}
 		this.ui.requestRender();
+	}
+
+	trackPendingUserEcho(text) {
+		const entry = { remaining: text };
+		this.pendingUserEchoes.push(entry);
+		return entry;
+	}
+
+	expirePendingUserEcho(entry) {
+		if (!entry) return;
+		const index = this.pendingUserEchoes.indexOf(entry);
+		if (index !== -1) this.pendingUserEchoes.splice(index, 1);
+	}
+
+	consumePendingUserEcho(text) {
+		let remaining = text;
+		while (remaining && this.pendingUserEchoes.length > 0) {
+			const pending = this.pendingUserEchoes[0].remaining;
+			if (pending.startsWith(remaining)) {
+				const next = pending.slice(remaining.length);
+				if (next) this.pendingUserEchoes[0].remaining = next;
+				else this.pendingUserEchoes.shift();
+				return "";
+			}
+			if (remaining.startsWith(pending)) {
+				remaining = remaining.slice(pending.length);
+				this.pendingUserEchoes.shift();
+				continue;
+			}
+			this.pendingUserEchoes.shift();
+		}
+		return remaining;
 	}
 
 	trackToolStatus(id, status) {
