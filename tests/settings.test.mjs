@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { AcpClient, applyHarnessSettings } from "../src/pi-harness.mjs";
+import { AcpClient, applyHarnessSettings, autoPermissionOutcome } from "../src/pi-harness.mjs";
 
 const config = {
 	defaultAgent: "codex",
@@ -40,6 +40,7 @@ const applied = applyHarnessSettings(config, {
 });
 
 assert.equal(applied.agents.claude._startupMode, "bypassPermissions");
+assert.equal(applied.agents.claude._autoPermissionRequests, true);
 assert.deepEqual(applied.agents.claude._sessionMeta, {
 	claudeCode: {
 		options: {
@@ -56,9 +57,47 @@ assert.deepEqual(applied.agents.codex.acp.args, [
 	"-c",
 	"sandbox_mode=\"danger-full-access\"",
 ]);
+assert.equal(applied.agents.codex._autoPermissionRequests, true);
 
-assert.deepEqual(applied.agents.cursor.acp.args, ["--model", "gpt-5", "--force", "--sandbox", "disabled", "acp"]);
+assert.deepEqual(applied.agents.cursor.acp.args, [
+	"--model",
+	"gpt-5",
+	"--force",
+	"--sandbox",
+	"disabled",
+	"--approve-mcps",
+	"acp",
+]);
+assert.equal(applied.agents.cursor._autoPermissionRequests, true);
 assert.deepEqual(config.agents.cursor.acp.args, ["acp"]);
+
+assert.deepEqual(
+	autoPermissionOutcome({
+		options: [
+			{ kind: "reject_once", name: "Reject", optionId: "reject" },
+			{ kind: "allow_once", name: "Allow", optionId: "allow" },
+		],
+	}),
+	{ outcome: "selected", optionId: "allow" },
+);
+
+assert.deepEqual(
+	autoPermissionOutcome({
+		options: [
+			{ kind: "allow_always", name: 'Yes, and use "auto" mode', optionId: "auto" },
+			{ kind: "allow_always", name: "Yes, and bypass permissions", optionId: "bypassPermissions" },
+			{ kind: "reject_once", name: "No, keep planning", optionId: "plan" },
+		],
+	}),
+	{ outcome: "selected", optionId: "bypassPermissions" },
+);
+
+assert.deepEqual(
+	autoPermissionOutcome({
+		options: [{ kind: "reject_once", name: "Reject", optionId: "reject" }],
+	}),
+	{ outcome: "cancelled" },
+);
 
 const harnessesSettings = applyHarnessSettings(config, {
 	agents: {},

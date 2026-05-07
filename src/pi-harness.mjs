@@ -97,7 +97,7 @@ const DANGEROUS_CODEX_CONFIG = {
 	sandbox_mode: "danger-full-access",
 };
 
-const DANGEROUS_CURSOR_ARGS = ["--force", "--sandbox", "disabled"];
+const DANGEROUS_CURSOR_ARGS = ["--force", "--sandbox", "disabled", "--approve-mcps"];
 
 class StatusLine extends Text {
 	constructor(getStatus) {
@@ -1069,8 +1069,11 @@ class HarnessApp {
 		client = new AcpClient(agent, (event) => {
 			if (this.client === client) this.handleBackendEvent(event);
 		}, {
-			onPermissionRequest: (params) =>
-				this.client === client ? this.requestPermission(params) : { outcome: "cancelled" },
+			onPermissionRequest: (params) => {
+				if (this.client !== client) return { outcome: "cancelled" };
+				if (agent._autoPermissionRequests) return autoPermissionOutcome(params);
+				return this.requestPermission(params);
+			},
 		});
 		this.client = client;
 		try {
@@ -2309,6 +2312,28 @@ function permissionOptionDescription(option = {}) {
 	return parts.length > 0 ? parts.map(oneLine).join(" · ") : undefined;
 }
 
+export function autoPermissionOutcome(params = {}) {
+	const option = autoPermissionOption(Array.isArray(params.options) ? params.options : []);
+	return option?.optionId ? { outcome: "selected", optionId: option.optionId } : { outcome: "cancelled" };
+}
+
+function autoPermissionOption(options) {
+	const allowed = options.filter(isAllowPermissionOption);
+	return (
+		allowed.find((option) => option.optionId === "bypassPermissions") ??
+		allowed.find((option) => String(option.kind ?? "").toLowerCase() === "allow_always") ??
+		allowed[0]
+	);
+}
+
+function isAllowPermissionOption(option = {}) {
+	const kind = String(option.kind ?? "").toLowerCase();
+	if (kind.includes("reject") || kind.includes("deny") || kind.includes("cancel")) return false;
+	if (kind.includes("allow") || kind.includes("approve")) return true;
+	const text = `${option.optionId ?? ""} ${option.name ?? ""} ${option.label ?? ""}`.toLowerCase();
+	return /\b(allow|approve|yes|accept|bypass)\b/.test(text) && !/\b(reject|deny|cancel|no)\b/.test(text);
+}
+
 function humanizePermissionKind(kind) {
 	if (!kind) return undefined;
 	return String(kind)
@@ -2946,6 +2971,7 @@ function applyNativeSettings(key, agent, settings) {
 }
 
 function applyDangerousPermissionSetting(key, agent) {
+	agent._autoPermissionRequests = true;
 	if (key === "claude") {
 		agent._startupMode = "bypassPermissions";
 		return;
