@@ -56,6 +56,8 @@ const DEFAULT_TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe";
 const BACKGROUND_CONNECT_DELAY_MS = parseDelay(process.env.CC_BACKGROUND_CONNECT_DELAY_MS, 250);
 const MARKDOWN_PRELOAD_DELAY_MS = parseDelay(process.env.CC_MARKDOWN_PRELOAD_DELAY_MS, 750);
 const RESIZE_SETTLE_DELAY_MS = parseDelay(process.env.CC_RESIZE_SETTLE_DELAY_MS, 90);
+const MOUSE_SCROLL_GUARD_ENABLE = "\x1b[?1006h\x1b[?1000h";
+const MOUSE_SCROLL_GUARD_DISABLE = "\x1b[?1000l\x1b[?1006l";
 let MarkdownComponent;
 let markdownLoadPromise;
 let CombinedAutocompleteProviderClass;
@@ -930,6 +932,7 @@ class HarnessApp {
 		this.startupConnectTimer = undefined;
 		this.markdownPreloadTimer = undefined;
 		this.resizeActive = false;
+		this.liveOutputScrollGuardEnabled = false;
 
 		const terminal = createHarnessTerminal({
 			onResizeStart: () => this.beginResize(),
@@ -1091,6 +1094,7 @@ class HarnessApp {
 
 	handleGlobalInput(data) {
 		if (isTerminalResponse(data)) return undefined;
+		if (isMouseInput(data)) return { consume: true };
 		if (isKeyRelease(data)) return undefined;
 		const control = splitControlInput(data);
 		if (control) {
@@ -2002,6 +2006,7 @@ class HarnessApp {
 	}
 
 	updateSpinner() {
+		this.setLiveOutputScrollGuard(Boolean(this.statusState));
 		if (!this.statusState) {
 			if (this.spinnerTimer) clearInterval(this.spinnerTimer);
 			this.spinnerTimer = undefined;
@@ -2013,6 +2018,12 @@ class HarnessApp {
 			this.spinnerIndex += 1;
 			this.ui.requestRender();
 		}, 80);
+	}
+
+	setLiveOutputScrollGuard(enabled) {
+		if (this.liveOutputScrollGuardEnabled === enabled) return;
+		this.liveOutputScrollGuardEnabled = enabled;
+		this.ui.terminal.write(enabled ? MOUSE_SCROLL_GUARD_ENABLE : MOUSE_SCROLL_GUARD_DISABLE);
 	}
 
 	updateAutocomplete() {
@@ -2121,6 +2132,7 @@ class HarnessApp {
 	stop() {
 		if (this.spinnerTimer) clearInterval(this.spinnerTimer);
 		if (this.markdownPreloadTimer) clearTimeout(this.markdownPreloadTimer);
+		this.setLiveOutputScrollGuard(false);
 		this.cancelPermissionPrompts();
 		this.voiceController?.dispose();
 		if (this.client) this.client.stop();
@@ -2612,6 +2624,10 @@ function isTerminalResponse(data) {
 		/^\x1bP[^\x1b]*(?:\x1b\\)?$/.test(data) ||
 		/^\x1b\][\s\S]*(?:\x07|\x1b\\)$/.test(data)
 	);
+}
+
+function isMouseInput(data) {
+	return typeof data === "string" && (/^\x1b\[<\d+;\d+;\d+[mM]$/.test(data) || /^\x1b\[M[\s\S]{3}$/.test(data));
 }
 
 function formatDuration(seconds) {
