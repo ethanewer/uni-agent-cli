@@ -51,6 +51,8 @@ const EDITOR_THEME = {
 };
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+// Cursor Agent-style two-cell wave. The first frame starts with a Braille blank.
+const AGENT_WORK_FRAMES = ["⠀⠞", "⠠⠜", "⠰⠰", "⠘⠤", "⠘⠆", "⠘⠣", "⠰⠳", "⠠⠛"];
 const VOICE_RECORDING_BLINK_INTERVAL_MS = 500;
 const DEFAULT_TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe";
 const BACKGROUND_CONNECT_DELAY_MS = parseDelay(process.env.CC_BACKGROUND_CONNECT_DELAY_MS, 250);
@@ -947,7 +949,7 @@ class HarnessApp {
 		this.status = new StatusLine(() => ({
 			agent: this.activeKey,
 			state: this.statusState,
-			spinner: this.statusState ? SPINNER_FRAMES[this.spinnerIndex % SPINNER_FRAMES.length] : "",
+			spinner: this.statusState ? AGENT_WORK_FRAMES[this.spinnerIndex % AGENT_WORK_FRAMES.length] : "",
 			transport: this.transport,
 		}));
 		this.ui.addChild(this.chat);
