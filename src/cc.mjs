@@ -192,7 +192,23 @@ function compactCwd(cwd) {
 }
 
 function truncate(value, width) {
-	return stripAnsi(value).length <= width ? value : `${value.slice(0, Math.max(1, width - 1))}~`;
+	if (stripAnsi(value).length <= width) return value;
+	const targetWidth = Math.max(1, width - 1);
+	let visible = 0;
+	let output = "";
+	for (let index = 0; index < value.length && visible < targetWidth; ) {
+		const ansi = value.slice(index).match(/^\x1b\[[\d;?]*[ -/]*[@-~]/);
+		if (ansi) {
+			output += ansi[0];
+			index += ansi[0].length;
+			continue;
+		}
+		const char = value[index];
+		output += char;
+		index += char.length;
+		visible += 1;
+	}
+	return `${output}\x1b[0m~`;
 }
 
 function stripAnsi(value) {
