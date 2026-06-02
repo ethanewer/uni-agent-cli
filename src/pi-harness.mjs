@@ -4065,8 +4065,32 @@ function createHarnessTerminal(resizeHooks = {}) {
 		stop();
 		if (useAlternateScreen) write("\x1b[?1049l\x1b[?25h");
 	};
-	terminal.write = (data) => write(rewriteFullScreenClear(data, { alternateScreen: useAlternateScreen }));
+	terminal.write = (data) => {
+		const rewritten = rewriteFullScreenClear(data, { alternateScreen: useAlternateScreen });
+		write(hideCursorDuringRender(rewritten));
+	};
 	return terminal;
+}
+
+export function hideCursorDuringRender(data) {
+	const syncStart = "\x1b[?2026h";
+	const hideCursor = "\x1b[?25l";
+	if (!data.includes(syncStart)) return data;
+
+	let output = "";
+	let index = 0;
+	while (index < data.length) {
+		const syncIndex = data.indexOf(syncStart, index);
+		if (syncIndex === -1) {
+			output += data.slice(index);
+			break;
+		}
+		const afterSync = syncIndex + syncStart.length;
+		output += data.slice(index, afterSync);
+		if (!data.startsWith(hideCursor, afterSync)) output += hideCursor;
+		index = afterSync;
+	}
+	return output;
 }
 
 export function rewriteFullScreenClear(data, options = {}) {

@@ -9,6 +9,7 @@ import {
 	findConfigValue,
 	findMode,
 	flattenModes,
+	hideCursorDuringRender,
 	isVsCodeAutoActivationCommand,
 	isVsCodeTerminal,
 	loadConfig,
@@ -206,6 +207,9 @@ const fullClear = "\x1b[2J\x1b[H\x1b[3J";
 assert.equal(rewriteFullScreenClear(`${fullClear}rendered`), "\x1b8\x1b[Jrendered");
 assert.equal(rewriteFullScreenClear(`${fullClear}rendered`, { alternateScreen: true }), "\x1b[2J\x1b[Hrendered");
 assert.equal(rewriteFullScreenClear(`before\x1b[3Jafter`), "beforeafter");
+assert.equal(hideCursorDuringRender("\x1b[?2026hrendered"), "\x1b[?2026h\x1b[?25lrendered");
+assert.equal(hideCursorDuringRender("\x1b[?2026h\x1b[?25lrendered"), "\x1b[?2026h\x1b[?25lrendered");
+assert.equal(hideCursorDuringRender("plain cursor move"), "plain cursor move");
 assert.equal(isVsCodeTerminal({ TERM_PROGRAM: "vscode" }), true);
 assert.equal(isVsCodeTerminal({ VSCODE_PID: "123" }), true);
 assert.equal(isVsCodeTerminal({ TERM_PROGRAM: "Apple_Terminal" }), false);
