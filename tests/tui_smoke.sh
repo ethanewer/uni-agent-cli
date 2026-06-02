@@ -9,8 +9,15 @@ fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SESSION="cc-tui-smoke-$$"
 WRITE_LOG="$(mktemp -t cc-tui-write-log.XXXXXX)"
+SETTINGS_FILE="$(mktemp -t cc-tui-settings.XXXXXX)"
+CONFIG_SETTINGS_THEME_FILE="$(mktemp -t cc-tui-config-settings-theme.XXXXXX)"
+CONFIG_TOP_THEME_FILE="$(mktemp -t cc-tui-config-top-theme.XXXXXX)"
+printf '{}\n' > "$SETTINGS_FILE"
 ROOT_Q="$(printf "%q" "$ROOT")"
 WRITE_LOG_Q="$(printf "%q" "$WRITE_LOG")"
+SETTINGS_FILE_Q="$(printf "%q" "$SETTINGS_FILE")"
+CONFIG_SETTINGS_THEME_FILE_Q="$(printf "%q" "$CONFIG_SETTINGS_THEME_FILE")"
+CONFIG_TOP_THEME_FILE_Q="$(printf "%q" "$CONFIG_TOP_THEME_FILE")"
 TERM_PROGRAM_Q="$(printf "%q" "${TERM_PROGRAM:-}")"
 VSCODE_PID_Q="$(printf "%q" "${VSCODE_PID:-}")"
 VSCODE_INJECTION_Q="$(printf "%q" "${VSCODE_INJECTION:-}")"
@@ -31,12 +38,16 @@ fi
 
 cleanup() {
 	tmux kill-session -t "$SESSION" >/dev/null 2>&1 || true
-	rm -f "$WRITE_LOG"
+	rm -f "$WRITE_LOG" "$SETTINGS_FILE" "$CONFIG_SETTINGS_THEME_FILE" "$CONFIG_TOP_THEME_FILE"
 }
 trap cleanup EXIT
 
 capture() {
 	tmux capture-pane -pt "$SESSION"
+}
+
+capture_ansi() {
+	tmux capture-pane -ept "$SESSION"
 }
 
 capture_all() {
@@ -67,6 +78,40 @@ wait_without_text() {
 	echo "Timed out waiting for text to disappear: $needle" >&2
 	capture >&2
 	exit 1
+}
+
+wait_for_write_log_text() {
+	local needle="$1"
+	for _ in {1..50}; do
+		if grep -Fq "$needle" "$WRITE_LOG"; then
+			return 0
+		fi
+		sleep 0.1
+	done
+	echo "Timed out waiting for write log text: $needle" >&2
+	capture >&2
+	exit 1
+}
+
+wait_for_ansi_text() {
+	local needle="$1"
+	for _ in {1..50}; do
+		if capture_ansi | grep -Fq "$needle"; then
+			return 0
+		fi
+		sleep 0.1
+	done
+	echo "Timed out waiting for ANSI pane text: $needle" >&2
+	capture_ansi >&2
+	exit 1
+}
+
+assert_no_prepaint_clear() {
+	if grep -Fq "$(printf '\0338\033[J\0337')" "$WRITE_LOG"; then
+		echo "Expected prepainted frame to be adopted without clear/repaint" >&2
+		cat "$WRITE_LOG" >&2
+		exit 1
+	fi
 }
 
 assert_next_line_blank() {
@@ -134,7 +179,7 @@ assert_no_mouse_tracking_enabled() {
 	fi
 }
 
-tmux new-session -d -s "$SESSION" -x 100 -y 30 "cd $ROOT_Q && printf 'outside-before-cc\n' && $PANE_ENV PI_TUI_WRITE_LOG=$WRITE_LOG_Q CC_CONFIG=tests/fake_config.json CC_BACKGROUND_CONNECT_DELAY_MS=0 FAKE_ACP_NEW_DELAY=0.4 ./src/cc fake"
+tmux new-session -d -s "$SESSION" -x 100 -y 30 "cd $ROOT_Q && printf 'outside-before-cc\n' && $PANE_ENV PI_TUI_WRITE_LOG=$WRITE_LOG_Q CC_CONFIG=tests/fake_config.json CC_SETTINGS=$SETTINGS_FILE_Q CC_BACKGROUND_CONNECT_DELAY_MS=0 FAKE_ACP_NEW_DELAY=0.4 ./src/cc fake"
 
 if [ "$VSCODE_TERMINAL" -eq 0 ]; then
 	wait_for_text "outside-before-cc"
@@ -156,6 +201,112 @@ assert_exact_scrollback_count "Space to record" 1
 
 tmux resize-window -t "$SESSION" -x 74 -y 12
 wait_for_text "Space to record"
+tmux resize-window -t "$SESSION" -x 110 -y 32
+wait_for_text "Space to record"
+tmux send-keys -t "$SESSION" / t h e m e Enter
+wait_for_text "Palette:"
+wait_for_text "Preview:"
+wait_for_text "Tokyo Night"
+tmux send-keys -t "$SESSION" Down
+wait_for_write_log_text "$(printf '\033[38;2;148;163;184mfake acp')"
+tmux send-keys -t "$SESSION" q
+wait_without_text "Palette:"
+tmux send-keys -t "$SESSION" / t h e m e Space m a t r i x Enter
+wait_for_text "/theme matrix (Matrix)"
+if ! grep -Fq '"theme": "matrix"' "$SETTINGS_FILE"; then
+	echo "Expected /theme matrix to persist matrix theme" >&2
+	cat "$SETTINGS_FILE" >&2
+	exit 1
+fi
+tmux send-keys -t "$SESSION" / t h e m e Space m i s s i n g Enter
+wait_for_text "Unknown theme: missing"
+if ! grep -Fq '"theme": "matrix"' "$SETTINGS_FILE"; then
+	echo "Unknown theme should not replace persisted matrix theme" >&2
+	cat "$SETTINGS_FILE" >&2
+	exit 1
+fi
+tmux send-keys -t "$SESSION" / c l e a r Enter
+wait_without_text "Unknown theme: missing"
+
+tmux kill-session -t "$SESSION"
+: > "$WRITE_LOG"
+tmux new-session -d -s "$SESSION" -x 110 -y 32 "cd $ROOT_Q && printf 'outside-before-cc\n' && $PANE_ENV PI_TUI_WRITE_LOG=$WRITE_LOG_Q CC_CONFIG=tests/fake_config.json CC_SETTINGS=$SETTINGS_FILE_Q CC_BACKGROUND_CONNECT_DELAY_MS=0 FAKE_ACP_NEW_DELAY=0.4 ./src/cc fake"
+wait_for_text "fake acp"
+wait_for_ansi_text "$(printf '\033[38;2;79;143;92mfake acp')"
+assert_no_prepaint_clear
+if capture_ansi | grep -Fq "$(printf '\033[2mfake acp')"; then
+	echo "Persisted non-system theme should not start with a system-colored prepaint" >&2
+	capture_ansi >&2
+	exit 1
+fi
+
+cat > "$CONFIG_SETTINGS_THEME_FILE" <<'JSON'
+{
+  "defaultAgent": "fake",
+  "agents": {
+    "fake": {
+      "label": "Fake",
+      "transport": "acp",
+      "command": "python3",
+      "args": ["tests/fake_acp.py"],
+      "acp": {
+        "command": "python3",
+        "args": ["tests/fake_acp.py"]
+      }
+    }
+  },
+  "settings": {
+    "theme": "tokyonight",
+    "agents": {
+      "fake": {
+        "config": {
+          "theme": "matrix"
+        }
+      }
+    }
+  }
+}
+JSON
+printf '{}\n' > "$SETTINGS_FILE"
+tmux kill-session -t "$SESSION"
+: > "$WRITE_LOG"
+tmux new-session -d -s "$SESSION" -x 110 -y 32 "cd $ROOT_Q && printf 'outside-before-cc\n' && $PANE_ENV PI_TUI_WRITE_LOG=$WRITE_LOG_Q CC_CONFIG=$CONFIG_SETTINGS_THEME_FILE_Q CC_SETTINGS=$SETTINGS_FILE_Q CC_BACKGROUND_CONNECT_DELAY_MS=0 FAKE_ACP_NEW_DELAY=0.4 ./src/cc fake"
+wait_for_text "fake acp"
+wait_for_ansi_text "$(printf '\033[38;2;86;95;137mfake acp')"
+assert_no_prepaint_clear
+if capture_ansi | grep -Fq "$(printf '\033[38;2;79;143;92mfake acp')"; then
+	echo "Nested backend theme should not drive shell prepaint" >&2
+	capture_ansi >&2
+	exit 1
+fi
+
+cat > "$CONFIG_TOP_THEME_FILE" <<'JSON'
+{
+  "defaultAgent": "fake",
+  "theme": "matrix",
+  "agents": {
+    "fake": {
+      "label": "Fake",
+      "transport": "acp",
+      "command": "python3",
+      "args": ["tests/fake_acp.py"],
+      "acp": {
+        "command": "python3",
+        "args": ["tests/fake_acp.py"]
+      }
+    }
+  }
+}
+JSON
+printf '{}\n' > "$SETTINGS_FILE"
+tmux kill-session -t "$SESSION"
+: > "$WRITE_LOG"
+tmux new-session -d -s "$SESSION" -x 110 -y 32 "cd $ROOT_Q && printf 'outside-before-cc\n' && $PANE_ENV PI_TUI_WRITE_LOG=$WRITE_LOG_Q CC_CONFIG=$CONFIG_TOP_THEME_FILE_Q CC_SETTINGS=$SETTINGS_FILE_Q CC_BACKGROUND_CONNECT_DELAY_MS=0 FAKE_ACP_NEW_DELAY=0.4 node src/cc.mjs fake"
+wait_for_text "fake acp"
+wait_for_ansi_text "$(printf '\033[38;2;79;143;92mfake acp')"
+assert_no_prepaint_clear
+
+tmux resize-window -t "$SESSION" -x 74 -y 12
 tmux send-keys -t "$SESSION" e c h o Enter
 sleep 0.1
 assert_no_mouse_tracking_enabled

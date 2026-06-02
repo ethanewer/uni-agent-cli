@@ -94,7 +94,335 @@ const DEFAULT_CONFIG = {
 
 const DEFAULT_SETTINGS = {
 	agents: {},
+	theme: "system",
 };
+
+const THEME_ROLE_ORDER = [
+	"primary",
+	"secondary",
+	"accent",
+	"success",
+	"warning",
+	"error",
+	"text",
+	"textMuted",
+	"textEmphasized",
+	"border",
+	"borderActive",
+	"selectionText",
+	"selectionBackground",
+	"markdownCode",
+	"markdownQuote",
+];
+
+const THEME_ALIASES = {
+	onedark: "one-dark",
+	"one_dark": "one-dark",
+	catppuccinmacchiato: "catppuccin-macchiato",
+	"catppuccin_macchiato": "catppuccin-macchiato",
+	tokyo: "tokyonight",
+	"tokyo-night": "tokyonight",
+};
+
+const BUILTIN_THEMES = {
+	system: {
+		label: "System",
+		description: "Terminal palette",
+		system: true,
+		colors: {
+			primary: "#0000aa",
+			secondary: "#00aaaa",
+			accent: "#00aaaa",
+			success: "#00aa00",
+			warning: "#aa5500",
+			error: "#aa0000",
+			text: "#e5e5e5",
+			textMuted: "#808080",
+			textEmphasized: "#ffffff",
+			border: "#0000aa",
+			borderActive: "#0000aa",
+			selectionText: "#000000",
+			selectionBackground: "#0000aa",
+			markdownCode: "#aa5500",
+			markdownQuote: "#808080",
+		},
+	},
+	opencode: {
+		label: "OpenCode",
+		description: "Clean cyan and violet",
+		colors: {
+			primary: "#7dd3fc",
+			secondary: "#a78bfa",
+			accent: "#34d399",
+			success: "#22c55e",
+			warning: "#f59e0b",
+			error: "#fb7185",
+			text: "#e5e7eb",
+			textMuted: "#94a3b8",
+			textEmphasized: "#ffffff",
+			border: "#334155",
+			borderActive: "#7dd3fc",
+			selectionText: "#0f172a",
+			selectionBackground: "#7dd3fc",
+			markdownCode: "#fbbf24",
+			markdownQuote: "#94a3b8",
+		},
+	},
+	tokyonight: {
+		label: "Tokyo Night",
+		description: "Neon on navy",
+		colors: {
+			primary: "#7aa2f7",
+			secondary: "#bb9af7",
+			accent: "#7dcfff",
+			success: "#9ece6a",
+			warning: "#e0af68",
+			error: "#f7768e",
+			text: "#c0caf5",
+			textMuted: "#565f89",
+			textEmphasized: "#ffffff",
+			border: "#414868",
+			borderActive: "#7aa2f7",
+			selectionText: "#1a1b26",
+			selectionBackground: "#7aa2f7",
+			markdownCode: "#e0af68",
+			markdownQuote: "#565f89",
+		},
+	},
+	everforest: {
+		label: "Everforest",
+		description: "Soft forest contrast",
+		colors: {
+			primary: "#a7c080",
+			secondary: "#d699b6",
+			accent: "#83c092",
+			success: "#a7c080",
+			warning: "#dbbc7f",
+			error: "#e67e80",
+			text: "#d3c6aa",
+			textMuted: "#859289",
+			textEmphasized: "#f2efdf",
+			border: "#4f5b58",
+			borderActive: "#a7c080",
+			selectionText: "#2b3339",
+			selectionBackground: "#a7c080",
+			markdownCode: "#dbbc7f",
+			markdownQuote: "#859289",
+		},
+	},
+	ayu: {
+		label: "Ayu",
+		description: "Amber and ocean blue",
+		colors: {
+			primary: "#59c2ff",
+			secondary: "#d2a6ff",
+			accent: "#95e6cb",
+			success: "#aad94c",
+			warning: "#ffb454",
+			error: "#f07178",
+			text: "#b3b1ad",
+			textMuted: "#626a73",
+			textEmphasized: "#e6e1cf",
+			border: "#3d424d",
+			borderActive: "#59c2ff",
+			selectionText: "#0f1419",
+			selectionBackground: "#59c2ff",
+			markdownCode: "#ffb454",
+			markdownQuote: "#626a73",
+		},
+	},
+	catppuccin: {
+		label: "Catppuccin Mocha",
+		description: "Pastel dark",
+		colors: {
+			primary: "#89b4fa",
+			secondary: "#cba6f7",
+			accent: "#94e2d5",
+			success: "#a6e3a1",
+			warning: "#f9e2af",
+			error: "#f38ba8",
+			text: "#cdd6f4",
+			textMuted: "#7f849c",
+			textEmphasized: "#f5e0dc",
+			border: "#45475a",
+			borderActive: "#89b4fa",
+			selectionText: "#1e1e2e",
+			selectionBackground: "#89b4fa",
+			markdownCode: "#fab387",
+			markdownQuote: "#7f849c",
+		},
+	},
+	"catppuccin-macchiato": {
+		label: "Catppuccin Macchiato",
+		description: "Cool pastel dark",
+		colors: {
+			primary: "#8aadf4",
+			secondary: "#c6a0f6",
+			accent: "#8bd5ca",
+			success: "#a6da95",
+			warning: "#eed49f",
+			error: "#ed8796",
+			text: "#cad3f5",
+			textMuted: "#8087a2",
+			textEmphasized: "#f4dbd6",
+			border: "#494d64",
+			borderActive: "#8aadf4",
+			selectionText: "#24273a",
+			selectionBackground: "#8aadf4",
+			markdownCode: "#f5a97f",
+			markdownQuote: "#8087a2",
+		},
+	},
+	gruvbox: {
+		label: "Gruvbox",
+		description: "Retro warm contrast",
+		colors: {
+			primary: "#83a598",
+			secondary: "#b16286",
+			accent: "#8ec07c",
+			success: "#b8bb26",
+			warning: "#fabd2f",
+			error: "#fb4934",
+			text: "#ebdbb2",
+			textMuted: "#928374",
+			textEmphasized: "#fbf1c7",
+			border: "#665c54",
+			borderActive: "#83a598",
+			selectionText: "#282828",
+			selectionBackground: "#83a598",
+			markdownCode: "#fabd2f",
+			markdownQuote: "#928374",
+		},
+	},
+	kanagawa: {
+		label: "Kanagawa",
+		description: "Ink and muted brights",
+		colors: {
+			primary: "#7e9cd8",
+			secondary: "#957fb8",
+			accent: "#7aa89f",
+			success: "#98bb6c",
+			warning: "#e6c384",
+			error: "#e82424",
+			text: "#dcd7ba",
+			textMuted: "#727169",
+			textEmphasized: "#c8c093",
+			border: "#54546d",
+			borderActive: "#7e9cd8",
+			selectionText: "#1f1f28",
+			selectionBackground: "#7e9cd8",
+			markdownCode: "#e6c384",
+			markdownQuote: "#727169",
+		},
+	},
+	nord: {
+		label: "Nord",
+		description: "Arctic blue",
+		colors: {
+			primary: "#88c0d0",
+			secondary: "#b48ead",
+			accent: "#8fbcbb",
+			success: "#a3be8c",
+			warning: "#ebcb8b",
+			error: "#bf616a",
+			text: "#d8dee9",
+			textMuted: "#81a1c1",
+			textEmphasized: "#eceff4",
+			border: "#4c566a",
+			borderActive: "#88c0d0",
+			selectionText: "#2e3440",
+			selectionBackground: "#88c0d0",
+			markdownCode: "#ebcb8b",
+			markdownQuote: "#81a1c1",
+		},
+	},
+	matrix: {
+		label: "Matrix",
+		description: "Terminal green",
+		colors: {
+			primary: "#00ff41",
+			secondary: "#5cff8d",
+			accent: "#00cc33",
+			success: "#00ff41",
+			warning: "#b6ff5c",
+			error: "#ff5555",
+			text: "#c8ffd4",
+			textMuted: "#4f8f5c",
+			textEmphasized: "#ffffff",
+			border: "#2f6f3a",
+			borderActive: "#00ff41",
+			selectionText: "#001a06",
+			selectionBackground: "#00ff41",
+			markdownCode: "#b6ff5c",
+			markdownQuote: "#4f8f5c",
+		},
+	},
+	"one-dark": {
+		label: "One Dark",
+		description: "Editor classic",
+		colors: {
+			primary: "#61afef",
+			secondary: "#c678dd",
+			accent: "#56b6c2",
+			success: "#98c379",
+			warning: "#e5c07b",
+			error: "#e06c75",
+			text: "#abb2bf",
+			textMuted: "#5c6370",
+			textEmphasized: "#ffffff",
+			border: "#4b5263",
+			borderActive: "#61afef",
+			selectionText: "#282c34",
+			selectionBackground: "#61afef",
+			markdownCode: "#e5c07b",
+			markdownQuote: "#5c6370",
+		},
+	},
+	dracula: {
+		label: "Dracula",
+		description: "High contrast purple",
+		colors: {
+			primary: "#8be9fd",
+			secondary: "#bd93f9",
+			accent: "#50fa7b",
+			success: "#50fa7b",
+			warning: "#f1fa8c",
+			error: "#ff5555",
+			text: "#f8f8f2",
+			textMuted: "#6272a4",
+			textEmphasized: "#ffffff",
+			border: "#6272a4",
+			borderActive: "#8be9fd",
+			selectionText: "#282a36",
+			selectionBackground: "#8be9fd",
+			markdownCode: "#f1fa8c",
+			markdownQuote: "#6272a4",
+		},
+	},
+	monokai: {
+		label: "Monokai",
+		description: "Bright editor palette",
+		colors: {
+			primary: "#66d9ef",
+			secondary: "#ae81ff",
+			accent: "#a6e22e",
+			success: "#a6e22e",
+			warning: "#e6db74",
+			error: "#f92672",
+			text: "#f8f8f2",
+			textMuted: "#75715e",
+			textEmphasized: "#ffffff",
+			border: "#75715e",
+			borderActive: "#66d9ef",
+			selectionText: "#272822",
+			selectionBackground: "#66d9ef",
+			markdownCode: "#e6db74",
+			markdownQuote: "#75715e",
+		},
+	},
+};
+
+let activeThemeName = "system";
 
 class StatusLine extends Text {
 	constructor(getStatus) {
@@ -167,7 +495,7 @@ class AgentMenu {
 			const cursor = index === this.selected ? "›" : " ";
 			const active = key === this.app.activeKey ? "●" : " ";
 			const label = `${cursor} ${index + 1}. ${active} ${agent.label ?? key} (${key})`;
-			lines.push(index === this.selected ? chalk.blue(label) : label);
+			lines.push(index === this.selected ? chalk.blue(label) : chalk.text(label));
 		});
 		lines.push("", chalk.dim("enter select · q cancel"));
 		return lines.map((line) => truncateVisual(line, width));
@@ -233,7 +561,7 @@ class SelectionPanel {
 			const marker = entry.active ? "●" : " ";
 			const description = entry.description ? chalk.dim(`  ${entry.description}`) : "";
 			const label = `${cursor} ${marker} ${entry.label}${description}`;
-			lines.push(index === this.selected ? chalk.blue(label) : label);
+			lines.push(index === this.selected ? chalk.blue(label) : chalk.text(label));
 		}
 
 		const position = entries.length > 0 ? `${this.selected + 1}/${entries.length}` : "0/0";
@@ -297,6 +625,124 @@ class SelectionPanel {
 		return this.entries.filter((entry) =>
 			[entry.label, entry.description, entry.value].filter(Boolean).some((value) => String(value).toLowerCase().includes(query)),
 		);
+	}
+}
+
+class ThemePanel {
+	constructor(app) {
+		this.app = app;
+		this.entries = themeEntries(app.themeName);
+		this.selected = Math.max(0, this.entries.findIndex((entry) => entry.value === app.themeName));
+		this.query = "";
+		this.previewSelectedTheme();
+	}
+
+	invalidate() {}
+
+	render(width) {
+		const entries = this.filteredEntries();
+		const maxVisible = 8;
+		const half = Math.floor(maxVisible / 2);
+		this.selected = entries.length > 0 ? Math.min(this.selected, entries.length - 1) : 0;
+		const start = Math.max(0, Math.min(this.selected - half, entries.length - maxVisible));
+		const visible = entries.slice(start, start + maxVisible);
+		const selected = entries[this.selected];
+		const selectedTheme = selected ? BUILTIN_THEMES[selected.value] : undefined;
+		const lines = [chalk.bold("Theme"), ""];
+
+		for (let offset = 0; offset < maxVisible; offset += 1) {
+			const entry = visible[offset];
+			if (!entry) {
+				if (offset === 0) lines.push(chalk.dim(this.query ? "No matches" : "No themes"));
+				else lines.push("");
+				continue;
+			}
+			const index = start + offset;
+			const cursor = index === this.selected ? "›" : " ";
+			const active = entry.value === this.app.themeName ? "●" : " ";
+			const swatches = compactThemeSwatches(entry.value);
+			const label = `${cursor} ${active} ${entry.label.padEnd(22)} ${swatches}  ${entry.description ?? ""}`;
+			lines.push(index === this.selected ? chalk.blue(label) : chalk.text(label));
+		}
+
+		const position = entries.length > 0 ? `${this.selected + 1}/${entries.length}` : "0/0";
+		lines.push("", chalk.dim(position), chalk.dim("type to filter · enter select · q/esc cancel"));
+		if (selectedTheme) {
+			lines.push("", ...themePaletteLines(selected.value), "", ...themePreviewLines(selected.value, width));
+		}
+		return lines.map((line) => truncateVisual(line, width));
+	}
+
+	handleInput(data) {
+		if (matchesKey(data, "escape") || data === "\x03" || (data === "q" && !this.query)) {
+			this.cancel();
+			return;
+		}
+		if (matchesKey(data, "backspace") || data === "\x7f" || data === "\b") {
+			this.query = this.query.slice(0, -1);
+			this.selected = 0;
+			this.previewSelectedTheme();
+			this.app.updateFilterEditor(this.query);
+			return;
+		}
+		if (data === "\x15") {
+			this.query = "";
+			this.selected = 0;
+			this.previewSelectedTheme();
+			this.app.updateFilterEditor(this.query);
+			return;
+		}
+		if (matchesKey(data, "up")) {
+			this.selected = Math.max(0, this.selected - 1);
+			this.previewSelectedTheme();
+			return;
+		}
+		if (matchesKey(data, "down")) {
+			const entries = this.filteredEntries();
+			this.selected = entries.length > 0 ? Math.min(entries.length - 1, this.selected + 1) : 0;
+			this.previewSelectedTheme();
+			return;
+		}
+		const entries = this.filteredEntries();
+		if ((matchesKey(data, "enter") || data === "\r" || data === "\n") && entries[this.selected]) {
+			void this.app.applyTheme(entries[this.selected].value, {
+				displayText: slashPromptDisplay("/theme", entries[this.selected].label),
+			});
+			return;
+		}
+		if (isPrintableInput(data)) {
+			this.query += data;
+			this.selected = 0;
+			this.previewSelectedTheme();
+			this.app.updateFilterEditor(this.query);
+		}
+	}
+
+	clearInput() {
+		if (!this.query) return false;
+		this.query = "";
+		this.selected = 0;
+		this.previewSelectedTheme();
+		this.app.updateFilterEditor(this.query);
+		return true;
+	}
+
+	cancel() {
+		this.app.closeMenu();
+	}
+
+	filteredEntries() {
+		if (!this.query) return this.entries;
+		const query = this.query.toLowerCase();
+		return this.entries.filter((entry) =>
+			[entry.label, entry.description, entry.value].filter(Boolean).some((value) => String(value).toLowerCase().includes(query)),
+		);
+	}
+
+	previewSelectedTheme() {
+		const entries = this.filteredEntries();
+		const entry = entries[this.selected];
+		this.app.previewTheme(entry?.value ?? this.app.themeName);
 	}
 }
 
@@ -923,6 +1369,9 @@ class VoiceController {
 class HarnessApp {
 	constructor(config, initialAgent, initialTransport) {
 		this.config = config;
+		this.themeName = resolveThemeName(config.theme ?? config.settings?.theme) ?? "system";
+		this.previewThemeName = undefined;
+		setActiveTheme(this.themeName);
 		this.activeKey = initialAgent;
 		this.transport = initialTransport ?? config.agents[initialAgent]?.transport ?? "acp";
 		this.ready = false;
@@ -1046,6 +1495,7 @@ class HarnessApp {
 	adoptPrepaintedFrame() {
 		if (process.env.CC_PREPAINTED !== "1") return;
 		if (process.env.CC_PREPAINT_AGENT !== this.activeKey || this.transport !== "acp") return;
+		if ((process.env.CC_PREPAINT_THEME || "system") !== this.themeName) return;
 		const width = this.ui.terminal.columns;
 		const height = this.ui.terminal.rows;
 		const rendered = this.ui.render(width).map((line) => `${normalizeTerminalOutput(line)}${TUI.SEGMENT_RESET}`);
@@ -1720,6 +2170,10 @@ class HarnessApp {
 			this.enterVoiceMode();
 			return;
 		}
+		if (name === "theme") {
+			await this.openThemeDialog(argument, name);
+			return;
+		}
 		if (name === "resume") {
 			await this.openResumeDialog(name);
 			return;
@@ -1796,9 +2250,82 @@ class HarnessApp {
 			model ? `model ${model}` : undefined,
 			mode ? `mode ${mode}` : undefined,
 			effort ? `reasoning ${effort}` : undefined,
+			`theme ${themeLabel(this.themeName)}`,
 			state.sessionId ? `session ${state.sessionId}` : undefined,
 		].filter(Boolean);
 		this.addNotice(parts.join(" · "));
+	}
+
+	async openThemeDialog(argument = "", commandName = "theme") {
+		if (argument) {
+			const canonical = resolveThemeName(argument);
+			if (!canonical) {
+				this.addCommandMessage(slashCommandText(commandName, argument));
+				this.addNotice(`Unknown theme: ${argument}`);
+				return;
+			}
+			await this.applyTheme(canonical, {
+				displayText: slashPromptDisplay(slashCommandText(commandName, argument), themeLabel(canonical)),
+			});
+			return;
+		}
+		this.closeMenu({ cancelSelection: true });
+		this.menuEditorText = this.editor.getText();
+		this.updateFilterEditor("");
+		this.menuHandle = new ThemePanel(this);
+		this.commandPanel.addChild(this.menuHandle);
+		this.ui.setFocus(this.editor);
+		this.ui.requestRender();
+	}
+
+	async applyTheme(themeName, options = {}) {
+		const canonical = resolveThemeName(themeName);
+		if (!canonical) return false;
+		try {
+			saveSettingsPatch({ theme: canonical });
+		} catch (error) {
+			this.closeMenu();
+			this.addCommandMessage(options.displayText ?? slashPromptDisplay("/theme", themeLabel(canonical)));
+			this.addError(`Could not save theme: ${error.message ?? error}`);
+			this.ui.requestRender();
+			return false;
+		}
+		this.closeMenu({ keepThemePreview: true });
+		this.themeName = canonical;
+		this.previewThemeName = undefined;
+		this.config.theme = canonical;
+		this.config.settings = { ...(this.config.settings ?? {}), theme: canonical };
+		setActiveTheme(canonical);
+		this.invalidateRenderedChildren();
+		this.addCommandMessage(options.displayText ?? slashPromptDisplay("/theme", themeLabel(canonical)));
+		this.updateAutocomplete();
+		this.ui.requestRender(true);
+		return true;
+	}
+
+	previewTheme(themeName) {
+		const canonical = resolveThemeName(themeName) ?? this.themeName;
+		if (this.previewThemeName === canonical && activeThemeName === canonical) return;
+		this.previewThemeName = canonical;
+		setActiveTheme(canonical);
+		this.invalidateRenderedChildren();
+		this.ui.requestRender(true);
+	}
+
+	restoreThemePreview() {
+		if (!this.previewThemeName && activeThemeName === this.themeName) return;
+		this.previewThemeName = undefined;
+		setActiveTheme(this.themeName);
+		this.invalidateRenderedChildren();
+		this.ui.requestRender(true);
+	}
+
+	invalidateRenderedChildren() {
+		invalidateRenderableTree(this.chat);
+		invalidateRenderableTree(this.commandPanel);
+		invalidateRenderableTree(this.queueSummary);
+		invalidateRenderableTree(this.editor);
+		invalidateRenderableTree(this.status);
 	}
 
 	async openResumeDialog(commandName = "resume") {
@@ -2108,13 +2635,16 @@ class HarnessApp {
 			this.commandPanel.clear();
 			this.menuHandle = undefined;
 		}
+		if (handle instanceof ThemePanel && !options.keepThemePreview) {
+			this.restoreThemePreview();
+		}
 		if (this.menuEditorText !== undefined) {
 			this.editor.setText(this.menuEditorText);
 			this.menuEditorText = undefined;
 		}
 		this.ui.setFocus(this.editor);
 		this.ui.requestRender();
-		if (options.cancelSelection) handle?.cancel?.();
+		if (options.cancelSelection && !(handle instanceof ThemePanel)) handle?.cancel?.();
 	}
 
 	updateFilterEditor(query) {
@@ -2384,7 +2914,7 @@ class MutableMarkdown {
 	render(width) {
 		const text = this.text.trimEnd();
 		if (this.cache?.width === width && this.cache.text === text) return this.cache.lines.slice();
-		const lines = renderMarkdown(text, width);
+		const lines = renderMarkdown(text, width, 0, 0, { color: (content) => chalk.text(content) });
 		this.cache = { width, text, lines };
 		return lines.slice();
 	}
@@ -2408,7 +2938,7 @@ class MutableUserMessage {
 	render(width) {
 		if (this.cache?.width === width && this.cache.text === this.text) return this.cache.lines.slice();
 		const contentWidth = Math.max(1, width);
-		const body = renderMarkdown(this.text, contentWidth, 0, 0, { color: (content) => content });
+		const body = renderMarkdown(this.text, contentWidth, 0, 0, { color: (content) => chalk.text(content) });
 		const rail = chalk.dim("─".repeat(Math.max(1, width)));
 		const lines = [
 			rail,
@@ -2534,6 +3064,14 @@ function lastRenderableChild(container) {
 	return undefined;
 }
 
+function invalidateRenderableTree(node) {
+	if (!node) return;
+	node.invalidate?.();
+	if (Array.isArray(node.children)) {
+		for (const child of node.children) invalidateRenderableTree(child);
+	}
+}
+
 function oneLine(value) {
 	return String(value).replace(/\s+/g, " ").trim();
 }
@@ -2650,8 +3188,141 @@ function createAnsiStyles() {
 		italic: style("\x1b[3m", "\x1b[23m"),
 		red: style("\x1b[31m", "\x1b[39m"),
 		strikethrough: style("\x1b[9m", "\x1b[29m"),
+		text: (text) => text,
 		underline: style("\x1b[4m", "\x1b[24m"),
 		yellow: style("\x1b[33m", "\x1b[39m"),
+	};
+}
+
+function createThemeStyles(themeName) {
+	const theme = themeByName(themeName);
+	if (theme.system) return createAnsiStyles();
+	const colors = theme.colors;
+	const fg = (role) => truecolorStyle(colors[role], "fg");
+	const fgHex = (hex) => truecolorStyle(hex, "fg");
+	const selection = (text) => `${truecolorOpen(colors.selectionText, "fg")}${truecolorOpen(colors.selectionBackground, "bg")}${text}\x1b[39m\x1b[49m`;
+	const black = Object.assign(fg("selectionText"), { bgBlue: selection });
+	return {
+		black,
+		blue: fg("primary"),
+		bold: (text) => `\x1b[1m${text}\x1b[22m`,
+		cyan: fg("accent"),
+		dim: fg("textMuted"),
+		green: fg("success"),
+		italic: (text) => `\x1b[3m${text}\x1b[23m`,
+		magenta: fgHex(colors.secondary),
+		red: fg("error"),
+		strikethrough: (text) => `\x1b[9m${text}\x1b[29m`,
+		text: fg("text"),
+		underline: (text) => `\x1b[4m${text}\x1b[24m`,
+		yellow: fg("markdownCode"),
+	};
+}
+
+function setActiveTheme(themeName) {
+	const canonical = resolveThemeName(themeName) ?? "system";
+	activeThemeName = canonical;
+	Object.assign(chalk, createThemeStyles(canonical));
+}
+
+export function resolveThemeName(value) {
+	const key = normalizeThemeKey(value);
+	if (!key) return undefined;
+	if (BUILTIN_THEMES[key]) return key;
+	const alias = THEME_ALIASES[key] ?? THEME_ALIASES[key.replace(/[-_]/g, "")];
+	return BUILTIN_THEMES[alias] ? alias : undefined;
+}
+
+export function themeNames() {
+	return Object.keys(BUILTIN_THEMES);
+}
+
+function themeByName(themeName) {
+	return BUILTIN_THEMES[resolveThemeName(themeName) ?? "system"];
+}
+
+function themeLabel(themeName) {
+	return themeByName(themeName).label;
+}
+
+function themeEntries(activeTheme) {
+	return themeNames().map((name) => ({
+		value: name,
+		label: BUILTIN_THEMES[name].label,
+		description: BUILTIN_THEMES[name].description,
+		active: name === activeTheme,
+	}));
+}
+
+function normalizeThemeKey(value) {
+	return String(value ?? "")
+		.trim()
+		.toLowerCase()
+		.replace(/\s+/g, "-");
+}
+
+function compactThemeSwatches(themeName) {
+	const roles = ["primary", "secondary", "accent", "success", "warning", "error"];
+	return roles.map((role) => themeSwatch(themeName, role, "  ")).join(" ");
+}
+
+function themePaletteLines(themeName) {
+	const theme = themeByName(themeName);
+	const lines = [chalk.bold(`Palette: ${theme.label}`)];
+	for (let index = 0; index < THEME_ROLE_ORDER.length; index += 3) {
+		const group = THEME_ROLE_ORDER.slice(index, index + 3).map((role) => {
+			const hex = theme.colors[role];
+			return `${themeSwatch(themeName, role, "  ")} ${role} ${hex}`;
+		});
+		lines.push(group.join("  "));
+	}
+	return lines;
+}
+
+function themePreviewLines(themeName, width) {
+	const theme = themeByName(themeName);
+	const styles = createThemeStyles(themeName);
+	const contentWidth = Math.max(12, Math.min(46, width - 2));
+	const rail = styles.dim("─".repeat(contentWidth));
+	const sample = [
+		styles.bold(`Preview: ${theme.label}`),
+		rail,
+		styles.dim(`/theme (${theme.label})`),
+		`You ${styles.dim("asked")}: Build theme support`,
+		`${styles.blue("Assistant")} ${styles.dim("uses markdown")} ${styles.yellow("`code`")} ${styles.cyan("link")}`,
+		`${styles.green ? styles.green("✓") : styles.cyan("✓")} Tool complete`,
+		styles.red("! Example error"),
+		styles.blue(`┌${"─".repeat(Math.max(1, contentWidth - 2))}┐`),
+		styles.blue("│") + truncateVisual(" Space to record · Ctrl+Space for text".padEnd(contentWidth - 2), contentWidth - 2) + styles.blue("│"),
+		styles.blue(`└${"─".repeat(Math.max(1, contentWidth - 2))}┘`),
+	];
+	return sample;
+}
+
+function themeSwatch(themeName, role, text = "  ") {
+	const color = themeByName(themeName).colors[role] ?? "#ffffff";
+	return `${truecolorOpen(color, "bg")}${text}\x1b[49m`;
+}
+
+function truecolorStyle(hex, target = "fg") {
+	const open = truecolorOpen(hex, target);
+	const close = target === "bg" ? "\x1b[49m" : "\x1b[39m";
+	return (text) => `${open}${text}${close}`;
+}
+
+function truecolorOpen(hex, target = "fg") {
+	const rgb = hexToRgb(hex);
+	const code = target === "bg" ? 48 : 38;
+	return `\x1b[${code};2;${rgb.r};${rgb.g};${rgb.b}m`;
+}
+
+function hexToRgb(hex) {
+	const match = String(hex ?? "").match(/^#?([0-9a-f]{6})$/i);
+	const value = match ? match[1] : "ffffff";
+	return {
+		r: Number.parseInt(value.slice(0, 2), 16),
+		g: Number.parseInt(value.slice(2, 4), 16),
+		b: Number.parseInt(value.slice(4, 6), 16),
 	};
 }
 
@@ -2679,6 +3350,7 @@ function localSlashCommands(app) {
 		{ name: "status", description: "Show current session status" },
 		{ name: "clear", description: "Clear the conversation" },
 		{ name: "voice", description: "Enter voice input mode" },
+		themeSlashCommand(app),
 	];
 	const addIfMissing = (command) => {
 		if (!commands.some((existing) => existing.name === command.name)) commands.push(command);
@@ -2716,6 +3388,23 @@ function localSlashCommands(app) {
 	if (hasPlanMode) addIfMissing({ name: "plan", description: "Switch to plan mode" });
 
 	return commands;
+}
+
+function themeSlashCommand(app) {
+	const entries = themeEntries(app.themeName);
+	return {
+		name: "theme",
+		description: "Change color theme",
+		argumentHint: `[${entries.map((entry) => entry.value).join("|")}]`,
+		getArgumentCompletions: (prefix) =>
+			entries
+				.filter((entry) => entry.value.startsWith(prefix) || entry.label.toLowerCase().includes(prefix.toLowerCase()))
+				.map((entry) => ({
+					value: entry.value,
+					label: entry.label,
+					description: entry.description,
+				})),
+	};
 }
 
 function shouldDeferLocalSlashCommand(name) {
@@ -3089,11 +3778,13 @@ function createHarnessTerminal(resizeHooks = {}) {
 			write("\x1b[?1049h\x1b[2J\x1b[H");
 			delete process.env.CC_PREPAINTED;
 			delete process.env.CC_PREPAINT_AGENT;
+			delete process.env.CC_PREPAINT_THEME;
 			delete process.env.CC_ADOPTED_PREPAINT;
 		} else if (process.env.CC_PREPAINTED === "1") {
 			if (process.env.CC_ADOPTED_PREPAINT !== "1") write("\x1b8\x1b[J\x1b7");
 			delete process.env.CC_PREPAINTED;
 			delete process.env.CC_PREPAINT_AGENT;
+			delete process.env.CC_PREPAINT_THEME;
 			delete process.env.CC_ADOPTED_PREPAINT;
 		} else {
 			write("\x1b7");
@@ -3250,7 +3941,7 @@ export function loadConfig() {
 	const file = configPath();
 	const user = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : {};
 	const config = deepMerge(DEFAULT_CONFIG, user);
-	const settings = deepMerge(config.settings ?? DEFAULT_SETTINGS, loadSettings());
+	const settings = normalizeSettings(deepMerge(config.settings ?? {}, loadSettings()), config.theme);
 	return applyHarnessSettings(config, settings);
 }
 
@@ -3261,8 +3952,8 @@ function configPath() {
 
 function loadSettings() {
 	const file = settingsPath();
-	if (!fs.existsSync(file)) return DEFAULT_SETTINGS;
-	return deepMerge(DEFAULT_SETTINGS, JSON.parse(fs.readFileSync(file, "utf8")));
+	if (!fs.existsSync(file)) return {};
+	return JSON.parse(fs.readFileSync(file, "utf8"));
 }
 
 function settingsPath() {
@@ -3270,13 +3961,31 @@ function settingsPath() {
 	return path.join(os.homedir(), ".config", "cc", "settings.json");
 }
 
-export function applyHarnessSettings(config, settings = DEFAULT_SETTINGS) {
+export function applyHarnessSettings(config, settings = {}) {
+	settings = normalizeSettings(settings, config.theme ?? config.settings?.theme);
 	const normalized = normalizeHarnessSettings(settings);
 	const agents = {};
 	for (const [key, agent] of Object.entries(config.agents ?? {})) {
 		agents[key] = applyAgentSettings(key, agent, normalized[key] ?? {});
 	}
-	return { ...config, settings, agents };
+	return { ...config, settings, theme: settings.theme, agents };
+}
+
+export function saveSettingsPatch(patch) {
+	const file = settingsPath();
+	const current = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : {};
+	const next = normalizeSettings(deepMerge(current, patch));
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	fs.writeFileSync(file, `${JSON.stringify(next, null, 2)}\n`);
+	return next;
+}
+
+function normalizeSettings(settings = {}, fallbackTheme = DEFAULT_SETTINGS.theme) {
+	const normalized = isPlainObject(settings) ? { ...settings } : {};
+	normalized.agents = isPlainObject(normalized.agents) ? normalized.agents : {};
+	normalized.theme =
+		resolveThemeName(Object.prototype.hasOwnProperty.call(normalized, "theme") ? normalized.theme : fallbackTheme) ?? DEFAULT_SETTINGS.theme;
+	return normalized;
 }
 
 function normalizeHarnessSettings(settings) {
@@ -3423,6 +4132,7 @@ Inside the TUI:
   /harness codex
   /harness claude
   /harness cursor
+  /theme
   /harness exit
 `);
 }

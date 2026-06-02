@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {
 	AcpClient,
 	applyHarnessSettings,
@@ -8,8 +11,12 @@ import {
 	flattenModes,
 	isVsCodeAutoActivationCommand,
 	isVsCodeTerminal,
+	loadConfig,
+	resolveThemeName,
 	rewriteFullScreenClear,
+	saveSettingsPatch,
 	shouldDropVsCodeAutoActivationInput,
+	themeNames,
 } from "../src/pi-harness.mjs";
 
 const config = {
@@ -55,6 +62,8 @@ const applied = applyHarnessSettings(config, {
 });
 
 assert.equal(applied.agents.claude._startupMode, "bypassPermissions");
+assert.equal(applied.theme, "system");
+assert.equal(applied.settings.theme, "system");
 assert.equal(applied.agents.claude._autoPermissionRequests, true);
 assert.deepEqual(applied.agents.claude._sessionMeta, {
 	claudeCode: {
@@ -88,6 +97,71 @@ assert.deepEqual(applied.agents.cursor.acp.args, [
 ]);
 assert.equal(applied.agents.cursor._autoPermissionRequests, true);
 assert.deepEqual(config.agents.cursor.acp.args, ["acp"]);
+
+assert.ok(themeNames().includes("tokyonight"));
+assert.ok(themeNames().includes("matrix"));
+assert.equal(resolveThemeName("Tokyo Night"), "tokyonight");
+assert.equal(resolveThemeName("onedark"), "one-dark");
+assert.equal(resolveThemeName("catppuccin_macchiato"), "catppuccin-macchiato");
+assert.equal(resolveThemeName("missing-theme"), undefined);
+assert.equal(applyHarnessSettings(config, { agents: {}, theme: "matrix" }).theme, "matrix");
+assert.equal(applyHarnessSettings(config, { agents: {}, theme: "not-real" }).theme, "system");
+
+const previousCcSettings = process.env.CC_SETTINGS;
+const previousCcConfig = process.env.CC_CONFIG;
+const tempSettingsDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-theme-settings-"));
+try {
+	const settingsFile = path.join(tempSettingsDir, "settings.json");
+	fs.writeFileSync(
+		settingsFile,
+		`${JSON.stringify({ agents: { codex: { config: { model: "gpt-4.1" } } } }, null, 2)}\n`,
+	);
+	process.env.CC_SETTINGS = settingsFile;
+	process.env.CC_CONFIG = path.join(process.cwd(), "tests", "fake_config.json");
+
+	const saved = saveSettingsPatch({ theme: "onedark" });
+	assert.equal(saved.theme, "one-dark");
+	assert.deepEqual(saved.agents.codex.config, { model: "gpt-4.1" });
+	assert.equal(JSON.parse(fs.readFileSync(settingsFile, "utf8")).theme, "one-dark");
+
+	const loaded = loadConfig();
+	assert.equal(loaded.theme, "one-dark");
+	assert.deepEqual(loaded.settings.agents.codex.config, { model: "gpt-4.1" });
+
+	const configThemeFile = path.join(tempSettingsDir, "config-theme.json");
+	const nestedThemeSettingsFile = path.join(tempSettingsDir, "nested-theme-settings.json");
+	fs.writeFileSync(
+		configThemeFile,
+		`${JSON.stringify({ ...config, theme: "matrix" }, null, 2)}\n`,
+	);
+	fs.writeFileSync(
+		nestedThemeSettingsFile,
+		`${JSON.stringify({ agents: { codex: { config: { theme: "tokyonight" } } } }, null, 2)}\n`,
+	);
+	process.env.CC_CONFIG = configThemeFile;
+	process.env.CC_SETTINGS = nestedThemeSettingsFile;
+	const configThemeLoaded = loadConfig();
+	assert.equal(configThemeLoaded.theme, "matrix");
+	assert.equal(configThemeLoaded.settings.theme, "matrix");
+	assert.equal(configThemeLoaded.settings.agents.codex.config.theme, "tokyonight");
+
+	const configSettingsThemeFile = path.join(tempSettingsDir, "config-settings-theme.json");
+	fs.writeFileSync(
+		configSettingsThemeFile,
+		`${JSON.stringify({ ...config, theme: "matrix", settings: { theme: "tokyonight" } }, null, 2)}\n`,
+	);
+	process.env.CC_CONFIG = configSettingsThemeFile;
+	process.env.CC_SETTINGS = nestedThemeSettingsFile;
+	const configSettingsThemeLoaded = loadConfig();
+	assert.equal(configSettingsThemeLoaded.theme, "tokyonight");
+	assert.equal(configSettingsThemeLoaded.settings.theme, "tokyonight");
+} finally {
+	if (previousCcSettings === undefined) delete process.env.CC_SETTINGS;
+	else process.env.CC_SETTINGS = previousCcSettings;
+	if (previousCcConfig === undefined) delete process.env.CC_CONFIG;
+	else process.env.CC_CONFIG = previousCcConfig;
+	fs.rmSync(tempSettingsDir, { recursive: true, force: true });
+}
 
 assert.deepEqual(
 	autoPermissionOutcome({
