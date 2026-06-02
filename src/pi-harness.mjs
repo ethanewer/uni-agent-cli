@@ -60,8 +60,6 @@ const MARKDOWN_PRELOAD_DELAY_MS = parseDelay(process.env.CC_MARKDOWN_PRELOAD_DEL
 const RESIZE_SETTLE_DELAY_MS = parseDelay(process.env.CC_RESIZE_SETTLE_DELAY_MS, 90);
 const VS_CODE_AUTO_ACTIVATION_MAX_INPUT_GAP_MS = 15;
 const VS_CODE_AUTO_ACTIVATION_MAX_SUBMIT_AGE_MS = 75;
-const MOUSE_SCROLL_GUARD_ENABLE = "\x1b[?1006h\x1b[?1000h";
-const MOUSE_SCROLL_GUARD_DISABLE = "\x1b[?1000l\x1b[?1006l";
 let MarkdownComponent;
 let markdownLoadPromise;
 let CombinedAutocompleteProviderClass;
@@ -965,7 +963,6 @@ class HarnessApp {
 		this.startupConnectTimer = undefined;
 		this.markdownPreloadTimer = undefined;
 		this.resizeActive = false;
-		this.liveOutputScrollGuardEnabled = false;
 		this.vsCodeActivationInputBurst = undefined;
 
 		const terminal = createHarnessTerminal({
@@ -2242,7 +2239,6 @@ class HarnessApp {
 	}
 
 	updateSpinner() {
-		this.setLiveOutputScrollGuard(Boolean(this.statusState));
 		if (!this.statusState) {
 			if (this.spinnerTimer) clearInterval(this.spinnerTimer);
 			this.spinnerTimer = undefined;
@@ -2254,12 +2250,6 @@ class HarnessApp {
 			this.spinnerIndex += 1;
 			this.ui.requestRender();
 		}, 80);
-	}
-
-	setLiveOutputScrollGuard(enabled) {
-		if (this.liveOutputScrollGuardEnabled === enabled) return;
-		this.liveOutputScrollGuardEnabled = enabled;
-		this.ui.terminal.write(enabled ? MOUSE_SCROLL_GUARD_ENABLE : MOUSE_SCROLL_GUARD_DISABLE);
 	}
 
 	updateAutocomplete() {
@@ -2368,7 +2358,6 @@ class HarnessApp {
 	stop() {
 		if (this.spinnerTimer) clearInterval(this.spinnerTimer);
 		if (this.markdownPreloadTimer) clearTimeout(this.markdownPreloadTimer);
-		this.setLiveOutputScrollGuard(false);
 		this.cancelPermissionPrompts();
 		this.voiceController?.dispose();
 		if (this.client) this.client.stop();

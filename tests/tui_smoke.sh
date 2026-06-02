@@ -8,7 +8,9 @@ fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SESSION="cc-tui-smoke-$$"
+WRITE_LOG="$(mktemp -t cc-tui-write-log.XXXXXX)"
 ROOT_Q="$(printf "%q" "$ROOT")"
+WRITE_LOG_Q="$(printf "%q" "$WRITE_LOG")"
 TERM_PROGRAM_Q="$(printf "%q" "${TERM_PROGRAM:-}")"
 VSCODE_PID_Q="$(printf "%q" "${VSCODE_PID:-}")"
 VSCODE_INJECTION_Q="$(printf "%q" "${VSCODE_INJECTION:-}")"
@@ -29,6 +31,7 @@ fi
 
 cleanup() {
 	tmux kill-session -t "$SESSION" >/dev/null 2>&1 || true
+	rm -f "$WRITE_LOG"
 }
 trap cleanup EXIT
 
@@ -124,7 +127,14 @@ assert_exact_scrollback_count() {
 	fi
 }
 
-tmux new-session -d -s "$SESSION" -x 100 -y 30 "cd $ROOT_Q && printf 'outside-before-cc\n' && $PANE_ENV CC_CONFIG=tests/fake_config.json CC_BACKGROUND_CONNECT_DELAY_MS=0 FAKE_ACP_NEW_DELAY=0.4 ./src/cc fake"
+assert_no_mouse_tracking_enabled() {
+	if grep -Fq "$(printf '\033[?1000h')" "$WRITE_LOG" || grep -Fq "$(printf '\033[?1006h')" "$WRITE_LOG"; then
+		echo "TUI enabled mouse tracking, which captures terminal scroll while the agent is running" >&2
+		exit 1
+	fi
+}
+
+tmux new-session -d -s "$SESSION" -x 100 -y 30 "cd $ROOT_Q && printf 'outside-before-cc\n' && $PANE_ENV PI_TUI_WRITE_LOG=$WRITE_LOG_Q CC_CONFIG=tests/fake_config.json CC_BACKGROUND_CONNECT_DELAY_MS=0 FAKE_ACP_NEW_DELAY=0.4 ./src/cc fake"
 
 if [ "$VSCODE_TERMINAL" -eq 0 ]; then
 	wait_for_text "outside-before-cc"
@@ -147,6 +157,8 @@ assert_exact_scrollback_count "Space to record" 1
 tmux resize-window -t "$SESSION" -x 74 -y 12
 wait_for_text "Space to record"
 tmux send-keys -t "$SESSION" e c h o Enter
+sleep 0.1
+assert_no_mouse_tracking_enabled
 wait_for_text "echo: echo"
 tmux send-keys -t "$SESSION" c o n d a
 sleep 0.05
