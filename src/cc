@@ -163,6 +163,55 @@ apply_theme_colors() {
 	reset="${esc}[39m"
 }
 
+truncate_ellipsis_text() {
+	text=$1
+	max_width=$2
+	if [ "$max_width" -le 0 ]; then
+		return
+	fi
+	length=$(text_length "$text")
+	if [ "$length" -le "$max_width" ]; then
+		printf '%s' "$text"
+	elif [ "$max_width" -le 3 ]; then
+		printf '%*s' "$max_width" '' | tr ' ' '.'
+	else
+		printf '%s...' "$(text_prefix "$text" "$((max_width - 3))")"
+	fi
+}
+
+truncate_visual_text() {
+	text=$1
+	max_width=$2
+	length=$(text_length "$text")
+	if [ "$length" -le "$max_width" ]; then
+		printf '%s' "$text"
+		return
+	fi
+	inner_width=$((max_width - 1))
+	if [ "$inner_width" -lt 1 ]; then
+		inner_width=1
+	fi
+	printf '%s~' "$(truncate_ellipsis_text "$text" "$inner_width")"
+}
+
+text_length() {
+	if command -v perl >/dev/null 2>&1; then
+		printf '%s' "$1" | perl -CS -Mutf8 -0777 -ne 'print length($_)'
+	else
+		printf '%s' "$1" | wc -m | tr -d '[:space:]'
+	fi
+}
+
+text_prefix() {
+	text=$1
+	max_width=$2
+	if command -v perl >/dev/null 2>&1; then
+		printf '%s' "$text" | MAX_WIDTH=$max_width perl -CS -Mutf8 -0777 -ne 'print substr($_, 0, $ENV{MAX_WIDTH})'
+	else
+		printf '%s' "$text" | awk -v max="$max_width" '{ printf "%s", substr($0, 1, max) }'
+	fi
+}
+
 if [ "$skip_prepaint" -eq 0 ] && [ -t 1 ]; then
 	width=${COLUMNS:-80}
 	case "$width" in
@@ -185,7 +234,25 @@ if [ "$skip_prepaint" -eq 0 ] && [ -t 1 ]; then
 			cwd="~${cwd#"$HOME"}"
 			;;
 	esac
-	printf '\0337\033[?2026h%s%s%s\n%s○%s   %sSpace to record · Ctrl+Space for text%s\n%s%s%s\n%s%s acp · %s%s\033[?2026l\033[?25l' "$primary" "$rule" "$reset" "$accent" "$reset" "$muted" "$muted_close" "$primary" "$rule" "$reset" "$muted" "$agent" "$cwd" "$muted_close"
+	voice_prompt="○   Space to record · Ctrl+Space for text"
+	voice_line=$(truncate_ellipsis_text "$voice_prompt" "$width")
+	status_line=$(truncate_visual_text "$agent acp · $cwd" "$width")
+	printf '\0337\033[?2026h%s%s%s\n' "$primary" "$rule" "$reset"
+	if [ "$(text_length "$voice_prompt")" -gt "$width" ]; then
+		case "$voice_line" in
+			○*...)
+				voice_body=${voice_line#○}
+				voice_body=${voice_body%...}
+				printf '%s○%s%s%s%s...\n' "$accent" "$reset" "$muted" "$voice_body" "$muted_close"
+				;;
+			*)
+				printf '%s\n' "$voice_line"
+				;;
+		esac
+	else
+		printf '%s○%s%s%s%s\n' "$accent" "$reset" "$muted" "${voice_line#○}" "$muted_close"
+	fi
+	printf '%s%s%s\n%s%s%s\033[?2026l\033[?25l' "$primary" "$rule" "$reset" "$muted" "$status_line" "$muted_close"
 	export CC_PREPAINTED=1
 	export CC_PREPAINT_AGENT=$agent
 	export CC_PREPAINT_THEME=$theme

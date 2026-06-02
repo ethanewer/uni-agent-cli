@@ -308,11 +308,26 @@ assert_no_prepaint_clear
 
 tmux kill-session -t "$SESSION"
 : > "$WRITE_LOG"
-tmux new-session -d -s "$SESSION" -x 30 -y 12 "cd $ROOT_Q && printf 'outside-before-cc\n' && $PANE_ENV PI_TUI_WRITE_LOG=$WRITE_LOG_Q CC_CONFIG=$CONFIG_TOP_THEME_FILE_Q CC_SETTINGS=$SETTINGS_FILE_Q CC_BACKGROUND_CONNECT_DELAY_MS=0 FAKE_ACP_NEW_DELAY=0.4 node src/cc.mjs fake"
+tmux new-session -d -s "$SESSION" -x 30 -y 12 "cd $ROOT_Q && printf 'outside-before-cc\n' && $PANE_ENV PI_TUI_WRITE_LOG=$WRITE_LOG_Q CC_CONFIG=$CONFIG_TOP_THEME_FILE_Q CC_SETTINGS=$SETTINGS_FILE_Q CC_BACKGROUND_CONNECT_DELAY_MS=0 FAKE_ACP_NEW_DELAY=0.4 ./src/cc fake"
 wait_for_text "Space to record"
 if capture_ansi | grep -Fq "$(printf '\033[38~')" || capture_ansi | grep -Fq "$(printf '\033[38;2;79;143;~')"; then
 	echo "Narrow prepaint should not truncate inside ANSI color sequences" >&2
 	capture_ansi >&2
+	exit 1
+fi
+if capture | grep -Fq "ce for text"; then
+	echo "Narrow shell prepaint should not wrap prompt text" >&2
+	capture >&2
+	exit 1
+fi
+if ! capture | grep -Fq "Ctrl+..."; then
+	echo "Narrow shell prepaint should match TUI placeholder truncation" >&2
+	capture >&2
+	exit 1
+fi
+if capture | grep -Fq "Ctrl+Sp~"; then
+	echo "Narrow shell prepaint should not leave stale shell-only truncation" >&2
+	capture >&2
 	exit 1
 fi
 assert_no_prepaint_clear

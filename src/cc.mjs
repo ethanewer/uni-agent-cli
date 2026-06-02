@@ -25,7 +25,9 @@ function prepaint(args) {
 	const rule = "─".repeat(Math.max(1, width));
 	const voice = `${styles.accent("○")}   ${styles.muted("Space to record · Ctrl+Space for text")}`;
 	const status = styles.muted(`${agent} acp · ${cwd}`);
-	process.stdout.write(`\x1b7\x1b[?2026h${styles.primary(rule)}\n${truncate(voice, width)}\n${styles.primary(rule)}\n${truncate(status, width)}\x1b[?2026l\x1b[?25l`);
+	process.stdout.write(
+		`\x1b7\x1b[?2026h${styles.primary(rule)}\n${truncateEllipsis(voice, width)}\n${styles.primary(rule)}\n${truncateVisual(status, width)}\x1b[?2026l\x1b[?25l`,
+	);
 }
 
 const PREPAINT_THEME_ALIASES = {
@@ -191,12 +193,25 @@ function compactCwd(cwd) {
 	return home && cwd.startsWith(home) ? `~${cwd.slice(home.length)}` : cwd;
 }
 
-function truncate(value, width) {
+function truncateEllipsis(value, width) {
+	return truncateAnsi(value, width, "...");
+}
+
+function truncateVisual(value, width) {
 	if (stripAnsi(value).length <= width) return value;
-	const targetWidth = Math.max(1, width - 1);
+	return `${truncateEllipsis(value, Math.max(1, width - 1))}~`;
+}
+
+function truncateAnsi(value, width, ellipsis) {
+	if (width <= 0) return "";
+	const ellipsisWidth = stripAnsi(ellipsis).length;
+	if (ellipsisWidth >= width) return `\x1b[0m${ellipsis.slice(0, width)}\x1b[0m`;
+	const textWidth = stripAnsi(value).length;
+	if (textWidth <= width) return value;
+	const contentWidth = width - ellipsisWidth;
 	let visible = 0;
 	let output = "";
-	for (let index = 0; index < value.length && visible < targetWidth; ) {
+	for (let index = 0; index < value.length && visible < contentWidth; ) {
 		const ansi = value.slice(index).match(/^\x1b\[[\d;?]*[ -/]*[@-~]/);
 		if (ansi) {
 			output += ansi[0];
@@ -208,7 +223,7 @@ function truncate(value, width) {
 		index += char.length;
 		visible += 1;
 	}
-	return `${output}\x1b[0m~`;
+	return `${output}\x1b[0m${ellipsis}\x1b[0m`;
 }
 
 function stripAnsi(value) {
