@@ -1,5 +1,13 @@
 import assert from "node:assert/strict";
-import { AcpClient, applyHarnessSettings, autoPermissionOutcome } from "../src/pi-harness.mjs";
+import {
+	AcpClient,
+	applyHarnessSettings,
+	autoPermissionOutcome,
+	isVsCodeAutoActivationCommand,
+	isVsCodeTerminal,
+	rewriteFullScreenClear,
+	shouldDropVsCodeAutoActivationInput,
+} from "../src/pi-harness.mjs";
 
 const config = {
 	defaultAgent: "codex",
@@ -104,6 +112,61 @@ assert.deepEqual(
 		options: [{ kind: "reject_once", name: "Reject", optionId: "reject" }],
 	}),
 	{ outcome: "cancelled" },
+);
+
+const fullClear = "\x1b[2J\x1b[H\x1b[3J";
+assert.equal(rewriteFullScreenClear(`${fullClear}rendered`), "\x1b8\x1b[Jrendered");
+assert.equal(rewriteFullScreenClear(`${fullClear}rendered`, { alternateScreen: true }), "\x1b[2J\x1b[Hrendered");
+assert.equal(rewriteFullScreenClear(`before\x1b[3Jafter`), "beforeafter");
+assert.equal(isVsCodeTerminal({ TERM_PROGRAM: "vscode" }), true);
+assert.equal(isVsCodeTerminal({ VSCODE_PID: "123" }), true);
+assert.equal(isVsCodeTerminal({ TERM_PROGRAM: "Apple_Terminal" }), false);
+assert.equal(isVsCodeAutoActivationCommand("source /Users/ethanewer/wbl-agent-data/.venv/bin/activate"), true);
+assert.equal(isVsCodeAutoActivationCommand('. "/Users/ethanewer/wbl agent data/.venv/bin/activate"'), true);
+assert.equal(isVsCodeAutoActivationCommand("conda activate base"), true);
+assert.equal(isVsCodeAutoActivationCommand("mamba activate 'project env'"), true);
+assert.equal(isVsCodeAutoActivationCommand("micromamba activate"), true);
+assert.equal(isVsCodeAutoActivationCommand("pyenv activate agent-env"), true);
+assert.equal(isVsCodeAutoActivationCommand("source code analysis"), false);
+assert.equal(isVsCodeAutoActivationCommand("source README.md"), false);
+assert.equal(isVsCodeAutoActivationCommand("conda activate base is broken"), false);
+assert.equal(isVsCodeAutoActivationCommand("source /tmp/.venv/bin/activate\nexplain this"), false);
+assert.equal(shouldDropVsCodeAutoActivationInput("source /tmp/.venv/bin/activate", {}, { TERM_PROGRAM: "vscode" }), false);
+assert.equal(
+	shouldDropVsCodeAutoActivationInput(
+		"source /tmp/.venv/bin/activate",
+		{ burst: { text: "source /tmp/.venv/bin/activate", maxGapMs: 1, lastAt: 100 }, now: 110 },
+		{ TERM_PROGRAM: "vscode" },
+	),
+	true,
+);
+assert.equal(
+	shouldDropVsCodeAutoActivationInput(
+		"source /tmp/.venv/bin/activate",
+		{ burst: { text: "source /tmp/.venv/bin/activate", maxGapMs: 50, lastAt: 100 }, now: 110 },
+		{ TERM_PROGRAM: "vscode" },
+	),
+	false,
+);
+assert.equal(
+	shouldDropVsCodeAutoActivationInput(
+		"source /tmp/.venv/bin/activate",
+		{ burst: { text: "source /tmp/.venv/bin/activate", maxGapMs: 1, lastAt: 100 }, now: 250 },
+		{ TERM_PROGRAM: "vscode" },
+	),
+	false,
+);
+assert.equal(
+	shouldDropVsCodeAutoActivationInput(
+		"source /tmp/.venv/bin/activate",
+		{ burst: { text: "source /tmp/.venv/bin/activate", maxGapMs: 1, lastAt: 100 }, now: 110 },
+		{ TERM_PROGRAM: "Apple_Terminal" },
+	),
+	false,
+);
+assert.equal(
+	shouldDropVsCodeAutoActivationInput("source README.md", { burst: { text: "source README.md", maxGapMs: 1, lastAt: 100 }, now: 110 }, { TERM_PROGRAM: "vscode" }),
+	false,
 );
 
 async function captureSessionRequests(methodName) {

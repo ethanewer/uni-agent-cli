@@ -9,6 +9,23 @@ fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SESSION="cc-tui-smoke-$$"
 ROOT_Q="$(printf "%q" "$ROOT")"
+TERM_PROGRAM_Q="$(printf "%q" "${TERM_PROGRAM:-}")"
+VSCODE_PID_Q="$(printf "%q" "${VSCODE_PID:-}")"
+VSCODE_INJECTION_Q="$(printf "%q" "${VSCODE_INJECTION:-}")"
+PANE_ENV="env -u TERM_PROGRAM -u VSCODE_PID -u VSCODE_INJECTION"
+VSCODE_TERMINAL=0
+if [ "${TERM_PROGRAM:-}" = "vscode" ] || [ -n "${VSCODE_PID:-}" ] || [ -n "${VSCODE_INJECTION:-}" ]; then
+	VSCODE_TERMINAL=1
+fi
+if [ -n "${TERM_PROGRAM:-}" ]; then
+	PANE_ENV="$PANE_ENV TERM_PROGRAM=$TERM_PROGRAM_Q"
+fi
+if [ -n "${VSCODE_PID:-}" ]; then
+	PANE_ENV="$PANE_ENV VSCODE_PID=$VSCODE_PID_Q"
+fi
+if [ -n "${VSCODE_INJECTION:-}" ]; then
+	PANE_ENV="$PANE_ENV VSCODE_INJECTION=$VSCODE_INJECTION_Q"
+fi
 
 cleanup() {
 	tmux kill-session -t "$SESSION" >/dev/null 2>&1 || true
@@ -17,6 +34,10 @@ trap cleanup EXIT
 
 capture() {
 	tmux capture-pane -pt "$SESSION"
+}
+
+capture_all() {
+	tmux capture-pane -pt "$SESSION" -S -
 }
 
 wait_for_text() {
@@ -91,13 +112,29 @@ assert_exact_line_count() {
 	fi
 }
 
-tmux new-session -d -s "$SESSION" -x 100 -y 30 "cd $ROOT_Q && printf 'outside-before-cc\n' && CC_CONFIG=tests/fake_config.json CC_BACKGROUND_CONNECT_DELAY_MS=0 ./src/cc fake"
+assert_exact_scrollback_count() {
+	local needle="$1"
+	local expected="$2"
+	local actual
+	actual="$(capture_all | awk -v needle="$needle" 'index($0, needle) { count++ } END { print count + 0 }')"
+	if [ "$actual" != "$expected" ]; then
+		echo "Expected $expected scrollback line(s) containing: $needle; got $actual" >&2
+		capture_all >&2
+		exit 1
+	fi
+}
 
-wait_for_text "outside-before-cc"
+tmux new-session -d -s "$SESSION" -x 100 -y 30 "cd $ROOT_Q && printf 'outside-before-cc\n' && $PANE_ENV CC_CONFIG=tests/fake_config.json CC_BACKGROUND_CONNECT_DELAY_MS=0 ./src/cc fake"
+
+if [ "$VSCODE_TERMINAL" -eq 0 ]; then
+	wait_for_text "outside-before-cc"
+fi
 wait_for_text "Space to record"
 
 tmux resize-window -t "$SESSION" -x 100 -y 32
-wait_for_text "outside-before-cc"
+if [ "$VSCODE_TERMINAL" -eq 0 ]; then
+	wait_for_text "outside-before-cc"
+fi
 wait_for_text "Space to record"
 
 tmux resize-window -t "$SESSION" -x 74 -y 26
@@ -105,11 +142,22 @@ wait_for_text "Space to record"
 
 tmux resize-window -t "$SESSION" -x 110 -y 32
 wait_for_text "Space to record"
+assert_exact_scrollback_count "Space to record" 1
 
 tmux resize-window -t "$SESSION" -x 74 -y 12
 wait_for_text "Space to record"
 tmux send-keys -t "$SESSION" e c h o Enter
 wait_for_text "echo: echo"
+tmux send-keys -t "$SESSION" c o n d a
+sleep 0.05
+tmux send-keys -t "$SESSION" Space a c t i v a t e
+sleep 0.05
+tmux send-keys -t "$SESSION" Space b a s e Enter
+wait_for_text "echo: conda activate base"
+tmux send-keys -t "$SESSION" c o n d a Space a c t i v a t e Space b a s e
+sleep 0.2
+tmux send-keys -t "$SESSION" Enter
+wait_for_text "echo: conda activate base"
 tmux send-keys -t "$SESSION" e c h o - u s e r - c h u n k Enter
 wait_for_text "echo: echo-user-chunk"
 tmux resize-window -t "$SESSION" -x 74 -y 28

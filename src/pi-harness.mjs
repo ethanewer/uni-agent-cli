@@ -58,6 +58,8 @@ const DEFAULT_TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe";
 const BACKGROUND_CONNECT_DELAY_MS = parseDelay(process.env.CC_BACKGROUND_CONNECT_DELAY_MS, 250);
 const MARKDOWN_PRELOAD_DELAY_MS = parseDelay(process.env.CC_MARKDOWN_PRELOAD_DELAY_MS, 750);
 const RESIZE_SETTLE_DELAY_MS = parseDelay(process.env.CC_RESIZE_SETTLE_DELAY_MS, 90);
+const VS_CODE_AUTO_ACTIVATION_MAX_INPUT_GAP_MS = 15;
+const VS_CODE_AUTO_ACTIVATION_MAX_SUBMIT_AGE_MS = 75;
 const MOUSE_SCROLL_GUARD_ENABLE = "\x1b[?1006h\x1b[?1000h";
 const MOUSE_SCROLL_GUARD_DISABLE = "\x1b[?1000l\x1b[?1006l";
 let MarkdownComponent;
@@ -935,10 +937,11 @@ class HarnessApp {
 		this.markdownPreloadTimer = undefined;
 		this.resizeActive = false;
 		this.liveOutputScrollGuardEnabled = false;
+		this.vsCodeActivationInputBurst = undefined;
 
 		const terminal = createHarnessTerminal({
 			onResizeStart: () => this.beginResize(),
-			onResizeEnd: () => this.endResize(),
+			onResizeEnd: (options) => this.endResize(options),
 		});
 		this.ui = new TUI(terminal, true);
 		this.ui.queryCellSize = () => {};
@@ -1009,8 +1012,9 @@ class HarnessApp {
 		}
 	}
 
-	endResize() {
+	endResize(options = {}) {
 		this.resizeActive = false;
+		if (options.render !== false) this.ui.requestRender(true);
 	}
 
 	adoptPrepaintedFrame() {
@@ -1139,6 +1143,7 @@ class HarnessApp {
 			this.handleInterrupt("input");
 			return { consume: true };
 		}
+		if (this.consumeVsCodeAutoActivationInput(data)) return { consume: true };
 		if (this.busy && isSubmitInput(data) && !this.editor.getText().trim()) {
 			this.promoteNextQueuedPromptToAfterTool();
 			return { consume: true };
@@ -1148,6 +1153,39 @@ class HarnessApp {
 		}
 		this.rememberEditorTextAfterInput();
 		return undefined;
+	}
+
+	consumeVsCodeAutoActivationInput(data) {
+		if (!isVsCodeTerminal() || this.menuHandle) return false;
+		if (isPrintableInput(data)) {
+			this.trackVsCodeActivationBurst(data);
+			return false;
+		}
+		if (!isSubmitInput(data)) {
+			this.vsCodeActivationInputBurst = undefined;
+			return false;
+		}
+		const text = this.editor.getText().trim();
+		const burst = this.vsCodeActivationInputBurst;
+		this.vsCodeActivationInputBurst = undefined;
+		if (!shouldDropVsCodeAutoActivationInput(text, { burst, now: performance.now() })) return false;
+		this.editor.setText("");
+		this.lastKnownEditorText = "";
+		this.ui.requestRender();
+		return true;
+	}
+
+	trackVsCodeActivationBurst(data) {
+		const now = performance.now();
+		const burst = this.vsCodeActivationInputBurst;
+		if (!burst || now - burst.lastAt > VS_CODE_AUTO_ACTIVATION_MAX_INPUT_GAP_MS) {
+			this.vsCodeActivationInputBurst = { text: data, firstAt: now, lastAt: now, maxGapMs: 0 };
+			return;
+		}
+		const gap = now - burst.lastAt;
+		burst.text += data;
+		burst.lastAt = now;
+		burst.maxGapMs = Math.max(burst.maxGapMs, gap);
 	}
 
 	handleInterrupt(source = "input") {
@@ -2822,6 +2860,7 @@ function createHarnessTerminal(resizeHooks = {}) {
 	const start = terminal.start.bind(terminal);
 	const stop = terminal.stop.bind(terminal);
 	const write = terminal.write.bind(terminal);
+	const useAlternateScreen = isVsCodeTerminal();
 	let resizeTimer;
 	terminal.start = (onInput, onResize) => {
 		start(onInput, () => {
@@ -2838,7 +2877,12 @@ function createHarnessTerminal(resizeHooks = {}) {
 			}, RESIZE_SETTLE_DELAY_MS);
 			resizeTimer.unref?.();
 		});
-		if (process.env.CC_PREPAINTED === "1") {
+		if (useAlternateScreen) {
+			write("\x1b[?1049h\x1b[2J\x1b[H");
+			delete process.env.CC_PREPAINTED;
+			delete process.env.CC_PREPAINT_AGENT;
+			delete process.env.CC_ADOPTED_PREPAINT;
+		} else if (process.env.CC_PREPAINTED === "1") {
 			if (process.env.CC_ADOPTED_PREPAINT !== "1") write("\x1b8\x1b[J\x1b7");
 			delete process.env.CC_PREPAINTED;
 			delete process.env.CC_PREPAINT_AGENT;
@@ -2850,18 +2894,55 @@ function createHarnessTerminal(resizeHooks = {}) {
 	terminal.stop = () => {
 		if (resizeTimer) clearTimeout(resizeTimer);
 		resizeTimer = undefined;
-		resizeHooks.onResizeEnd?.();
+		resizeHooks.onResizeEnd?.({ render: false });
 		stop();
+		if (useAlternateScreen) write("\x1b[?1049l\x1b[?25h");
 	};
-	terminal.write = (data) => write(rewriteFullScreenClear(data));
+	terminal.write = (data) => write(rewriteFullScreenClear(data, { alternateScreen: useAlternateScreen }));
 	return terminal;
 }
 
-function rewriteFullScreenClear(data) {
+export function rewriteFullScreenClear(data, options = {}) {
 	const fullClear = "\x1b[2J\x1b[H\x1b[3J";
 	if (!data.includes("\x1b[3J")) return data;
 	if (!data.includes(fullClear)) return data.replaceAll("\x1b[3J", "");
+	if (options.alternateScreen) return data.replaceAll(fullClear, "\x1b[2J\x1b[H");
 	return data.replaceAll(fullClear, "\x1b8\x1b[J");
+}
+
+export function isVsCodeTerminal(env = process.env) {
+	return env.TERM_PROGRAM === "vscode" || Boolean(env.VSCODE_PID || env.VSCODE_INJECTION);
+}
+
+export function shouldDropVsCodeAutoActivationInput(text, context = {}, env = process.env) {
+	const command = String(text ?? "").trim();
+	const burstText = context.burst?.text?.trim();
+	const submitAgeMs = (context.now ?? Infinity) - (context.burst?.lastAt ?? -Infinity);
+	return (
+		isVsCodeTerminal(env) &&
+		Boolean(burstText) &&
+		burstText === command &&
+		(context.burst?.maxGapMs ?? Infinity) <= VS_CODE_AUTO_ACTIVATION_MAX_INPUT_GAP_MS &&
+		submitAgeMs >= 0 &&
+		submitAgeMs <= VS_CODE_AUTO_ACTIVATION_MAX_SUBMIT_AGE_MS &&
+		isVsCodeAutoActivationCommand(command)
+	);
+}
+
+export function isVsCodeAutoActivationCommand(text) {
+	const command = String(text ?? "").trim();
+	if (!command || /[\r\n]/.test(command)) return false;
+	if (/^(?:source|\.)\s+(?:"[^"\r\n]*\/bin\/activate"|'[^'\r\n]*\/bin\/activate'|\S*\/bin\/activate)\s*$/.test(command)) {
+		return true;
+	}
+	const activationMatch = command.match(/^(conda|mamba|micromamba|pyenv)\s+activate(?:\s+(.+))?$/);
+	if (!activationMatch) return false;
+	const argument = activationMatch[2]?.trim();
+	return !argument || isSingleShellToken(argument);
+}
+
+function isSingleShellToken(value) {
+	return /^(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s"'`;&|<>()[\]{}]+)$/.test(value);
 }
 
 function splitControlInput(data) {

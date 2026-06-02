@@ -17,6 +17,10 @@ for arg do
 	esac
 done
 
+if [ "${TERM_PROGRAM:-}" = "vscode" ] || [ -n "${VSCODE_PID:-}" ] || [ -n "${VSCODE_INJECTION:-}" ]; then
+	skip_prepaint=1
+fi
+
 if [ "$skip_prepaint" -eq 0 ] && [ -t 1 ]; then
 	width=${COLUMNS:-80}
 	case "$width" in

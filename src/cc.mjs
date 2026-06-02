@@ -2,7 +2,12 @@
 
 const args = process.argv.slice(2);
 const shouldPrepaint =
-	process.env.CC_PREPAINTED !== "1" && process.stdout.isTTY && !args.includes("--help") && !args.includes("-h") && !args.includes("--list");
+	process.env.CC_PREPAINTED !== "1" &&
+	!isVsCodeTerminal() &&
+	process.stdout.isTTY &&
+	!args.includes("--help") &&
+	!args.includes("-h") &&
+	!args.includes("--list");
 
 if (shouldPrepaint) {
 	process.env.CC_PREPAINTED = "1";
@@ -27,6 +32,10 @@ function prepaint(args) {
 	const voice = `\x1b[36m○\x1b[39m   \x1b[2mSpace to record · Ctrl+Space for text\x1b[22m`;
 	const status = `\x1b[2m${agent} acp · ${cwd}\x1b[22m`;
 	process.stdout.write(`\x1b7\x1b[?2026h\x1b[34m${rule}\x1b[39m\n${truncate(voice, width)}\n\x1b[34m${rule}\x1b[39m\n${truncate(status, width)}\x1b[?2026l\x1b[?25l`);
+}
+
+function isVsCodeTerminal(env = process.env) {
+	return env.TERM_PROGRAM === "vscode" || Boolean(env.VSCODE_PID || env.VSCODE_INJECTION);
 }
 
 function compactCwd(cwd) {
