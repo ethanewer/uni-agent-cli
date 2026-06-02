@@ -96,9 +96,19 @@ normalize_theme() {
 		onedark) value=one-dark ;;
 		catppuccinmacchiato) value=catppuccin-macchiato ;;
 		tokyo|tokyo-night) value=tokyonight ;;
+		cursor|cursor-default) value=cursor-dark ;;
+		cursor-dark-midnight|cursormidnight|cursor--dark--midnight) value=cursor-midnight ;;
+		cursorlight|cursor-light) value=cursor-light ;;
+		cursor-dark-high-contrast|cursorhighcontrast) value=cursor-high-contrast ;;
+		vscode|code|vs-code|visual-studio-code|vs-code-dark-modern|visual-studio-code-dark-modern|dark-modern) value=vscode-dark-modern ;;
+		vs-code-dark+|vs-code-dark-plus|visual-studio-code-dark+|visual-studio-code-dark-plus|dark+|dark-plus|darkplus) value=vscode-dark-plus ;;
+		vs-code-light-modern|visual-studio-code-light-modern|light-modern) value=vscode-light-modern ;;
+		vs-code-light+|vs-code-light-plus|visual-studio-code-light+|visual-studio-code-light-plus|light+|light-plus|lightplus) value=vscode-light-plus ;;
+		vs-code-dark-2026|visual-studio-code-dark-2026|dark-2026) value=vscode-dark-2026 ;;
+		vs-code-light-2026|visual-studio-code-light-2026|light-2026) value=vscode-light-2026 ;;
 	esac
 	case "$value" in
-		system|opencode|tokyonight|everforest|ayu|catppuccin|catppuccin-macchiato|gruvbox|kanagawa|nord|matrix|one-dark|dracula|monokai)
+		system|opencode|cursor-dark|cursor-midnight|cursor-light|cursor-high-contrast|vscode-dark-modern|vscode-dark-plus|vscode-light-modern|vscode-light-plus|vscode-dark-2026|vscode-light-2026|tokyonight|everforest|ayu|catppuccin|catppuccin-macchiato|gruvbox|kanagawa|nord|matrix|one-dark|dracula|monokai)
 			printf '%s' "$value"
 			;;
 		*)
@@ -126,6 +136,16 @@ apply_theme_colors() {
 	esc=$(printf '\033')
 	case "$1" in
 		opencode) primary="${esc}[38;2;125;211;252m"; accent="${esc}[38;2;52;211;153m"; muted="${esc}[38;2;148;163;184m"; muted_close="${esc}[39m" ;;
+		cursor-dark) primary="${esc}[38;2;129;161;193m"; accent="${esc}[38;2;129;161;193m"; muted="${esc}[38;2;137;137;137m"; muted_close="${esc}[39m" ;;
+		cursor-midnight) primary="${esc}[38;2;136;192;208m"; accent="${esc}[38;2;143;188;187m"; muted="${esc}[38;2;76;86;106m"; muted_close="${esc}[39m" ;;
+		cursor-light) primary="${esc}[38;2;60;124;171m"; accent="${esc}[38;2;60;124;171m"; muted="${esc}[38;2;137;137;137m"; muted_close="${esc}[39m" ;;
+		cursor-high-contrast) primary="${esc}[38;2;67;76;94m"; accent="${esc}[38;2;136;192;208m"; muted="${esc}[38;2;80;80;80m"; muted_close="${esc}[39m" ;;
+		vscode-dark-modern) primary="${esc}[38;2;0;120;212m"; accent="${esc}[38;2;77;170;252m"; muted="${esc}[38;2;157;157;157m"; muted_close="${esc}[39m" ;;
+		vscode-dark-plus) primary="${esc}[38;2;86;156;214m"; accent="${esc}[38;2;78;201;176m"; muted="${esc}[38;2;128;128;128m"; muted_close="${esc}[39m" ;;
+		vscode-light-modern) primary="${esc}[38;2;0;95;184m"; accent="${esc}[38;2;38;127;153m"; muted="${esc}[38;2;110;118;129m"; muted_close="${esc}[39m" ;;
+		vscode-light-plus) primary="${esc}[38;2;0;0;255m"; accent="${esc}[38;2;38;127;153m"; muted="${esc}[38;2;111;111;111m"; muted_close="${esc}[39m" ;;
+		vscode-dark-2026) primary="${esc}[38;2;57;148;188m"; accent="${esc}[38;2;72;160;199m"; muted="${esc}[38;2;140;140;140m"; muted_close="${esc}[39m" ;;
+		vscode-light-2026) primary="${esc}[38;2;0;105;204m"; accent="${esc}[38;2;10;48;105m"; muted="${esc}[38;2;96;96;96m"; muted_close="${esc}[39m" ;;
 		tokyonight) primary="${esc}[38;2;122;162;247m"; accent="${esc}[38;2;125;207;255m"; muted="${esc}[38;2;86;95;137m"; muted_close="${esc}[39m" ;;
 		everforest) primary="${esc}[38;2;167;192;128m"; accent="${esc}[38;2;131;192;146m"; muted="${esc}[38;2;133;146;137m"; muted_close="${esc}[39m" ;;
 		ayu) primary="${esc}[38;2;89;194;255m"; accent="${esc}[38;2;149;230;203m"; muted="${esc}[38;2;98;106;115m"; muted_close="${esc}[39m" ;;
