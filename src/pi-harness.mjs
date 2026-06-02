@@ -384,6 +384,8 @@ export class AcpClient {
 		this.configOptions = [];
 		this.models = undefined;
 		this.modes = undefined;
+		this.bufferingSessionUpdates = false;
+		this.bufferedSessionUpdates = [];
 		this.terminals = new Map();
 		this.nextTerminalId = 1;
 		this.exited = false;
@@ -437,11 +439,11 @@ export class AcpClient {
 		this.capabilities = initialized?.agentCapabilities ?? {};
 		this.agentInfo = initialized?.agentInfo ?? {};
 		this.authMethods = initialized?.authMethods ?? [];
-		const session = await this.request("session/new", this.sessionRequestParams());
-		this.sessionId = session?.sessionId ?? session?.id;
-		if (!this.sessionId) throw new Error("ACP session/new did not return a session id");
-		this.applySessionState(session);
-		await this.applyStartupMode();
+		await this.newSession();
+	}
+
+	async newSession(options = {}) {
+		return await this.switchSession("session/new", this.sessionRequestParams(), undefined, options);
 	}
 
 	async prompt(text) {
@@ -468,19 +470,37 @@ export class AcpClient {
 
 	async loadSession(sessionId) {
 		const params = this.sessionRequestParams({ sessionId });
-		const result = this.capabilities?.loadSession
-			? await this.request("session/load", params)
-			: await this.request("session/resume", params);
-		this.sessionId = sessionId;
-		this.applySessionState(result);
-		await this.applyStartupMode();
-		return result;
+		return await this.switchSession(this.capabilities?.loadSession ? "session/load" : "session/resume", params, sessionId);
 	}
 
 	async resumeSession(sessionId) {
-		const result = await this.request("session/resume", this.sessionRequestParams({ sessionId }));
+		return await this.switchSession("session/resume", this.sessionRequestParams({ sessionId }), sessionId);
+	}
+
+	async switchSession(method, params, targetSessionId = undefined, options = {}) {
+		this.bufferingSessionUpdates = true;
+		this.bufferedSessionUpdates = [];
+		let result;
+		try {
+			result = await this.request(method, params);
+		} catch (error) {
+			this.bufferingSessionUpdates = false;
+			this.bufferedSessionUpdates = [];
+			throw error;
+		}
+		const sessionId = targetSessionId ?? result?.sessionId ?? result?.id;
+		if (!sessionId) {
+			this.bufferingSessionUpdates = false;
+			this.bufferedSessionUpdates = [];
+			throw new Error("ACP session/new did not return a session id");
+		}
 		this.sessionId = sessionId;
+		const buffered = this.bufferedSessionUpdates;
+		this.bufferingSessionUpdates = false;
+		this.bufferedSessionUpdates = [];
 		this.applySessionState(result);
+		await options.beforeReplay?.(result);
+		for (const update of buffered) this.handleSessionUpdate(update);
 		await this.applyStartupMode();
 		return result;
 	}
@@ -676,6 +696,12 @@ export class AcpClient {
 	}
 
 	handleSessionUpdate(params) {
+		if (this.bufferingSessionUpdates) {
+			this.bufferedSessionUpdates.push(params);
+			return;
+		}
+		const sessionId = params?.sessionId ?? params?.session?.sessionId ?? params?.session?.id;
+		if (sessionId && this.sessionId && sessionId !== this.sessionId) return;
 		const update = params?.update;
 		if (!update) return;
 		const kind = update.sessionUpdate;
@@ -919,6 +945,9 @@ class HarnessApp {
 		this.promptQueue = [];
 		this.flushingPromptQueue = false;
 		this.promptQueueDrainScheduled = false;
+		this.pendingNewSessionCommandName = undefined;
+		this.sessionSwitchInProgress = false;
+		this.deferredLocalSlashCommands = [];
 		this.permissionQueue = [];
 		this.permissionPromptActive = false;
 		this.cancelRequested = false;
@@ -1053,6 +1082,9 @@ class HarnessApp {
 		this.busy = false;
 		this.cancelRequested = false;
 		this.afterToolCancelPending = false;
+		this.pendingNewSessionCommandName = undefined;
+		this.sessionSwitchInProgress = false;
+		this.deferredLocalSlashCommands = [];
 		this.activeToolIds.clear();
 		this.seenToolThisTurn = false;
 		this.currentAssistantText = undefined;
@@ -1433,7 +1465,7 @@ class HarnessApp {
 			this.ui.requestRender();
 			return;
 		}
-		if (this.busy) {
+		if (this.busy || this.sessionSwitchInProgress) {
 			this.enqueuePrompt(text, "afterTurn", { displayText, compactCommand: options.compactCommand });
 			return;
 		}
@@ -1472,15 +1504,21 @@ class HarnessApp {
 			this.statusState = this.promptQueue.length > 0 ? "working" : "";
 			this.updateSpinner();
 			this.ui.requestRender();
+			if (this.pendingNewSessionCommandName) {
+				const commandName = this.pendingNewSessionCommandName;
+				this.pendingNewSessionCommandName = undefined;
+				await this.startNewSession(commandName, { afterTurn: true });
+				return;
+			}
 			this.schedulePromptQueueDrain();
 		}
 	}
 
 	async flushPromptQueue() {
-		if (!this.ready || this.busy || this.flushingPromptQueue) return;
+		if (!this.ready || this.busy || this.sessionSwitchInProgress || this.flushingPromptQueue) return;
 		this.flushingPromptQueue = true;
 		try {
-			while (this.ready && !this.busy && this.promptQueue.length > 0) {
+			while (this.ready && !this.busy && !this.sessionSwitchInProgress && this.promptQueue.length > 0) {
 				const prompt = this.promptQueue.shift();
 				const pendingUserEcho = this.trackPendingUserEcho(prompt.text);
 				this.addUserMessage(prompt.displayText ?? prompt.text, { compactCommand: prompt.compactCommand });
@@ -1540,6 +1578,18 @@ class HarnessApp {
 		this.updateSpinner();
 		this.client.cancel();
 		this.ui.requestRender();
+	}
+
+	deferNewSessionUntilIdle(commandName = "new") {
+		this.pendingNewSessionCommandName = commandName;
+		this.promptQueue = [];
+		this.pendingPromptDisplay = undefined;
+		this.interruptTurn();
+		if (!this.cancelRequested) {
+			this.statusState = "starting new session";
+			this.updateSpinner();
+			this.ui.requestRender();
+		}
 	}
 
 	maybeCancelAfterTool() {
@@ -1639,6 +1689,10 @@ class HarnessApp {
 	}
 
 	async runLocalSlashCommand(name, argument) {
+		if (this.sessionSwitchInProgress && shouldDeferLocalSlashCommand(name)) {
+			this.deferLocalSlashCommand(name, argument);
+			return;
+		}
 		if (name === "help") {
 			this.addCommandMessage(slashCommandText(name, argument));
 			this.showHelp();
@@ -1650,11 +1704,7 @@ class HarnessApp {
 			return;
 		}
 		if (name === "clear") {
-			this.chat.clear();
-			this.currentAssistantText = undefined;
-			this.currentUserText = undefined;
-			this.currentToolSummary = undefined;
-			this.pendingUserEchoes = [];
+			this.resetConversationView();
 			this.ui.requestRender();
 			return;
 		}
@@ -1677,6 +1727,10 @@ class HarnessApp {
 			await this.openResumeDialog(name);
 			return;
 		}
+		if (name === "new") {
+			await this.startNewSession(name);
+			return;
+		}
 		if (name === "model") {
 			await this.openConfigDialog("model", "Model", argument, name);
 			return;
@@ -1692,6 +1746,28 @@ class HarnessApp {
 		if (name === "plan") {
 			await this.setPlanMode(name);
 		}
+	}
+
+	deferLocalSlashCommand(name, argument = "") {
+		this.deferredLocalSlashCommands.push({ name, argument });
+		this.updateSpinner();
+		this.ui.requestRender();
+	}
+
+	async flushDeferredLocalSlashCommands() {
+		while (!this.sessionSwitchInProgress && this.deferredLocalSlashCommands.length > 0) {
+			const command = this.deferredLocalSlashCommands.shift();
+			await this.runLocalSlashCommand(command.name, command.argument);
+		}
+	}
+
+	resetConversationView() {
+		this.chat.clear();
+		this.currentAssistantText = undefined;
+		this.currentToolSummary = undefined;
+		this.currentUserText = undefined;
+		this.pendingUserEchoes = [];
+		this.pendingPromptDisplay = undefined;
 	}
 
 	async ensureConnected() {
@@ -1779,11 +1855,7 @@ class HarnessApp {
 		this.ui.requestRender();
 		try {
 			const loadsHistory = Boolean(this.client.capabilities?.loadSession);
-			this.chat.clear();
-			this.currentAssistantText = undefined;
-			this.currentToolSummary = undefined;
-			this.currentUserText = undefined;
-			this.pendingUserEchoes = [];
+			this.resetConversationView();
 			if (loadsHistory) await this.client.loadSession(session.sessionId);
 			else {
 				await this.client.resumeSession(session.sessionId);
@@ -1800,6 +1872,65 @@ class HarnessApp {
 		}
 	}
 
+	async startNewSession(commandName = "new", options = {}) {
+		const displayText = slashPromptDisplay(`/${commandName}`, "New session");
+		if (!this.client || !this.ready) {
+			const wasReady = this.ready;
+			const connected = await this.ensureConnected();
+			if (!connected) return;
+			if (!wasReady) {
+				this.promptQueue = [];
+				this.pendingPromptDisplay = undefined;
+				this.resetConversationView();
+				this.addCommandMessage(displayText);
+				this.updateAutocomplete();
+				this.ui.requestRender();
+				return;
+			}
+		}
+		if (this.sessionSwitchInProgress) return;
+		if (this.busy && !options.afterTurn) {
+			this.deferNewSessionUntilIdle(commandName);
+			return;
+		}
+		this.promptQueue = [];
+		this.pendingPromptDisplay = undefined;
+		this.statusState = "starting new session";
+		this.sessionSwitchInProgress = true;
+		this.updateSpinner();
+		this.ui.requestRender();
+		const client = this.client;
+		let switched = false;
+		try {
+			await client.newSession({
+				beforeReplay: async () => {
+					if (this.client !== client) return;
+					switched = true;
+					this.resetConversationView();
+					this.addCommandMessage(displayText);
+					this.updateAutocomplete();
+				},
+			});
+			if (this.client !== client) return;
+		} catch (error) {
+			if (this.client !== client) return;
+			this.promptQueue = [];
+			this.deferredLocalSlashCommands = [];
+			this.pendingPromptDisplay = undefined;
+			this.addError(error.message ?? String(error));
+		} finally {
+			if (this.client !== client) return;
+			this.sessionSwitchInProgress = false;
+			this.statusState = "";
+			this.updateSpinner();
+			this.ui.requestRender();
+			if (switched) {
+				await this.flushDeferredLocalSlashCommands();
+				this.schedulePromptQueueDrain();
+			}
+		}
+	}
+
 	async openConfigDialog(category, title, argument = "", commandName = title.toLowerCase()) {
 		if (!this.client || !this.ready) {
 			const connected = await this.ensureConnected();
@@ -1807,6 +1938,10 @@ class HarnessApp {
 		}
 		const state = this.sessionStates.get(this.activeKey);
 		const option = findConfigOption(state, category);
+		if (!option && category === "mode") {
+			await this.openModeDialog(title, argument, commandName);
+			return;
+		}
 		if (!option) {
 			this.addCommandMessage(slashCommandText(commandName, argument));
 			this.addNotice(`${title} selection is not advertised by this agent`);
@@ -1870,6 +2005,60 @@ class HarnessApp {
 		}
 	}
 
+	async openModeDialog(title, argument = "", commandName = title.toLowerCase()) {
+		const modes = flattenModes(this.sessionStates.get(this.activeKey));
+		if (modes.length === 0) {
+			this.addCommandMessage(slashCommandText(commandName, argument));
+			this.addNotice(`${title} selection is not advertised by this agent`);
+			return;
+		}
+		if (argument) {
+			const match = modes.find((entry) => entry.id === argument || entry.name.toLowerCase() === argument.toLowerCase());
+			if (!match) {
+				this.addCommandMessage(slashCommandText(commandName, argument));
+				this.addNotice(`Unknown ${title.toLowerCase()}: ${argument}`);
+				return;
+			}
+			await this.setModeValue(match.id, match.name, {
+				displayText: slashPromptDisplay(slashCommandText(commandName, argument), match.name),
+			});
+			return;
+		}
+		const currentModeId = this.sessionStates.get(this.activeKey)?.modes?.currentModeId;
+		const entries = modes.map((mode) => ({
+			value: mode.id,
+			label: mode.name,
+			description: mode.description,
+			active: mode.id === currentModeId,
+		}));
+		this.openSelection(title, entries, async (entry) => {
+			this.closeMenu();
+			if (!entry) return;
+			await this.setModeValue(entry.value, entry.label, {
+				displayText: slashPromptDisplay(`/${commandName}`, entry.label),
+			});
+		});
+	}
+
+	async setModeValue(modeId, label = modeId, options = {}) {
+		if (!this.client) return;
+		const displayText = options.displayText ?? slashPromptDisplay("/mode", label);
+		this.statusState = "updating";
+		this.updateSpinner();
+		this.ui.requestRender();
+		try {
+			await this.client.setMode(modeId);
+			this.addCommandMessage(displayText);
+			this.updateAutocomplete();
+		} catch (error) {
+			this.addError(error.message ?? String(error));
+		} finally {
+			this.statusState = "";
+			this.updateSpinner();
+			this.ui.requestRender();
+		}
+	}
+
 	async setPlanMode(commandName = "plan") {
 		if (!this.ready) {
 			const connected = await this.ensureConnected();
@@ -1877,15 +2066,22 @@ class HarnessApp {
 		}
 		const state = this.sessionStates.get(this.activeKey);
 		const option = findConfigOption(state, "mode");
-		const value = flattenConfigOptions(option).find((entry) => entry.value === "plan" || entry.name.toLowerCase() === "plan");
-		if (!option || !value) {
-			this.addCommandMessage(`/${commandName}`);
-			this.addNotice("Plan mode is not advertised by this agent");
+		const value = findConfigValue(option, "plan");
+		if (option && value) {
+			await this.setConfigValue(option, value.value, value.name, {
+				displayText: slashPromptDisplay(`/${commandName}`, value.name),
+			});
 			return;
 		}
-		await this.setConfigValue(option, value.value, value.name, {
-			displayText: slashPromptDisplay(`/${commandName}`, value.name),
-		});
+		const mode = findMode(state, "plan");
+		if (mode) {
+			await this.setModeValue(mode.id, mode.name, {
+				displayText: slashPromptDisplay(`/${commandName}`, mode.name),
+			});
+			return;
+		}
+		this.addCommandMessage(`/${commandName}`);
+		this.addNotice("Plan mode is not advertised by this agent");
 	}
 
 	openMenu() {
@@ -2500,6 +2696,7 @@ function localSlashCommands(app) {
 	};
 
 	addIfMissing({ name: "resume", description: "Resume a previous ACP session" });
+	addIfMissing({ name: "new", description: "Start a new ACP session" });
 	addIfMissing({ name: "model", description: "Change model" });
 	addIfMissing({ name: "mode", description: "Change agent mode" });
 	addIfMissing({ name: "effort", description: "Change reasoning effort" });
@@ -2516,6 +2713,7 @@ function localSlashCommands(app) {
 
 	const modeOption = findConfigOption(state, "mode");
 	if (modeOption) replaceCommand(commands, configSlashCommand("mode", "Change agent mode", modeOption));
+	else if (flattenModes(state).length > 0) replaceCommand(commands, modeSlashCommand("mode", "Change agent mode", state));
 
 	const effortOption = findConfigOption(state, "thought_level");
 	if (effortOption) {
@@ -2525,10 +2723,14 @@ function localSlashCommands(app) {
 		replaceCommand(commands, { ...effortCommand, name: "thinking" });
 	}
 
-	const hasPlanMode = flattenConfigOptions(modeOption).some((entry) => entry.value === "plan" || entry.name.toLowerCase() === "plan");
+	const hasPlanMode = Boolean(findConfigValue(modeOption, "plan") || findMode(state, "plan"));
 	if (hasPlanMode) addIfMissing({ name: "plan", description: "Switch to plan mode" });
 
 	return commands;
+}
+
+function shouldDeferLocalSlashCommand(name) {
+	return ["resume", "model", "mode", "effort", "reasoning", "thinking", "plan"].includes(name);
 }
 
 function replaceCommand(commands, command) {
@@ -2548,6 +2750,23 @@ function configSlashCommand(name, description, option) {
 				.filter((entry) => entry.value.startsWith(prefix) || entry.name.toLowerCase().includes(prefix.toLowerCase()))
 				.map((entry) => ({
 					value: entry.value,
+					label: entry.name,
+					description: entry.description,
+				})),
+	};
+}
+
+function modeSlashCommand(name, description, state) {
+	const values = flattenModes(state);
+	return {
+		name,
+		description,
+		argumentHint: `[${values.map((entry) => entry.id).join("|")}]`,
+		getArgumentCompletions: (prefix) =>
+			values
+				.filter((entry) => entry.id.startsWith(prefix) || entry.name.toLowerCase().includes(prefix.toLowerCase()))
+				.map((entry) => ({
+					value: entry.id,
 					label: entry.name,
 					description: entry.description,
 				})),
@@ -2974,6 +3193,11 @@ function findConfigOption(state, category) {
 	return (state?.configOptions ?? []).find((option) => option?.category === category || option?.id === category);
 }
 
+export function findConfigValue(option, target) {
+	const normalizedTarget = String(target ?? "").toLowerCase();
+	return flattenConfigOptions(option).find((entry) => entry.value === target || entry.name.toLowerCase() === normalizedTarget);
+}
+
 function flattenConfigOptions(option) {
 	if (!option?.options) return [];
 	const options = option.options;
@@ -2986,6 +3210,27 @@ function flattenConfigOptions(option) {
 		}
 	}
 	return flattened.filter((entry) => entry.value && entry.name);
+}
+
+export function flattenModes(state) {
+	const modes = state?.modes?.availableModes;
+	if (!Array.isArray(modes)) return [];
+	return modes
+		.map((mode) => {
+			const id = mode?.id ?? mode?.modeId ?? mode?.value;
+			const name = mode?.name ?? mode?.label ?? id;
+			return {
+				id,
+				name,
+				description: mode?.description,
+			};
+		})
+		.filter((mode) => mode.id && mode.name);
+}
+
+export function findMode(state, target) {
+	const normalizedTarget = String(target ?? "").toLowerCase();
+	return flattenModes(state).find((mode) => mode.id === target || mode.name.toLowerCase() === normalizedTarget);
 }
 
 function normalizeConfigValue(value, groupName = "") {

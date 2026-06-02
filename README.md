@@ -36,8 +36,10 @@ Inside a session:
 
 Agent-advertised ACP commands are shown in autocomplete and forwarded to that backend. Local commands are implemented in the shared UI when ACP exposes the needed capability:
 
+- `/new` starts a fresh ACP session and clears the visible thread.
 - `/resume` opens the ACP session picker when `session/list` is supported.
 - `/model`, `/mode`, and `/effort` open ACP config selectors when the backend advertises those config options.
+- `/plan` switches to a Plan mode only when the backend advertises one. Current `codex-acp` exposes approval/sandbox modes, but does not expose the native Codex TUI Plan mode.
 - `/voice` returns the empty input box to voice mode.
 - `/help`, `/status`, and `/clear` are handled locally.
 

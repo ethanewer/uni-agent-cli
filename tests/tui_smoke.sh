@@ -124,7 +124,7 @@ assert_exact_scrollback_count() {
 	fi
 }
 
-tmux new-session -d -s "$SESSION" -x 100 -y 30 "cd $ROOT_Q && printf 'outside-before-cc\n' && $PANE_ENV CC_CONFIG=tests/fake_config.json CC_BACKGROUND_CONNECT_DELAY_MS=0 ./src/cc fake"
+tmux new-session -d -s "$SESSION" -x 100 -y 30 "cd $ROOT_Q && printf 'outside-before-cc\n' && $PANE_ENV CC_CONFIG=tests/fake_config.json CC_BACKGROUND_CONNECT_DELAY_MS=0 FAKE_ACP_NEW_DELAY=0.4 ./src/cc fake"
 
 if [ "$VSCODE_TERMINAL" -eq 0 ]; then
 	wait_for_text "outside-before-cc"
@@ -197,6 +197,32 @@ wait_for_text "Unknown command: /harnessx"
 tmux send-keys -t "$SESSION" / c l e a r Enter
 wait_without_text "echo: /tmp/foo/bar"
 wait_without_text "Unknown command: /harnessx"
+
+tmux send-keys -t "$SESSION" n e w Space s e s s i o n Space p r o b e Enter
+wait_for_text "echo: new session probe"
+tmux send-keys -t "$SESSION" / n e w Enter
+wait_for_text "/new (New session)"
+wait_without_text "echo: new session probe"
+
+tmux send-keys -t "$SESSION" / n e w Enter
+tmux send-keys -t "$SESSION" q u e u e d Space a f t e r Space n e w Enter
+wait_for_text "/new (New session)"
+wait_for_text "echo: queued after new"
+sleep 0.6
+wait_for_text "echo: queued after new"
+
+tmux send-keys -t "$SESSION" / n e w Enter
+tmux send-keys -t "$SESSION" / m o d e Space a g e n t Enter
+wait_for_text "/mode agent (Agent)"
+sleep 0.6
+wait_for_text "/mode agent (Agent)"
+
+tmux send-keys -t "$SESSION" s l o w Space t o o l Enter
+wait_for_text "Slow Tool"
+tmux send-keys -t "$SESSION" / n e w Enter
+wait_for_text "/new (New session)"
+wait_without_text "Slow Tool"
+wait_without_text "slow done"
 
 tmux send-keys -t "$SESSION" / m o d e l Enter
 wait_for_text "Model"

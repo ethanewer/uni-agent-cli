@@ -7,6 +7,7 @@ import time
 
 next_client_request_id = 1000
 SLOW_DELAY = float(os.environ.get("FAKE_ACP_SLOW_DELAY", "0.8"))
+NEW_DELAY = float(os.environ.get("FAKE_ACP_NEW_DELAY", "0"))
 
 CONFIG_OPTIONS = [
     {
@@ -134,6 +135,8 @@ def handle_message(message):
             }
         )
     elif method == "session/new":
+        if NEW_DELAY > 0:
+            poll_cancel(NEW_DELAY)
         send(
             {
                 "jsonrpc": "2.0",

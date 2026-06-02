@@ -3,6 +3,9 @@ import {
 	AcpClient,
 	applyHarnessSettings,
 	autoPermissionOutcome,
+	findConfigValue,
+	findMode,
+	flattenModes,
 	isVsCodeAutoActivationCommand,
 	isVsCodeTerminal,
 	rewriteFullScreenClear,
@@ -169,6 +172,37 @@ assert.equal(
 	false,
 );
 
+assert.deepEqual(
+	flattenModes({
+		modes: {
+			availableModes: [
+				{ id: "agent", name: "Agent" },
+				{ modeId: "plan", label: "Plan", description: "Draft before editing" },
+			],
+		},
+	}),
+	[
+		{ id: "agent", name: "Agent", description: undefined },
+		{ id: "plan", name: "Plan", description: "Draft before editing" },
+	],
+);
+assert.deepEqual(
+	findMode({ modes: { availableModes: [{ id: "agent", name: "Agent" }, { id: "plan", name: "Plan" }] } }, "plan"),
+	{ id: "plan", name: "Plan", description: undefined },
+);
+assert.deepEqual(
+	findConfigValue(
+		{
+			options: [
+				{ value: "agent", name: "Agent" },
+				{ value: "plan", name: "Plan" },
+			],
+		},
+		"plan",
+	),
+	{ value: "plan", name: "Plan", description: undefined },
+);
+
 async function captureSessionRequests(methodName) {
 	const requests = [];
 	const client = new AcpClient(
@@ -203,3 +237,57 @@ for (const methodName of ["loadSession", "resumeSession"]) {
 	assert.equal(requests[1].params.sessionId, "previous-session");
 	assert.equal(requests[1].params.modeId, "bypassPermissions");
 }
+
+const earlyEvents = [];
+const earlyUpdateClient = new AcpClient({ command: "fake" }, (event) => earlyEvents.push(event));
+earlyUpdateClient.sessionId = "current-session";
+earlyUpdateClient.capabilities = { loadSession: true };
+earlyUpdateClient.request = async (method) => {
+	if (method === "session/load") {
+		earlyUpdateClient.handleSessionUpdate({
+			sessionId: "stale-session",
+			update: {
+				sessionUpdate: "agent_message_chunk",
+				content: { type: "text", text: "stale history" },
+			},
+		});
+		earlyUpdateClient.handleSessionUpdate({
+			sessionId: "previous-session",
+			update: {
+				sessionUpdate: "agent_message_chunk",
+				content: { type: "text", text: "early history" },
+			},
+		});
+		return { configOptions: [] };
+	}
+	return {};
+};
+await earlyUpdateClient.loadSession("previous-session");
+assert.deepEqual(
+	earlyEvents.filter((event) => event.type === "text").map((event) => event.text),
+	["early history"],
+);
+
+const newSessionOrder = [];
+const earlyNewClient = new AcpClient({ command: "fake" }, (event) => {
+	if (event.type === "text") newSessionOrder.push(event.text);
+});
+earlyNewClient.request = async (method) => {
+	if (method === "session/new") {
+		earlyNewClient.handleSessionUpdate({
+			sessionId: "fresh-session",
+			update: {
+				sessionUpdate: "agent_message_chunk",
+				content: { type: "text", text: "fresh welcome" },
+			},
+		});
+		return { sessionId: "fresh-session", configOptions: [] };
+	}
+	return {};
+};
+await earlyNewClient.newSession({
+	beforeReplay: () => {
+		newSessionOrder.push("before replay");
+	},
+});
+assert.deepEqual(newSessionOrder, ["before replay", "fresh welcome"]);

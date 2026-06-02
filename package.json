@@ -17,7 +17,7 @@
   },
   "scripts": {
     "check": "node --check src/cc.mjs && node --check src/pi-harness.mjs",
-    "test": "npm run check && node tests/settings.test.mjs && python3 -m py_compile tests/fake_acp.py && bash tests/permission_auto_smoke.sh && bash tests/tui_smoke.sh"
+    "test": "npm run check && node tests/settings.test.mjs && python3 -c \"compile(open('tests/fake_acp.py').read(), 'tests/fake_acp.py', 'exec')\" && bash tests/permission_auto_smoke.sh && bash tests/tui_smoke.sh"
   },
   "keywords": [],
   "author": "",
