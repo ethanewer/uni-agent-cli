@@ -10,13 +10,15 @@
     "src/cc",
     "src/cc.mjs",
     "src/pi-harness.mjs",
+    "src/harnesses/**/*.py",
+    "src/harnesses/**/*.txt",
     "README.md"
   ],
   "directories": {
     "test": "tests"
   },
   "scripts": {
-    "check": "node --check src/cc.mjs && node --check src/pi-harness.mjs",
+    "check": "node --check src/cc.mjs && node --check src/pi-harness.mjs && python3 -c \"import pathlib; files=list(pathlib.Path('src/harnesses').rglob('*.py'))+[pathlib.Path('tests/e2e_harness_bridges.py')]; [compile(path.read_text(), str(path), 'exec') for path in files]\"",
     "test": "npm run check && node tests/settings.test.mjs && python3 -c \"compile(open('tests/fake_acp.py').read(), 'tests/fake_acp.py', 'exec')\" && bash tests/permission_auto_smoke.sh && bash tests/tui_smoke.sh"
   },
   "keywords": [],

@@ -53,6 +53,16 @@ const config = {
 			transport: "acp",
 			acp: { command: "cursor-agent", args: ["acp"] },
 		},
+		"terminus-2": {
+			label: "Terminus-2",
+			transport: "acp",
+			acp: { command: "python3", args: ["src/harnesses/terminus_2/bridge.py"] },
+		},
+		"mini-swe-agent": {
+			label: "mini-swe-agent",
+			transport: "acp",
+			acp: { command: "python3", args: ["src/harnesses/mini_swe_agent/bridge.py"] },
+		},
 	},
 };
 
@@ -95,6 +105,12 @@ const applied = applyHarnessSettings(config, {
 		cursor: {
 			args: ["--model", "gpt-5", "--force", "--sandbox", "disabled", "--approve-mcps"],
 		},
+		"terminus-2": {
+			args: ["--model", "openai/gpt-5", "--max-episodes", "2"],
+		},
+		"mini-swe-agent": {
+			args: ["--model", "openai/gpt-5", "--no-yolo"],
+		},
 	},
 });
 
@@ -134,6 +150,33 @@ assert.deepEqual(applied.agents.cursor.acp.args, [
 ]);
 assert.equal(applied.agents.cursor._autoPermissionRequests, true);
 assert.deepEqual(config.agents.cursor.acp.args, ["acp"]);
+assert.deepEqual(applied.agents["terminus-2"].acp.args, [
+	"src/harnesses/terminus_2/bridge.py",
+	"--model",
+	"openai/gpt-5",
+	"--max-episodes",
+	"2",
+]);
+assert.deepEqual(applied.agents["mini-swe-agent"].acp.args, [
+	"src/harnesses/mini_swe_agent/bridge.py",
+	"--model",
+	"openai/gpt-5",
+	"--no-yolo",
+]);
+
+const previousDefaultCcConfig = process.env.CC_CONFIG;
+const previousDefaultCcSettings = process.env.CC_SETTINGS;
+process.env.CC_CONFIG = path.join(os.tmpdir(), `cc-missing-config-${process.pid}.json`);
+process.env.CC_SETTINGS = path.join(os.tmpdir(), `cc-missing-settings-${process.pid}.json`);
+const defaultConfig = loadConfig();
+if (previousDefaultCcConfig === undefined) delete process.env.CC_CONFIG;
+else process.env.CC_CONFIG = previousDefaultCcConfig;
+if (previousDefaultCcSettings === undefined) delete process.env.CC_SETTINGS;
+else process.env.CC_SETTINGS = previousDefaultCcSettings;
+assert.ok(defaultConfig.agents["terminus-2"]);
+assert.ok(defaultConfig.agents["mini-swe-agent"]);
+assert.match(defaultConfig.agents["terminus-2"].acp.args[0], /terminus_2\/bridge\.py$/);
+assert.match(defaultConfig.agents["mini-swe-agent"].acp.args[0], /mini_swe_agent\/bridge\.py$/);
 
 assert.ok(themeNames().includes("tokyonight"));
 assert.ok(themeNames().includes("matrix"));

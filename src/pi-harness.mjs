@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { Editor } from "@mariozechner/pi-tui/dist/components/editor.js";
 import { Spacer } from "@mariozechner/pi-tui/dist/components/spacer.js";
 import { Text } from "@mariozechner/pi-tui/dist/components/text.js";
@@ -14,6 +14,9 @@ import { Container, TUI } from "@mariozechner/pi-tui/dist/tui.js";
 import { normalizeTerminalOutput, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui/dist/utils.js";
 
 const HARNESS = "/harness";
+const SOURCE_DIR = path.dirname(fileURLToPath(import.meta.url));
+const HARNESS_ROOT = path.join(SOURCE_DIR, "harnesses");
+const HARNESS_PYTHON = resolveHarnessPython();
 const OSC133_ZONE_START = "\x1b]133;A\x07";
 const OSC133_ZONE_END = "\x1b]133;B\x07";
 const OSC133_ZONE_FINAL = "\x1b]133;C\x07";
@@ -90,6 +93,20 @@ const DEFAULT_CONFIG = {
 			command: "cursor-agent",
 			args: [],
 			acp: { command: "cursor-agent", args: ["acp"] },
+		},
+		"terminus-2": {
+			label: "Terminus-2",
+			transport: "acp",
+			command: "terminus-2",
+			args: [],
+			acp: { command: HARNESS_PYTHON, args: [path.join(HARNESS_ROOT, "terminus_2", "bridge.py")] },
+		},
+		"mini-swe-agent": {
+			label: "mini-swe-agent",
+			transport: "acp",
+			command: "mini",
+			args: [],
+			acp: { command: HARNESS_PYTHON, args: [path.join(HARNESS_ROOT, "mini_swe_agent", "bridge.py")] },
 		},
 	},
 };
@@ -4547,6 +4564,17 @@ function settingsPath() {
 	return path.join(os.homedir(), ".config", "cc", "settings.json");
 }
 
+function resolveHarnessPython() {
+	if (process.env.CC_HARNESS_PYTHON) return process.env.CC_HARNESS_PYTHON;
+	for (const candidate of [
+		path.join(SOURCE_DIR, "..", ".venv", "bin", "python"),
+		path.join(process.cwd(), ".venv", "bin", "python"),
+	]) {
+		if (fs.existsSync(candidate)) return candidate;
+	}
+	return "python3";
+}
+
 export function applyHarnessSettings(config, settings = {}) {
 	settings = normalizeSettings(settings, config.theme ?? config.settings?.theme);
 	const normalized = normalizeHarnessSettings(settings);
@@ -4718,6 +4746,8 @@ Inside the TUI:
   /harness codex
   /harness claude
   /harness cursor
+  /harness terminus-2
+  /harness mini-swe-agent
   /theme
   /harness exit
 `);

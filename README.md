@@ -1,6 +1,6 @@
 # cc
 
-A fast `cc` CLI for switching between Claude Code, Codex, and Cursor Agent.
+A fast `cc` CLI for switching between Claude Code, Codex, Cursor Agent, Terminus-2, and mini-swe-agent.
 
 The default runtime is a shared TUI backed by ACP. The UI layer uses `@mariozechner/pi-tui` from Pi instead of a custom renderer, so the editor sits after the rendered conversation and moves naturally as messages stream in. The wrapper owns `/harness` switching while each agent runs as a backend process.
 
@@ -17,6 +17,8 @@ Then run:
 cc
 cc claude
 cc cursor
+cc terminus-2
+cc mini-swe-agent
 ```
 
 ## Switching
@@ -28,6 +30,8 @@ Inside a session:
 /harness codex
 /harness claude
 /harness cursor
+/harness terminus-2
+/harness mini-swe-agent
 ```
 
 `/harness` opens the minimal switcher. Direct commands switch immediately.
@@ -56,12 +60,18 @@ ACP is the default transport. The defaults are:
 - Claude Code ACP: `claude-agent-acp`
 - Codex ACP: `codex-acp`
 - Cursor ACP: `cursor-agent acp`
+- Terminus-2: local ACP bridge in `src/harnesses/terminus_2`
+- mini-swe-agent: local ACP bridge in `src/harnesses/mini_swe_agent`
 
 Install the adapters once:
 
 ```sh
 npm install -g @agentclientprotocol/claude-agent-acp @zed-industries/codex-acp
 ```
+
+The Terminus-2 bridge vendors the upstream Terminal-Bench `terminus_2` files and prompt templates, but still needs its Python runtime dependencies available: `terminal-bench`, `litellm`, `tenacity`, and `tmux`. `cc` automatically uses `.venv/bin/python` next to this CLI when present; use `CC_HARNESS_PYTHON=/path/to/python` to override it. Configure the model with `TERMINUS_2_MODEL` or `settings.agents["terminus-2"].args`, for example `["--model", "openai/gpt-5"]`.
+
+The mini-swe-agent bridge follows the DeepSWE/Pier benchmark implementation. When `MINI_SWE_AGENT_TASK_PATH` or `--task-path` is set, it runs `pier run -p <path> --agent mini-swe-agent`. Without a task path it adapts the submitted free-form prompt through Pier's vendored `MiniSweAgent` implementation in the current working directory, preserving its model-class selection, `mini.yaml` config flags, env setup, and trajectory handling. Install with `uv venv .venv && uv pip install --python .venv/bin/python mini-swe-agent datacurve-pier terminal-bench tenacity`, and configure `MINI_SWE_AGENT_MODEL` or `MSWEA_MODEL_NAME`.
 
 Then use:
 

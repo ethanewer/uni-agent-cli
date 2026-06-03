@@ -1,5 +1,6 @@
 node_modules/
 target/
+.venv/
 .DS_Store
 
 # Local agent/editor state
