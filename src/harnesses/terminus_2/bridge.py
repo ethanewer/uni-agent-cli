@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
 import argparse
-import concurrent.futures
+import multiprocessing
 import os
+import queue
 import shutil
 import subprocess
 import sys
+import threading
 import time
+import traceback
 import uuid
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent / "vendor"))
 
-from acp_bridge import AcpBridge
+from acp_bridge import AcpBridge, require_python_version
 
 
 class LocalTmuxSession:
-    def __init__(self, cwd):
+    def __init__(self, cwd, name=None):
         if shutil.which("tmux") is None:
             raise RuntimeError("terminus-2 requires tmux on PATH")
-        self.name = f"cc-terminus-2-{uuid.uuid4().hex}"
+        self.name = name or f"cc-terminus-2-{uuid.uuid4().hex}"
         self.cwd = cwd
         self.started_at = time.monotonic()
         self._last_output = ""
@@ -76,11 +79,58 @@ class LocalTmuxSession:
         return time.monotonic() - self.started_at
 
     def stop(self):
-        subprocess.run(
-            ["tmux", "kill-session", "-t", self.name],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+        kill_tmux_session(self.name)
+
+
+def kill_tmux_session(name):
+    subprocess.run(
+        ["tmux", "kill-session", "-t", name],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def run_terminus_worker(args, instruction, cwd, session_name, result_queue):
+    session = None
+    try:
+        session = LocalTmuxSession(cwd, name=session_name)
+        result_queue.put({"type": "session", "name": session.name})
+
+        from terminal_bench.agents.terminus_2.terminus_2 import Terminus2
+
+        agent = Terminus2(
+            model_name=args["model"],
+            max_episodes=args["max_episodes"],
+            parser_name=args["parser"],
+            api_base=args["api_base"],
+            temperature=args["temperature"],
         )
+        result = agent.perform_task(
+            instruction=instruction,
+            session=session,
+            logging_dir=Path(args["logging_dir"]) if args["logging_dir"] else None,
+            time_limit_seconds=args["time_limit_seconds"],
+        )
+        terminal_output = session.capture_pane(capture_entire=True).strip()
+        result_queue.put(
+            {
+                "type": "result",
+                "input_tokens": result.total_input_tokens,
+                "output_tokens": result.total_output_tokens,
+                "terminal_output": terminal_output,
+            }
+        )
+    except Exception as error:
+        result_queue.put(
+            {
+                "type": "error",
+                "message": str(error),
+                "traceback": traceback.format_exc(),
+            }
+        )
+    finally:
+        if session:
+            session.stop()
 
 
 class Terminus2Bridge(AcpBridge):
@@ -89,87 +139,95 @@ class Terminus2Bridge(AcpBridge):
         self.args = args
 
     def make_prompt_runner(self, params):
-        cancelled = False
-        session = None
+        cancelled = threading.Event()
+        process = None
+        tmux_session_name = None
 
         def cancel():
-            nonlocal cancelled
-            cancelled = True
-            if session:
-                session.stop()
+            cancelled.set()
+            if process and process.is_alive():
+                process.terminate()
+            if tmux_session_name:
+                kill_tmux_session(tmux_session_name)
 
         def run():
-            nonlocal session
+            nonlocal process, tmux_session_name
             instruction = self.prompt_text(params).strip()
             if not instruction:
                 self.agent_text("No task instruction was provided.")
                 return "end_turn"
+            require_python_version("terminus-2 bridge")
 
             cwd = params.get("cwd") or os.getcwd()
-            session = LocalTmuxSession(cwd)
             self.tool_call("terminus-2", f"Terminus-2: {self.args.model}")
-            try:
-                from terminal_bench.agents.terminus_2.terminus_2 import Terminus2
 
-                agent = Terminus2(
-                    model_name=self.args.model,
-                    max_episodes=self.args.max_episodes,
-                    parser_name=self.args.parser,
-                    api_base=self.args.api_base,
-                    temperature=self.args.temperature,
-                )
-                try:
-                    result = self.perform_task_with_time_limit(
-                        agent=agent,
-                        instruction=instruction,
-                        session=session,
-                        logging_dir=Path(self.args.logging_dir) if self.args.logging_dir else None,
-                    )
-                except Exception:
-                    if cancelled:
-                        self.tool_update("terminus-2", "cancelled")
-                        return "cancelled"
-                    raise
-                if cancelled:
+            result_queue = multiprocessing.Queue()
+            tmux_session_name = f"cc-terminus-2-{uuid.uuid4().hex}"
+            process = multiprocessing.Process(
+                target=run_terminus_worker,
+                args=(terminus_args_dict(self.args), instruction, cwd, tmux_session_name, result_queue),
+                daemon=True,
+            )
+            process.start()
+            deadline = time.monotonic() + self.args.time_limit_seconds if self.args.time_limit_seconds else None
+
+            while True:
+                if cancelled.is_set():
+                    self.stop_worker(process, tmux_session_name)
                     self.tool_update("terminus-2", "cancelled")
                     return "cancelled"
-                self.tool_update("terminus-2", "completed")
-                terminal_output = session.capture_pane(capture_entire=True).strip()
-                self.agent_text(
-                    "Terminus-2 finished.\n"
-                    f"Input tokens: {result.total_input_tokens}\n"
-                    f"Output tokens: {result.total_output_tokens}\n"
-                )
-                if terminal_output:
-                    self.agent_text(f"\nRecent terminal output:\n{limit_output(terminal_output)}\n")
-                return "end_turn"
-            finally:
-                session.stop()
+                if deadline is not None and time.monotonic() >= deadline:
+                    self.stop_worker(process, tmux_session_name)
+                    self.tool_update("terminus-2", "failed")
+                    raise TimeoutError(f"terminus-2 timed out after {self.args.time_limit_seconds}s")
+                try:
+                    message = result_queue.get(timeout=0.1)
+                except queue.Empty:
+                    if not process.is_alive():
+                        code = process.exitcode
+                        self.stop_worker(process, tmux_session_name)
+                        self.tool_update("terminus-2", "failed")
+                        raise RuntimeError(f"terminus-2 worker exited with status {code}")
+                    continue
+
+                message_type = message.get("type")
+                if message_type == "session":
+                    tmux_session_name = message.get("name")
+                    continue
+                if message_type == "result":
+                    process.join(timeout=1)
+                    if process.is_alive():
+                        self.stop_worker(process, tmux_session_name)
+                    if cancelled.is_set():
+                        self.tool_update("terminus-2", "cancelled")
+                        return "cancelled"
+                    self.tool_update("terminus-2", "completed")
+                    self.agent_text(
+                        "Terminus-2 finished.\n"
+                        f"Input tokens: {message.get('input_tokens')}\n"
+                        f"Output tokens: {message.get('output_tokens')}\n"
+                    )
+                    terminal_output = message.get("terminal_output") or ""
+                    if terminal_output:
+                        self.agent_text(f"\nRecent terminal output:\n{limit_output(terminal_output)}\n")
+                    return "end_turn"
+                if message_type == "error":
+                    self.stop_worker(process, tmux_session_name)
+                    self.tool_update("terminus-2", "failed")
+                    raise RuntimeError(message.get("message") or message.get("traceback") or "terminus-2 failed")
 
         return cancel, run
 
-    def perform_task_with_time_limit(self, agent, instruction, session, logging_dir):
-        def perform_task():
-            return agent.perform_task(
-                instruction=instruction,
-                session=session,
-                logging_dir=logging_dir,
-                time_limit_seconds=self.args.time_limit_seconds,
-            )
-
-        if not self.args.time_limit_seconds:
-            return perform_task()
-
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(perform_task)
-        try:
-            return future.result(timeout=self.args.time_limit_seconds)
-        except concurrent.futures.TimeoutError as error:
-            session.stop()
-            self.tool_update("terminus-2", "failed")
-            raise TimeoutError(f"terminus-2 timed out after {self.args.time_limit_seconds}s") from error
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+    def stop_worker(self, process, tmux_session_name):
+        if process:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=2)
+            if process.is_alive():
+                process.kill()
+                process.join(timeout=2)
+        if tmux_session_name:
+            kill_tmux_session(tmux_session_name)
 
 
 def parse_args():
@@ -182,6 +240,18 @@ def parse_args():
     parser.add_argument("--logging-dir", default=os.environ.get("TERMINUS_2_LOGGING_DIR"))
     parser.add_argument("--time-limit-seconds", type=float, default=None)
     return parser.parse_args()
+
+
+def terminus_args_dict(args):
+    return {
+        "model": args.model,
+        "parser": args.parser,
+        "api_base": args.api_base,
+        "temperature": args.temperature,
+        "max_episodes": args.max_episodes,
+        "logging_dir": args.logging_dir,
+        "time_limit_seconds": args.time_limit_seconds,
+    }
 
 
 def env_int(name):

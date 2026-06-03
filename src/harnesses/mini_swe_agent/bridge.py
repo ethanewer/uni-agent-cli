@@ -14,7 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent / "vendor"))
 
-from acp_bridge import AcpBridge
+from acp_bridge import AcpBridge, require_python_version
 
 
 class MiniSweAgentBridge(AcpBridge):
@@ -107,6 +107,7 @@ class MiniSweAgentBridge(AcpBridge):
         return env
 
     def run_pier_local_prompt(self, prompt, cwd, cancelled):
+        require_python_version("mini-swe-agent free-form bridge")
         from pier.agents.installed.mini_swe_agent import MiniSweAgent
         from pier.models.agent.context import AgentContext
 

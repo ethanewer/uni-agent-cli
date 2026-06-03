@@ -4569,10 +4569,22 @@ function resolveHarnessPython() {
 	for (const candidate of [
 		path.join(SOURCE_DIR, "..", ".venv", "bin", "python"),
 		path.join(process.cwd(), ".venv", "bin", "python"),
+		"python3",
+		"python3.12",
+		"python3.11",
+		"python3.10",
 	]) {
-		if (fs.existsSync(candidate)) return candidate;
+		if (isHarnessPython(candidate)) return candidate;
 	}
 	return "python3";
+}
+
+function isHarnessPython(command) {
+	if (command.includes(path.sep) && !fs.existsSync(command)) return false;
+	const result = spawnSync(command, ["-c", "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)"], {
+		stdio: "ignore",
+	});
+	return result.status === 0;
 }
 
 export function applyHarnessSettings(config, settings = {}) {

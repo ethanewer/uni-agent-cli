@@ -6,6 +6,17 @@ import traceback
 import uuid
 
 
+def require_python_version(name, minimum=(3, 10)):
+    if sys.version_info >= minimum:
+        return
+    current = ".".join(str(part) for part in sys.version_info[:3])
+    required = ".".join(str(part) for part in minimum)
+    raise RuntimeError(
+        f"{name} requires Python {required} or newer; current interpreter is Python {current}. "
+        "Set CC_HARNESS_PYTHON to a newer Python executable."
+    )
+
+
 class AcpBridge:
     def __init__(self, name, title, version="0.1.0"):
         self.name = name
