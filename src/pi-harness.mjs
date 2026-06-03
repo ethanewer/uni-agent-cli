@@ -1634,7 +1634,7 @@ class VoiceController {
 	}
 }
 
-class HarnessApp {
+export class HarnessApp {
 	constructor(config, initialAgent, initialTransport) {
 		this.config = config;
 		this.themeName = resolveThemeName(config.theme ?? config.settings?.theme) ?? "system";
@@ -1684,7 +1684,7 @@ class HarnessApp {
 		this.clipboardImages = [];
 		this.clipboardImageCounter = 0;
 		this.clipboardPasteInProgress = false;
-		this.submitAfterClipboardPaste = false;
+		this.bufferedClipboardPasteInput = [];
 
 		const terminal = createHarnessTerminal({
 			onResizeStart: () => this.beginResize(),
@@ -1882,12 +1882,12 @@ class HarnessApp {
 			isCtrlSpace: matchesKey(data, "ctrl+space"),
 		});
 		if (voiceConsumed) return { consume: true };
-		if (isClipboardPasteInput(data)) {
-			void this.handleClipboardPaste();
+		if (this.clipboardPasteInProgress) {
+			this.bufferClipboardPasteInput(data);
 			return { consume: true };
 		}
-		if (this.clipboardPasteInProgress) {
-			if (isSubmitInput(data)) this.submitAfterClipboardPaste = true;
+		if (isClipboardPasteInput(data)) {
+			void this.handleClipboardPaste();
 			return { consume: true };
 		}
 		if (isCtrlD(data)) {
@@ -2026,17 +2026,15 @@ class HarnessApp {
 			const label = `[Image ${++this.clipboardImageCounter}]`;
 			this.clipboardImages.push({ ...image, label });
 			this.insertClipboardImagePlaceholder(label);
-			inserted = true;
 			this.lastKnownEditorText = this.editor.getText();
+			inserted = true;
 			this.ui.requestRender();
 		} catch (error) {
 			this.addError(error.message ?? String(error));
 			this.ui.requestRender();
 		} finally {
 			this.clipboardPasteInProgress = false;
-			const submit = this.submitAfterClipboardPaste;
-			this.submitAfterClipboardPaste = false;
-			if (inserted && submit && this.editor.getText().trim()) this.editor.submitValue();
+			this.flushBufferedClipboardPasteInput({ allowSubmit: inserted });
 		}
 	}
 
@@ -2055,6 +2053,24 @@ class HarnessApp {
 
 	clearClipboardImages() {
 		this.clipboardImages = [];
+	}
+
+	bufferClipboardPasteInput(data) {
+		this.bufferedClipboardPasteInput.push(data);
+	}
+
+	flushBufferedClipboardPasteInput(options = {}) {
+		const allowSubmit = options.allowSubmit === true;
+		const buffered = this.bufferedClipboardPasteInput;
+		this.bufferedClipboardPasteInput = [];
+		for (const data of buffered) {
+			if (this.clipboardPasteInProgress) {
+				this.bufferedClipboardPasteInput.push(data);
+				continue;
+			}
+			if (!allowSubmit && isSubmitInput(data)) continue;
+			this.ui.handleInput(data);
+		}
 	}
 
 	consumeImagePromptParts(text) {

@@ -9,6 +9,7 @@ import {
 	findConfigValue,
 	findMode,
 	flattenModes,
+	HarnessApp,
 	hideCursorDuringRender,
 	isVsCodeAutoActivationCommand,
 	isVsCodeTerminal,
@@ -19,6 +20,19 @@ import {
 	shouldDropVsCodeAutoActivationInput,
 	themeNames,
 } from "../src/pi-harness.mjs";
+
+function clipboardReplayHarness() {
+	const replayed = [];
+	const app = Object.create(HarnessApp.prototype);
+	app.bufferedClipboardPasteInput = [];
+	app.clipboardPasteInProgress = false;
+	app.ui = {
+		handleInput(data) {
+			replayed.push(data);
+		},
+	};
+	return { app, replayed };
+}
 
 const config = {
 	defaultAgent: "codex",
@@ -40,6 +54,27 @@ const config = {
 		},
 	},
 };
+
+{
+	const { app, replayed } = clipboardReplayHarness();
+	app.bufferClipboardPasteInput("\r");
+	app.bufferClipboardPasteInput("n");
+	app.flushBufferedClipboardPasteInput({ allowSubmit: true });
+	assert.deepEqual(replayed, ["\r", "n"]);
+	assert.deepEqual(app.bufferedClipboardPasteInput, []);
+}
+
+{
+	const { app, replayed } = clipboardReplayHarness();
+	app.bufferClipboardPasteInput("a");
+	app.bufferClipboardPasteInput("\r");
+	app.bufferClipboardPasteInput("b");
+	app.bufferClipboardPasteInput("\n");
+	app.bufferClipboardPasteInput("c");
+	app.flushBufferedClipboardPasteInput({ allowSubmit: false });
+	assert.deepEqual(replayed, ["a", "b", "c"]);
+	assert.deepEqual(app.bufferedClipboardPasteInput, []);
+}
 
 const applied = applyHarnessSettings(config, {
 	agents: {
