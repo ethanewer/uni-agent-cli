@@ -60,6 +60,7 @@ const MARKDOWN_PRELOAD_DELAY_MS = parseDelay(process.env.CC_MARKDOWN_PRELOAD_DEL
 const RESIZE_SETTLE_DELAY_MS = parseDelay(process.env.CC_RESIZE_SETTLE_DELAY_MS, 90);
 const VS_CODE_AUTO_ACTIVATION_MAX_INPUT_GAP_MS = 15;
 const VS_CODE_AUTO_ACTIVATION_MAX_SUBMIT_AGE_MS = 75;
+const CLIPBOARD_IMAGE_TIMEOUT_MS = 2_500;
 let MarkdownComponent;
 let markdownLoadPromise;
 let CombinedAutocompleteProviderClass;
@@ -1156,11 +1157,12 @@ export class AcpClient {
 		return await this.switchSession("session/new", this.sessionRequestParams(), undefined, options);
 	}
 
-	async prompt(text) {
+	async prompt(prompt) {
 		if (!this.sessionId) throw new Error("ACP session is not ready");
+		const parts = Array.isArray(prompt) ? prompt : [{ type: "text", text: prompt }];
 		await this.request("session/prompt", {
 			sessionId: this.sessionId,
-			prompt: [{ type: "text", text }],
+			prompt: parts,
 		});
 	}
 
@@ -1679,6 +1681,10 @@ class HarnessApp {
 		this.markdownPreloadTimer = undefined;
 		this.resizeActive = false;
 		this.vsCodeActivationInputBurst = undefined;
+		this.clipboardImages = [];
+		this.clipboardImageCounter = 0;
+		this.clipboardPasteInProgress = false;
+		this.submitAfterClipboardPaste = false;
 
 		const terminal = createHarnessTerminal({
 			onResizeStart: () => this.beginResize(),
@@ -1876,6 +1882,14 @@ class HarnessApp {
 			isCtrlSpace: matchesKey(data, "ctrl+space"),
 		});
 		if (voiceConsumed) return { consume: true };
+		if (isClipboardPasteInput(data)) {
+			void this.handleClipboardPaste();
+			return { consume: true };
+		}
+		if (this.clipboardPasteInProgress) {
+			if (isSubmitInput(data)) this.submitAfterClipboardPaste = true;
+			return { consume: true };
+		}
 		if (isCtrlD(data)) {
 			this.stop();
 			return { consume: true };
@@ -1948,6 +1962,7 @@ class HarnessApp {
 		}
 		if (this.editor.getText()) {
 			this.editor.setText("");
+			this.clearClipboardImages();
 			this.lastKnownEditorText = "";
 			this.lastInputClearSource = source;
 			this.suppressNextPairedEmptyInterrupt = true;
@@ -1989,6 +2004,99 @@ class HarnessApp {
 		queueMicrotask(() => {
 			if (!this.menuHandle) this.lastKnownEditorText = this.editor.getText();
 		});
+	}
+
+	async handleClipboardPaste() {
+		if (this.clipboardPasteInProgress) return;
+		if (this.imagePromptCapability() === false) {
+			this.addNotice(`${this.config.agents[this.activeKey]?.label ?? this.activeKey} does not support image prompts.`);
+			this.ui.requestRender();
+			return;
+		}
+		this.clipboardPasteInProgress = true;
+		this.exitVoiceMode();
+		let inserted = false;
+		try {
+			const image = await readClipboardImage();
+			if (!image) {
+				this.addNotice("No image found in clipboard.");
+				this.ui.requestRender();
+				return;
+			}
+			const label = `[Image ${++this.clipboardImageCounter}]`;
+			this.clipboardImages.push({ ...image, label });
+			this.insertClipboardImagePlaceholder(label);
+			inserted = true;
+			this.lastKnownEditorText = this.editor.getText();
+			this.ui.requestRender();
+		} catch (error) {
+			this.addError(error.message ?? String(error));
+			this.ui.requestRender();
+		} finally {
+			this.clipboardPasteInProgress = false;
+			const submit = this.submitAfterClipboardPaste;
+			this.submitAfterClipboardPaste = false;
+			if (inserted && submit && this.editor.getText().trim()) this.editor.submitValue();
+		}
+	}
+
+	insertClipboardImagePlaceholder(label) {
+		const cursor = this.editor.getCursor?.();
+		const lines = this.editor.getLines?.();
+		const line = cursor && lines ? (lines[cursor.line] ?? "") : this.editor.getText();
+		const before = cursor ? line.slice(0, cursor.col) : line;
+		const after = cursor ? line.slice(cursor.col) : "";
+		const prefix = before && !/\s$/.test(before) ? " " : "";
+		const suffix = after && !/^\s/.test(after) ? " " : "";
+		const text = `${prefix}${label}${suffix || " "}`;
+		if (this.editor.insertTextAtCursor) this.editor.insertTextAtCursor(text);
+		else this.editor.setText(`${this.editor.getText()}${text}`);
+	}
+
+	clearClipboardImages() {
+		this.clipboardImages = [];
+	}
+
+	consumeImagePromptParts(text) {
+		if (this.clipboardImages.length === 0) return undefined;
+		const images = this.clipboardImages;
+		this.clipboardImages = [];
+
+		const matches = images
+			.map((image) => ({ image, index: text.indexOf(image.label) }))
+			.filter((entry) => entry.index >= 0)
+			.sort((a, b) => a.index - b.index);
+
+		if (matches.length === 0) return [{ type: "text", text }];
+
+		const parts = [];
+		let offset = 0;
+		for (const { image, index } of matches) {
+			const before = text.slice(offset, index);
+			if (before.trim()) parts.push({ type: "text", text: before });
+			parts.push({ type: "image", data: image.data, mimeType: image.mimeType });
+			offset = index + image.label.length;
+		}
+		const after = text.slice(offset);
+		if (after.trim()) parts.push({ type: "text", text: after });
+		return parts.length > 0 ? parts : matches.map(({ image }) => ({ type: "image", data: image.data, mimeType: image.mimeType }));
+	}
+
+	restagePromptImages(text, promptParts) {
+		this.clipboardImages = imageAttachmentsFromPromptParts(text, promptParts);
+	}
+
+	imagePromptCapability() {
+		const state = this.sessionStates.get(this.activeKey);
+		const capabilities = state?.capabilities ?? this.client?.capabilities;
+		return imagePromptCapability(capabilities);
+	}
+
+	promptForActiveCapabilities(text, promptParts) {
+		if (!hasImagePromptPart(promptParts)) return promptParts ?? text;
+		if (this.imagePromptCapability() === true) return promptParts;
+		this.addNotice(`${this.config.agents[this.activeKey]?.label ?? this.activeKey} does not support image prompts; sending text only.`);
+		return text;
 	}
 
 	initVoiceInput() {
@@ -2148,6 +2256,7 @@ class HarnessApp {
 		this.lastKnownEditorText = "";
 		const text = rawText.trim();
 		if (!text) return;
+		const promptParts = this.consumeImagePromptParts(text);
 		const displayText = this.consumePromptDisplay(text);
 		this.editor.addToHistory(text);
 		this.editor.onSubmit = undefined;
@@ -2165,13 +2274,13 @@ class HarnessApp {
 			compactCommand = handled === "backend";
 			if (handled === true) return;
 		}
-		await this.submitBackendPrompt(text, { displayText, compactCommand });
+		await this.submitBackendPrompt(text, { displayText, compactCommand, promptParts });
 	}
 
 	async submitBackendPrompt(text, options = {}) {
 		const displayText = options.displayText ?? text;
 		if (!this.ready) {
-			this.enqueuePrompt(text, "afterTurn", { displayText, compactCommand: options.compactCommand });
+			this.enqueuePrompt(text, "afterTurn", { displayText, compactCommand: options.compactCommand, promptParts: options.promptParts });
 			this.statusState = "connecting";
 			this.updateSpinner();
 			if (!this.client) void this.switchAgent(this.activeKey, this.transport, { quiet: true });
@@ -2179,12 +2288,12 @@ class HarnessApp {
 			return;
 		}
 		if (this.busy || this.sessionSwitchInProgress) {
-			this.enqueuePrompt(text, "afterTurn", { displayText, compactCommand: options.compactCommand });
+			this.enqueuePrompt(text, "afterTurn", { displayText, compactCommand: options.compactCommand, promptParts: options.promptParts });
 			return;
 		}
 		const pendingUserEcho = this.trackPendingUserEcho(text);
 		this.addUserMessage(displayText, { compactCommand: options.compactCommand });
-		await this.sendPrompt(text, { pendingUserEcho });
+		await this.sendPrompt(text, { pendingUserEcho, promptParts: options.promptParts });
 		await this.flushPromptQueue();
 	}
 
@@ -2203,7 +2312,7 @@ class HarnessApp {
 		this.updateSpinner();
 		this.ui.requestRender();
 		try {
-			await this.client.prompt(text);
+			await this.client.prompt(this.promptForActiveCapabilities(text, options.promptParts));
 		} catch (error) {
 			this.addError(error.message ?? String(error));
 		} finally {
@@ -2236,7 +2345,7 @@ class HarnessApp {
 				const pendingUserEcho = this.trackPendingUserEcho(prompt.text);
 				this.addUserMessage(prompt.displayText ?? prompt.text, { compactCommand: prompt.compactCommand });
 				this.ui.requestRender();
-				await this.sendPrompt(prompt.text, { pendingUserEcho });
+				await this.sendPrompt(prompt.text, { pendingUserEcho, promptParts: prompt.promptParts });
 			}
 		} finally {
 			this.flushingPromptQueue = false;
@@ -2249,7 +2358,7 @@ class HarnessApp {
 	}
 
 	enqueuePrompt(text, timing = "afterTurn", options = {}) {
-		this.promptQueue.push({ text, timing, displayText: options.displayText, compactCommand: options.compactCommand });
+		this.promptQueue.push({ text, timing, displayText: options.displayText, compactCommand: options.compactCommand, promptParts: options.promptParts });
 		this.updateSpinner();
 		this.ui.requestRender();
 		this.schedulePromptQueueDrain();
@@ -2277,6 +2386,7 @@ class HarnessApp {
 		if (this.promptQueue.length === 0) return false;
 		const prompt = this.promptQueue.pop();
 		this.editor.setText(prompt.text);
+		this.restagePromptImages(prompt.text, prompt.promptParts);
 		this.pendingPromptDisplay = prompt.displayText ? { text: prompt.text, displayText: prompt.displayText } : undefined;
 		this.lastKnownEditorText = prompt.text;
 		this.updateSpinner();
@@ -3926,6 +4036,112 @@ function audioCommand() {
 	throw new Error(`ffmpeg or sox is required for voice recording. ${installHint}`);
 }
 
+async function readClipboardImage() {
+	if (process.platform === "darwin") return await readMacClipboardImage();
+	if (process.platform === "win32" || isWsl()) return await readWindowsClipboardImage();
+	if (process.platform === "linux") return await readLinuxClipboardImage();
+	return undefined;
+}
+
+async function readMacClipboardImage() {
+	const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "cc-clipboard-"));
+	const file = path.join(dir, "clipboard.png");
+	const escaped = file.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+	try {
+		await runCapture("osascript", [
+			"-e",
+			'set imageData to the clipboard as "PNGf"',
+			"-e",
+			`set fileRef to open for access POSIX file "${escaped}" with write permission`,
+			"-e",
+			"set eof fileRef to 0",
+			"-e",
+			"write imageData to fileRef",
+			"-e",
+			"close access fileRef",
+		]);
+		const data = await fs.promises.readFile(file);
+		if (data.length === 0) return undefined;
+		return { data: data.toString("base64"), mimeType: "image/png" };
+	} catch {
+		return undefined;
+	} finally {
+		await fs.promises.rm(dir, { recursive: true, force: true }).catch(() => {});
+	}
+}
+
+async function readWindowsClipboardImage() {
+	const script =
+		"Add-Type -AssemblyName System.Windows.Forms; " +
+		"$img = [System.Windows.Forms.Clipboard]::GetImage(); " +
+		"if ($img) { $ms = New-Object System.IO.MemoryStream; " +
+		"$img.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png); " +
+		"[System.Convert]::ToBase64String($ms.ToArray()) }";
+	try {
+		const result = await runCapture("powershell.exe", ["-NonInteractive", "-NoProfile", "-Command", script]);
+		const base64 = result.stdout.toString("utf8").trim();
+		if (!base64) return undefined;
+		const data = Buffer.from(base64, "base64");
+		if (data.length === 0) return undefined;
+		return { data: data.toString("base64"), mimeType: "image/png" };
+	} catch {
+		return undefined;
+	}
+}
+
+async function readLinuxClipboardImage() {
+	const wayland = await runCapture("wl-paste", ["-t", "image/png"], { rejectOnExit: false }).catch(() => undefined);
+	if (wayland?.stdout?.length > 0) return { data: wayland.stdout.toString("base64"), mimeType: "image/png" };
+	const x11 = await runCapture("xclip", ["-selection", "clipboard", "-t", "image/png", "-o"], { rejectOnExit: false }).catch(() => undefined);
+	if (x11?.stdout?.length > 0) return { data: x11.stdout.toString("base64"), mimeType: "image/png" };
+	return undefined;
+}
+
+function runCapture(command, args = [], options = {}) {
+	const timeoutMs = options.timeoutMs ?? CLIPBOARD_IMAGE_TIMEOUT_MS;
+	const rejectOnExit = options.rejectOnExit !== false;
+	return new Promise((resolve, reject) => {
+		const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+		const stdout = [];
+		const stderr = [];
+		let settled = false;
+		const timer = setTimeout(() => {
+			if (settled) return;
+			settled = true;
+			try {
+				child.kill("SIGTERM");
+			} catch {}
+			reject(new Error(`${command} timed out`));
+		}, timeoutMs);
+		timer.unref?.();
+
+		const finish = (error, result) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			if (error) reject(error);
+			else resolve(result);
+		};
+
+		child.stdout?.on("data", (chunk) => stdout.push(Buffer.from(chunk)));
+		child.stderr?.on("data", (chunk) => stderr.push(Buffer.from(chunk)));
+		child.once("error", (error) => finish(error));
+		child.once("close", (code, signal) => {
+			const result = { code, signal, stdout: Buffer.concat(stdout), stderr: Buffer.concat(stderr) };
+			if (rejectOnExit && code !== 0) {
+				const details = result.stderr.toString("utf8").trim();
+				finish(new Error(`${command} exited ${signal ?? code}${details ? `: ${oneLine(details)}` : ""}`));
+				return;
+			}
+			finish(undefined, result);
+		});
+	});
+}
+
+function isWsl(env = process.env, release = os.release()) {
+	return Boolean(env.WSL_DISTRO_NAME || /microsoft|wsl/i.test(release));
+}
+
 function recordAudio() {
 	const [bin, ...args] = audioCommand();
 	const child = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
@@ -4000,6 +4216,27 @@ function isPrintableInput(data) {
 	return typeof data === "string" && data.length === 1 && data >= " " && data !== "\x7f";
 }
 
+function imageAttachmentsFromPromptParts(text, promptParts) {
+	if (!Array.isArray(promptParts)) return [];
+	const imageParts = promptParts.filter((part) => part?.type === "image" && part.data);
+	if (imageParts.length === 0) return [];
+	const labels = [...String(text ?? "").matchAll(/\[Image \d+\]/g)].map((match) => match[0]);
+	return imageParts.slice(0, labels.length).map((part, index) => ({
+		label: labels[index],
+		data: part.data,
+		mimeType: part.mimeType ?? part.mime_type ?? "image/png",
+	}));
+}
+
+function hasImagePromptPart(promptParts) {
+	return Array.isArray(promptParts) && promptParts.some((part) => part?.type === "image");
+}
+
+function imagePromptCapability(capabilities) {
+	if (!capabilities || Object.keys(capabilities).length === 0) return undefined;
+	return capabilities.promptCapabilities?.image === true;
+}
+
 function isPlainSpaceInput(data) {
 	return matchesKey(data, "space") && !isModifiedSpaceInput(data);
 }
@@ -4010,6 +4247,16 @@ function isModifiedSpaceInput(data) {
 
 function isSubmitInput(data) {
 	return matchesKey(data, "enter") || matchesKey(data, "return");
+}
+
+function isClipboardPasteInput(data) {
+	return (
+		data === "\x16" ||
+		matchesKey(data, "ctrl+v") ||
+		matchesKey(data, "ctrl+shift+v") ||
+		matchesKey(data, "super+v") ||
+		data === "\x1b[200~\x1b[201~"
+	);
 }
 
 function isEscape(data) {

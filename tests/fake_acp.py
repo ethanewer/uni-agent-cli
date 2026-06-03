@@ -270,7 +270,8 @@ def handle_message(message):
 
 def handle_prompt(message):
     request_id = message.get("id")
-    prompt = message["params"]["prompt"][0]["text"]
+    prompt_parts = message["params"]["prompt"]
+    prompt = prompt_text(prompt_parts)
     if prompt == "delayed tool":
         if poll_cancel(SLOW_DELAY):
             send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "cancelled"}})
@@ -467,6 +468,20 @@ def handle_prompt(message):
         return
 
     send_default_prompt_response(request_id, prompt)
+
+
+def prompt_text(parts):
+    chunks = []
+    for part in parts:
+        kind = part.get("type")
+        if kind == "text":
+            chunks.append(part.get("text", ""))
+        elif kind == "image":
+            mime = part.get("mimeType") or part.get("mime_type") or "image"
+            chunks.append(f"[image:{mime}]")
+        else:
+            chunks.append(f"[{kind or 'part'}]")
+    return "".join(chunks)
 
 
 def send_review_response(request_id, prompt):
