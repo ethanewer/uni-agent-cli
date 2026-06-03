@@ -61,6 +61,7 @@ const RESIZE_SETTLE_DELAY_MS = parseDelay(process.env.CC_RESIZE_SETTLE_DELAY_MS,
 const VS_CODE_AUTO_ACTIVATION_MAX_INPUT_GAP_MS = 15;
 const VS_CODE_AUTO_ACTIVATION_MAX_SUBMIT_AGE_MS = 75;
 const CLIPBOARD_IMAGE_TIMEOUT_MS = 2_500;
+const STREAMING_MARKDOWN_MUTABLE_TAIL_LINES = 4;
 let MarkdownComponent;
 let markdownLoadPromise;
 let CombinedAutocompleteProviderClass;
@@ -1806,7 +1807,7 @@ export class HarnessApp {
 		this.deferredLocalSlashCommands = [];
 		this.activeToolIds.clear();
 		this.seenToolThisTurn = false;
-		this.currentAssistantText = undefined;
+		this.closeCurrentAssistantText();
 		this.currentUserText = undefined;
 		this.currentToolSummary = undefined;
 		this.pendingUserEchoes = [];
@@ -2323,7 +2324,7 @@ export class HarnessApp {
 		this.afterToolCancelPending = false;
 		this.activeToolIds.clear();
 		this.seenToolThisTurn = false;
-		this.currentAssistantText = undefined;
+		this.closeCurrentAssistantText();
 		this.statusState = "working";
 		this.updateSpinner();
 		this.ui.requestRender();
@@ -2338,7 +2339,7 @@ export class HarnessApp {
 			}
 			this.activeToolIds.clear();
 			this.busy = false;
-			this.currentAssistantText = undefined;
+			this.closeCurrentAssistantText();
 			this.statusState = this.promptQueue.length > 0 ? "working" : "";
 			this.updateSpinner();
 			this.ui.requestRender();
@@ -3194,7 +3195,7 @@ export class HarnessApp {
 	}
 
 	appendUserText(text) {
-		this.currentAssistantText = undefined;
+		this.closeCurrentAssistantText();
 		this.currentToolSummary = undefined;
 		if (!this.currentUserText) {
 			this.addHistorySpacer("user");
@@ -3216,7 +3217,7 @@ export class HarnessApp {
 	}
 
 	addCommandMessage(text) {
-		this.currentAssistantText = undefined;
+		this.closeCurrentAssistantText();
 		this.currentUserText = undefined;
 		this.currentToolSummary = undefined;
 		this.addHistorySpacer("command");
@@ -3224,7 +3225,7 @@ export class HarnessApp {
 	}
 
 	addNotice(text) {
-		this.currentAssistantText = undefined;
+		this.closeCurrentAssistantText();
 		this.currentUserText = undefined;
 		this.currentToolSummary = undefined;
 		this.addHistorySpacer("notice");
@@ -3232,7 +3233,7 @@ export class HarnessApp {
 	}
 
 	addTool(title, status, id) {
-		this.currentAssistantText = undefined;
+		this.closeCurrentAssistantText();
 		this.currentUserText = undefined;
 		if (!this.currentToolSummary) {
 			this.addHistorySpacer("tool");
@@ -3253,7 +3254,7 @@ export class HarnessApp {
 	addCtrlCExitHint() {
 		const last = lastRenderableChild(this.chat);
 		if (last instanceof CtrlCExitHint) return;
-		this.currentAssistantText = undefined;
+		this.closeCurrentAssistantText();
 		this.currentUserText = undefined;
 		this.currentToolSummary = undefined;
 		this.addHistorySpacer("notice");
@@ -3261,11 +3262,16 @@ export class HarnessApp {
 	}
 
 	addError(text) {
-		this.currentAssistantText = undefined;
+		this.closeCurrentAssistantText();
 		this.currentUserText = undefined;
 		this.currentToolSummary = undefined;
 		this.addHistorySpacer("error");
 		this.chat.addChild(new Text(chalk.red(`! ${text}`), 0, 0));
+	}
+
+	closeCurrentAssistantText() {
+		this.currentAssistantText?.invalidate();
+		this.currentAssistantText = undefined;
 	}
 
 	addHistorySpacer(kind) {
@@ -3296,7 +3302,6 @@ class MutableMarkdown {
 
 	append(text) {
 		this.text += text;
-		this.cache = undefined;
 	}
 
 	invalidate() {
@@ -3305,9 +3310,11 @@ class MutableMarkdown {
 
 	render(width) {
 		const text = this.text.trimEnd();
-		if (this.cache?.width === width && this.cache.text === text) return this.cache.lines.slice();
-		const lines = renderMarkdown(text, width, 0, 0, { color: (content) => chalk.text(content) });
-		this.cache = { width, text, lines };
+		const renderer = MarkdownComponent ? "markdown" : "plain";
+		if (this.cache?.width === width && this.cache.text === text && this.cache.renderer === renderer) return this.cache.lines.slice();
+		const rendered = renderMarkdown(text, width, 0, 0, { color: (content) => chalk.text(content) });
+		const lines = stabilizeGrowingRenderedLines(this.cache, { width, text, lines: rendered, renderer }, STREAMING_MARKDOWN_MUTABLE_TAIL_LINES);
+		this.cache = { width, text, lines, renderer };
 		return lines.slice();
 	}
 }
@@ -3462,6 +3469,30 @@ function invalidateRenderableTree(node) {
 	if (Array.isArray(node.children)) {
 		for (const child of node.children) invalidateRenderableTree(child);
 	}
+}
+
+export function stabilizeGrowingRenderedLines(previous, next, mutableTailLines = STREAMING_MARKDOWN_MUTABLE_TAIL_LINES) {
+	if (!previous || previous.width !== next.width) return next.lines.slice();
+	if (previous.renderer !== next.renderer) return next.lines.slice();
+	if (next.text.length <= previous.text.length || !next.text.startsWith(previous.text)) return next.lines.slice();
+	if (next.lines.length < previous.lines.length) return next.lines.slice();
+
+	const protectedPrefixLength = Math.max(0, previous.lines.length - Math.max(0, mutableTailLines));
+	if (protectedPrefixLength === 0) return next.lines.slice();
+
+	let commonPrefixLength = 0;
+	while (
+		commonPrefixLength < protectedPrefixLength &&
+		previous.lines[commonPrefixLength] === next.lines[commonPrefixLength]
+	) {
+		commonPrefixLength += 1;
+	}
+	if (commonPrefixLength >= protectedPrefixLength) return next.lines.slice();
+
+	return [
+		...previous.lines.slice(0, protectedPrefixLength),
+		...next.lines.slice(protectedPrefixLength),
+	];
 }
 
 function oneLine(value) {

@@ -123,6 +123,7 @@ def handle_message(message):
                     "protocolVersion": 1,
                     "agentCapabilities": {
                         "loadSession": True,
+                        "promptCapabilities": {"image": True},
                         "sessionCapabilities": {"list": {}, "resume": {}},
                     },
                     "agentInfo": {

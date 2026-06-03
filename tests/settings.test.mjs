@@ -18,6 +18,7 @@ import {
 	rewriteFullScreenClear,
 	saveSettingsPatch,
 	shouldDropVsCodeAutoActivationInput,
+	stabilizeGrowingRenderedLines,
 	themeNames,
 } from "../src/pi-harness.mjs";
 
@@ -242,6 +243,30 @@ const fullClear = "\x1b[2J\x1b[H\x1b[3J";
 assert.equal(rewriteFullScreenClear(`${fullClear}rendered`), "\x1b8\x1b[Jrendered");
 assert.equal(rewriteFullScreenClear(`${fullClear}rendered`, { alternateScreen: true }), "\x1b[2J\x1b[Hrendered");
 assert.equal(rewriteFullScreenClear(`before\x1b[3Jafter`), "beforeafter");
+assert.deepEqual(
+	stabilizeGrowingRenderedLines(
+		{ width: 20, text: "old", lines: ["a", "b", "c", "d", "tail"] },
+		{ width: 20, text: "older", lines: ["A", "B", "C", "D", "tail", "new"] },
+		2,
+	),
+	["a", "b", "c", "D", "tail", "new"],
+);
+assert.deepEqual(
+	stabilizeGrowingRenderedLines(
+		{ width: 20, text: "old", lines: ["a", "b"] },
+		{ width: 30, text: "older", lines: ["A", "B", "new"] },
+		2,
+	),
+	["A", "B", "new"],
+);
+assert.deepEqual(
+	stabilizeGrowingRenderedLines(
+		{ width: 20, text: "# old", lines: ["# old"], renderer: "plain" },
+		{ width: 20, text: "# older", lines: ["old", "new"], renderer: "markdown" },
+		2,
+	),
+	["old", "new"],
+);
 assert.equal(hideCursorDuringRender("\x1b[?2026hrendered"), "\x1b[?2026h\x1b[?25lrendered");
 assert.equal(hideCursorDuringRender("\x1b[?2026h\x1b[?25lrendered"), "\x1b[?2026h\x1b[?25lrendered");
 assert.equal(hideCursorDuringRender("plain cursor move"), "plain cursor move");
@@ -361,6 +386,30 @@ for (const methodName of ["loadSession", "resumeSession"]) {
 	assert.equal(requests[1].params.sessionId, "previous-session");
 	assert.equal(requests[1].params.modeId, "bypassPermissions");
 }
+
+const promptRequests = [];
+const imagePromptClient = new AcpClient({ command: "fake" }, () => {});
+imagePromptClient.sessionId = "image-session";
+imagePromptClient.request = async (method, params) => {
+	promptRequests.push({ method, params });
+	return {};
+};
+await imagePromptClient.prompt([
+	{ type: "text", text: "describe " },
+	{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" },
+]);
+assert.deepEqual(promptRequests, [
+	{
+		method: "session/prompt",
+		params: {
+			sessionId: "image-session",
+			prompt: [
+				{ type: "text", text: "describe " },
+				{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" },
+			],
+		},
+	},
+]);
 
 const earlyEvents = [];
 const earlyUpdateClient = new AcpClient({ command: "fake" }, (event) => earlyEvents.push(event));
