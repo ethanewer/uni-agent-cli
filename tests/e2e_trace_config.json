@@ -1,0 +1,13 @@
+{
+  "defaultAgent": "trace",
+  "agents": {
+    "trace": {
+      "label": "Trace E2E",
+      "transport": "acp",
+      "acp": {
+        "command": "python3",
+        "args": ["tests/e2e_trace_acp.py"]
+      }
+    }
+  }
+}

@@ -19,6 +19,7 @@ import {
 	saveSettingsPatch,
 	shouldDropVsCodeAutoActivationInput,
 	stabilizeGrowingRenderedLines,
+	stabilizeMutableRenderedLines,
 	themeNames,
 } from "../src/pi-harness.mjs";
 
@@ -33,6 +34,60 @@ function clipboardReplayHarness() {
 		},
 	};
 	return { app, replayed };
+}
+
+function afterToolHarness() {
+	let cancelCount = 0;
+	const app = Object.create(HarnessApp.prototype);
+	app.busy = true;
+	app.afterToolCancelPending = false;
+	app.cancelRequested = false;
+	app.activeToolIds = new Set();
+	app.activeAnonymousToolCount = 0;
+	app.seenToolThisTurn = false;
+	app.promptQueue = [{ text: "queued", timing: "afterTool" }];
+	app.client = {
+		cancel() {
+			cancelCount += 1;
+		},
+	};
+	app.statusState = "working";
+	app.updateSpinner = () => {};
+	app.ui = { requestRender() {} };
+	return { app, cancelCount: () => cancelCount };
+}
+
+function busyPromptHarness(agentName = "codex-acp") {
+	const prompts = [];
+	let cancelCount = 0;
+	const app = Object.create(HarnessApp.prototype);
+	app.ready = true;
+	app.busy = true;
+	app.cancelRequested = false;
+	app.sessionSwitchInProgress = false;
+	app.activeKey = agentName === "codex-acp" ? "codex" : "claude";
+	app.config = config;
+	app.client = {
+		agentInfo: { name: agentName },
+		prompt(prompt) {
+			prompts.push(prompt);
+			return new Promise(() => {});
+		},
+		cancel() {
+			cancelCount += 1;
+		},
+	};
+	app.sessionStates = new Map([[app.activeKey, { agentInfo: { name: agentName } }]]);
+	app.promptQueue = [];
+	app.promptQueueDrainScheduled = false;
+	app.afterToolCancelPending = false;
+	app.seenToolThisTurn = false;
+	app.activeToolIds = new Set();
+	app.activeAnonymousToolCount = 0;
+	app.updateSpinner = () => {};
+	app.ui = { requestRender() {} };
+	app.promptForActiveCapabilities = (text) => text;
+	return { app, prompts, cancelCount: () => cancelCount };
 }
 
 const config = {
@@ -85,6 +140,135 @@ const config = {
 	app.flushBufferedClipboardPasteInput({ allowSubmit: false });
 	assert.deepEqual(replayed, ["a", "b", "c"]);
 	assert.deepEqual(app.bufferedClipboardPasteInput, []);
+}
+
+{
+	const { app, cancelCount } = afterToolHarness();
+	app.trackToolStatus("read-1", "running");
+	app.trackToolStatus("read-2", "running");
+	app.trackToolStatus("read-1", "complete");
+	assert.equal(cancelCount(), 0);
+	assert.equal(app.cancelRequested, false);
+	assert.equal(app.afterToolCancelPending, false);
+	app.trackToolStatus("read-2", "complete");
+	assert.equal(cancelCount(), 1);
+	assert.equal(app.cancelRequested, true);
+	assert.equal(app.afterToolCancelPending, true);
+}
+
+{
+	const { app, cancelCount } = afterToolHarness();
+	app.trackToolStatus(undefined, "running");
+	assert.equal(cancelCount(), 0);
+	app.trackToolStatus(undefined, "complete");
+	assert.equal(cancelCount(), 1);
+}
+
+{
+	const { app, cancelCount } = afterToolHarness();
+	app.trackToolStatus(undefined, "running");
+	app.trackToolStatus(undefined, "running");
+	app.trackToolStatus(undefined, "complete");
+	assert.equal(cancelCount(), 0);
+	assert.equal(app.activeAnonymousToolCount, 1);
+	app.trackToolStatus(undefined, "complete");
+	assert.equal(cancelCount(), 1);
+	assert.equal(app.activeAnonymousToolCount, 0);
+}
+
+{
+	const { app, cancelCount } = afterToolHarness();
+	app.trackToolStatus(undefined, "running", { startsTool: true });
+	app.trackToolStatus(undefined, "running", { startsTool: false });
+	assert.equal(app.activeAnonymousToolCount, 1);
+	app.trackToolStatus(undefined, "complete", { startsTool: false });
+	assert.equal(cancelCount(), 1);
+	assert.equal(app.activeAnonymousToolCount, 0);
+}
+
+{
+	const { app, cancelCount } = afterToolHarness();
+	app.trackToolStatus(undefined, "running", { startsTool: true });
+	app.trackToolStatus(undefined, "complete", { startsTool: true });
+	assert.equal(app.activeAnonymousToolCount, 1);
+	assert.equal(cancelCount(), 0);
+	app.trackToolStatus(undefined, "complete", { startsTool: false });
+	assert.equal(app.activeAnonymousToolCount, 0);
+	assert.equal(cancelCount(), 1);
+}
+
+{
+	const { app, prompts, cancelCount } = busyPromptHarness("codex-acp");
+	app.seenToolThisTurn = true;
+	app.activeToolIds.add("read-1");
+	await app.submitBackendPrompt("steer now");
+	assert.deepEqual(prompts, []);
+	assert.equal(app.promptQueue.length, 1);
+	assert.equal(app.promptQueue[0].text, "steer now");
+	assert.equal(app.promptQueue[0].timing, "afterTool");
+	assert.equal(cancelCount(), 0);
+	app.trackToolStatus("read-1", "complete");
+	assert.equal(cancelCount(), 1);
+}
+
+{
+	const { app, prompts, cancelCount } = busyPromptHarness("codex-acp");
+	app.seenToolThisTurn = true;
+	app.activeToolIds.add("read-1");
+	await app.submitBackendPrompt("first steer");
+	await app.submitBackendPrompt("second queued");
+	assert.deepEqual(prompts, []);
+	assert.equal(app.promptQueue.length, 2);
+	assert.equal(app.promptQueue[0].timing, "afterTool");
+	assert.equal(app.promptQueue[1].timing, "afterTurn");
+	app.trackToolStatus("read-1", "complete");
+	assert.equal(cancelCount(), 1);
+
+	app.promptQueue.shift();
+	app.cancelRequested = false;
+	app.afterToolCancelPending = false;
+	app.seenToolThisTurn = false;
+	app.activeToolIds.clear();
+	app.activeAnonymousToolCount = 0;
+	app.trackToolStatus("next-turn-tool", "running");
+	app.trackToolStatus("next-turn-tool", "complete");
+	assert.equal(cancelCount(), 1);
+}
+
+{
+	const { app, prompts, cancelCount } = busyPromptHarness("fake-acp");
+	app.seenToolThisTurn = true;
+	await app.submitBackendPrompt("queue after tool");
+	assert.deepEqual(prompts, []);
+	assert.equal(app.promptQueue.length, 1);
+	assert.equal(app.promptQueue[0].text, "queue after tool");
+	assert.equal(app.promptQueue[0].timing, "afterTool");
+	assert.equal(cancelCount(), 1);
+}
+
+{
+	const { app, prompts, cancelCount } = busyPromptHarness("codex-acp");
+	app.seenToolThisTurn = true;
+	await app.submitBackendPrompt("/review", { compactCommand: true });
+	assert.deepEqual(prompts, []);
+	assert.equal(app.promptQueue.length, 1);
+	assert.equal(app.promptQueue[0].text, "/review");
+	assert.equal(app.promptQueue[0].timing, "afterTurn");
+	assert.equal(cancelCount(), 0);
+}
+
+{
+	let invalidated = false;
+	const app = Object.create(HarnessApp.prototype);
+	app.ui = { terminal: { rows: 4 } };
+	app.currentAssistantText = {
+		invalidate: () => {
+			invalidated = true;
+		},
+	};
+	app.closeCurrentAssistantText();
+	assert.equal(invalidated, true);
+	assert.equal(app.currentAssistantText, undefined);
 }
 
 const applied = applyHarnessSettings(config, {
@@ -309,6 +493,14 @@ assert.deepEqual(
 		2,
 	),
 	["old", "new"],
+);
+assert.deepEqual(
+	stabilizeMutableRenderedLines(
+		{ width: 20, lines: ["old running", "old complete", "tail"] },
+		{ width: 20, lines: ["new complete", "old complete", "tail", "new tail"] },
+		1,
+	),
+	["old running", "old complete", "tail", "new tail"],
 );
 assert.equal(hideCursorDuringRender("\x1b[?2026hrendered"), "\x1b[?2026h\x1b[?25lrendered");
 assert.equal(hideCursorDuringRender("\x1b[?2026h\x1b[?25lrendered"), "\x1b[?2026h\x1b[?25lrendered");

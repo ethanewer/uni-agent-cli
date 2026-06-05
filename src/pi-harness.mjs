@@ -1686,6 +1686,7 @@ export class HarnessApp {
 		this.cancelRequested = false;
 		this.afterToolCancelPending = false;
 		this.activeToolIds = new Set();
+		this.activeAnonymousToolCount = 0;
 		this.seenToolThisTurn = false;
 		this.pendingPromptDisplay = undefined;
 		this.availableCommands = new Map();
@@ -1823,6 +1824,7 @@ export class HarnessApp {
 		this.sessionSwitchInProgress = false;
 		this.deferredLocalSlashCommands = [];
 		this.activeToolIds.clear();
+		this.activeAnonymousToolCount = 0;
 		this.seenToolThisTurn = false;
 		this.closeCurrentAssistantText();
 		this.currentUserText = undefined;
@@ -2322,7 +2324,12 @@ export class HarnessApp {
 			return;
 		}
 		if (this.busy || this.sessionSwitchInProgress) {
-			this.enqueuePrompt(text, "afterTurn", { displayText, compactCommand: options.compactCommand, promptParts: options.promptParts });
+			const timing = this.busy && !this.sessionSwitchInProgress && !options.compactCommand && this.promptQueue.length === 0 ? "afterTool" : "afterTurn";
+			this.enqueuePrompt(text, timing, {
+				displayText,
+				compactCommand: options.compactCommand,
+				promptParts: options.promptParts,
+			});
 			return;
 		}
 		const pendingUserEcho = this.trackPendingUserEcho(text);
@@ -2340,6 +2347,7 @@ export class HarnessApp {
 		this.cancelRequested = false;
 		this.afterToolCancelPending = false;
 		this.activeToolIds.clear();
+		this.activeAnonymousToolCount = 0;
 		this.seenToolThisTurn = false;
 		this.closeCurrentAssistantText();
 		this.statusState = "working";
@@ -2355,6 +2363,7 @@ export class HarnessApp {
 				for (const id of this.activeToolIds) this.updateTool("canceled", id);
 			}
 			this.activeToolIds.clear();
+			this.activeAnonymousToolCount = 0;
 			this.busy = false;
 			this.closeCurrentAssistantText();
 			this.statusState = this.promptQueue.length > 0 ? "working" : "";
@@ -2395,6 +2404,7 @@ export class HarnessApp {
 		this.promptQueue.push({ text, timing, displayText: options.displayText, compactCommand: options.compactCommand, promptParts: options.promptParts });
 		this.updateSpinner();
 		this.ui.requestRender();
+		if (timing === "afterTool") this.maybeCancelAfterTool();
 		this.schedulePromptQueueDrain();
 	}
 
@@ -2454,6 +2464,7 @@ export class HarnessApp {
 		if (!this.promptQueue.some((entry) => entry.timing === "afterTool")) return;
 		if (!this.seenToolThisTurn) return;
 		if (this.activeToolIds.size > 0) return;
+		if (this.activeAnonymousToolCount > 0) return;
 		this.afterToolCancelPending = true;
 		this.interruptTurn();
 	}
@@ -3119,10 +3130,10 @@ export class HarnessApp {
 			const text = this.consumePendingUserEcho(event.text);
 			if (text) this.appendUserText(text);
 		} else if (event.type === "tool") {
-			this.trackToolStatus(event.id, event.status);
+			this.trackToolStatus(event.id, event.status, { startsTool: true });
 			this.addTool(event.title, event.status, event.id);
 		} else if (event.type === "tool_update") {
-			this.trackToolStatus(event.id, event.status);
+			this.trackToolStatus(event.id, event.status, { startsTool: false });
 			this.updateTool(event.status, event.id, event.title);
 		} else if (event.type === "error") {
 			this.addError(event.message);
@@ -3170,12 +3181,21 @@ export class HarnessApp {
 		return remaining;
 	}
 
-	trackToolStatus(id, status) {
-		if (!id) return;
+	trackToolStatus(id, status, options = {}) {
+		const finishedTool = status !== "running";
 		this.seenToolThisTurn = true;
-		if (status === "running") this.activeToolIds.add(id);
-		else this.activeToolIds.delete(id);
-		this.maybeCancelAfterTool();
+		if (!id) {
+			if (status === "running") {
+				if (options.startsTool !== false) this.activeAnonymousToolCount += 1;
+			} else if (options.startsTool !== true) {
+				this.activeAnonymousToolCount = Math.max(0, this.activeAnonymousToolCount - 1);
+			}
+		} else if (status === "running") {
+			this.activeToolIds.add(id);
+		} else {
+			this.activeToolIds.delete(id);
+		}
+		if (finishedTool) this.maybeCancelAfterTool();
 	}
 
 	updateSpinner() {
@@ -3216,7 +3236,7 @@ export class HarnessApp {
 		this.currentToolSummary = undefined;
 		if (!this.currentUserText) {
 			this.addHistorySpacer("user");
-			this.currentUserText = new MutableUserMessage("");
+			this.currentUserText = new MutableUserMessage("", () => this.ui.terminal.rows);
 			this.chat.addChild(this.currentUserText);
 		}
 		this.currentUserText.append(text);
@@ -3254,7 +3274,7 @@ export class HarnessApp {
 		this.currentUserText = undefined;
 		if (!this.currentToolSummary) {
 			this.addHistorySpacer("tool");
-			this.currentToolSummary = new ToolSummary(() => SPINNER_FRAMES[this.spinnerIndex % SPINNER_FRAMES.length]);
+			this.currentToolSummary = new ToolSummary(() => this.ui.terminal.rows);
 			this.chat.addChild(this.currentToolSummary);
 		}
 		this.currentToolSummary.add(title, status, id);
@@ -3327,9 +3347,9 @@ class MutableMarkdown {
 
 	render(width) {
 		const text = this.text.trimEnd();
-		const renderer = MarkdownComponent ? "markdown" : "plain";
+		const renderer = MarkdownComponent ? "markdown" : (this.cache?.renderer ?? "plain");
 		if (this.cache?.width === width && this.cache.text === text && this.cache.renderer === renderer) return this.cache.lines.slice();
-		const rendered = renderMarkdown(text, width, 0, 0, { color: (content) => chalk.text(content) });
+		const rendered = renderMarkdown(text, width, 0, 0, { color: (content) => chalk.text(content) }, renderer);
 		const lines = stabilizeGrowingRenderedLines(this.cache, { width, text, lines: rendered, renderer }, STREAMING_MARKDOWN_MUTABLE_TAIL_LINES);
 		this.cache = { width, text, lines, renderer };
 		return lines.slice();
@@ -3337,14 +3357,14 @@ class MutableMarkdown {
 }
 
 class MutableUserMessage {
-	constructor(text) {
+	constructor(text, getMutableTailLines = () => Number.POSITIVE_INFINITY) {
 		this.text = text;
+		this.getMutableTailLines = getMutableTailLines;
 		this.cache = undefined;
 	}
 
 	append(text) {
 		this.text += text;
-		this.cache = undefined;
 	}
 
 	invalidate() {
@@ -3352,20 +3372,25 @@ class MutableUserMessage {
 	}
 
 	render(width) {
-		if (this.cache?.width === width && this.cache.text === this.text) return this.cache.lines.slice();
+		const renderer = MarkdownComponent ? "markdown" : (this.cache?.renderer ?? "plain");
+		if (this.cache?.width === width && this.cache.text === this.text && this.cache.renderer === renderer) {
+			return markUserMessageLines(this.cache.lines);
+		}
 		const contentWidth = Math.max(1, width);
-		const body = renderMarkdown(this.text, contentWidth, 0, 0, { color: (content) => chalk.text(content) });
+		const body = renderMarkdown(this.text, contentWidth, 0, 0, { color: (content) => chalk.text(content) }, renderer);
 		const rail = chalk.dim("─".repeat(Math.max(1, width)));
-		const lines = [
+		const rendered = [
 			rail,
 			...body,
 			rail,
 		];
-		if (lines.length === 0) return lines;
-		lines[0] = OSC133_ZONE_START + lines[0];
-		lines[lines.length - 1] = OSC133_ZONE_END + OSC133_ZONE_FINAL + lines[lines.length - 1];
-		this.cache = { width, text: this.text, lines };
-		return lines.slice();
+		const lines = stabilizeGrowingRenderedLines(
+			this.cache,
+			{ width, text: this.text, lines: rendered, renderer },
+			this.getMutableTailLines(),
+		);
+		this.cache = { width, text: this.text, lines, renderer };
+		return markUserMessageLines(lines);
 	}
 }
 
@@ -3390,9 +3415,10 @@ class MutableCommandMessage {
 class CommandMessage extends MutableCommandMessage {}
 
 class ToolSummary {
-	constructor(getSpinner) {
+	constructor(getMutableTailLines = () => 0) {
 		this.tools = [];
-		this.getSpinner = getSpinner;
+		this.getMutableTailLines = getMutableTailLines;
+		this.cache = undefined;
 	}
 
 	add(title, status = "running", id) {
@@ -3411,12 +3437,26 @@ class ToolSummary {
 		return this.tools.find((tool) => tool.id === id);
 	}
 
-	invalidate() {}
+	invalidate() {
+		this.cache = undefined;
+	}
 
 	render(width) {
 		if (this.tools.length === 0) return [];
-		const lines = this.tools.map((tool) => `${toolGlyph(tool.status, this.getSpinner)} ${tool.title}`);
-		return lines.map((line) => chalk.dim(truncateVisual(line, width)));
+		const terminalRows = this.getMutableTailLines();
+		const longSummary = this.tools.length > terminalRows;
+		const rendered = this.tools
+			.map((tool) => `${longSummary ? "•" : toolGlyph(tool.status)} ${tool.title}`)
+			.map((line) => chalk.dim(truncateVisual(line, width)));
+		if (longSummary) rendered.push(chalk.dim(truncateVisual(toolSummaryFooter(this.tools), width)));
+		const previousLineCount = this.cache?.lines.length ?? 0;
+		const mutableTailLines = previousLineCount <= terminalRows ? terminalRows : (longSummary ? 1 : 0);
+		// For summaries taller than the terminal, rewriting historical rows replays
+		// the block into tmux scrollback/copy-mode panes. Keep rows append-stable
+		// and expose status changes through the mutable aggregate footer.
+		const lines = stabilizeMutableRenderedLines(this.cache, { width, lines: rendered }, mutableTailLines);
+		this.cache = { width, lines };
+		return lines.slice();
 	}
 }
 
@@ -3465,11 +3505,36 @@ class LazyCombinedAutocompleteProvider {
 	}
 }
 
-function toolGlyph(status, getSpinner) {
+function toolGlyph(status) {
 	if (status === "complete") return "✓";
 	if (status === "error") return "×";
 	if (status === "canceled") return "×";
-	return getSpinner();
+	return "•";
+}
+
+function toolSummaryFooter(tools) {
+	const counts = new Map();
+	for (const tool of tools) counts.set(tool.status, (counts.get(tool.status) ?? 0) + 1);
+	const parts = [
+		["running", "running"],
+		["complete", "complete"],
+		["error", "error"],
+		["canceled", "canceled"],
+	]
+		.map(([status, label]) => {
+			const count = counts.get(status) ?? 0;
+			return count > 0 ? `${count} ${label}` : undefined;
+		})
+		.filter(Boolean);
+	return `• ${tools.length} tools · ${parts.join(" · ")}`;
+}
+
+function markUserMessageLines(lines) {
+	if (lines.length === 0) return [];
+	const marked = lines.slice();
+	marked[0] = OSC133_ZONE_START + marked[0];
+	marked[marked.length - 1] = OSC133_ZONE_END + OSC133_ZONE_FINAL + marked[marked.length - 1];
+	return marked;
 }
 
 function lastRenderableChild(container) {
@@ -3492,6 +3557,11 @@ export function stabilizeGrowingRenderedLines(previous, next, mutableTailLines =
 	if (!previous || previous.width !== next.width) return next.lines.slice();
 	if (previous.renderer !== next.renderer) return next.lines.slice();
 	if (next.text.length <= previous.text.length || !next.text.startsWith(previous.text)) return next.lines.slice();
+	return stabilizeMutableRenderedLines(previous, next, mutableTailLines);
+}
+
+export function stabilizeMutableRenderedLines(previous, next, mutableTailLines = 0) {
+	if (!previous || previous.width !== next.width) return next.lines.slice();
 	if (next.lines.length < previous.lines.length) return next.lines.slice();
 
 	const protectedPrefixLength = Math.max(0, previous.lines.length - Math.max(0, mutableTailLines));
@@ -3904,9 +3974,9 @@ function dedupeCommands(commands) {
 	return result;
 }
 
-function renderMarkdown(text, width, paddingX = 0, paddingY = 0, defaultTextStyle) {
+function renderMarkdown(text, width, paddingX = 0, paddingY = 0, defaultTextStyle, renderer = MarkdownComponent ? "markdown" : "plain") {
 	const Markdown = MarkdownComponent;
-	if (Markdown) return new Markdown(text, paddingX, paddingY, MARKDOWN_THEME, defaultTextStyle).render(width);
+	if (renderer === "markdown" && Markdown) return new Markdown(text, paddingX, paddingY, MARKDOWN_THEME, defaultTextStyle).render(width);
 	loadMarkdownRenderer();
 	return renderPlainText(text, width, paddingX, paddingY, defaultTextStyle);
 }

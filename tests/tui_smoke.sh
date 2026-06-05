@@ -480,9 +480,6 @@ tmux send-keys -t "$SESSION" s l o w Space t o o l Enter
 wait_for_text "Slow Tool"
 
 tmux send-keys -t "$SESSION" q u e u e d - o n e Enter
-wait_for_text "queued: queued-one"
-
-tmux send-keys -t "$SESSION" Enter
 wait_for_text "after tool: queued-one"
 wait_for_text "echo: queued-one"
 
@@ -492,7 +489,6 @@ wait_without_text "queued-one"
 tmux send-keys -t "$SESSION" s l o w Space t o o l Enter
 wait_for_text "✓ Slow Tool"
 tmux send-keys -t "$SESSION" l a t e - q u e u e Enter
-wait_for_text "queued: late-queue"
 wait_for_text "echo: late-queue"
 
 tmux send-keys -t "$SESSION" / c l e a r Enter
@@ -500,7 +496,6 @@ wait_without_text "late-queue"
 
 tmux send-keys -t "$SESSION" d e l a y e d Space t o o l Enter
 tmux send-keys -t "$SESSION" p r e - t o o l - q u e u e Enter
-tmux send-keys -t "$SESSION" Enter
 wait_for_text "Slow Tool"
 wait_for_text "after tool: pre-tool-queue"
 wait_for_text "echo: pre-tool-queue"
@@ -512,3 +507,61 @@ tmux send-keys -t "$SESSION" C-Space
 tmux send-keys -t "$SESSION" / p e r m i s s i o n - e x i t Enter
 wait_for_text "backend exited"
 wait_without_text "Permission: Permission Exit"
+
+tmux kill-session -t "$SESSION"
+printf '{}\n' > "$SETTINGS_FILE"
+tmux new-session -d -s "$SESSION" -x 100 -y 12 "cd $ROOT_Q && $PANE_ENV PI_TUI_WRITE_LOG=$WRITE_LOG_Q CC_CONFIG=tests/e2e_trace_config.json CC_SETTINGS=$SETTINGS_FILE_Q CC_BACKGROUND_CONNECT_DELAY_MS=0 ./src/cc trace"
+wait_for_text "trace acp"
+tmux send-keys -t "$SESSION" -l "many tools"
+sleep 0.1
+tmux send-keys -t "$SESSION" Enter
+wait_for_text "Trace Tool"
+tmux copy-mode -t "$SESSION"
+tmux send-keys -t "$SESSION" -X page-up
+tmux send-keys -t "$SESSION" -X page-up
+tmux send-keys -t "$SESSION" -X page-up
+sleep 1.8
+if [ "$(tmux display-message -p -t "$SESSION" "#{pane_in_mode}")" != "1" ]; then
+	echo "Trace pane left copy mode while agent was running" >&2
+	capture >&2
+	exit 1
+fi
+tmux send-keys -t "$SESSION" q
+wait_for_text "trace done"
+trace_prompt_count="$(capture_all | awk '$0 == "many tools" { count++ } END { print count + 0 }')"
+trace_tool_1_count="$(capture_all | awk 'index($0, "Trace Tool 01") { count++ } END { print count + 0 }')"
+trace_tool_30_count="$(capture_all | awk 'index($0, "Trace Tool 30") { count++ } END { print count + 0 }')"
+if [ "$trace_prompt_count" != "1" ] || [ "$trace_tool_1_count" != "1" ] || [ "$trace_tool_30_count" != "1" ]; then
+	echo "Trace content duplicated in scrollback: prompt=$trace_prompt_count tool1=$trace_tool_1_count tool30=$trace_tool_30_count" >&2
+	capture_all >&2
+	exit 1
+fi
+
+tmux kill-session -t "$SESSION"
+printf '{}\n' > "$SETTINGS_FILE"
+tmux new-session -d -s "$SESSION" -x 100 -y 12 "cd $ROOT_Q && $PANE_ENV PI_TUI_WRITE_LOG=$WRITE_LOG_Q CC_CONFIG=tests/e2e_trace_config.json CC_SETTINGS=$SETTINGS_FILE_Q CC_BACKGROUND_CONNECT_DELAY_MS=0 ./src/cc trace"
+wait_for_text "trace acp"
+tmux send-keys -t "$SESSION" -l "many user chunks"
+sleep 0.1
+tmux send-keys -t "$SESSION" Enter
+wait_for_text "user trace line"
+tmux copy-mode -t "$SESSION"
+tmux send-keys -t "$SESSION" -X page-up
+tmux send-keys -t "$SESSION" -X page-up
+tmux send-keys -t "$SESSION" -X page-up
+sleep 1.2
+if [ "$(tmux display-message -p -t "$SESSION" "#{pane_in_mode}")" != "1" ]; then
+	echo "User trace pane left copy mode while agent was running" >&2
+	capture >&2
+	exit 1
+fi
+tmux send-keys -t "$SESSION" q
+wait_for_text "user trace done"
+user_trace_prompt_count="$(capture_all | awk '$0 == "many user chunks" { count++ } END { print count + 0 }')"
+user_trace_line_1_count="$(capture_all | awk 'index($0, "user trace line 01") { count++ } END { print count + 0 }')"
+user_trace_line_30_count="$(capture_all | awk 'index($0, "user trace line 30") { count++ } END { print count + 0 }')"
+if [ "$user_trace_prompt_count" != "1" ] || [ "$user_trace_line_1_count" != "1" ] || [ "$user_trace_line_30_count" != "1" ]; then
+	echo "User trace content duplicated in scrollback: prompt=$user_trace_prompt_count line1=$user_trace_line_1_count line30=$user_trace_line_30_count" >&2
+	capture_all >&2
+	exit 1
+fi
