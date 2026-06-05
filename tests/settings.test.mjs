@@ -205,6 +205,9 @@ const config = {
 	assert.deepEqual(prompts, []);
 	assert.equal(app.promptQueue.length, 1);
 	assert.equal(app.promptQueue[0].text, "steer now");
+	assert.equal(app.promptQueue[0].timing, "afterTurn");
+	assert.equal(cancelCount(), 0);
+	app.promoteNextQueuedPromptToAfterTool();
 	assert.equal(app.promptQueue[0].timing, "afterTool");
 	assert.equal(cancelCount(), 0);
 	app.trackToolStatus("read-1", "complete");
@@ -219,6 +222,9 @@ const config = {
 	await app.submitBackendPrompt("second queued");
 	assert.deepEqual(prompts, []);
 	assert.equal(app.promptQueue.length, 2);
+	assert.equal(app.promptQueue[0].timing, "afterTurn");
+	assert.equal(app.promptQueue[1].timing, "afterTurn");
+	app.promoteNextQueuedPromptToAfterTool();
 	assert.equal(app.promptQueue[0].timing, "afterTool");
 	assert.equal(app.promptQueue[1].timing, "afterTurn");
 	app.trackToolStatus("read-1", "complete");
@@ -242,6 +248,9 @@ const config = {
 	assert.deepEqual(prompts, []);
 	assert.equal(app.promptQueue.length, 1);
 	assert.equal(app.promptQueue[0].text, "queue after tool");
+	assert.equal(app.promptQueue[0].timing, "afterTurn");
+	assert.equal(cancelCount(), 0);
+	app.promoteNextQueuedPromptToAfterTool();
 	assert.equal(app.promptQueue[0].timing, "afterTool");
 	assert.equal(cancelCount(), 1);
 }

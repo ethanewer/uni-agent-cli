@@ -480,6 +480,8 @@ tmux send-keys -t "$SESSION" s l o w Space t o o l Enter
 wait_for_text "Slow Tool"
 
 tmux send-keys -t "$SESSION" q u e u e d - o n e Enter
+wait_for_text "queued: queued-one"
+tmux send-keys -t "$SESSION" Enter
 wait_for_text "after tool: queued-one"
 wait_for_text "echo: queued-one"
 
@@ -496,6 +498,7 @@ wait_without_text "late-queue"
 
 tmux send-keys -t "$SESSION" d e l a y e d Space t o o l Enter
 tmux send-keys -t "$SESSION" p r e - t o o l - q u e u e Enter
+tmux send-keys -t "$SESSION" Enter
 wait_for_text "Slow Tool"
 wait_for_text "after tool: pre-tool-queue"
 wait_for_text "echo: pre-tool-queue"

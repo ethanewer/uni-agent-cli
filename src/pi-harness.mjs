@@ -2324,8 +2324,7 @@ export class HarnessApp {
 			return;
 		}
 		if (this.busy || this.sessionSwitchInProgress) {
-			const timing = this.busy && !this.sessionSwitchInProgress && !options.compactCommand && this.promptQueue.length === 0 ? "afterTool" : "afterTurn";
-			this.enqueuePrompt(text, timing, {
+			this.enqueuePrompt(text, "afterTurn", {
 				displayText,
 				compactCommand: options.compactCommand,
 				promptParts: options.promptParts,
