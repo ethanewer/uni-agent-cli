@@ -1780,7 +1780,22 @@ export class HarnessApp {
 
 	endResize(options = {}) {
 		this.resizeActive = false;
-		if (options.render !== false) this.ui.requestRender(true);
+		if (options.render !== false) {
+			this.prepareResizeFullClear();
+			this.ui.requestRender(true);
+		}
+	}
+
+	prepareResizeFullClear() {
+		const terminal = this.ui.terminal;
+		if (typeof terminal.useFullClearReplacementOnce !== "function") return;
+		const height = Math.max(1, this.ui.previousHeight || terminal.rows || 1);
+		const screenRow = Math.max(
+			0,
+			Math.min(height - 1, (this.ui.hardwareCursorRow || 0) - (this.ui.previousViewportTop || 0)),
+		);
+		const moveToFrameTop = screenRow > 0 ? `\x1b[${screenRow}A` : "";
+		terminal.useFullClearReplacementOnce(`\r${moveToFrameTop}\x1b[J\x1b7`);
 	}
 
 	adoptPrepaintedFrame() {
@@ -4407,6 +4422,10 @@ function createHarnessTerminal(resizeHooks = {}) {
 	const write = terminal.write.bind(terminal);
 	const useAlternateScreen = isVsCodeTerminal();
 	let resizeTimer;
+	let fullClearReplacementOnce;
+	terminal.useFullClearReplacementOnce = (replacement) => {
+		fullClearReplacementOnce = replacement;
+	};
 	terminal.start = (onInput, onResize) => {
 		start(onInput, () => {
 			if (RESIZE_SETTLE_DELAY_MS <= 0) {
@@ -4446,7 +4465,10 @@ function createHarnessTerminal(resizeHooks = {}) {
 		if (useAlternateScreen) write("\x1b[?1049l\x1b[?25h");
 	};
 	terminal.write = (data) => {
-		const rewritten = rewriteFullScreenClear(data, { alternateScreen: useAlternateScreen });
+		const hasFullClear = data.includes("\x1b[2J\x1b[H\x1b[3J");
+		const fullClearReplacement = hasFullClear ? fullClearReplacementOnce : undefined;
+		if (hasFullClear) fullClearReplacementOnce = undefined;
+		const rewritten = rewriteFullScreenClear(data, { alternateScreen: useAlternateScreen, fullClearReplacement });
 		write(hideCursorDuringRender(rewritten));
 	};
 	return terminal;
@@ -4478,7 +4500,7 @@ export function rewriteFullScreenClear(data, options = {}) {
 	if (!data.includes("\x1b[3J")) return data;
 	if (!data.includes(fullClear)) return data.replaceAll("\x1b[3J", "");
 	if (options.alternateScreen) return data.replaceAll(fullClear, "\x1b[2J\x1b[H");
-	return data.replaceAll(fullClear, "\x1b8\x1b[J");
+	return data.replaceAll(fullClear, options.fullClearReplacement ?? "\x1b8\x1b[J\x1b7");
 }
 
 export function isVsCodeTerminal(env = process.env) {

@@ -476,8 +476,9 @@ assert.deepEqual(
 );
 
 const fullClear = "\x1b[2J\x1b[H\x1b[3J";
-assert.equal(rewriteFullScreenClear(`${fullClear}rendered`), "\x1b8\x1b[Jrendered");
+assert.equal(rewriteFullScreenClear(`${fullClear}rendered`), "\x1b8\x1b[J\x1b7rendered");
 assert.equal(rewriteFullScreenClear(`${fullClear}rendered`, { alternateScreen: true }), "\x1b[2J\x1b[Hrendered");
+assert.equal(rewriteFullScreenClear(`${fullClear}rendered`, { fullClearReplacement: "\r\x1b[4A\x1b[J\x1b7" }), "\r\x1b[4A\x1b[J\x1b7rendered");
 assert.equal(rewriteFullScreenClear(`before\x1b[3Jafter`), "beforeafter");
 assert.deepEqual(
 	stabilizeGrowingRenderedLines(

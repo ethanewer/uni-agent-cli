@@ -160,6 +160,18 @@ assert_exact_line_count() {
 	fi
 }
 
+assert_visible_contains_count() {
+	local needle="$1"
+	local expected="$2"
+	local actual
+	actual="$(capture | awk -v needle="$needle" 'index($0, needle) { count++ } END { print count + 0 }')"
+	if [ "$actual" != "$expected" ]; then
+		echo "Expected $expected visible line(s) containing: $needle; got $actual" >&2
+		capture >&2
+		exit 1
+	fi
+}
+
 assert_exact_scrollback_count() {
 	local needle="$1"
 	local expected="$2"
@@ -198,6 +210,13 @@ wait_for_text "Space to record"
 tmux resize-window -t "$SESSION" -x 110 -y 32
 wait_for_text "Space to record"
 assert_exact_scrollback_count "Space to record" 1
+
+for size in 72x18 128x36 81x22 118x30 74x12 110x32; do
+	tmux resize-window -t "$SESSION" -x "${size%x*}" -y "${size#*x}"
+	sleep 0.03
+done
+wait_for_text "Space to record"
+assert_visible_contains_count "Space to record" 1
 
 tmux resize-window -t "$SESSION" -x 74 -y 12
 wait_for_text "Space to record"
