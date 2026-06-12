@@ -90,6 +90,25 @@ function busyPromptHarness(agentName = "codex-acp") {
 	return { app, prompts, cancelCount: () => cancelCount };
 }
 
+function normalizedToolStatusEvents(statuses) {
+	const events = [];
+	const client = Object.create(AcpClient.prototype);
+	client.sessionId = "fake-session";
+	client.onEvent = (event) => events.push(event);
+	client.bufferingSessionUpdates = false;
+	for (const status of statuses) {
+		client.handleSessionUpdate({
+			sessionId: "fake-session",
+			update: {
+				sessionUpdate: "tool_call_update",
+				toolCallId: "tool-1",
+				status,
+			},
+		});
+	}
+	return events.map((event) => event.status);
+}
+
 const config = {
 	defaultAgent: "codex",
 	agents: {
@@ -154,6 +173,33 @@ const config = {
 	assert.equal(cancelCount(), 1);
 	assert.equal(app.cancelRequested, true);
 	assert.equal(app.afterToolCancelPending, true);
+}
+
+{
+	const { app, cancelCount } = afterToolHarness();
+	app.trackToolStatus("read-1", "running");
+	app.trackToolStatus(undefined, "complete", { startsTool: false });
+	assert.equal(cancelCount(), 1);
+	assert.equal(app.activeToolIds.size, 0);
+	assert.equal(app.cancelRequested, true);
+	assert.equal(app.afterToolCancelPending, true);
+}
+
+{
+	const { app, cancelCount } = afterToolHarness();
+	app.trackToolStatus("read-1", "running");
+	app.trackToolStatus(undefined, "complete", { startsTool: true });
+	assert.equal(cancelCount(), 0);
+	assert.deepEqual([...app.activeToolIds], ["read-1"]);
+	assert.equal(app.cancelRequested, false);
+	assert.equal(app.afterToolCancelPending, false);
+}
+
+{
+	assert.deepEqual(
+		normalizedToolStatusEvents(["finished", "finished-successfully", "timed out", "errored"]),
+		["complete", "complete", "canceled", "error"],
+	);
 }
 
 {

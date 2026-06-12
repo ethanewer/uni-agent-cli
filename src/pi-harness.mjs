@@ -3201,8 +3201,11 @@ export class HarnessApp {
 		if (!id) {
 			if (status === "running") {
 				if (options.startsTool !== false) this.activeAnonymousToolCount += 1;
-			} else if (options.startsTool !== true) {
+			} else if (this.activeAnonymousToolCount > 0 && options.startsTool !== true) {
 				this.activeAnonymousToolCount = Math.max(0, this.activeAnonymousToolCount - 1);
+			} else if (options.startsTool === false) {
+				const latestActiveId = [...this.activeToolIds].pop();
+				if (latestActiveId) this.activeToolIds.delete(latestActiveId);
 			}
 		} else if (status === "running") {
 			this.activeToolIds.add(id);
@@ -3678,9 +3681,36 @@ function humanizePermissionKind(kind) {
 
 function normalizedToolStatus(status) {
 	const value = oneLine(status).toLowerCase();
-	if (["completed", "complete", "succeeded", "success", "done"].includes(value)) return "complete";
-	if (["failed", "failure", "error"].includes(value)) return "error";
-	if (["canceled", "cancelled"].includes(value)) return "canceled";
+	const normalized = value.replace(/[\s-]+/g, "_");
+	if ([
+		"completed",
+		"complete",
+		"succeeded",
+		"success",
+		"done",
+		"finished",
+		"finished_successfully",
+		"successful",
+		"ok",
+		"passed",
+	].includes(normalized)) return "complete";
+	if ([
+		"failed",
+		"failure",
+		"error",
+		"errored",
+		"rejected",
+		"denied",
+	].includes(normalized)) return "error";
+	if ([
+		"canceled",
+		"cancelled",
+		"aborted",
+		"abort",
+		"stopped",
+		"timed_out",
+		"timeout",
+	].includes(normalized)) return "canceled";
 	return "running";
 }
 
