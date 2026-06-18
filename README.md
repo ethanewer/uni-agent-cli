@@ -64,6 +64,8 @@ Queued messages are shown above the input box (`after tool: …` / `queued: …`
 /harness exit       # quit
 ```
 
+The harness you pick with `/harness` is remembered (written to `settings.json` as `defaultAgent`) and becomes the default the next time you launch `cc` with no agent argument. Naming an agent on the command line (`cc claude`) still overrides it for that session.
+
 ## Slash commands
 
 Agent-advertised ACP commands appear in autocomplete and are forwarded to that backend (a backend command always takes precedence over a same-named local command, except the reserved UI commands below). `cc` implements these locally for every backend:

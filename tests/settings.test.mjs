@@ -495,6 +495,38 @@ try {
 	fs.rmSync(tempSettingsDir, { recursive: true, force: true });
 }
 
+// A harness picked via /harness is persisted to settings and becomes the
+// default on the next load; a stale/unknown key falls back to config.
+{
+	const prevSettings = process.env.CC_SETTINGS;
+	const prevConfig = process.env.CC_CONFIG;
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-harness-"));
+	try {
+		const settingsFile = path.join(dir, "settings.json");
+		process.env.CC_SETTINGS = settingsFile;
+		process.env.CC_CONFIG = path.join(process.cwd(), "tests", "fake_config.json");
+
+		const saved = saveSettingsPatch({ defaultAgent: "cursor" });
+		assert.equal(saved.defaultAgent, "cursor");
+		assert.equal(JSON.parse(fs.readFileSync(settingsFile, "utf8")).defaultAgent, "cursor");
+		assert.equal(loadConfig().defaultAgent, "cursor");
+
+		// A persisted key that no longer maps to an agent falls back to the config default.
+		saveSettingsPatch({ defaultAgent: "ghost-harness" });
+		assert.equal(loadConfig().defaultAgent, "fake");
+
+		// applyHarnessSettings ignores a key with no matching agent.
+		assert.equal(applyHarnessSettings(config, { agents: {}, defaultAgent: "claude" }).defaultAgent, "claude");
+		assert.equal(applyHarnessSettings(config, { agents: {}, defaultAgent: "nope" }).defaultAgent, config.defaultAgent);
+	} finally {
+		if (prevSettings === undefined) delete process.env.CC_SETTINGS;
+		else process.env.CC_SETTINGS = prevSettings;
+		if (prevConfig === undefined) delete process.env.CC_CONFIG;
+		else process.env.CC_CONFIG = prevConfig;
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+}
+
 assert.deepEqual(
 	autoPermissionOutcome({
 		options: [

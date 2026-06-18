@@ -806,12 +806,12 @@ class AgentMenu {
 		}
 		if (data >= "1" && data <= "9") {
 			const key = keys[Number(data) - 1];
-			if (key) void this.app.switchAgent(key, "acp", { displayText: slashPromptDisplay("/harness", this.app.config.agents[key]?.label ?? key) });
+			if (key) void this.app.switchAgent(key, "acp", { persist: true, displayText: slashPromptDisplay("/harness", this.app.config.agents[key]?.label ?? key) });
 			return;
 		}
 		if (matchesKey(data, "enter") || data === "\r" || data === "\n") {
 			const key = keys[this.selected];
-			if (key) void this.app.switchAgent(key, "acp", { displayText: slashPromptDisplay("/harness", this.app.config.agents[key]?.label ?? key) });
+			if (key) void this.app.switchAgent(key, "acp", { persist: true, displayText: slashPromptDisplay("/harness", this.app.config.agents[key]?.label ?? key) });
 		}
 	}
 }
@@ -2364,6 +2364,18 @@ export class HarnessApp {
 		if (this.client) this.client.stop();
 		this.activeKey = key;
 		this.transport = transport;
+		// Remember an explicit harness pick so it carries over to the next `cc`
+		// session, mirroring how /theme persists. Best-effort: a failed write
+		// should not block switching.
+		if (options.persist) {
+			try {
+				saveSettingsPatch({ defaultAgent: key });
+				this.config.defaultAgent = key;
+				this.config.settings = { ...(this.config.settings ?? {}), defaultAgent: key };
+			} catch (error) {
+				this.addError(`Could not save harness: ${error.message ?? error}`);
+			}
+		}
 		this.ready = false;
 		this.busy = false;
 		this.cancelRequested = false;
@@ -3175,7 +3187,7 @@ export class HarnessApp {
 			this.addNotice(`usage: /harness [${Object.keys(this.config.agents).join("|")}]`);
 			return;
 		}
-		await this.switchAgent(agentKey, "acp", { displayText: slashPromptDisplay("/harness", this.config.agents[agentKey]?.label ?? agentKey) });
+		await this.switchAgent(agentKey, "acp", { persist: true, displayText: slashPromptDisplay("/harness", this.config.agents[agentKey]?.label ?? agentKey) });
 	}
 
 	async handleSlashCommand(text) {
@@ -5945,7 +5957,10 @@ export function applyHarnessSettings(config, settings = {}) {
 	for (const [key, agent] of Object.entries(config.agents ?? {})) {
 		agents[key] = applyAgentSettings(key, agent, normalized[key] ?? {});
 	}
-	return { ...config, settings, theme: settings.theme, agents };
+	// A harness persisted from a prior session (via /harness) becomes the default
+	// when no harness is named on the command line. Ignore stale keys.
+	const defaultAgent = typeof settings.defaultAgent === "string" && agents[settings.defaultAgent] ? settings.defaultAgent : config.defaultAgent;
+	return { ...config, defaultAgent, settings, theme: settings.theme, agents };
 }
 
 export function saveSettingsPatch(patch) {
@@ -5962,6 +5977,7 @@ function normalizeSettings(settings = {}, fallbackTheme = DEFAULT_SETTINGS.theme
 	normalized.agents = isPlainObject(normalized.agents) ? normalized.agents : {};
 	normalized.theme =
 		resolveThemeName(Object.prototype.hasOwnProperty.call(normalized, "theme") ? normalized.theme : fallbackTheme) ?? DEFAULT_SETTINGS.theme;
+	if (typeof normalized.defaultAgent !== "string" || !normalized.defaultAgent) delete normalized.defaultAgent;
 	return normalized;
 }
 
