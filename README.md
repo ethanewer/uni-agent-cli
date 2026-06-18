@@ -97,12 +97,13 @@ Forking support is per-backend:
 - **Codex** has no ACP fork, so `cc` copies the session's rollout file to a new id and `session/load`s the copy — an isolated branch with full history + tools, original untouched (this reads/writes `~/.codex` session files and is sensitive to Codex's on-disk format; if it can't fork it reports why in the pane).
 - **Cursor** does not support forking, so `/btw` reports that it's unavailable there.
 
-### ultracode and workflows (Claude Code)
+### Effort levels, ultracode, and workflows (Claude Code)
 
-Claude's `ultracode` effort level and multi-agent **workflows** run inside the Claude backend, so they "just work" through `cc`:
+`cc` is a thin ACP client with no ultracode-specific handling. Claude's `ultracode` effort level is a feature of the interactive `claude` CLI's own main loop — keyword detection, the standing workflow opt-in, and the effort bump all run *above* the Agent SDK. The `claude-agent-acp` backend drives the SDK query loop directly and does not reproduce that layer, so:
 
-- Select the effort level with `/effort` when `claude-agent-acp` advertises it, or simply include the keyword `ultracode` in your prompt.
-- Workflow/sub-agent fan-out streams back as nested tool calls and plan updates, which `cc` renders live. Use `Esc` to cancel.
+- **Typing `ultracode` in a prompt has no special effect** through `cc`. The keyword is forwarded to the backend as plain text, but the app-layer machinery that would normally pick it up never runs over ACP.
+- **`/effort` only offers a reasoning level when `claude-agent-acp` advertises one** as an ACP config option. If it doesn't, `cc` reports "Reasoning selection is not advertised by this agent" — and it currently does not advertise an `ultracode` tier.
+- When a backend *does* run multi-agent **workflows** or sub-agent fan-out, `cc` renders the nested tool calls and plan updates live, and `Esc` cancels the turn. This is generic ACP rendering, not ultracode-specific.
 
 ### Cursor
 
