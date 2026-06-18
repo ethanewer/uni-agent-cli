@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 import { spawn, spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline";
+import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Editor } from "@mariozechner/pi-tui/dist/components/editor.js";
 import { Spacer } from "@mariozechner/pi-tui/dist/components/spacer.js";
@@ -14,6 +16,8 @@ import { Container, TUI } from "@mariozechner/pi-tui/dist/tui.js";
 import { normalizeTerminalOutput, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui/dist/utils.js";
 
 const HARNESS = "/harness";
+// Commands the shared UI always owns, even if a backend advertises the same name.
+const RESERVED_LOCAL_COMMANDS = new Set(["harness", "help", "status", "clear", "voice", "theme", "btw", "diff", "copy"]);
 const SOURCE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const HARNESS_ROOT = path.join(SOURCE_DIR, "harnesses");
 const HARNESS_PYTHON = resolveHarnessPython();
@@ -1031,6 +1035,366 @@ class ThemePanel {
 	}
 }
 
+// A forked side conversation ("/btw"). It owns its own AcpClient (a separate
+// backend process whose session is a fork/resume of the main session, so it has
+// full context AND tools), its own chat container, and its own streaming/turn
+// state — so it can run concurrently with the main thread without clobbering it.
+// It reuses the same hardened render components as the main thread.
+class BtwThread {
+	constructor(app, client, question) {
+		this.app = app;
+		this.client = client;
+		this.question = question;
+		this.chat = new Container();
+		this.sessionId = undefined;
+		this.state = "connecting"; // connecting | ready | working | done | error
+		this.statusState = "connecting";
+		this.busy = false;
+		this.cancelRequested = false;
+		this.activeToolIds = new Set();
+		this.activeAnonymousToolCount = 0;
+		this.seenToolThisTurn = false;
+		this.currentAssistantText = undefined;
+		this.currentUserText = undefined;
+		this.currentToolSummary = undefined;
+		this.lastAssistantText = "";
+		this.pendingUserEchoes = [];
+		this.queue = [];
+		this.ready = false;
+		this.cancelGraceTimer = undefined;
+		// Page-view scroll state for this fork thread.
+		this.view = { offset: 0, stick: true };
+	}
+
+	terminalRows() {
+		return this.app.ui.terminal.rows;
+	}
+
+	clearCancelGraceTimer() {
+		if (this.cancelGraceTimer) {
+			clearTimeout(this.cancelGraceTimer);
+			this.cancelGraceTimer = undefined;
+		}
+	}
+
+	handleEvent(event) {
+		// Until the fork is ready, drop streamed content. This discards the parent
+		// transcript that session/load replays while the fork is being established,
+		// so the side pane shows only the new conversation (the parent thread is
+		// already visible above). Establishment errors surface via runBtw's catch.
+		if (!this.ready) return;
+		if (event.type === "text") this.appendAssistantText(event.text);
+		else if (event.type === "line") this.addNotice(event.text);
+		else if (event.type === "user_text") {
+			const text = this.consumeUserEcho(event.text);
+			if (text) this.appendUserText(text);
+		} else if (event.type === "tool") {
+			this.trackToolStatus(event.id, event.status, { startsTool: true });
+			this.addTool(event.title, event.status, event.id);
+		} else if (event.type === "tool_update") {
+			this.trackToolStatus(event.id, event.status, { startsTool: false });
+			this.updateTool(event.status, event.id, event.title);
+		} else if (event.type === "error") {
+			this.addError(event.message);
+		} else if (event.type === "cursor_todos") {
+			this.addNotice(cursorTodosText(event.todos));
+		} else if (event.type === "backend_exit") {
+			this.busy = false;
+			this.statusState = "";
+			this.state = "error";
+			this.closeCurrentAssistantText();
+		}
+		this.app.onThreadActivity();
+	}
+
+	async submit(text, promptParts) {
+		const trimmed = text.trim();
+		if (!trimmed) return;
+		if (!this.client || this.client.exited) {
+			this.addError("Side thread backend has exited — press esc to close.");
+			this.app.onThreadActivity();
+			return;
+		}
+		// Queue until the fork session is established (ready), or while busy.
+		if (!this.ready || this.busy) {
+			this.queue.push({ text: trimmed, promptParts });
+			this.app.onThreadActivity();
+			return;
+		}
+		this.addUserMessage(trimmed);
+		await this.sendPrompt(trimmed, promptParts);
+	}
+
+	// Called once the fork session exists; flushes anything typed while connecting.
+	markReady() {
+		this.ready = true;
+		if (this.state === "connecting") {
+			this.state = "ready";
+			this.statusState = "";
+		}
+		this.drainQueue();
+	}
+
+	drainQueue() {
+		if (!this.ready || this.busy || this.queue.length === 0) return;
+		const next = this.queue.shift();
+		this.addUserMessage(next.text);
+		void this.sendPrompt(next.text, next.promptParts);
+	}
+
+	async sendPrompt(text, promptParts) {
+		if (!this.client || this.client.exited) return;
+		this.busy = true;
+		this.cancelRequested = false;
+		this.activeToolIds.clear();
+		this.activeAnonymousToolCount = 0;
+		this.seenToolThisTurn = false;
+		this.closeCurrentAssistantText();
+		this.state = "working";
+		this.statusState = "working";
+		this.app.onThreadActivity();
+		const echo = this.trackUserEcho(text);
+		// Only attach images if the fork's backend advertises image support.
+		const payload = promptParts && imagePromptCapability(this.client.capabilities) === true ? promptParts : text;
+		try {
+			const result = await this.client.prompt(payload);
+			if (!this.cancelRequested && result?.stopReason === "refusal") this.addNotice("The model declined to respond.");
+		} catch (error) {
+			this.addError(error.message ?? String(error));
+		} finally {
+			this.clearCancelGraceTimer();
+			this.expireUserEcho(echo);
+			if (this.cancelRequested) {
+				for (const id of this.activeToolIds) this.updateTool("canceled", id);
+			}
+			this.activeToolIds.clear();
+			this.activeAnonymousToolCount = 0;
+			this.busy = false;
+			this.closeCurrentAssistantText();
+			this.state = "done";
+			this.statusState = "";
+			this.app.onThreadActivity();
+			if (!this.cancelRequested) this.drainQueue();
+		}
+	}
+
+	interrupt() {
+		if (!this.busy || !this.client || this.cancelRequested) return;
+		this.cancelRequested = true;
+		this.statusState = "canceling";
+		this.client.cancel();
+		this.app.onThreadActivity();
+		// Force-settle if the backend acknowledges cancel but never finishes.
+		this.clearCancelGraceTimer();
+		this.cancelGraceTimer = setTimeout(() => this.client?.forceResolvePrompt?.(), 8000);
+		this.cancelGraceTimer?.unref?.();
+	}
+
+	stop() {
+		this.clearCancelGraceTimer();
+		this.client?.stop?.();
+	}
+
+	trackUserEcho(text) {
+		const entry = { remaining: text };
+		this.pendingUserEchoes.push(entry);
+		return entry;
+	}
+
+	expireUserEcho(entry) {
+		if (!entry) return;
+		const index = this.pendingUserEchoes.indexOf(entry);
+		if (index !== -1) this.pendingUserEchoes.splice(index, 1);
+	}
+
+	consumeUserEcho(text) {
+		let remaining = text;
+		while (remaining && this.pendingUserEchoes.length > 0) {
+			const pending = this.pendingUserEchoes[0].remaining;
+			if (pending.startsWith(remaining)) {
+				const next = pending.slice(remaining.length);
+				if (next) this.pendingUserEchoes[0].remaining = next;
+				else this.pendingUserEchoes.shift();
+				return "";
+			}
+			if (remaining.startsWith(pending)) {
+				remaining = remaining.slice(pending.length);
+				this.pendingUserEchoes.shift();
+				continue;
+			}
+			this.pendingUserEchoes.shift();
+		}
+		return remaining;
+	}
+
+	trackToolStatus(id, status, options = {}) {
+		this.seenToolThisTurn = true;
+		if (!id) {
+			if (status === "running") {
+				if (options.startsTool !== false) this.activeAnonymousToolCount += 1;
+			} else if (this.activeAnonymousToolCount > 0 && options.startsTool !== true) {
+				this.activeAnonymousToolCount = Math.max(0, this.activeAnonymousToolCount - 1);
+			} else if (options.startsTool === false) {
+				const latestActiveId = [...this.activeToolIds].pop();
+				if (latestActiveId) this.activeToolIds.delete(latestActiveId);
+			}
+		} else if (status === "running") {
+			this.activeToolIds.add(id);
+		} else {
+			this.activeToolIds.delete(id);
+		}
+	}
+
+	addUserMessage(text) {
+		this.currentUserText = undefined;
+		this.currentToolSummary = undefined;
+		this.addHistorySpacer("user");
+		this.chat.addChild(new UserMessage(text));
+	}
+
+	appendUserText(text) {
+		this.closeCurrentAssistantText();
+		this.currentToolSummary = undefined;
+		if (!this.currentUserText) {
+			this.addHistorySpacer("user");
+			this.currentUserText = new MutableUserMessage("", () => this.terminalRows());
+			this.chat.addChild(this.currentUserText);
+		}
+		this.currentUserText.append(text);
+	}
+
+	appendAssistantText(text) {
+		this.currentUserText = undefined;
+		this.currentToolSummary = undefined;
+		if (!this.currentAssistantText) {
+			this.addHistorySpacer("assistant");
+			this.currentAssistantText = new MutableMarkdown("");
+			this.chat.addChild(this.currentAssistantText);
+		}
+		this.currentAssistantText.append(text);
+	}
+
+	addNotice(text) {
+		this.closeCurrentAssistantText();
+		this.currentUserText = undefined;
+		this.currentToolSummary = undefined;
+		this.addHistorySpacer("notice");
+		this.chat.addChild(new Text(chalk.dim(text), 0, 0));
+	}
+
+	addError(text) {
+		this.closeCurrentAssistantText();
+		this.currentUserText = undefined;
+		this.currentToolSummary = undefined;
+		this.addHistorySpacer("error");
+		this.chat.addChild(new Text(chalk.red(`! ${text}`), 0, 0));
+	}
+
+	addTool(title, status, id) {
+		this.closeCurrentAssistantText();
+		this.currentUserText = undefined;
+		if (!this.currentToolSummary) {
+			this.addHistorySpacer("tool");
+			this.currentToolSummary = new ToolSummary(() => this.terminalRows());
+			this.chat.addChild(this.currentToolSummary);
+		}
+		this.currentToolSummary.add(title, status, id);
+	}
+
+	updateTool(status, id, title) {
+		if (!this.currentToolSummary) {
+			this.addTool(title ?? "tool", status, id);
+			return;
+		}
+		this.currentToolSummary.update(status, id, title);
+	}
+
+	closeCurrentAssistantText() {
+		const text = this.currentAssistantText?.text?.trim();
+		if (text) this.lastAssistantText = this.currentAssistantText.text;
+		this.currentAssistantText?.invalidate();
+		this.currentAssistantText = undefined;
+	}
+
+	addHistorySpacer(kind) {
+		const last = lastRenderableChild(this.chat);
+		if (!last) return;
+		if (last instanceof CommandMessage) {
+			if (kind === "command" || kind === "assistant" || kind === "notice" || kind === "tool") return;
+		}
+		this.chat.addChild(new Spacer(1));
+	}
+}
+
+// The single top-level view. Normally it renders the stacked layout (chat,
+// menus, queue, editor, status) exactly as before — so the no-fork experience is
+// unchanged. While a /btw fork is open it switches to a Codex-style PAGE VIEW: a
+// frame exactly terminal.rows tall (a header tab-bar + one app-scrolled thread
+// transcript + the pinned menu/queue/editor/status). Because the frame never
+// exceeds the screen height, nothing spills into terminal scrollback and the
+// per-thread scroll offset is the only way to see earlier content — clean,
+// switchable paging without the alternate screen.
+class RootView {
+	constructor(app) {
+		this.app = app;
+	}
+
+	invalidate() {}
+
+	render(width) {
+		const app = this.app;
+		if (!app.pageViewActive) {
+			return [
+				...app.chat.render(width),
+				...app.commandPanel.render(width),
+				...app.queueSummary.render(width),
+				...app.editor.render(width),
+				...app.status.render(width),
+			];
+		}
+		return this.renderPage(width);
+	}
+
+	renderPage(width) {
+		const app = this.app;
+		const rows = app.ui.terminal.rows || 24;
+		const onBtw = app.focusedThread === "btw" && Boolean(app.btwThread);
+		const chat = onBtw ? app.btwThread.chat : app.chat;
+		const view = onBtw ? app.btwThread.view : app.mainView;
+		// Pinned bottom UI — each component already returns width-correct lines.
+		const menuLines = app.commandPanel.render(width);
+		const queueLines = onBtw ? [] : app.queueSummary.render(width);
+		const editorLines = app.editor.render(width);
+		const statusLines = app.status.render(width);
+		const body = chat.render(width);
+		const viewportH = Math.max(0, rows - 1 - menuLines.length - queueLines.length - editorLines.length - statusLines.length);
+		const maxOffset = Math.max(0, body.length - viewportH);
+		if (view.stick) view.offset = maxOffset;
+		view.offset = Math.min(Math.max(0, view.offset), maxOffset);
+		// At the bottom re-engages follow (covers End and paging to the bottom).
+		if (view.offset >= maxOffset) view.stick = true;
+		const slice = body.slice(view.offset, view.offset + viewportH);
+		while (slice.length < viewportH) slice.push("");
+		const frame = [this.headerLine(width, maxOffset, view.offset), ...slice, ...menuLines, ...queueLines, ...editorLines, ...statusLines];
+		// Never exceed the screen height — surplus rows would scroll into terminal
+		// scrollback (e.g. a tall permission menu on a short terminal). Keep the
+		// bottom (editor + status + cursor marker) visible.
+		return frame.length > rows ? frame.slice(frame.length - rows) : frame;
+	}
+
+	headerLine(width, maxOffset, offset) {
+		const app = this.app;
+		const onBtw = app.focusedThread === "btw" && Boolean(app.btwThread);
+		const mainTab = (onBtw ? chalk.dim : chalk.blue)(`${onBtw ? "  " : "› "}main`);
+		const btwTab = (onBtw ? chalk.blue : chalk.dim)(`${onBtw ? "› " : "  "}btw (fork)`);
+		const left = `${mainTab}   ${btwTab}`;
+		const pct = maxOffset > 0 ? ` ${Math.round((offset / maxOffset) * 100)}%` : "";
+		const right = chalk.dim(`shift+tab switch · pgup/pgdn scroll · esc close${pct}`);
+		const gap = Math.max(1, width - visibleWidth(left) - visibleWidth(right));
+		return truncateVisual(`${left}${" ".repeat(gap)}${right}`, width);
+	}
+}
+
 class ManagedTerminal {
 	constructor(id, params) {
 		this.id = id;
@@ -1051,8 +1415,12 @@ class ManagedTerminal {
 			env,
 			stdio: ["ignore", "pipe", "pipe"],
 		});
-		this.child.stdout.on("data", (chunk) => this.appendOutput(chunk));
-		this.child.stderr.on("data", (chunk) => this.appendOutput(chunk));
+		// Decode each stream incrementally so multibyte UTF-8 split across chunk
+		// boundaries is not corrupted into replacement characters.
+		const stdoutDecoder = new StringDecoder("utf8");
+		const stderrDecoder = new StringDecoder("utf8");
+		this.child.stdout.on("data", (chunk) => this.appendOutput(stdoutDecoder.write(chunk)));
+		this.child.stderr.on("data", (chunk) => this.appendOutput(stderrDecoder.write(chunk)));
 		this.child.once("error", (error) => {
 			this.appendOutput(`${error.message}\n`);
 			this.exitStatus = { exitCode: null, signal: "ERROR" };
@@ -1064,8 +1432,8 @@ class ManagedTerminal {
 		});
 	}
 
-	appendOutput(chunk) {
-		this.output += String(chunk);
+	appendOutput(text) {
+		this.output += text;
 		const limit = Math.max(0, this.outputByteLimit);
 		if (limit > 0 && Buffer.byteLength(this.output, "utf8") > limit) {
 			let bytes = 0;
@@ -1102,6 +1470,7 @@ export class AcpClient {
 		this.agent = agent;
 		this.onEvent = onEvent;
 		this.onPermissionRequest = options.onPermissionRequest;
+		this.onCursorRequest = options.onCursorRequest;
 		this.nextId = 1;
 		this.pending = new Map();
 		this.sessionId = undefined;
@@ -1119,7 +1488,7 @@ export class AcpClient {
 		this.nextTerminalId = 1;
 		this.exited = false;
 		this.stopping = false;
-		this.lastStderr = "";
+		this.stderrTail = "";
 	}
 
 	start() {
@@ -1135,27 +1504,31 @@ export class AcpClient {
 			this.rejectPending(error);
 			this.onEvent({ type: "error", message: error.message });
 		});
-		this.child.once("exit", (code, signal) => {
+		// Mark dead immediately on exit so in-flight writes stop, but reject pending
+		// requests on close (after stdio drains) so the crash stderr is complete.
+		this.child.once("exit", () => {
+			this.exited = true;
+		});
+		this.child.once("close", (code, signal) => {
 			this.exited = true;
 			const reason = signal ?? code ?? "unknown";
-			const stderr = this.lastStderr ? `: ${this.lastStderr}` : "";
+			const tail = this.stderrTail.trim();
+			const lastLines = tail ? tail.split(/\r?\n/).filter(Boolean).slice(-3).join(" | ") : "";
+			const stderr = lastLines ? `: ${oneLine(lastLines)}` : "";
 			const hadPending = this.pending.size > 0;
 			this.rejectPending(new Error(`backend exited (${reason})${stderr}`));
 			if (!this.stopping) this.onEvent({ type: "backend_exit" });
 			if (!this.stopping && !hadPending) this.onEvent({ type: "line", text: `• backend exited (${reason})${stderr}` });
 		});
 		this.child.stderr.on("data", (chunk) => {
-			const text = String(chunk).trim();
-			if (text) {
-				this.lastStderr = oneLine(text);
-			}
+			this.stderrTail = (this.stderrTail + String(chunk)).slice(-4096);
 		});
 		this.child.stdin.on("error", (error) => this.rejectPending(error));
 		const rl = readline.createInterface({ input: this.child.stdout });
 		rl.on("line", (line) => this.handleLine(line));
 	}
 
-	async initialize() {
+	async initialize(options = {}) {
 		this.start();
 		const initialized = await this.request("initialize", {
 			protocolVersion: 1,
@@ -1168,17 +1541,31 @@ export class AcpClient {
 		this.capabilities = initialized?.agentCapabilities ?? {};
 		this.agentInfo = initialized?.agentInfo ?? {};
 		this.authMethods = initialized?.authMethods ?? [];
-		await this.newSession();
+		// createSession:false lets a caller (e.g. /btw) decide between newSession,
+		// forkSession, or loadSession after seeing the advertised capabilities.
+		if (options.createSession !== false) await this.newSession();
+		return initialized;
 	}
 
 	async newSession(options = {}) {
 		return await this.switchSession("session/new", this.sessionRequestParams(), undefined, options);
 	}
 
+	supportsFork() {
+		return Boolean(this.capabilities?.sessionCapabilities?.fork);
+	}
+
+	// Create a new session branched from an existing one's full history (ACP
+	// unstable session/fork). The new session gets a fresh id; the parent is
+	// untouched and the default tool preset is preserved.
+	async forkSession(parentSessionId, options = {}) {
+		return await this.switchSession("session/fork", this.sessionRequestParams({ sessionId: parentSessionId }), undefined, options);
+	}
+
 	async prompt(prompt) {
 		if (!this.sessionId) throw new Error("ACP session is not ready");
 		const parts = Array.isArray(prompt) ? prompt : [{ type: "text", text: prompt }];
-		await this.request("session/prompt", {
+		return await this.request("session/prompt", {
 			sessionId: this.sessionId,
 			prompt: parts,
 		});
@@ -1225,12 +1612,16 @@ export class AcpClient {
 			throw new Error("ACP session/new did not return a session id");
 		}
 		this.sessionId = sessionId;
-		const buffered = this.bufferedSessionUpdates;
-		this.bufferingSessionUpdates = false;
-		this.bufferedSessionUpdates = [];
 		this.applySessionState(result);
+		// Keep buffering across beforeReplay so a live update arriving during its
+		// await cannot jump ahead of the older buffered updates. Drain via shift()
+		// so anything appended mid-drain stays FIFO-ordered.
 		await options.beforeReplay?.(result);
-		for (const update of buffered) this.handleSessionUpdate(update);
+		this.bufferingSessionUpdates = false;
+		while (this.bufferedSessionUpdates.length > 0) {
+			this.handleSessionUpdate(this.bufferedSessionUpdates.shift());
+		}
+		this.bufferedSessionUpdates = [];
 		await this.applyStartupMode();
 		return result;
 	}
@@ -1299,6 +1690,20 @@ export class AcpClient {
 		this.notify("session/cancel", { sessionId: this.sessionId });
 	}
 
+	// Locally settle a still-pending session/prompt request (e.g. a backend that
+	// acknowledged session/cancel but never sent the final response). Resolves
+	// rather than rejects so no spurious error is surfaced.
+	forceResolvePrompt() {
+		for (const [id, pending] of this.pending) {
+			if (pending.method === "session/prompt") {
+				this.pending.delete(id);
+				pending.resolve({ stopReason: "cancelled" });
+				return true;
+			}
+		}
+		return false;
+	}
+
 	stop() {
 		this.stopping = true;
 		for (const terminal of this.terminals.values()) terminal.kill();
@@ -1322,13 +1727,23 @@ export class AcpClient {
 	}
 
 	notify(method, params) {
-		if (!this.child || this.exited) return;
-		this.write({ jsonrpc: "2.0", method, params });
+		this.writeSafe({ jsonrpc: "2.0", method, params });
 	}
 
 	write(message) {
 		if (!this.child || this.exited) throw new Error("ACP backend is not running");
 		this.child.stdin.write(`${JSON.stringify(message)}\n`);
+	}
+
+	// Best-effort write for replies/notifications: the backend may exit while a
+	// response is in flight, so never let the write throw out to a caller.
+	writeSafe(message) {
+		if (!this.child || this.exited || this.stopping) return;
+		try {
+			this.write(message);
+		} catch {
+			// The backend exited mid-flight; replies/notifications are best-effort.
+		}
 	}
 
 	rejectPending(error) {
@@ -1363,6 +1778,16 @@ export class AcpClient {
 			void this.handlePermissionRequest(message);
 			return;
 		}
+		if (message.id !== undefined && message.method?.startsWith("cursor/")) {
+			void this.handleCursorRequest(message);
+			return;
+		}
+		if (message.id !== undefined && message.method) {
+			// Any other id-bearing request must be answered or the backend hangs
+			// waiting (e.g. an optional/extension method we do not implement).
+			// Reply method-not-found so the agent can fall back gracefully.
+			this.writeSafe({ jsonrpc: "2.0", id: message.id, error: { code: -32601, message: `Method not found: ${message.method}` } });
+		}
 	}
 
 	async handlePermissionRequest(message) {
@@ -1384,6 +1809,45 @@ export class AcpClient {
 			// The backend may exit while the user is answering the permission
 			// prompt. Permission replies are best-effort at that point.
 		}
+	}
+
+	// Cursor sends every cursor/* extension as a JSON-RPC request (with an id),
+	// so each must be answered or the agent's tool call hangs. The fire-and-forget
+	// ones are rendered and acked with {}; ask_question/create_plan block on a real
+	// user outcome (correct tagged-union result shapes), defaulting to cancelled.
+	async handleCursorRequest(message) {
+		const method = message.method;
+		const params = message.params ?? {};
+		if (method === "cursor/update_todos") {
+			this.onEvent({ type: "cursor_todos", todos: Array.isArray(params.todos) ? params.todos : [] });
+			this.writeSafe({ jsonrpc: "2.0", id: message.id, result: {} });
+			return;
+		}
+		if (method === "cursor/task") {
+			this.onEvent({ type: "line", text: cursorTaskLine(params) });
+			this.writeSafe({ jsonrpc: "2.0", id: message.id, result: {} });
+			return;
+		}
+		if (method === "cursor/generate_image") {
+			const description = params.description ? `: ${oneLine(params.description)}` : "";
+			this.onEvent({ type: "line", text: `• Generating image${description}` });
+			this.writeSafe({ jsonrpc: "2.0", id: message.id, result: {} });
+			return;
+		}
+		if (method === "cursor/ask_question" || method === "cursor/create_plan") {
+			let result = cursorCancelResult(method);
+			if (this.onCursorRequest) {
+				try {
+					result = (await this.onCursorRequest(method, params)) ?? cursorCancelResult(method);
+				} catch {
+					result = cursorCancelResult(method);
+				}
+			}
+			this.writeSafe({ jsonrpc: "2.0", id: message.id, result });
+			return;
+		}
+		// Unknown cursor/* request: ack so the agent never hangs.
+		this.writeSafe({ jsonrpc: "2.0", id: message.id, result: {} });
 	}
 
 	async handleTerminalRequest(message) {
@@ -1409,9 +1873,9 @@ export class AcpClient {
 			} else {
 				throw new Error(`Unsupported terminal method: ${message.method}`);
 			}
-			this.write({ jsonrpc: "2.0", id: message.id, result });
+			this.writeSafe({ jsonrpc: "2.0", id: message.id, result });
 		} catch (error) {
-			this.write({
+			this.writeSafe({
 				jsonrpc: "2.0",
 				id: message.id,
 				error: { code: -32603, message: error.message ?? String(error) },
@@ -1685,11 +2149,14 @@ export class HarnessApp {
 		this.permissionPromptActive = false;
 		this.cancelRequested = false;
 		this.afterToolCancelPending = false;
+		this.cancelGraceTimer = undefined;
 		this.activeToolIds = new Set();
 		this.activeAnonymousToolCount = 0;
 		this.seenToolThisTurn = false;
 		this.pendingPromptDisplay = undefined;
 		this.availableCommands = new Map();
+		this.commandsLoaded = new Set();
+		this.lastAutocompleteKey = undefined;
 		this.sessionStates = new Map();
 		this.voiceController = undefined;
 		this.voiceModeEnabled = true;
@@ -1704,6 +2171,11 @@ export class HarnessApp {
 		this.clipboardImageCounter = 0;
 		this.clipboardPasteInProgress = false;
 		this.bufferedClipboardPasteInput = [];
+		this.lastAssistantText = "";
+		this.btwThread = undefined;
+		this.focusedThread = "main";
+		// Page-view scroll state for the main thread (offset from top; stick=follow tail).
+		this.mainView = { offset: 0, stick: true };
 
 		const terminal = createHarnessTerminal({
 			onResizeStart: () => this.beginResize(),
@@ -1715,21 +2187,24 @@ export class HarnessApp {
 		this.chat = new Container();
 		this.commandPanel = new Container();
 		this.editor = new VoiceEditor(this.ui, EDITOR_THEME, { paddingX: 0, autocompleteMaxVisible: 8 });
-		this.status = new StatusLine(() => ({
-			agent: this.activeKey,
-			state: this.statusState,
-			spinner: this.statusState ? AGENT_WORK_FRAMES[this.spinnerIndex % AGENT_WORK_FRAMES.length] : "",
-			transport: this.transport,
-		}));
-		this.ui.addChild(this.chat);
-		this.ui.addChild(this.commandPanel);
+		this.status = new StatusLine(() => {
+			const btwFocused = this.focusedThread === "btw" && this.btwThread;
+			const state = btwFocused ? this.btwThread.statusState : this.statusState;
+			return {
+				agent: btwFocused ? `${this.activeKey} · btw` : this.activeKey,
+				state,
+				spinner: state ? AGENT_WORK_FRAMES[this.spinnerIndex % AGENT_WORK_FRAMES.length] : "",
+				transport: this.transport,
+			};
+		});
 		this.queueSummary = new PromptQueueSummary(
 			() => this.promptQueue,
 			() => SPINNER_FRAMES[this.spinnerIndex % SPINNER_FRAMES.length],
 		);
-		this.ui.addChild(this.queueSummary);
-		this.ui.addChild(this.editor);
-		this.ui.addChild(this.status);
+		// Single root view: it renders the normal stacked layout, or — while a /btw
+		// fork is open — a fixed-height, app-scrolled page view of one thread.
+		this.rootView = new RootView(this);
+		this.ui.addChild(this.rootView);
 		this.ui.setFocus(this.editor);
 		this.updateAutocomplete();
 		this.initVoiceInput();
@@ -1739,6 +2214,41 @@ export class HarnessApp {
 			void this.handleSubmit(text);
 		};
 		this.ui.addInputListener((data) => this.handleGlobalInput(data));
+	}
+
+	// The page view is active exactly when a /btw fork is open.
+	get pageViewActive() {
+		return Boolean(this.btwThread);
+	}
+
+	focusedView() {
+		return this.focusedThread === "btw" && this.btwThread ? this.btwThread.view : this.mainView;
+	}
+
+	// App-managed scroll for the page view. Returns true if the key was handled.
+	// PgUp/PgDn always scroll; Home/End and Up/Down only when the input is empty,
+	// so line-editing keys (Home/End/Ctrl+A-E, arrows) keep working while typing.
+	// Arrow-Up is left for the main queue's "edit last queued" when one is queued.
+	handlePageScroll(data) {
+		if (!this.pageViewActive) return false;
+		const view = this.focusedView();
+		const page = Math.max(1, (this.ui.terminal.rows || 24) - 4);
+		const editorEmpty = !this.editor.getText();
+		const queuedMain = this.focusedThread === "main" && this.promptQueue.length > 0;
+		let handled = true;
+		if (matchesKey(data, "pageup")) view.offset -= page;
+		else if (matchesKey(data, "pagedown")) view.offset += page;
+		else if (editorEmpty && matchesKey(data, "home")) view.offset = 0;
+		else if (editorEmpty && matchesKey(data, "end")) view.offset = Number.MAX_SAFE_INTEGER;
+		else if (editorEmpty && !queuedMain && isArrowUp(data)) view.offset -= 1;
+		else if (editorEmpty && matchesKey(data, "down")) view.offset += 1;
+		else handled = false;
+		if (!handled) return false;
+		view.offset = Math.max(0, view.offset);
+		// End pins follow; renderPage re-engages follow when any scroll lands at the bottom.
+		view.stick = view.offset === Number.MAX_SAFE_INTEGER;
+		this.ui.requestRender();
+		return true;
 	}
 
 	async start() {
@@ -1761,7 +2271,13 @@ export class HarnessApp {
 	installResizeRenderGate() {
 		const requestRender = this.ui.requestRender.bind(this.ui);
 		this.ui.requestRender = (force = false) => {
-			if (this.resizeActive && !force) return;
+			if (this.resizeActive) {
+				if (!force) return;
+				// A forced render slipped through mid-resize (e.g. theme preview).
+				// Prime the relative-move clear so it doesn't use the stale DECRC
+				// restore that mis-clears after the terminal reflowed.
+				this.prepareResizeFullClear();
+			}
 			requestRender(force);
 		};
 	}
@@ -1798,6 +2314,20 @@ export class HarnessApp {
 		terminal.useFullClearReplacementOnce(`\r${moveToFrameTop}\x1b[J\x1b7`);
 	}
 
+	// Hard absolute-clear + renderer reset. Used only on page-view <-> natural-flow
+	// transitions, where the frame height changes drastically and the differential
+	// clear (a relative cursor restore) would leave stale rows on screen.
+	forceFullRepaint() {
+		const ui = this.ui;
+		ui.terminal.write("\x1b[2J\x1b[H");
+		ui.previousLines = [];
+		ui.maxLinesRendered = 0;
+		ui.previousViewportTop = 0;
+		ui.hardwareCursorRow = 0;
+		ui.cursorRow = 0;
+		ui.requestRender(true);
+	}
+
 	adoptPrepaintedFrame() {
 		if (process.env.CC_PREPAINTED !== "1") return;
 		if (process.env.CC_PREPAINT_AGENT !== this.activeKey || this.transport !== "acp") return;
@@ -1828,6 +2358,9 @@ export class HarnessApp {
 		}
 		this.cancelPermissionPrompts();
 		this.closeMenu();
+		// A /btw fork is branched from the current agent's session; switching
+		// agents invalidates it, so tear it down.
+		if (this.btwThread) this.closeBtw();
 		if (this.client) this.client.stop();
 		this.activeKey = key;
 		this.transport = transport;
@@ -1835,6 +2368,7 @@ export class HarnessApp {
 		this.busy = false;
 		this.cancelRequested = false;
 		this.afterToolCancelPending = false;
+		this.clearCancelGraceTimer();
 		this.pendingNewSessionCommandName = undefined;
 		this.sessionSwitchInProgress = false;
 		this.deferredLocalSlashCommands = [];
@@ -1864,6 +2398,11 @@ export class HarnessApp {
 				if (agent._autoPermissionRequests) return autoPermissionOutcome(params);
 				return this.requestPermission(params);
 			},
+			onCursorRequest: (method, params) => {
+				if (this.client !== client) return cursorCancelResult(method);
+				if (agent._autoPermissionRequests) return autoCursorOutcome(method, params);
+				return this.requestCursorInteraction(method, params);
+			},
 		});
 		this.client = client;
 		try {
@@ -1872,6 +2411,9 @@ export class HarnessApp {
 			this.ready = true;
 			this.statusState = "";
 			this.updateSpinner();
+			// Load the markdown renderer now (before the first token) so it never
+			// flips plain->markdown mid-stream and re-styles already-scrolled lines.
+			loadMarkdownRenderer(() => this.ui.requestRender());
 			this.schedulePromptQueueDrain();
 			this.ui.requestRender();
 		} catch (error) {
@@ -1906,8 +2448,39 @@ export class HarnessApp {
 			this.ui.requestRender();
 			return { consume: true };
 		}
-		if (this.busy && isEscape(data)) {
-			this.interruptTurn();
+		// Shift+Tab toggles focus between the main thread and the /btw fork.
+		if (this.btwThread && matchesKey(data, "shift+tab")) {
+			this.focusedThread = this.focusedThread === "btw" ? "main" : "btw";
+			this.ui.requestRender();
+			return { consume: true };
+		}
+		// Page-view scrolling (PgUp/PgDn/Home/End, and Up/Down when the input is empty).
+		if (this.handlePageScroll(data)) {
+			return { consume: true };
+		}
+		// When the /btw fork is focused, Esc cancels its turn (second Esc force-
+		// settles a stuck cancel) or closes it when idle. Voice cancel takes
+		// precedence so a recording can still be aborted. (Copy is via /copy,
+		// which routes to the focused thread — a bare letter would eat typing.)
+		if (this.btwThread && this.focusedThread === "btw" && isEscape(data)) {
+			if (this.voiceController?.isRecording() || this.voiceController?.isTranscribing()) {
+				// fall through to voice handling below
+			} else if (this.btwThread.busy) {
+				if (this.btwThread.cancelRequested) this.btwThread.client?.forceResolvePrompt?.();
+				else this.btwThread.interrupt();
+				return { consume: true };
+			} else {
+				this.closeBtw();
+				return { consume: true };
+			}
+		}
+		// Busy-input steering applies to the focused main thread only.
+		if (this.focusedThread === "main" && this.busy && isEscape(data)) {
+			this.interruptViaEscape();
+			return { consume: true };
+		}
+		if (this.focusedThread === "main" && this.busy && isTabInput(data) && this.editor.getText().trim() && !this.editor.autocompleteState) {
+			this.queueCurrentInput("afterTurn");
 			return { consume: true };
 		}
 		const voiceWasRecording = this.voiceController?.isRecording();
@@ -1915,6 +2488,7 @@ export class HarnessApp {
 			isSpace: isPlainSpaceInput(data),
 			isModifiedSpace: isModifiedSpaceInput(data),
 			isCtrlSpace: matchesKey(data, "ctrl+space"),
+			isCancel: isCtrlC(data) || isEscape(data),
 		});
 		if (voiceConsumed) return { consume: true };
 		if (this.clipboardPasteInProgress) {
@@ -1938,11 +2512,7 @@ export class HarnessApp {
 			return { consume: true };
 		}
 		if (this.consumeVsCodeAutoActivationInput(data)) return { consume: true };
-		if (this.busy && isSubmitInput(data) && !this.editor.getText().trim()) {
-			this.promoteNextQueuedPromptToAfterTool();
-			return { consume: true };
-		}
-		if (isArrowUp(data) && !this.editor.getText() && this.unqueuePromptForEditing()) {
+		if (this.focusedThread === "main" && isArrowUp(data) && !this.editor.getText() && this.unqueuePromptForEditing()) {
 			return { consume: true };
 		}
 		this.rememberEditorTextAfterInput();
@@ -2193,6 +2763,14 @@ export class HarnessApp {
 		const controller = this.voiceController;
 		if (!controller) return false;
 
+		// Ctrl+C / Esc aborts an in-progress recording or transcription (discard,
+		// no transcription) instead of finalizing and sending it.
+		if (keyInfo.isCancel && (controller.isRecording() || controller.isTranscribing())) {
+			controller.cancel();
+			this.exitVoiceMode();
+			return true;
+		}
+
 		if (!this.voiceModeEnabled) {
 			return keyInfo.isCtrlSpace;
 		}
@@ -2303,10 +2881,29 @@ export class HarnessApp {
 		this.ui.requestRender();
 	}
 
-	async handleSubmit(rawText) {
+	async handleSubmit(rawText, opts = {}) {
 		this.lastKnownEditorText = "";
 		const text = rawText.trim();
 		if (!text) return;
+		// When the /btw fork is focused, the editor drives that thread — except
+		// harness and reserved local UI commands, which still run on the main path.
+		if (this.focusedThread === "btw" && this.btwThread) {
+			this.editor.addToHistory(text);
+			if (isHarnessCommandText(text)) {
+				await this.handleHarnessCommand(text);
+				return;
+			}
+			if (text.startsWith("/")) {
+				const { name, argument } = parseSlashCommand(text);
+				if (RESERVED_LOCAL_COMMANDS.has(name)) {
+					await this.runLocalSlashCommand(name, argument);
+					return;
+				}
+			}
+			const promptParts = this.consumeImagePromptParts(text);
+			void this.btwThread.submit(text, promptParts);
+			return;
+		}
 		const promptParts = this.consumeImagePromptParts(text);
 		const displayText = this.consumePromptDisplay(text);
 		this.editor.addToHistory(text);
@@ -2325,7 +2922,7 @@ export class HarnessApp {
 			compactCommand = handled === "backend";
 			if (handled === true) return;
 		}
-		await this.submitBackendPrompt(text, { displayText, compactCommand, promptParts });
+		await this.submitBackendPrompt(text, { displayText, compactCommand, promptParts, queueTiming: opts.queueTiming });
 	}
 
 	async submitBackendPrompt(text, options = {}) {
@@ -2334,12 +2931,17 @@ export class HarnessApp {
 			this.enqueuePrompt(text, "afterTurn", { displayText, compactCommand: options.compactCommand, promptParts: options.promptParts });
 			this.statusState = "connecting";
 			this.updateSpinner();
-			if (!this.client) void this.switchAgent(this.activeKey, this.transport, { quiet: true });
+			// Reconnect when there is no client or the previous one died (e.g. backend crash).
+			if (!this.client || this.client.exited) void this.switchAgent(this.activeKey, this.transport, { quiet: true });
 			this.ui.requestRender();
 			return;
 		}
 		if (this.busy || this.sessionSwitchInProgress) {
-			this.enqueuePrompt(text, "afterTurn", {
+			// While a turn is running, Enter queues "after tool" (steer at the next
+			// tool-call boundary); Tab queues "after turn". During a session switch
+			// there is no live turn, so always queue for after the switch.
+			const timing = this.busy ? (options.queueTiming ?? "afterTool") : "afterTurn";
+			this.enqueuePrompt(text, timing, {
 				displayText,
 				compactCommand: options.compactCommand,
 				promptParts: options.promptParts,
@@ -2353,7 +2955,7 @@ export class HarnessApp {
 	}
 
 	async sendPrompt(text, options = {}) {
-		if (!this.client || !this.ready) {
+		if (!this.client || !this.ready || this.client.exited) {
 			this.expirePendingUserEcho(options.pendingUserEcho);
 			return;
 		}
@@ -2368,10 +2970,12 @@ export class HarnessApp {
 		this.updateSpinner();
 		this.ui.requestRender();
 		try {
-			await this.client.prompt(this.promptForActiveCapabilities(text, options.promptParts));
+			const result = await this.client.prompt(this.promptForActiveCapabilities(text, options.promptParts));
+			this.noticeForStopReason(result?.stopReason);
 		} catch (error) {
 			this.addError(error.message ?? String(error));
 		} finally {
+			this.clearCancelGraceTimer();
 			this.expirePendingUserEcho(options.pendingUserEcho);
 			if (this.cancelRequested) {
 				for (const id of this.activeToolIds) this.updateTool("canceled", id);
@@ -2380,7 +2984,10 @@ export class HarnessApp {
 			this.activeAnonymousToolCount = 0;
 			this.busy = false;
 			this.closeCurrentAssistantText();
-			this.statusState = this.promptQueue.length > 0 ? "working" : "";
+			// A user Escape (cancelRequested without an intentional after-tool send)
+			// must not auto-fire queued after-turn prompts, and should drop the spinner.
+			const userCanceled = this.cancelRequested && !this.afterToolCancelPending;
+			this.statusState = this.promptQueue.length > 0 && !userCanceled ? "working" : "";
 			this.updateSpinner();
 			this.ui.requestRender();
 			if (this.pendingNewSessionCommandName) {
@@ -2389,15 +2996,22 @@ export class HarnessApp {
 				await this.startNewSession(commandName, { afterTurn: true });
 				return;
 			}
-			this.schedulePromptQueueDrain();
+			if (!userCanceled) this.schedulePromptQueueDrain();
 		}
 	}
 
+	noticeForStopReason(stopReason) {
+		if (!stopReason || this.cancelRequested) return;
+		if (stopReason === "refusal") this.addNotice("The model declined to respond.");
+		else if (stopReason === "max_tokens") this.addNotice("Response stopped at the output token limit.");
+		else if (stopReason === "max_turn_requests") this.addNotice("Response stopped at the per-turn request limit.");
+	}
+
 	async flushPromptQueue() {
-		if (!this.ready || this.busy || this.sessionSwitchInProgress || this.flushingPromptQueue) return;
+		if (!this.ready || this.busy || this.sessionSwitchInProgress || this.flushingPromptQueue || this.client?.exited) return;
 		this.flushingPromptQueue = true;
 		try {
-			while (this.ready && !this.busy && !this.sessionSwitchInProgress && this.promptQueue.length > 0) {
+			while (this.ready && !this.busy && !this.sessionSwitchInProgress && !this.client?.exited && this.promptQueue.length > 0) {
 				const prompt = this.promptQueue.shift();
 				const pendingUserEcho = this.trackPendingUserEcho(prompt.text);
 				this.addUserMessage(prompt.displayText ?? prompt.text, { compactCommand: prompt.compactCommand });
@@ -2432,12 +3046,51 @@ export class HarnessApp {
 		timer.unref?.();
 	}
 
-	promoteNextQueuedPromptToAfterTool() {
-		const prompt = this.promptQueue.find((entry) => entry.timing !== "afterTool");
-		if (!prompt) return;
-		prompt.timing = "afterTool";
-		this.maybeCancelAfterTool();
-		this.ui.requestRender();
+	queueCurrentInput(timing) {
+		const text = this.editor.getText();
+		if (!text.trim()) return false;
+		this.editor.setText("");
+		this.lastKnownEditorText = "";
+		void this.handleSubmit(text, { queueTiming: timing });
+		return true;
+	}
+
+	interruptViaEscape() {
+		if (!this.busy || !this.client) return;
+		// A second Escape while already canceling force-settles a stuck turn.
+		if (this.cancelRequested) {
+			this.interruptTurn();
+			return;
+		}
+		// After-tool messages are committed: stop now and let them send immediately.
+		if (this.promptQueue.some((entry) => entry.timing === "afterTool")) {
+			this.afterToolCancelPending = true;
+			this.interruptTurn();
+			return;
+		}
+		// After-turn messages are a soft queue: stop, do not send, and hand them
+		// back to the composer (newline-joined) so the user can edit/resubmit.
+		const queued = this.promptQueue.filter((entry) => entry.timing === "afterTurn");
+		if (queued.length > 0) {
+			this.promptQueue = this.promptQueue.filter((entry) => entry.timing !== "afterTurn");
+			this.pendingPromptDisplay = undefined;
+			this.restoreQueuedTextToComposer(queued);
+		}
+		this.interruptTurn();
+	}
+
+	restoreQueuedTextToComposer(entries) {
+		const joined = entries.map((entry) => entry.text).join("\n");
+		const current = this.editor.getText();
+		const next = current ? `${joined}\n${current}` : joined;
+		this.editor.setText(next);
+		// Prepend the queued entries' images to any image the user already staged in
+		// the composer rather than overwriting; labels stay unique so consume matches
+		// each by its placeholder regardless of order.
+		const promptParts = entries.flatMap((entry) => (Array.isArray(entry.promptParts) ? entry.promptParts : []));
+		const restored = imageAttachmentsFromPromptParts(joined, promptParts);
+		this.clipboardImages = [...restored, ...this.clipboardImages];
+		this.lastKnownEditorText = next;
 	}
 
 	unqueuePromptForEditing() {
@@ -2453,12 +3106,35 @@ export class HarnessApp {
 	}
 
 	interruptTurn() {
-		if (!this.busy || !this.client || this.cancelRequested) return;
+		if (!this.busy || !this.client) return;
+		// Already canceling and the backend has not settled the prompt: force it
+		// locally so the UI can never get stuck in "canceling".
+		if (this.cancelRequested) {
+			this.forceSettleCanceledTurn();
+			return;
+		}
 		this.cancelRequested = true;
 		this.statusState = "canceling";
 		this.updateSpinner();
 		this.client.cancel();
 		this.ui.requestRender();
+		this.clearCancelGraceTimer();
+		this.cancelGraceTimer = setTimeout(() => this.forceSettleCanceledTurn(), 8000);
+		this.cancelGraceTimer?.unref?.();
+	}
+
+	forceSettleCanceledTurn() {
+		this.clearCancelGraceTimer();
+		// Resolve the still-pending session/prompt without killing the backend so
+		// sendPrompt's finally runs and the UI returns to idle.
+		this.client?.forceResolvePrompt?.();
+	}
+
+	clearCancelGraceTimer() {
+		if (this.cancelGraceTimer) {
+			clearTimeout(this.cancelGraceTimer);
+			this.cancelGraceTimer = undefined;
+		}
 	}
 
 	deferNewSessionUntilIdle(commandName = "new") {
@@ -2513,12 +3189,22 @@ export class HarnessApp {
 			this.openCodexReviewDialog();
 			return true;
 		}
-		if (localNames.has(name)) {
+		// Reserved UI commands stay local even if a backend advertises the name.
+		if (RESERVED_LOCAL_COMMANDS.has(name) && localNames.has(name)) {
 			await this.runLocalSlashCommand(name, argument);
 			return true;
 		}
 		if (this.isKnownCodexReviewCommand(name)) return "backend";
+		// Prefer the backend's own command when it actually advertises the name,
+		// so a backend /model or /new is reachable instead of being shadowed.
 		if (backendNames.has(name)) return "backend";
+		if (localNames.has(name)) {
+			await this.runLocalSlashCommand(name, argument);
+			return true;
+		}
+		// The command list may not have arrived yet (cold start / right after a
+		// switch); forward to the backend rather than rejecting a valid command.
+		if (!this.commandsLoaded.has(this.activeKey)) return "backend";
 		this.addCommandMessage(text);
 		this.addNotice(`Unknown command: /${name}`);
 		return true;
@@ -2586,6 +3272,7 @@ export class HarnessApp {
 			return;
 		}
 		if (name === "clear") {
+			if (this.btwThread) this.closeBtw();
 			this.resetConversationView();
 			this.ui.requestRender();
 			return;
@@ -2603,6 +3290,18 @@ export class HarnessApp {
 			}
 			this.editor.setText("");
 			this.enterVoiceMode();
+			return;
+		}
+		if (name === "btw") {
+			await this.runBtw(argument);
+			return;
+		}
+		if (name === "diff") {
+			await this.runDiff(argument);
+			return;
+		}
+		if (name === "copy") {
+			await this.runCopy();
 			return;
 		}
 		if (name === "theme") {
@@ -2654,6 +3353,7 @@ export class HarnessApp {
 		this.currentUserText = undefined;
 		this.pendingUserEchoes = [];
 		this.pendingPromptDisplay = undefined;
+		this.lastAssistantText = "";
 	}
 
 	async ensureConnected() {
@@ -2757,6 +3457,7 @@ export class HarnessApp {
 
 	invalidateRenderedChildren() {
 		invalidateRenderableTree(this.chat);
+		if (this.btwThread) invalidateRenderableTree(this.btwThread.chat);
 		invalidateRenderableTree(this.commandPanel);
 		invalidateRenderableTree(this.queueSummary);
 		invalidateRenderableTree(this.editor);
@@ -2778,13 +3479,19 @@ export class HarnessApp {
 		this.ui.requestRender();
 		try {
 			const sessions = await this.client.listSessions();
-			const entries = sessions.map((session) => ({
-				value: session.sessionId,
-				label: session.title || session.sessionId,
-				description: session.updatedAt ? `${compactDate(session.updatedAt)} · ${compactPath(session.cwd)}` : compactPath(session.cwd),
-				active: session.sessionId === this.client.sessionId,
-				session,
-			}));
+			const forkIds = loadForkIds();
+			const entries = sessions.map((session) => {
+				const title = session.title || session.sessionId;
+				return {
+					value: session.sessionId,
+					// /btw forks inherit the parent's title; mark them so a resume list
+					// of a parent + its fork(s) is distinguishable.
+					label: forkIds.has(session.sessionId) ? `(fork) ${title}` : title,
+					description: session.updatedAt ? `${compactDate(session.updatedAt)} · ${compactPath(session.cwd)}` : compactPath(session.cwd),
+					active: session.sessionId === this.client.sessionId,
+					session,
+				};
+			});
 			this.openSelection("Resume session", entries, async (entry) => {
 				this.closeMenu();
 				if (!entry) return;
@@ -2833,6 +3540,8 @@ export class HarnessApp {
 
 	async startNewSession(commandName = "new", options = {}) {
 		const displayText = slashPromptDisplay(`/${commandName}`, "New session");
+		// A /btw fork is branched from the session we're about to replace.
+		if (this.btwThread) this.closeBtw();
 		if (!this.client || !this.ready) {
 			const wasReady = this.ready;
 			const connected = await this.ensureConnected();
@@ -2847,7 +3556,11 @@ export class HarnessApp {
 				return;
 			}
 		}
-		if (this.sessionSwitchInProgress) return;
+		if (this.sessionSwitchInProgress) {
+			this.addNotice("Already starting a new session");
+			this.ui.requestRender();
+			return;
+		}
 		if (this.busy && !options.afterTurn) {
 			this.deferNewSessionUntilIdle(commandName);
 			return;
@@ -3043,6 +3756,204 @@ export class HarnessApp {
 		this.addNotice("Plan mode is not advertised by this agent");
 	}
 
+	async runBtw(question) {
+		const trimmed = (question ?? "").trim();
+		this.addCommandMessage(trimmed ? slashCommandText("btw", trimmed) : "/btw");
+		if (this.btwThread) {
+			this.addNotice("A /btw thread is already open — shift+tab to focus it, esc (when focused) to close.");
+			this.ui.requestRender();
+			return;
+		}
+		if (this.activeKey === "cursor") {
+			this.addNotice("/btw is not supported for Cursor (it does not support session forking).");
+			this.ui.requestRender();
+			return;
+		}
+		if (!this.ready || !this.client?.sessionId) {
+			this.addNotice("/btw needs an active session — try again once connected.");
+			this.ui.requestRender();
+			return;
+		}
+		const agent = this.config.agents[this.activeKey];
+		this.closeMenu();
+		const parentSessionId = this.client.sessionId;
+		let thread;
+		const btwClient = new AcpClient(
+			agent,
+			(event) => {
+				if (this.btwThread === thread) thread.handleEvent(event);
+			},
+			{
+				onPermissionRequest: (params) => {
+					if (this.btwThread !== thread) return { outcome: "cancelled" };
+					if (agent._autoPermissionRequests) return autoPermissionOutcome(params);
+					return this.requestPermission(params);
+				},
+				onCursorRequest: (method, params) => {
+					if (this.btwThread !== thread) return cursorCancelResult(method);
+					if (agent._autoPermissionRequests) return autoCursorOutcome(method, params);
+					return this.requestCursorInteraction(method, params);
+				},
+			},
+		);
+		thread = new BtwThread(this, btwClient, trimmed);
+		this.btwThread = thread;
+		this.focusedThread = "btw";
+		this.updateSpinner();
+		// Entering the fixed-height page view from natural flow: hard repaint.
+		this.forceFullRepaint();
+		// Queue the initial question (if any) — it sends once the fork is ready.
+		// A bare /btw just opens the focused fork, ready for the first message.
+		if (trimmed) thread.submit(trimmed);
+
+		try {
+			await btwClient.initialize({ createSession: false });
+			if (this.btwThread !== thread) {
+				btwClient.stop();
+				return;
+			}
+			if (btwClient.supportsFork()) {
+				await btwClient.forkSession(parentSessionId);
+			} else if (this.activeKey === "codex") {
+				await this.forkCodexSession(btwClient, parentSessionId);
+			} else {
+				throw new Error("this agent does not support session forking");
+			}
+			thread.sessionId = btwClient.sessionId;
+			// Remember this fork so /resume can label it (it inherits the parent's title).
+			recordForkId(btwClient.sessionId);
+			thread.markReady();
+			this.onThreadActivity();
+		} catch (error) {
+			// Fork setup failed (submit handles its own errors internally), so the
+			// fork's backend never got going — stop it to avoid a leaked process.
+			btwClient.stop();
+			if (this.btwThread === thread) {
+				thread.addError(`Could not start side thread: ${error.message ?? error}`);
+				thread.state = "error";
+				thread.statusState = "";
+				this.onThreadActivity();
+			}
+		}
+	}
+
+	closeBtw() {
+		const thread = this.btwThread;
+		this.btwThread = undefined;
+		this.focusedThread = "main";
+		this.mainView.stick = true;
+		if (thread) {
+			thread.cancelRequested = true;
+			thread.client?.cancel?.();
+			thread.stop();
+		}
+		this.updateSpinner();
+		// Leaving the fixed-height page view back to natural flow: hard repaint so
+		// the main transcript is re-emitted cleanly into the terminal scrollback.
+		this.forceFullRepaint();
+	}
+
+	// Codex's ACP bridge (codex-acp) does not expose session/fork — session/load and
+	// session/resume reuse the SAME thread id and append to the SAME rollout file,
+	// so resuming the live session in a second process would corrupt its rollout.
+	// To fork safely we copy the main session's rollout JSONL to a brand-new id and
+	// load the copy: an isolated branch with full history + tools, parent untouched.
+	//
+	// VERSION-SPECIFIC ASSUMPTIONS (verified against openai/codex + codex-acp as of
+	// 2026-06; if Codex changes its on-disk layout this is where to fix it):
+	//   • Rollouts live under $CODEX_HOME (default ~/.codex) at
+	//     sessions/YYYY/MM/DD/rollout-<timestamp>-<threadUuid>.jsonl (JSON Lines).
+	//   • The ACP session id returned by session/new equals <threadUuid>, which is
+	//     also embedded in the rollout (SessionMeta header + per-item thread_id).
+	//   • codex-acp resolves session/load by scanning rollout filenames for the id,
+	//     so writing a copy named with the new uuid makes it loadable without the
+	//     state_5.sqlite index. Replacing every occurrence of the old uuid with the
+	//     new one keeps the header and all item records internally consistent.
+	// If any assumption no longer holds, forking throws a clear error (shown in the
+	// /btw pane) rather than corrupting anything.
+	async forkCodexSession(btwClient, parentSessionId) {
+		const rolloutPath = findCodexRolloutPath(parentSessionId);
+		if (!rolloutPath) throw new Error("could not locate the Codex session rollout to fork (see forkCodexSession notes)");
+		if (rolloutPath.endsWith(".zst")) throw new Error("the Codex session rollout is compressed; cannot fork it (see forkCodexSession notes)");
+		const newId = randomUUID();
+		copyCodexRolloutWithNewId(rolloutPath, parentSessionId, newId);
+		// codex-acp only implements session/load (session/resume is "method not
+		// found"), and load replays the parent transcript. That replay arrives
+		// before the thread is marked ready, and BtwThread discards pre-ready
+		// events, so the fork inherits context without dumping history into the
+		// pane (the parent conversation is already visible in the main thread).
+		await btwClient.loadSession(newId);
+	}
+
+	async runDiff(argument) {
+		this.addCommandMessage(slashCommandText("diff", argument));
+		const args = argument ? argument.split(/\s+/).filter(Boolean) : ["HEAD"];
+		if (!this.busy) {
+			this.statusState = "loading diff";
+			this.updateSpinner();
+			this.ui.requestRender();
+		}
+		try {
+			const result = await runCapture("git", ["--no-pager", "diff", ...args], { rejectOnExit: false, timeoutMs: 30_000 });
+			const text = result.stdout.toString("utf8");
+			if (result.code !== 0 && !text.trim()) {
+				const detail = oneLine(result.stderr.toString("utf8")) || "git diff failed";
+				this.addNotice(detail);
+			} else if (!text.trim()) {
+				this.addNotice("No changes in the working tree.");
+			} else {
+				this.showMarkdownBlock(`\`\`\`diff\n${truncateDiff(text)}\n\`\`\``);
+			}
+		} catch (error) {
+			this.addError(`git diff failed: ${error.message ?? error}`);
+		} finally {
+			// Don't drop the spinner if a turn is still running or messages are queued.
+			this.statusState = this.busy || this.promptQueue.length > 0 ? "working" : "";
+			this.updateSpinner();
+			this.ui.requestRender();
+		}
+	}
+
+	async runCopy() {
+		this.addCommandMessage("/copy");
+		// Copy the focused thread's last response (the fork, when it is focused).
+		const text =
+			this.focusedThread === "btw" && this.btwThread
+				? this.btwThread.lastAssistantText?.trim()
+				: (this.currentAssistantText?.text?.trim() ? this.currentAssistantText.text : this.lastAssistantText)?.trim();
+		if (!text) {
+			this.addNotice("Nothing to copy yet.");
+			this.ui.requestRender();
+			return;
+		}
+		try {
+			await writeClipboardText(text);
+			this.addNotice("Copied the last response to the clipboard.");
+		} catch (error) {
+			this.addError(`Could not copy: ${error.message ?? error}`);
+		}
+		this.ui.requestRender();
+	}
+
+	async copyTextToClipboard(text) {
+		try {
+			await writeClipboardText(text);
+			return true;
+		} catch (error) {
+			this.addError(`Could not copy: ${error.message ?? error}`);
+			this.ui.requestRender();
+			return false;
+		}
+	}
+
+	showMarkdownBlock(text) {
+		this.closeCurrentAssistantText();
+		this.currentUserText = undefined;
+		this.currentToolSummary = undefined;
+		this.addHistorySpacer("assistant");
+		this.chat.addChild(new MutableMarkdown(text));
+	}
+
 	openMenu() {
 		this.closeMenu();
 		this.menuHandle = new AgentMenu(this);
@@ -3088,7 +3999,14 @@ export class HarnessApp {
 
 	requestPermission(params = {}) {
 		return new Promise((resolve) => {
-			this.permissionQueue.push({ params, resolve });
+			this.permissionQueue.push({ kind: "permission", params, resolve });
+			this.drainPermissionQueue();
+		});
+	}
+
+	requestCursorInteraction(method, params = {}) {
+		return new Promise((resolve) => {
+			this.permissionQueue.push({ kind: "cursor", method, params, resolve });
 			this.drainPermissionQueue();
 		});
 	}
@@ -3098,7 +4016,51 @@ export class HarnessApp {
 		const request = this.permissionQueue.shift();
 		if (!request) return;
 		this.permissionPromptActive = true;
-		this.openPermissionRequest(request);
+		if (request.kind === "cursor") this.openCursorInteraction(request);
+		else this.openPermissionRequest(request);
+	}
+
+	openCursorInteraction(request) {
+		const { method, params, resolve } = request;
+		const finish = (result) => {
+			this.closeMenu();
+			resolve(result);
+			this.permissionPromptActive = false;
+			this.drainPermissionQueue();
+		};
+		if (method === "cursor/create_plan") {
+			this.addNotice(cursorPlanText(params));
+			const entries = [
+				{ value: "accepted", label: "Accept plan" },
+				{ value: "rejected", label: "Reject plan" },
+			];
+			this.openSelection(`Plan: ${oneLine(params.name ?? params.overview ?? "proposed plan")}`, entries, (entry) => {
+				finish({ outcome: { outcome: entry?.value === "accepted" ? "accepted" : "rejected" } });
+			});
+			return;
+		}
+		const questions = Array.isArray(params.questions) ? params.questions : [];
+		const answers = [];
+		const askNext = (index) => {
+			if (index >= questions.length) {
+				finish({ outcome: { outcome: "answered", answers } });
+				return;
+			}
+			const question = questions[index] ?? {};
+			const options = Array.isArray(question.options) ? question.options : [];
+			const entries = options.map((option) => ({ value: option.id, label: oneLine(option.label ?? option.id) }));
+			const title = oneLine(question.prompt ?? params.title ?? "Question");
+			this.openSelection(title, entries, (entry) => {
+				if (!entry) {
+					finish({ outcome: { outcome: "cancelled" } });
+					return;
+				}
+				answers.push({ questionId: question.id, selectedOptionIds: [entry.value] });
+				this.closeMenu();
+				askNext(index + 1);
+			}, { emptyText: "No options" });
+		};
+		askNext(0);
 	}
 
 	openPermissionRequest({ params, resolve }) {
@@ -3129,7 +4091,9 @@ export class HarnessApp {
 
 	cancelPermissionPrompts() {
 		const queued = this.permissionQueue.splice(0);
-		for (const request of queued) request.resolve({ outcome: "cancelled" });
+		for (const request of queued) {
+			request.resolve(request.kind === "cursor" ? cursorCancelResult(request.method) : { outcome: "cancelled" });
+		}
 		if (!this.permissionPromptActive) return;
 		this.permissionPromptActive = false;
 		this.closeMenu({ cancelSelection: true });
@@ -3152,9 +4116,22 @@ export class HarnessApp {
 		} else if (event.type === "error") {
 			this.addError(event.message);
 		} else if (event.type === "backend_exit") {
+			// The backend died unexpectedly. Mark it dead so queued prompts are
+			// preserved (not drained into errors) and the next submit reconnects
+			// against a fresh client instead of erroring on the dead one.
 			this.cancelPermissionPrompts();
+			this.clearCancelGraceTimer();
+			this.ready = false;
+			this.busy = false;
+			this.cancelRequested = false;
+			this.afterToolCancelPending = false;
+			this.statusState = "";
+			this.updateSpinner();
+		} else if (event.type === "cursor_todos") {
+			this.addNotice(cursorTodosText(event.todos));
 		} else if (event.type === "commands") {
 			this.availableCommands.set(this.activeKey, event.commands);
+			this.commandsLoaded.add(this.activeKey);
 			this.updateAutocomplete();
 		} else if (event.type === "session_info") {
 			this.sessionStates.set(this.activeKey, event.sessionInfo);
@@ -3216,7 +4193,7 @@ export class HarnessApp {
 	}
 
 	updateSpinner() {
-		if (!this.statusState) {
+		if (!this.statusState && !this.btwThread?.statusState) {
 			if (this.spinnerTimer) clearInterval(this.spinnerTimer);
 			this.spinnerTimer = undefined;
 			this.spinnerIndex = 0;
@@ -3229,12 +4206,24 @@ export class HarnessApp {
 		}, 80);
 	}
 
+	// A btw thread changed state; refresh the spinner driver and repaint.
+	onThreadActivity() {
+		this.updateSpinner();
+		this.ui.requestRender();
+	}
+
 	updateAutocomplete() {
-		const commands = [
+		const commands = dedupeCommands([
 			...localSlashCommands(this),
 			...(this.availableCommands.get(this.activeKey) ?? []),
-		];
-		this.editor.setAutocompleteProvider(new LazyCombinedAutocompleteProvider(dedupeCommands(commands), process.cwd(), null));
+		]);
+		// Rebuilding the provider tears down any open autocomplete popup, so skip
+		// it when the effective command set is unchanged (a frequent no-op on
+		// every config/mode/session-info update while the user is mid-type).
+		const key = `${this.activeKey} ${JSON.stringify(commands.map((command) => [command.name, command.description, command.argumentHint]))}`;
+		if (key === this.lastAutocompleteKey) return;
+		this.lastAutocompleteKey = key;
+		this.editor.setAutocompleteProvider(new LazyCombinedAutocompleteProvider(commands, process.cwd(), null));
 	}
 
 	addUserMessage(text, options = {}) {
@@ -3324,6 +4313,8 @@ export class HarnessApp {
 	}
 
 	closeCurrentAssistantText() {
+		const text = this.currentAssistantText?.text?.trim();
+		if (text) this.lastAssistantText = this.currentAssistantText.text;
 		this.currentAssistantText?.invalidate();
 		this.currentAssistantText = undefined;
 	}
@@ -3340,9 +4331,13 @@ export class HarnessApp {
 	stop() {
 		if (this.spinnerTimer) clearInterval(this.spinnerTimer);
 		if (this.markdownPreloadTimer) clearTimeout(this.markdownPreloadTimer);
+		this.clearCancelGraceTimer();
 		this.cancelPermissionPrompts();
 		this.voiceController?.dispose();
 		if (this.client) this.client.stop();
+		// Tear down the /btw fork's backend process too, if one is open.
+		this.btwThread?.stop?.();
+		this.btwThread = undefined;
 		this.ui.stop();
 		process.exit(0);
 	}
@@ -3367,7 +4362,7 @@ class MutableMarkdown {
 		const renderer = MarkdownComponent ? "markdown" : (this.cache?.renderer ?? "plain");
 		if (this.cache?.width === width && this.cache.text === text && this.cache.renderer === renderer) return this.cache.lines.slice();
 		const rendered = renderMarkdown(text, width, 0, 0, { color: (content) => chalk.text(content) }, renderer);
-		const lines = stabilizeGrowingRenderedLines(this.cache, { width, text, lines: rendered, renderer }, STREAMING_MARKDOWN_MUTABLE_TAIL_LINES);
+		const lines = stabilizeGrowingRenderedLines(this.cache, { width, text, lines: rendered, renderer }, streamingMutableTail(text, rendered.length));
 		this.cache = { width, text, lines, renderer };
 		return lines.slice();
 	}
@@ -3497,7 +4492,7 @@ class PromptQueueSummary {
 		const queue = this.getQueue();
 		if (queue.length === 0) return [];
 		return ["", ...queue.map((entry) => {
-			const prefix = entry.timing === "afterTool" ? `${this.getSpinner()} after tool` : "↵ queued";
+			const prefix = entry.timing === "afterTool" ? `${this.getSpinner()} after tool` : "⇥ queued";
 			return chalk.dim(truncateVisual(`${prefix}: ${oneLine(entry.displayText ?? entry.text)}`, width));
 		})];
 	}
@@ -3572,9 +4567,37 @@ function invalidateRenderableTree(node) {
 
 export function stabilizeGrowingRenderedLines(previous, next, mutableTailLines = STREAMING_MARKDOWN_MUTABLE_TAIL_LINES) {
 	if (!previous || previous.width !== next.width) return next.lines.slice();
-	if (previous.renderer !== next.renderer) return next.lines.slice();
 	if (next.text.length <= previous.text.length || !next.text.startsWith(previous.text)) return next.lines.slice();
+	// A growing prefix is diffed line-by-line even across a plain->markdown
+	// renderer flip (the async markdown load landing mid-stream), so already
+	// committed/scrolled-off lines stay byte-stable and never force a repaint.
 	return stabilizeMutableRenderedLines(previous, next, mutableTailLines);
+}
+
+// How many trailing rendered lines may still restructure as more text streams.
+// Closed markdown blocks never change, so only the open trailing block needs to
+// stay mutable; freezing everything before it keeps scrolled-off lines stable.
+export function streamingMutableTail(text, renderedLineCount) {
+	const sourceLines = String(text).split("\n");
+	let fenceOpen = false;
+	let fenceStart = -1;
+	for (let index = 0; index < sourceLines.length; index += 1) {
+		if (/^\s{0,3}(```|~~~)/.test(sourceLines[index])) {
+			if (fenceOpen) {
+				fenceOpen = false;
+				fenceStart = -1;
+			} else {
+				fenceOpen = true;
+				fenceStart = index;
+			}
+		}
+	}
+	if (fenceOpen && fenceStart >= 0) {
+		// An open code fence re-styles its whole block when it closes; keep it mutable.
+		const openSourceLines = sourceLines.length - fenceStart;
+		return Math.min(renderedLineCount, Math.max(STREAMING_MARKDOWN_MUTABLE_TAIL_LINES, openSourceLines + 2));
+	}
+	return STREAMING_MARKDOWN_MUTABLE_TAIL_LINES;
 }
 
 export function stabilizeMutableRenderedLines(previous, next, mutableTailLines = 0) {
@@ -3677,6 +4700,55 @@ function humanizePermissionKind(kind) {
 	return String(kind)
 		.replace(/_/g, " ")
 		.replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function cursorCancelResult(method) {
+	if (method === "cursor/create_plan") return { outcome: { outcome: "rejected", reason: "Cancelled" } };
+	if (method === "cursor/ask_question") return { outcome: { outcome: "cancelled" } };
+	return {};
+}
+
+function autoCursorOutcome(method, params = {}) {
+	if (method === "cursor/create_plan") return { outcome: { outcome: "accepted" } };
+	if (method === "cursor/ask_question") {
+		const answers = (Array.isArray(params.questions) ? params.questions : []).map((question) => ({
+			questionId: question.id,
+			selectedOptionIds: question.options?.[0]?.id ? [question.options[0].id] : [],
+		}));
+		return { outcome: { outcome: "answered", answers } };
+	}
+	return {};
+}
+
+function cursorTaskLine(params = {}) {
+	const type = params.subagentType ? ` (${oneLine(params.subagentType)})` : "";
+	const description = params.description ?? params.prompt ?? "subagent task";
+	return `• Subagent${type}: ${oneLine(description)}`;
+}
+
+function cursorTodoGlyph(status) {
+	const value = oneLine(status).toLowerCase();
+	if (value === "completed" || value === "complete") return "✓";
+	if (value === "in_progress") return "▸";
+	if (value === "cancelled" || value === "canceled") return "×";
+	return "○";
+}
+
+function cursorPlanText(params = {}) {
+	const lines = [];
+	const heading = params.name ?? params.overview;
+	if (heading) lines.push(`Plan: ${oneLine(heading)}`);
+	if (params.overview && params.overview !== heading) lines.push(oneLine(params.overview));
+	for (const todo of Array.isArray(params.todos) ? params.todos : []) {
+		lines.push(`  ${cursorTodoGlyph(todo.status)} ${oneLine(todo.content ?? "")}`);
+	}
+	return lines.length > 0 ? lines.join("\n") : "Proposed plan";
+}
+
+function cursorTodosText(todos) {
+	const list = Array.isArray(todos) ? todos : [];
+	if (list.length === 0) return "• todos updated";
+	return ["• todos", ...list.map((todo) => `  ${cursorTodoGlyph(todo.status)} ${oneLine(todo.content ?? "")}`)].join("\n");
 }
 
 function normalizedToolStatus(status) {
@@ -3906,6 +4978,9 @@ function localSlashCommands(app) {
 		{ name: "status", description: "Show current session status" },
 		{ name: "clear", description: "Clear the conversation" },
 		{ name: "voice", description: "Enter voice input mode" },
+		{ name: "btw", description: "Fork this conversation into a side thread (full context + tools)", argumentHint: "<question>" },
+		{ name: "diff", description: "Show the working-tree git diff" },
+		{ name: "copy", description: "Copy the last response to the clipboard" },
 		themeSlashCommand(app),
 	];
 	const addIfMissing = (command) => {
@@ -4320,6 +5395,117 @@ function isWsl(env = process.env, release = os.release()) {
 	return Boolean(env.WSL_DISTRO_NAME || /microsoft|wsl/i.test(release));
 }
 
+function codexHome() {
+	return process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
+}
+
+// Locate a Codex rollout file for a thread id by scanning $CODEX_HOME/sessions
+// newest-first (the layout is sessions/YYYY/MM/DD/rollout-<ts>-<id>.jsonl).
+export function findCodexRolloutPath(sessionId, root = path.join(codexHome(), "sessions")) {
+	if (!sessionId) return undefined;
+	return findRolloutFile(root, `-${sessionId}.jsonl`, 0);
+}
+
+function findRolloutFile(dir, suffix, depth) {
+	let entries;
+	try {
+		entries = fs.readdirSync(dir, { withFileTypes: true });
+	} catch {
+		return undefined;
+	}
+	for (const entry of entries) {
+		// Match the plain rollout; also match a compressed one so the caller can
+		// report it rather than silently failing to locate the session.
+		if (entry.isFile() && (entry.name.endsWith(suffix) || entry.name.endsWith(`${suffix}.zst`))) {
+			return path.join(dir, entry.name);
+		}
+	}
+	if (depth >= 5) return undefined;
+	const dirs = entries
+		.filter((entry) => entry.isDirectory())
+		.map((entry) => entry.name)
+		.sort()
+		.reverse();
+	for (const name of dirs) {
+		const found = findRolloutFile(path.join(dir, name), suffix, depth + 1);
+		if (found) return found;
+	}
+	return undefined;
+}
+
+// Copy a rollout to a sibling file named with newId, replacing every occurrence
+// of the old thread uuid (header + item records) so the copy is a consistent,
+// independent branch. Returns the new file path.
+export function copyCodexRolloutWithNewId(srcPath, oldId, newId) {
+	const content = fs.readFileSync(srcPath, "utf8");
+	const rewritten = content.split(oldId).join(newId);
+	const destName = path.basename(srcPath).split(oldId).join(newId);
+	const dest = path.join(path.dirname(srcPath), destName);
+	fs.writeFileSync(dest, rewritten);
+	return dest;
+}
+
+function truncateDiff(text, maxLines = 500) {
+	const lines = String(text).split("\n");
+	if (lines.length <= maxLines) return text;
+	return [...lines.slice(0, maxLines), `… (${lines.length - maxLines} more lines truncated)`].join("\n");
+}
+
+function writeClipboardText(text) {
+	const targets =
+		process.platform === "darwin"
+			? [["pbcopy", []]]
+			: process.platform === "win32"
+				? [["clip", []]]
+				: [
+						["wl-copy", []],
+						["xclip", ["-selection", "clipboard"]],
+						["xsel", ["--clipboard", "--input"]],
+					];
+	return writeToFirstClipboardTarget(targets, text);
+}
+
+async function writeToFirstClipboardTarget(targets, text) {
+	let lastError;
+	for (const [command, args] of targets) {
+		try {
+			await pipeToCommand(command, args, text);
+			return;
+		} catch (error) {
+			lastError = error;
+		}
+	}
+	throw lastError ?? new Error("No clipboard tool available");
+}
+
+function pipeToCommand(command, args, input) {
+	return new Promise((resolve, reject) => {
+		let child;
+		try {
+			child = spawn(command, args, { stdio: ["pipe", "ignore", "ignore"] });
+		} catch (error) {
+			reject(error);
+			return;
+		}
+		let settled = false;
+		const done = (error) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			if (error) reject(error);
+			else resolve();
+		};
+		// wl-copy and friends keep serving the selection and never exit; once
+		// stdin is flushed, treat that as success after a short grace period.
+		const timer = setTimeout(() => done(undefined), 500);
+		timer.unref?.();
+		child.once("error", (error) => done(error));
+		child.once("close", (code) => done(code === 0 ? undefined : new Error(`${command} exited ${code}`)));
+		child.stdin.on("error", () => {});
+		child.stdin.end(input);
+	});
+}
+
 function recordAudio() {
 	const [bin, ...args] = audioCommand();
 	const child = spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
@@ -4427,6 +5613,10 @@ function isSubmitInput(data) {
 	return matchesKey(data, "enter") || matchesKey(data, "return");
 }
 
+function isTabInput(data) {
+	return matchesKey(data, "tab");
+}
+
 function isClipboardPasteInput(data) {
 	return (
 		data === "\x16" ||
@@ -4459,6 +5649,11 @@ function createHarnessTerminal(resizeHooks = {}) {
 	terminal.start = (onInput, onResize) => {
 		start(onInput, () => {
 			if (RESIZE_SETTLE_DELAY_MS <= 0) {
+				// Still run the resize lifecycle so prepareResizeFullClear primes the
+				// relative-move clear; otherwise the forced render falls back to the
+				// stale DECRC clear and leaves garbled rows after a resize.
+				resizeHooks.onResizeStart?.();
+				resizeHooks.onResizeEnd?.();
 				onResize();
 				return;
 			}
@@ -4570,6 +5765,9 @@ function isSingleShellToken(value) {
 
 function splitControlInput(data) {
 	if (typeof data !== "string" || data.length <= 1) return undefined;
+	// Never split a bracketed paste: its content may contain literal control
+	// bytes that are not Ctrl+C/Ctrl+D. The editor's paste handler strips them.
+	if (data.includes("\x1b[200~")) return undefined;
 	const ctrlC = data.indexOf("\x03");
 	const ctrlD = data.indexOf("\x04");
 	const indexes = [ctrlC, ctrlD].filter((index) => index >= 0);
@@ -4683,6 +5881,38 @@ function loadSettings() {
 function settingsPath() {
 	if (process.env.CC_SETTINGS) return process.env.CC_SETTINGS;
 	return path.join(os.homedir(), ".config", "cc", "settings.json");
+}
+
+// /btw forks reuse the parent's title, so they are indistinguishable in a resume
+// list. Persist the session ids cc forks (across both backends) so /resume can
+// mark them. Capped so the file can't grow without bound.
+function forksPath() {
+	if (process.env.CC_FORKS) return process.env.CC_FORKS;
+	return path.join(path.dirname(settingsPath()), "forks.json");
+}
+
+export function loadForkIds() {
+	try {
+		const data = JSON.parse(fs.readFileSync(forksPath(), "utf8"));
+		return new Set(Array.isArray(data?.forks) ? data.forks.filter((id) => typeof id === "string") : []);
+	} catch {
+		return new Set();
+	}
+}
+
+export function recordForkId(sessionId) {
+	if (!sessionId) return;
+	const ids = loadForkIds();
+	if (ids.has(sessionId)) return;
+	ids.add(sessionId);
+	const forks = [...ids].slice(-500);
+	try {
+		const file = forksPath();
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(file, `${JSON.stringify({ forks })}\n`);
+	} catch {
+		// Best-effort: fork labeling in /resume is a nicety, not critical.
+	}
 }
 
 function resolveHarnessPython() {

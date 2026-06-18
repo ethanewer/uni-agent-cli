@@ -6,6 +6,10 @@ import {
 	AcpClient,
 	applyHarnessSettings,
 	autoPermissionOutcome,
+	copyCodexRolloutWithNewId,
+	findCodexRolloutPath,
+	loadForkIds,
+	recordForkId,
 	findConfigValue,
 	findMode,
 	flattenModes,
@@ -244,6 +248,8 @@ const config = {
 }
 
 {
+	// Enter while busy queues "after tool"; with a tool still running the steer
+	// waits for the tool boundary before canceling.
 	const { app, prompts, cancelCount } = busyPromptHarness("codex-acp");
 	app.seenToolThisTurn = true;
 	app.activeToolIds.add("read-1");
@@ -251,9 +257,6 @@ const config = {
 	assert.deepEqual(prompts, []);
 	assert.equal(app.promptQueue.length, 1);
 	assert.equal(app.promptQueue[0].text, "steer now");
-	assert.equal(app.promptQueue[0].timing, "afterTurn");
-	assert.equal(cancelCount(), 0);
-	app.promoteNextQueuedPromptToAfterTool();
 	assert.equal(app.promptQueue[0].timing, "afterTool");
 	assert.equal(cancelCount(), 0);
 	app.trackToolStatus("read-1", "complete");
@@ -261,16 +264,15 @@ const config = {
 }
 
 {
+	// Enter queues after-tool; Tab queues after-turn. Only the after-tool item
+	// triggers the boundary cancel.
 	const { app, prompts, cancelCount } = busyPromptHarness("codex-acp");
 	app.seenToolThisTurn = true;
 	app.activeToolIds.add("read-1");
 	await app.submitBackendPrompt("first steer");
-	await app.submitBackendPrompt("second queued");
+	await app.submitBackendPrompt("second queued", { queueTiming: "afterTurn" });
 	assert.deepEqual(prompts, []);
 	assert.equal(app.promptQueue.length, 2);
-	assert.equal(app.promptQueue[0].timing, "afterTurn");
-	assert.equal(app.promptQueue[1].timing, "afterTurn");
-	app.promoteNextQueuedPromptToAfterTool();
 	assert.equal(app.promptQueue[0].timing, "afterTool");
 	assert.equal(app.promptQueue[1].timing, "afterTurn");
 	app.trackToolStatus("read-1", "complete");
@@ -288,26 +290,26 @@ const config = {
 }
 
 {
+	// Enter while busy with a tool already finished cancels immediately to steer.
 	const { app, prompts, cancelCount } = busyPromptHarness("fake-acp");
 	app.seenToolThisTurn = true;
 	await app.submitBackendPrompt("queue after tool");
 	assert.deepEqual(prompts, []);
 	assert.equal(app.promptQueue.length, 1);
 	assert.equal(app.promptQueue[0].text, "queue after tool");
-	assert.equal(app.promptQueue[0].timing, "afterTurn");
-	assert.equal(cancelCount(), 0);
-	app.promoteNextQueuedPromptToAfterTool();
 	assert.equal(app.promptQueue[0].timing, "afterTool");
 	assert.equal(cancelCount(), 1);
 }
 
 {
+	// Tab keeps a slash command queued for after the turn without canceling.
 	const { app, prompts, cancelCount } = busyPromptHarness("codex-acp");
 	app.seenToolThisTurn = true;
-	await app.submitBackendPrompt("/review", { compactCommand: true });
+	await app.submitBackendPrompt("/review", { compactCommand: true, queueTiming: "afterTurn" });
 	assert.deepEqual(prompts, []);
 	assert.equal(app.promptQueue.length, 1);
 	assert.equal(app.promptQueue[0].text, "/review");
+	assert.equal(app.promptQueue[0].compactCommand, true);
 	assert.equal(app.promptQueue[0].timing, "afterTurn");
 	assert.equal(cancelCount(), 0);
 }
@@ -755,3 +757,52 @@ await earlyNewClient.newSession({
 	},
 });
 assert.deepEqual(newSessionOrder, ["before replay", "fresh welcome"]);
+
+// Codex /btw fork helpers: locate the rollout by id and copy it to a new id.
+{
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "cc-codex-"));
+	const oldId = "11111111-1111-1111-1111-111111111111";
+	const newId = "22222222-2222-2222-2222-222222222222";
+	const dayDir = path.join(root, "sessions", "2026", "06", "18");
+	fs.mkdirSync(dayDir, { recursive: true });
+	const rollout = path.join(dayDir, `rollout-2026-06-18T10-00-00-${oldId}.jsonl`);
+	fs.writeFileSync(rollout, `{"type":"session_meta","id":"${oldId}"}\n{"type":"item","thread_id":"${oldId}","text":"hi"}\n`);
+	// Add an older day to confirm newest-first does not matter for a single match.
+	const found = findCodexRolloutPath(oldId, path.join(root, "sessions"));
+	assert.equal(found, rollout);
+	assert.equal(findCodexRolloutPath("does-not-exist", path.join(root, "sessions")), undefined);
+	const copy = copyCodexRolloutWithNewId(found, oldId, newId);
+	assert.equal(path.basename(copy), `rollout-2026-06-18T10-00-00-${newId}.jsonl`);
+	const copied = fs.readFileSync(copy, "utf8");
+	assert.ok(!copied.includes(oldId), "old id must be fully replaced");
+	assert.ok(copied.includes(`"id":"${newId}"`), "new id must appear in the header");
+	assert.ok(copied.includes(`"thread_id":"${newId}"`), "new id must appear in item records");
+	// Original rollout is untouched.
+	assert.ok(fs.readFileSync(rollout, "utf8").includes(oldId), "parent rollout must be untouched");
+	fs.rmSync(root, { recursive: true, force: true });
+}
+
+// Fork registry: /btw fork session ids are recorded (deduped, persisted) so the
+// resume picker can label them.
+{
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-forks-"));
+	const prev = process.env.CC_FORKS;
+	process.env.CC_FORKS = path.join(dir, "forks.json");
+	try {
+		assert.equal(loadForkIds().size, 0);
+		recordForkId("fork-aaa");
+		recordForkId("fork-bbb");
+		recordForkId("fork-aaa"); // dedup
+		recordForkId(""); // ignored
+		recordForkId(undefined); // ignored
+		const ids = loadForkIds();
+		assert.equal(ids.size, 2);
+		assert.ok(ids.has("fork-aaa") && ids.has("fork-bbb"));
+		// Persisted across a fresh load.
+		assert.ok(loadForkIds().has("fork-bbb"));
+	} finally {
+		if (prev === undefined) delete process.env.CC_FORKS;
+		else process.env.CC_FORKS = prev;
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+}

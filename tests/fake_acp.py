@@ -124,7 +124,7 @@ def handle_message(message):
                     "agentCapabilities": {
                         "loadSession": True,
                         "promptCapabilities": {"image": True},
-                        "sessionCapabilities": {"list": {}, "resume": {}},
+                        "sessionCapabilities": {"list": {}, "resume": {}, "fork": {}},
                     },
                     "agentInfo": {
                         "name": "fake-acp",
@@ -241,6 +241,16 @@ def handle_message(message):
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "result": {"configOptions": CONFIG_OPTIONS},
+            }
+        )
+    elif method == "session/fork":
+        # A fork keeps the same fake session id for simplicity; in this process it
+        # behaves like a fresh forked thread that can still prompt and use tools.
+        send(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {"sessionId": "fake-session", "configOptions": CONFIG_OPTIONS},
             }
         )
     elif method == "session/set_config_option":

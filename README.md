@@ -1,97 +1,124 @@
 # cc
 
-A fast `cc` CLI for switching between Claude Code, Codex, Cursor Agent, Terminus-2, and mini-swe-agent.
+A fast, low-latency `cc` CLI for driving **Claude Code**, **Codex**, and **Cursor Agent** (plus Terminus-2 and mini-swe-agent) from one shared terminal UI.
 
-The default runtime is a shared TUI backed by ACP. The UI layer uses `@mariozechner/pi-tui` from Pi instead of a custom renderer, so the editor sits after the rendered conversation and moves naturally as messages stream in. The wrapper owns `/harness` switching while each agent runs as a backend process.
+`cc` is a thin wrapper: each agent runs as a backend process and `cc` talks to it over the [Agent Client Protocol](https://agentclientprotocol.com) (ACP). The UI layer is built on Pi's `@mariozechner/pi-tui`, so the editor sits after the rendered conversation and moves naturally as messages stream in. The wrapper owns `/harness` switching, the message queue, voice input, themes, and a set of local commands; everything an agent advertises over ACP is forwarded to that backend.
 
 ## Install
+
+One command (requires Node 18+ and `git`):
+
+```sh
+npm install -g github:ethanewer/uni-agent-cli
+```
+
+The post-install step installs the ACP adapters for Claude and Codex (`@agentclientprotocol/claude-agent-acp` and `@zed-industries/codex-acp`) if they aren't already on your `PATH`. To skip that, set `CC_SKIP_ADAPTER_INSTALL=1`.
+
+Then run:
+
+```sh
+cc            # default agent (codex)
+cc claude     # Claude Code
+cc cursor     # Cursor Agent
+cc terminus-2
+cc mini-swe-agent
+```
+
+Optional backends and integrations:
+
+- **Cursor**: install `cursor-agent` from <https://cursor.com> (it is not an npm package).
+- **Voice input**: set `OPENAI_API_KEY` and install `sox` (`rec`) or `ffmpeg`.
+- **Image paste**: macOS works out of the box; Linux needs `wl-paste` (Wayland) or `xclip` (X11).
+- **Terminus-2 / mini-swe-agent**: create a Python venv next to the CLI and install their deps; point `CC_HARNESS_PYTHON` at it if needed.
+
+If you're developing on a clone instead:
 
 ```sh
 npm install
 npm link
 ```
 
-Then run:
+## Sending messages while the agent is working
 
-```sh
-cc
-cc claude
-cc cursor
-cc terminus-2
-cc mini-swe-agent
-```
+`cc` mirrors Codex's steering model so you never have to wait for a turn to finish:
 
-## Switching
+| Key (while the agent is working) | What it does |
+| --- | --- |
+| **Enter** (with text) | Queue the message **after the next tool call** — `cc` interrupts at the next tool boundary and sends it. |
+| **Tab** (with text) | Queue the message **for after the turn** finishes. |
+| **Enter** (autocomplete open) | Accept the autocomplete suggestion (normal editor behavior). |
+| **Esc** (an after-tool message is queued) | Stop the agent immediately and send that message now. |
+| **Esc** (only after-turn messages queued) | Stop the agent **without sending**; the queued messages drop back into the input box (newline-separated) for editing. |
+| **Esc** (nothing queued) | Interrupt the current turn. A second Esc force-settles a stuck cancel. |
+| **↑** (empty input) | Pull the last queued message back into the editor. |
 
-Inside a session:
+Queued messages are shown above the input box (`after tool: …` / `queued: …`). If the backend crashes while messages are queued, they are preserved and re-sent against a fresh connection on your next submit — never silently dropped.
+
+## Switching agents
 
 ```text
-/harness
-/harness codex
+/harness            # open the switcher
+/harness codex      # switch immediately
 /harness claude
 /harness cursor
-/harness terminus-2
-/harness mini-swe-agent
+/harness exit       # quit
 ```
 
-`/harness` opens the minimal switcher. Direct commands switch immediately.
+## Slash commands
 
-## Slash Commands
+Agent-advertised ACP commands appear in autocomplete and are forwarded to that backend (a backend command always takes precedence over a same-named local command, except the reserved UI commands below). `cc` implements these locally for every backend:
 
-Agent-advertised ACP commands are shown in autocomplete and forwarded to that backend. Local commands are implemented in the shared UI when ACP exposes the needed capability:
+- `/new` — start a fresh ACP session and clear the visible thread.
+- `/resume` — open the session picker (when the backend supports `session/list`).
+- `/model`, `/mode`, `/effort` (aka `/reasoning`, `/thinking`) — open ACP config selectors when the backend advertises them.
+- `/plan` — switch to a Plan mode when the backend advertises one.
+- `/btw <question>` — ask an **ephemeral side question** in a transient overlay (see below).
+- `/diff` — show the working-tree git diff (`git diff HEAD`; pass args like `/diff --staged`).
+- `/copy` — copy the last response to the clipboard.
+- `/voice` — return the empty input box to voice mode.
+- `/theme` — pick a color theme (persisted).
+- `/help`, `/status`, `/clear` — handled locally.
 
-- `/new` starts a fresh ACP session and clears the visible thread.
-- `/resume` opens the ACP session picker when `session/list` is supported.
-- `/model`, `/mode`, and `/effort` open ACP config selectors when the backend advertises those config options.
-- `/plan` switches to a Plan mode only when the backend advertises one. Current `codex-acp` exposes approval/sandbox modes, but does not expose the native Codex TUI Plan mode.
-- `/voice` returns the empty input box to voice mode.
-- `/help`, `/status`, and `/clear` are handled locally.
+### `/btw` — forked side thread (page view)
 
-## Voice Input
+`/btw` **forks the current conversation** into a side thread. The fork inherits the full prior context **and can use tools** — it's a real branch, not a read-only aside — and the original thread is untouched. `/btw` on its own opens the fork ready for input; `/btw <question>` opens it and asks immediately. Works even while the main agent is mid-turn.
 
-When the input box is empty, press `space` to start recording and `space` again to transcribe and send. Press `ctrl+space` to switch from voice mode to normal text input without inserting a character. If recording is active, typing or pressing `ctrl+space` stops recording, transcribes, and keeps the transcript in the input box for editing.
+While a fork is open, `cc` switches to a **page view** (Codex-style): one thread fills the screen with its own scroll position, so scrolling is clean and per-thread instead of mixed into the terminal scrollback.
 
-Voice recording uses `rec` from sox when available, otherwise `ffmpeg`. Transcription uses OpenAI's audio transcription endpoint with `OPENAI_API_KEY`; set `OPENAI_BASE_URL` for a compatible proxy, `CC_TRANSCRIPTION_MODEL` to override the model, and `CC_AUDIO_DEVICE` to select a microphone.
+- **Shift+Tab** switches which thread fills the page (a tab bar at the top shows `main` / `btw (fork)`, with the active one marked `›`).
+- **PgUp/PgDn**, **Home/End**, and **Up/Down** (when the input is empty) scroll the page; **End** follows the live tail.
+- **Esc** cancels the fork's turn, or closes the fork when idle (returning to the normal main view with full scrollback restored). **/copy** copies the focused thread's last answer.
 
-## ACP
+Forking support is per-backend:
 
-ACP is the default transport. The defaults are:
+- **Claude** uses the native ACP `session/fork` (isolated branch, full context + tools).
+- **Codex** has no ACP fork, so `cc` copies the session's rollout file to a new id and `session/load`s the copy — an isolated branch with full history + tools, original untouched (this reads/writes `~/.codex` session files and is sensitive to Codex's on-disk format; if it can't fork it reports why in the pane).
+- **Cursor** does not support forking, so `/btw` reports that it's unavailable there.
 
-- Claude Code ACP: `claude-agent-acp`
-- Codex ACP: `codex-acp`
-- Cursor ACP: `cursor-agent acp`
-- Terminus-2: local ACP bridge in `src/harnesses/terminus_2`
-- mini-swe-agent: local ACP bridge in `src/harnesses/mini_swe_agent`
+### ultracode and workflows (Claude Code)
 
-Install the adapters once:
+Claude's `ultracode` effort level and multi-agent **workflows** run inside the Claude backend, so they "just work" through `cc`:
 
-```sh
-npm install -g @agentclientprotocol/claude-agent-acp @zed-industries/codex-acp
-```
+- Select the effort level with `/effort` when `claude-agent-acp` advertises it, or simply include the keyword `ultracode` in your prompt.
+- Workflow/sub-agent fan-out streams back as nested tool calls and plan updates, which `cc` renders live. Use `Esc` to cancel.
 
-The Terminus-2 bridge vendors the upstream Terminal-Bench `terminus_2` files and prompt templates, but still needs its Python runtime dependencies available: `terminal-bench`, `litellm`, `tenacity`, and `tmux`. `cc` automatically uses `.venv/bin/python` next to this CLI when present; use `CC_HARNESS_PYTHON=/path/to/python` to override it. Configure the model with `TERMINUS_2_MODEL` or `settings.agents["terminus-2"].args`, for example `["--model", "openai/gpt-5"]`.
+### Cursor
 
-The mini-swe-agent bridge follows the DeepSWE/Pier benchmark implementation. When `MINI_SWE_AGENT_TASK_PATH` or `--task-path` is set, it runs `pier run -p <path> --agent mini-swe-agent`. Without a task path it adapts the submitted free-form prompt through Pier's vendored `MiniSweAgent` implementation in the current working directory, preserving its model-class selection, `mini.yaml` config flags, env setup, and trajectory handling. Install with `uv venv .venv && uv pip install --python .venv/bin/python mini-swe-agent datacurve-pier terminal-bench tenacity`, and configure `MINI_SWE_AGENT_MODEL` or `MSWEA_MODEL_NAME`.
+`cc` natively handles Cursor's ACP extensions: `cursor/ask_question` and `cursor/create_plan` are surfaced as TUI prompts (accept/answer/reject), and `update_todos` / `task` / `generate_image` are rendered inline. Cursor's `agent` / `plan` / `ask` modes map onto `/mode`.
 
-Then use:
+## Voice input
 
-```text
-/harness codex
-```
+When the input box is empty, press `space` to start recording and `space` again to transcribe and send. Press `ctrl+space` to switch from voice mode to normal text input. While recording, typing keeps the transcript in the box for editing; `Ctrl+C` or `Esc` cancels the recording without transcribing.
 
-PTY fallback is not part of the Pi-TUI path; the shared UI talks to ACP backends.
-The client advertises ACP terminal support and implements `terminal/*` requests so backend slash commands that need shell execution can run inside the shared UI.
-ACP permission requests are shown as TUI selection prompts. `cc` waits for the user to approve or reject unless the active agent's native settings imply bypass/force mode.
+Recording uses `rec` from sox when available, otherwise `ffmpeg`. Transcription uses OpenAI's audio endpoint with `OPENAI_API_KEY`; set `OPENAI_BASE_URL` for a compatible proxy, `CC_TRANSCRIPTION_MODEL` to override the model, and `CC_AUDIO_DEVICE` to select a microphone.
 
-## Development
+## Permissions
 
-```sh
-npm test
-```
+ACP permission requests are shown as TUI selection prompts. `cc` waits for you to approve or reject unless the active agent's native settings imply a bypass/force mode (see Settings), in which case it auto-accepts. `cc` advertises ACP terminal support and implements `terminal/*` so backend commands that need shell execution run inside the shared UI.
 
 ## Configuration
 
-Create `~/.config/cc/config.json` to override commands:
+Create `~/.config/cc/config.json` to override commands (or point `CC_CONFIG` at another file):
 
 ```json
 {
@@ -100,71 +127,37 @@ Create `~/.config/cc/config.json` to override commands:
     "codex": {
       "command": "codex",
       "args": [],
-      "acp": {
-        "command": "codex-acp",
-        "args": []
-      }
+      "acp": { "command": "codex-acp", "args": [] }
     }
   }
 }
 ```
-
-You can also point `CC_CONFIG` at a different JSON file.
 
 ## Settings
 
-Create `~/.config/cc/settings.json` to apply default native settings per harness:
+Create `~/.config/cc/settings.json` (or point `CC_SETTINGS` at another file) to apply default native settings per harness and choose a theme:
 
 ```json
 {
+  "theme": "tokyonight",
   "agents": {
-    "claude": {
-      "settings": {
-        "permissions": {
-          "defaultMode": "bypassPermissions"
-        }
-      }
-    },
-    "codex": {
-      "config": {
-        "approval_policy": "never",
-        "sandbox_mode": "danger-full-access"
-      }
-    },
-    "cursor": {
-      "args": ["--force", "--sandbox", "disabled", "--approve-mcps"]
-    }
+    "claude": { "settings": { "permissions": { "defaultMode": "bypassPermissions" }, "model": "sonnet" } },
+    "codex":  { "config": { "approval_policy": "never", "sandbox_mode": "danger-full-access", "model": "gpt-5" } },
+    "cursor": { "args": ["--force", "--sandbox", "disabled", "--approve-mcps", "--model", "gpt-5"] }
   }
 }
 ```
 
-These settings mirror each backend as closely as the ACP wrapper allows: Claude uses its `settings.permissions.defaultMode`, Codex uses `-c key=value` config overrides, and Cursor uses command-line args before the `acp` subcommand. When these native settings imply bypass/force mode, `cc` also auto-accepts ACP permission requests that the backend still emits.
+These mirror each backend as closely as the ACP wrapper allows: Claude uses its `settings.permissions.defaultMode`, Codex uses `-c key=value` config overrides, and Cursor uses command-line args before the `acp` subcommand. When these imply bypass/force mode, `cc` also auto-accepts ACP permission requests the backend still emits. `args` are appended to the backend command (Cursor args are inserted before the `acp` subcommand).
 
-You can also set native defaults that the ACP backends expose:
+## Development
 
-```json
-{
-  "agents": {
-    "codex": {
-      "config": {
-        "model": "gpt-5"
-      }
-    },
-    "cursor": {
-      "args": ["--model", "gpt-5"]
-    },
-    "claude": {
-      "settings": {
-        "model": "sonnet"
-      }
-    }
-  }
-}
+```sh
+npm test
 ```
 
-`args` are appended to the backend command, except Cursor args are inserted before the `acp` subcommand. `config` becomes Codex `-c key=value` overrides. `settings` is passed to Claude as native `--settings`-equivalent session settings. You can point `CC_SETTINGS` at a different JSON file.
+This runs syntax/compile checks, the settings/queue unit tests, and the tmux-driven TUI smoke test (resize, scroll-during-streaming, the message queue, slash commands, permissions, and the new `/btw` / `/diff` / `/copy` commands).
 
 ## Notes
 
-T3 Code takes a richer web-app approach around provider sessions and currently uses `codex app-server` for structured Codex integration. `cc` uses the same product model in a smaller terminal form: backend events are normalized into shared UI state, and `/harness` stays in the wrapper input layer instead of being forwarded to an agent.
-The terminal UI itself is based on Pi's `@mariozechner/pi-tui` primitives: `TUI`, `ProcessTerminal`, `Editor`, `Markdown`, autocomplete, and differential rendering.
+T3 Code takes a richer web-app approach around provider sessions and uses `codex app-server` for structured Codex integration. `cc` uses the same product model in a smaller terminal form: backend events are normalized into shared UI state, and `/harness` stays in the wrapper input layer instead of being forwarded to an agent. The terminal UI is based on Pi's `@mariozechner/pi-tui` primitives (`TUI`, `Editor`, `Markdown`, autocomplete, differential rendering).

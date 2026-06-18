@@ -495,18 +495,27 @@ wait_for_text '"optionId": "allow-two"'
 tmux send-keys -t "$SESSION" / c l e a r Enter
 wait_without_text '"optionId": "allow-one"'
 
+# Enter while the agent is working queues the message as "after tool" (steer at the next tool boundary).
 tmux send-keys -t "$SESSION" s l o w Space t o o l Enter
 wait_for_text "Slow Tool"
-
 tmux send-keys -t "$SESSION" q u e u e d - o n e Enter
-wait_for_text "queued: queued-one"
-tmux send-keys -t "$SESSION" Enter
 wait_for_text "after tool: queued-one"
 wait_for_text "echo: queued-one"
 
 tmux send-keys -t "$SESSION" / c l e a r Enter
 wait_without_text "queued-one"
 
+# Tab while the agent is working queues the message as "after turn".
+tmux send-keys -t "$SESSION" s l o w Space t o o l Enter
+wait_for_text "Slow Tool"
+tmux send-keys -t "$SESSION" q u e u e d - t a b Tab
+wait_for_text "queued: queued-tab"
+wait_for_text "echo: queued-tab"
+
+tmux send-keys -t "$SESSION" / c l e a r Enter
+wait_without_text "queued-tab"
+
+# Enter once the tool has finished still steers via after-tool.
 tmux send-keys -t "$SESSION" s l o w Space t o o l Enter
 wait_for_text "✓ Slow Tool"
 tmux send-keys -t "$SESSION" l a t e - q u e u e Enter
@@ -515,12 +524,109 @@ wait_for_text "echo: late-queue"
 tmux send-keys -t "$SESSION" / c l e a r Enter
 wait_without_text "late-queue"
 
+# A message queued (Enter) before the first tool call still sends after that tool.
 tmux send-keys -t "$SESSION" d e l a y e d Space t o o l Enter
 tmux send-keys -t "$SESSION" p r e - t o o l - q u e u e Enter
-tmux send-keys -t "$SESSION" Enter
 wait_for_text "Slow Tool"
 wait_for_text "after tool: pre-tool-queue"
 wait_for_text "echo: pre-tool-queue"
+
+tmux send-keys -t "$SESSION" / c l e a r Enter
+wait_without_text "pre-tool-queue"
+
+# Esc with an after-tool message queued stops the turn and sends it immediately.
+tmux send-keys -t "$SESSION" d e l a y e d Space t o o l Enter
+tmux send-keys -t "$SESSION" e s c - s e n d Enter
+wait_for_text "after tool: esc-send"
+tmux send-keys -t "$SESSION" Escape
+wait_for_text "echo: esc-send"
+
+tmux send-keys -t "$SESSION" / c l e a r Enter
+wait_without_text "esc-send"
+
+# Esc with only after-turn messages queued aborts without sending and restores them to the composer.
+tmux send-keys -t "$SESSION" s l o w Space t o o l Enter
+wait_for_text "Slow Tool"
+tmux send-keys -t "$SESSION" e s c - r e s t o r e Tab
+wait_for_text "queued: esc-restore"
+tmux send-keys -t "$SESSION" Escape
+wait_without_text "queued: esc-restore"
+sleep 0.5
+if capture | grep -Fq "echo: esc-restore"; then
+	echo "after-turn message must not be sent when Esc aborts the turn" >&2
+	capture >&2
+	exit 1
+fi
+tmux send-keys -t "$SESSION" Enter
+wait_for_text "echo: esc-restore"
+
+tmux send-keys -t "$SESSION" / c l e a r Enter
+wait_without_text "esc-restore"
+
+# /copy with nothing to copy is recognized locally (not forwarded as unknown).
+tmux send-keys -t "$SESSION" / c o p y Enter
+wait_for_text "Nothing to copy yet."
+
+# After a response, /copy reports a copy result (success or a clear error).
+tmux send-keys -t "$SESSION" h e l l o - c o p y Enter
+wait_for_text "echo: hello-copy"
+tmux send-keys -t "$SESSION" / c o p y Enter
+for _ in {1..50}; do
+	if capture | grep -Eq "Copied the last response|Could not copy"; then break; fi
+	sleep 0.1
+done
+if ! capture | grep -Eq "Copied the last response|Could not copy"; then
+	echo "/copy was not handled" >&2
+	capture >&2
+	exit 1
+fi
+
+tmux send-keys -t "$SESSION" / c l e a r Enter
+wait_without_text "echo: hello-copy"
+
+# /diff is recognized locally; against an unchanged tracked path it reports no changes.
+tmux send-keys -t "$SESSION" / d i f f Space - - Space . g i t i g n o r e Enter
+wait_for_text "No changes in the working tree."
+
+tmux send-keys -t "$SESSION" / c l e a r Enter
+wait_without_text "No changes in the working tree."
+
+# Bare /btw opens an empty focused fork, ready for input; Esc closes it.
+tmux send-keys -t "$SESSION" / b t w Enter
+wait_for_text "› btw (fork)"
+sleep 0.3
+tmux send-keys -t "$SESSION" Escape
+wait_without_text "btw (fork)"
+tmux send-keys -t "$SESSION" / c l e a r Enter
+
+# /btw <question> forks the session into a split-view side thread (full context + tools).
+tmux send-keys -t "$SESSION" / b t w Space w h y Space i s Space s k y Space b l u e Enter
+wait_for_text "btw (fork)"
+wait_for_text "echo: why is sky blue"
+# Focused on the fork (cursor marker on the divider).
+wait_for_text "› btw (fork)"
+# Shift+Tab moves focus back to the main thread.
+tmux send-keys -t "$SESSION" BTab
+wait_for_text "  btw (fork)"
+wait_without_text "› btw (fork)"
+# Page-view scroll keys (focus is on main here) are handled without crashing or
+# leaving the page view.
+tmux send-keys -t "$SESSION" PageUp
+sleep 0.2
+tmux send-keys -t "$SESSION" Home
+sleep 0.2
+tmux send-keys -t "$SESSION" End
+sleep 0.2
+wait_for_text "› main"
+wait_for_text "btw (fork)"
+# Shift+Tab focuses the fork, then Esc (idle) closes it.
+tmux send-keys -t "$SESSION" BTab
+wait_for_text "› btw (fork)"
+sleep 0.3
+tmux send-keys -t "$SESSION" Escape
+wait_without_text "btw (fork)"
+
+tmux send-keys -t "$SESSION" / c l e a r Enter
 
 tmux send-keys -t "$SESSION" / v o i c e Enter
 wait_for_text "Space to record"
