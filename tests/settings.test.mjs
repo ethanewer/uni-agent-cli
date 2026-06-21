@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -18,6 +19,7 @@ import {
 	isVsCodeAutoActivationCommand,
 	isVsCodeTerminal,
 	loadConfig,
+	readCodexThreadState,
 	resolveThemeName,
 	rewriteFullScreenClear,
 	saveSettingsPatch,
@@ -91,6 +93,74 @@ function busyPromptHarness(agentName = "codex-acp") {
 	app.updateSpinner = () => {};
 	app.ui = { requestRender() {} };
 	app.promptForActiveCapabilities = (text) => text;
+	return { app, prompts, cancelCount: () => cancelCount };
+}
+
+function unsendHarness({ initialState, currentState = initialState } = {}) {
+	const prompts = [];
+	let cancelCount = 0;
+	let resolvePrompt;
+	const app = Object.create(HarnessApp.prototype);
+	app.ready = true;
+	app.busy = false;
+	app.cancelRequested = false;
+	app.afterToolCancelPending = false;
+	app.sessionSwitchInProgress = false;
+	app.transport = "acp";
+	app.activeKey = "codex";
+	app.config = config;
+	app.client = {
+		sessionId: "codex-session",
+		agentInfo: { name: "codex-acp" },
+		exited: false,
+		prompt(prompt) {
+			prompts.push(prompt);
+			return new Promise((resolve) => {
+				resolvePrompt = resolve;
+			});
+		},
+		cancel() {
+			cancelCount += 1;
+		},
+		forceResolvePrompt() {
+			resolvePrompt?.({ stopReason: "cancelled" });
+			return true;
+		},
+	};
+	app.sessionStates = new Map([["codex", { agentInfo: { name: "codex-acp" } }]]);
+	app.chat = {
+		children: [],
+		addChild(child) {
+			this.children.push(child);
+		},
+		removeChild(child) {
+			const index = this.children.indexOf(child);
+			if (index !== -1) this.children.splice(index, 1);
+		},
+	};
+	app.editor = {
+		text: "",
+		getText() {
+			return this.text;
+		},
+		setText(text) {
+			this.text = text;
+		},
+	};
+	app.promptQueue = [];
+	app.pendingUserEchoes = [];
+	app.pendingUnsendPrompt = undefined;
+	app.codexThreadStateSnapshot = initialState;
+	app.activeToolIds = new Set();
+	app.activeAnonymousToolCount = 0;
+	app.seenToolThisTurn = false;
+	app.pendingPromptDisplay = undefined;
+	app.clipboardImages = [];
+	app.updateSpinner = () => {};
+	app.ui = { requestRender() {} };
+	app.promptForActiveCapabilities = (text) => text;
+	app.readCodexThreadState = () => currentState;
+	app.restagePromptImages = HarnessApp.prototype.restagePromptImages;
 	return { app, prompts, cancelCount: () => cancelCount };
 }
 
@@ -452,6 +522,295 @@ const config = {
 	assert.equal(app.promptQueue[0].compactCommand, true);
 	assert.equal(app.promptQueue[0].timing, "afterTurn");
 	assert.equal(cancelCount(), 0);
+}
+
+{
+	const unchanged = {
+		sessionId: "codex-session",
+		row: { updated_at_ms: 100, preview: "before" },
+		rollout: { size: 20, mtimeMs: 1000 },
+	};
+	const { app, prompts, cancelCount } = unsendHarness({ initialState: unchanged });
+	void app.submitBackendPrompt("recall this");
+	assert.deepEqual(prompts, ["recall this"]);
+	assert.equal(app.chat.children.length, 1);
+	assert.equal(app.tryUnsendPendingPrompt(), true);
+	assert.equal(cancelCount(), 1);
+	assert.equal(app.editor.getText(), "recall this");
+	assert.equal(app.chat.children.length, 0);
+	assert.equal(app.pendingUnsendPrompt, undefined);
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	assert.equal(app.busy, false);
+}
+
+{
+	const unchanged = {
+		sessionId: "codex-session",
+		row: { updated_at_ms: 100, preview: "before" },
+		rollout: { size: 20, mtimeMs: 1000 },
+	};
+	const { app, prompts, cancelCount } = unsendHarness({ initialState: unchanged });
+	app.promptQueue.push({ text: "queued prompt", timing: "afterTurn" });
+	void app.flushPromptQueue();
+	assert.deepEqual(prompts, ["queued prompt"]);
+	assert.equal(app.promptQueue.length, 0);
+	assert.equal(app.tryUnsendPendingPrompt(), true);
+	assert.equal(cancelCount(), 1);
+	assert.equal(app.editor.getText(), "queued prompt");
+	assert.equal(app.chat.children.length, 0);
+}
+
+{
+	const emptySession = {
+		sessionId: "codex-session",
+		row: null,
+		rollout: null,
+	};
+	const { app, prompts, cancelCount } = unsendHarness({ initialState: emptySession });
+	void app.submitBackendPrompt("first message");
+	assert.deepEqual(prompts, ["first message"]);
+	assert.equal(app.tryUnsendPendingPrompt(), true);
+	assert.equal(cancelCount(), 1);
+	assert.equal(app.editor.getText(), "first message");
+	assert.equal(app.chat.children.length, 0);
+}
+
+{
+	const emptySession = {
+		sessionId: "codex-session",
+		row: null,
+		rollout: null,
+	};
+	const rolloutCreated = {
+		sessionId: "codex-session",
+		row: null,
+		rollout: { size: 40, mtimeMs: 1001 },
+	};
+	const { app, prompts, cancelCount } = unsendHarness({ initialState: emptySession, currentState: rolloutCreated });
+	void app.submitBackendPrompt("first message");
+	assert.deepEqual(prompts, ["first message"]);
+	assert.equal(app.tryUnsendPendingPrompt(), false);
+	assert.equal(app.editor.getText(), "");
+	app.interruptViaEscape();
+	assert.equal(cancelCount(), 1);
+	assert.equal(app.chat.children.length, 1);
+}
+
+{
+	const emptySession = {
+		sessionId: "codex-session",
+		row: null,
+		rollout: null,
+	};
+	const createdState = {
+		sessionId: "codex-session",
+		row: { updated_at_ms: 101, preview: "first message" },
+		rollout: { size: 40, mtimeMs: 1001 },
+	};
+	const { app, prompts, cancelCount } = unsendHarness({ initialState: emptySession, currentState: createdState });
+	void app.submitBackendPrompt("first message");
+	assert.deepEqual(prompts, ["first message"]);
+	assert.equal(app.tryUnsendPendingPrompt(), false);
+	assert.equal(app.editor.getText(), "");
+	app.interruptViaEscape();
+	assert.equal(cancelCount(), 1);
+	assert.equal(app.chat.children.length, 1);
+}
+
+{
+	const unchanged = {
+		sessionId: "codex-session",
+		row: { updated_at_ms: 100, preview: "before" },
+		rollout: { size: 20, mtimeMs: 1000 },
+	};
+	const { app } = unsendHarness({ initialState: unchanged });
+	void app.submitBackendPrompt("recall this");
+	app.promptQueue.push({ text: "queued after turn", timing: "afterTurn" });
+	assert.equal(app.tryUnsendPendingPrompt(), true);
+	assert.equal(app.editor.getText(), "recall this\nqueued after turn");
+	assert.equal(app.promptQueue.length, 0);
+}
+
+{
+	const unchanged = {
+		sessionId: "codex-session",
+		row: { updated_at_ms: 100, preview: "before" },
+		rollout: { size: 20, mtimeMs: 1000 },
+	};
+	const { app } = unsendHarness({ initialState: unchanged });
+	void app.submitBackendPrompt("recall this");
+	app.promptQueue.push({ text: "queued after tool", timing: "afterTool" });
+	assert.equal(app.tryUnsendPendingPrompt(), false);
+	assert.equal(app.editor.getText(), "");
+	assert.equal(app.promptQueue.length, 1);
+}
+
+{
+	const unchanged = {
+		sessionId: "codex-session",
+		row: { updated_at_ms: 100, preview: "before" },
+		rollout: { size: 20, mtimeMs: 1000 },
+	};
+	const { app } = unsendHarness({ initialState: unchanged });
+	void app.submitBackendPrompt("already active");
+	app.handleBackendEvent({ type: "text", text: "started" });
+	assert.equal(app.pendingUnsendPrompt, undefined);
+	assert.equal(app.tryUnsendPendingPrompt(), false);
+	assert.equal(app.editor.getText(), "");
+	assert.equal(app.chat.children.length, 3);
+}
+
+{
+	const unchanged = {
+		sessionId: "codex-session",
+		row: { updated_at_ms: 100, preview: "before" },
+		rollout: { size: 20, mtimeMs: 1000 },
+	};
+	const { app } = unsendHarness({ initialState: unchanged });
+	void app.submitBackendPrompt("backend progressed");
+	app.handleBackendEvent({ type: "backend_activity" });
+	assert.equal(app.pendingUnsendPrompt, undefined);
+	assert.equal(app.tryUnsendPendingPrompt(), false);
+	assert.equal(app.editor.getText(), "");
+	assert.equal(app.chat.children.length, 1);
+}
+
+{
+	const unchanged = {
+		sessionId: "codex-session",
+		row: { updated_at_ms: 100, preview: "before" },
+		rollout: { size: 20, mtimeMs: 1000 },
+	};
+	const { app, cancelCount } = unsendHarness({ initialState: unchanged });
+	app.activeKey = "claude";
+	app.client.agentInfo = { name: "claude-agent-acp" };
+	app.sessionStates = new Map([["claude", { agentInfo: { name: "claude-agent-acp" } }]]);
+	void app.submitBackendPrompt("not codex");
+	assert.equal(app.pendingUnsendPrompt, undefined);
+	assert.equal(app.tryUnsendPendingPrompt(), false);
+	assert.equal(app.editor.getText(), "");
+	app.interruptViaEscape();
+	assert.equal(cancelCount(), 1);
+	assert.equal(app.chat.children.length, 1);
+}
+
+{
+	const unchanged = {
+		sessionId: "codex-session",
+		row: { updated_at_ms: 100, preview: "before" },
+		rollout: { size: 20, mtimeMs: 1000 },
+	};
+	const { app } = unsendHarness({ initialState: unchanged });
+	void app.submitBackendPrompt("recall [Image 1]", {
+		promptParts: [
+			{ type: "text", text: "recall " },
+			{ type: "image", data: "aW1hZ2Ux", mimeType: "image/png" },
+		],
+	});
+	app.editor.setText("next [Image 9]");
+	app.clipboardImages = [{ label: "[Image 9]", data: "aW1hZ2U5", mimeType: "image/png" }];
+	assert.equal(app.tryUnsendPendingPrompt(), true);
+	assert.equal(app.editor.getText(), "recall [Image 1]\nnext [Image 9]");
+	assert.deepEqual(app.clipboardImages.map((image) => image.label), ["[Image 1]", "[Image 9]"]);
+}
+
+{
+	const unchanged = {
+		sessionId: "codex-session",
+		row: { updated_at_ms: 100, preview: "before" },
+		rollout: { size: 20, mtimeMs: 1000 },
+	};
+	const { app } = unsendHarness({ initialState: unchanged });
+	const previous = { render: () => ["previous"], invalidate() {} };
+	app.chat.children.push(previous);
+	void app.submitBackendPrompt("recall this");
+	assert.equal(app.chat.children.length, 3);
+	assert.equal(app.tryUnsendPendingPrompt(), true);
+	assert.deepEqual(app.chat.children, [previous]);
+}
+
+{
+	const initial = {
+		sessionId: "codex-session",
+		row: { updated_at_ms: 100, preview: "before" },
+		rollout: { size: 20, mtimeMs: 1000 },
+	};
+	const changed = {
+		sessionId: "codex-session",
+		row: { updated_at_ms: 101, preview: "after" },
+		rollout: { size: 40, mtimeMs: 1001 },
+	};
+	const { app, prompts, cancelCount } = unsendHarness({ initialState: initial, currentState: changed });
+	void app.submitBackendPrompt("already received");
+	assert.deepEqual(prompts, ["already received"]);
+	assert.equal(app.tryUnsendPendingPrompt(), false);
+	assert.equal(app.editor.getText(), "");
+	assert.equal(app.chat.children.length, 1);
+	app.interruptViaEscape();
+	assert.equal(cancelCount(), 1);
+	assert.equal(app.chat.children.length, 1);
+}
+
+{
+	const events = [];
+	const client = Object.create(AcpClient.prototype);
+	client.sessionId = "codex-session";
+	client.pending = new Map();
+	client.bufferingSessionUpdates = false;
+	client.onEvent = (event) => events.push(event);
+	client.handleLine(JSON.stringify({
+		jsonrpc: "2.0",
+		method: "session/update",
+		params: {
+			sessionId: "codex-session",
+			update: {
+				sessionUpdate: "usage_update",
+				inputTokens: 1,
+			},
+		},
+	}));
+	assert.deepEqual(events, [{ type: "backend_activity" }]);
+}
+
+{
+	const events = [];
+	const client = Object.create(AcpClient.prototype);
+	client.sessionId = "codex-session";
+	client.pending = new Map();
+	client.bufferingSessionUpdates = false;
+	client.onEvent = (event) => events.push(event);
+	client.handleLine(JSON.stringify({
+		jsonrpc: "2.0",
+		method: "session/update",
+		params: {
+			sessionId: "stale-session",
+			update: {
+				sessionUpdate: "usage_update",
+				inputTokens: 1,
+			},
+		},
+	}));
+	assert.deepEqual(events, []);
+}
+
+{
+	const events = [];
+	const writes = [];
+	const client = Object.create(AcpClient.prototype);
+	client.sessionId = "codex-session";
+	client.pending = new Map();
+	client.bufferingSessionUpdates = false;
+	client.onEvent = (event) => events.push(event);
+	client.writeSafe = (message) => writes.push(message);
+	client.handleLine(JSON.stringify({
+		jsonrpc: "2.0",
+		id: 10,
+		method: "unknown/request",
+		params: {},
+	}));
+	assert.deepEqual(events, [{ type: "backend_activity" }]);
+	assert.equal(writes[0].id, 10);
+	assert.equal(writes[0].error.code, -32601);
 }
 
 {
@@ -951,6 +1310,46 @@ assert.deepEqual(newSessionOrder, ["before replay", "fresh welcome"]);
 	assert.ok(copied.includes(`"thread_id":"${newId}"`), "new id must appear in item records");
 	// Original rollout is untouched.
 	assert.ok(fs.readFileSync(rollout, "utf8").includes(oldId), "parent rollout must be untouched");
+	fs.rmSync(root, { recursive: true, force: true });
+}
+
+{
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "cc-codex-db-"));
+	const missingDb = path.join(root, "state_5.sqlite");
+	assert.equal(readCodexThreadState("new-session", missingDb), undefined);
+	assert.equal(fs.existsSync(missingDb), false);
+	fs.rmSync(root, { recursive: true, force: true });
+}
+
+{
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "cc-codex-db-"));
+	const dbPath = path.join(root, "state_5.sqlite");
+	const sqliteAvailable = spawnSync("sqlite3", ["--version"], { encoding: "utf8" });
+	if (sqliteAvailable.status === 0) {
+		const createDb = spawnSync("sqlite3", [
+			dbPath,
+			[
+				"create table threads (",
+				"id text, rollout_path text, updated_at text, updated_at_ms integer, has_user_event integer, archived integer,",
+				"tokens_used integer, title text, first_user_message text, preview text, model text, reasoning_effort text",
+				");",
+			].join(" "),
+		], { encoding: "utf8" });
+		assert.equal(createDb.status, 0, createDb.stderr || createDb.error?.message);
+		assert.deepEqual(readCodexThreadState("new-session", dbPath), {
+			sessionId: "new-session",
+			row: null,
+			rollout: null,
+		});
+		const dayDir = path.join(root, "sessions", "2026", "06", "21");
+		fs.mkdirSync(dayDir, { recursive: true });
+		const rollout = path.join(dayDir, "rollout-2026-06-21T10-00-00-new-session.jsonl");
+		fs.writeFileSync(rollout, "{\"type\":\"item\",\"text\":\"first message\"}\n");
+		const state = readCodexThreadState("new-session", dbPath);
+		assert.equal(state.sessionId, "new-session");
+		assert.equal(state.row, null);
+		assert.equal(state.rollout.size, fs.statSync(rollout).size);
+	}
 	fs.rmSync(root, { recursive: true, force: true });
 }
 

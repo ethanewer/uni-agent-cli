@@ -1767,18 +1767,22 @@ export class AcpClient {
 			return;
 		}
 		if (message.method === "session/update") {
+			if (this.sessionUpdateTargetsCurrentSession(message.params)) this.onEvent({ type: "backend_activity" });
 			this.handleSessionUpdate(message.params);
 			return;
 		}
 		if (message.id !== undefined && message.method?.startsWith("terminal/")) {
+			this.onEvent({ type: "backend_activity" });
 			void this.handleTerminalRequest(message);
 			return;
 		}
 		if (message.id !== undefined && message.method === "session/request_permission") {
+			this.onEvent({ type: "backend_activity" });
 			void this.handlePermissionRequest(message);
 			return;
 		}
 		if (message.id !== undefined && message.method?.startsWith("cursor/")) {
+			this.onEvent({ type: "backend_activity" });
 			void this.handleCursorRequest(message);
 			return;
 		}
@@ -1786,6 +1790,7 @@ export class AcpClient {
 			// Any other id-bearing request must be answered or the backend hangs
 			// waiting (e.g. an optional/extension method we do not implement).
 			// Reply method-not-found so the agent can fall back gracefully.
+			this.onEvent({ type: "backend_activity" });
 			this.writeSafe({ jsonrpc: "2.0", id: message.id, error: { code: -32601, message: `Method not found: ${message.method}` } });
 		}
 	}
@@ -1894,8 +1899,7 @@ export class AcpClient {
 			this.bufferedSessionUpdates.push(params);
 			return;
 		}
-		const sessionId = params?.sessionId ?? params?.session?.sessionId ?? params?.session?.id;
-		if (sessionId && this.sessionId && sessionId !== this.sessionId) return;
+		if (!this.sessionUpdateTargetsCurrentSession(params)) return;
 		const update = params?.update;
 		if (!update) return;
 		const kind = update.sessionUpdate;
@@ -1955,6 +1959,11 @@ export class AcpClient {
 				text: ["• plan", ...update.entries.map((entry) => `  - [${entry.status ?? "pending"}] ${entry.content}`)].join("\n"),
 			});
 		}
+	}
+
+	sessionUpdateTargetsCurrentSession(params) {
+		const sessionId = params?.sessionId ?? params?.session?.sessionId ?? params?.session?.id;
+		return !(sessionId && this.sessionId && sessionId !== this.sessionId);
 	}
 }
 
@@ -2142,6 +2151,8 @@ export class HarnessApp {
 		this.currentUserText = undefined;
 		this.currentToolSummary = undefined;
 		this.pendingUserEchoes = [];
+		this.pendingUnsendPrompt = undefined;
+		this.codexThreadStateSnapshot = undefined;
 		this.lastInputClearSource = undefined;
 		this.lastKnownEditorText = "";
 		this.suppressNextPairedEmptyInterrupt = false;
@@ -2400,6 +2411,8 @@ export class HarnessApp {
 		this.currentUserText = undefined;
 		this.currentToolSummary = undefined;
 		this.pendingUserEchoes = [];
+		this.pendingUnsendPrompt = undefined;
+		this.codexThreadStateSnapshot = undefined;
 		this.statusState = options.statusState ?? (this.promptQueue.length > 0 ? "connecting" : "");
 		this.updateSpinner();
 		this.updateAutocomplete();
@@ -2508,6 +2521,7 @@ export class HarnessApp {
 		if (voiceWasActive && this.handleVoiceKey(data, voiceKeyInfo)) return { consume: true };
 		// Busy-input steering applies to the focused main thread only.
 		if (this.focusedThread === "main" && this.busy && isEscape(data)) {
+			if (this.tryUnsendPendingPrompt()) return { consume: true };
 			this.interruptViaEscape();
 			return { consume: true };
 		}
@@ -2997,14 +3011,120 @@ export class HarnessApp {
 			return;
 		}
 		const pendingUserEcho = this.trackPendingUserEcho(text);
-		this.addUserMessage(displayText, { compactCommand: options.compactCommand });
+		const transcriptEntry = this.addUserMessage(displayText, { compactCommand: options.compactCommand });
+		this.armPendingUnsendPrompt({
+			text,
+			displayText,
+			promptParts: options.promptParts,
+			pendingUserEcho,
+			transcriptEntry,
+		});
 		await this.sendPrompt(text, { pendingUserEcho, promptParts: options.promptParts });
 		await this.flushPromptQueue();
+	}
+
+	armPendingUnsendPrompt(entry) {
+		const sessionId = this.client?.sessionId;
+		const stateSnapshot = this.codexThreadStateSnapshot;
+		if (!entry.transcriptEntry?.message || !this.isCodexAcpActive() || !sessionId || stateSnapshot?.sessionId !== sessionId) {
+			this.pendingUnsendPrompt = undefined;
+			return;
+		}
+		this.pendingUnsendPrompt = {
+			...entry,
+			sessionId,
+			client: this.client,
+			stateSnapshot,
+		};
+	}
+
+	disarmPendingUnsendPrompt(pendingUserEcho) {
+		if (!this.pendingUnsendPrompt) return;
+		if (!pendingUserEcho || this.pendingUnsendPrompt.pendingUserEcho === pendingUserEcho) {
+			this.pendingUnsendPrompt = undefined;
+		}
+	}
+
+	tryUnsendPendingPrompt() {
+		const pending = this.pendingUnsendPrompt;
+		if (!pending || pending.client !== this.client || !this.busy || this.cancelRequested) return false;
+		if (this.promptQueue.some((entry) => entry.timing === "afterTool")) return false;
+		if (!this.isCodexAcpActive()) {
+			this.pendingUnsendPrompt = undefined;
+			return false;
+		}
+		const currentState = this.readCodexThreadState(pending.sessionId);
+		if (!codexThreadStatesEqual(currentState, pending.stateSnapshot)) {
+			this.pendingUnsendPrompt = undefined;
+			this.codexThreadStateSnapshot = currentState;
+			return false;
+		}
+
+		this.pendingUnsendPrompt = undefined;
+		this.restoreSoftQueuedPromptsToComposer();
+		this.removeTranscriptEntry(pending.transcriptEntry);
+		this.expirePendingUserEcho(pending.pendingUserEcho);
+		this.restoreUnsentPromptToComposer(pending);
+		this.cancelRequested = true;
+		this.afterToolCancelPending = false;
+		this.statusState = "";
+		this.updateSpinner();
+		this.client?.cancel?.();
+		this.forceSettleCanceledTurn();
+		this.ui.requestRender();
+		return true;
+	}
+
+	restoreUnsentPromptToComposer(pending) {
+		const current = this.editor.getText();
+		const next = current ? `${pending.text}\n${current}` : pending.text;
+		this.editor.setText(next);
+		const restored = imageAttachmentsFromPromptParts(pending.text, Array.isArray(pending.promptParts) ? pending.promptParts : []);
+		this.clipboardImages = [...restored, ...this.clipboardImages];
+		this.pendingPromptDisplay = pending.displayText && pending.displayText !== pending.text
+			? { text: pending.text, displayText: pending.displayText }
+			: undefined;
+		this.lastKnownEditorText = next;
+	}
+
+	restoreSoftQueuedPromptsToComposer() {
+		const queued = this.promptQueue.filter((entry) => entry.timing === "afterTurn");
+		if (queued.length === 0) return;
+		this.promptQueue = this.promptQueue.filter((entry) => entry.timing !== "afterTurn");
+		this.pendingPromptDisplay = undefined;
+		this.restoreQueuedTextToComposer(queued);
+	}
+
+	removeTranscriptEntry(entry) {
+		if (!entry?.message || !this.chat?.children) return;
+		const index = this.chat.children.indexOf(entry.message);
+		if (index === -1) return;
+		if (entry.spacer && this.chat.children[index - 1] === entry.spacer) {
+			this.chat.removeChild(entry.spacer);
+		}
+		this.chat.removeChild(entry.message);
+	}
+
+	isCodexAcpActive() {
+		const info = this.client?.agentInfo ?? this.sessionStates.get(this.activeKey)?.agentInfo;
+		return this.transport === "acp" && info?.name === "codex-acp";
+	}
+
+	refreshCodexThreadStateSnapshot(sessionInfo = undefined) {
+		if (!this.isCodexAcpActive()) return;
+		const sessionId = sessionInfo?.sessionId ?? this.client?.sessionId;
+		const snapshot = this.readCodexThreadState(sessionId);
+		if (snapshot) this.codexThreadStateSnapshot = snapshot;
+	}
+
+	readCodexThreadState(sessionId) {
+		return readCodexThreadState(sessionId);
 	}
 
 	async sendPrompt(text, options = {}) {
 		if (!this.client || !this.ready || this.client.exited) {
 			this.expirePendingUserEcho(options.pendingUserEcho);
+			this.disarmPendingUnsendPrompt(options.pendingUserEcho);
 			return;
 		}
 		this.busy = true;
@@ -3025,6 +3145,7 @@ export class HarnessApp {
 		} finally {
 			this.clearCancelGraceTimer();
 			this.expirePendingUserEcho(options.pendingUserEcho);
+			this.disarmPendingUnsendPrompt(options.pendingUserEcho);
 			if (this.cancelRequested) {
 				for (const id of this.activeToolIds) this.updateTool("canceled", id);
 			}
@@ -3037,6 +3158,7 @@ export class HarnessApp {
 			const userCanceled = this.cancelRequested && !this.afterToolCancelPending;
 			this.statusState = this.promptQueue.length > 0 && !userCanceled ? "working" : "";
 			this.updateSpinner();
+			this.refreshCodexThreadStateSnapshot();
 			this.ui.requestRender();
 			if (this.pendingNewSessionCommandName) {
 				const commandName = this.pendingNewSessionCommandName;
@@ -3062,7 +3184,14 @@ export class HarnessApp {
 			while (this.ready && !this.busy && !this.sessionSwitchInProgress && !this.client?.exited && this.promptQueue.length > 0) {
 				const prompt = this.promptQueue.shift();
 				const pendingUserEcho = this.trackPendingUserEcho(prompt.text);
-				this.addUserMessage(prompt.displayText ?? prompt.text, { compactCommand: prompt.compactCommand });
+				const transcriptEntry = this.addUserMessage(prompt.displayText ?? prompt.text, { compactCommand: prompt.compactCommand });
+				this.armPendingUnsendPrompt({
+					text: prompt.text,
+					displayText: prompt.displayText ?? prompt.text,
+					promptParts: prompt.promptParts,
+					pendingUserEcho,
+					transcriptEntry,
+				});
 				this.ui.requestRender();
 				await this.sendPrompt(prompt.text, { pendingUserEcho, promptParts: prompt.promptParts });
 			}
@@ -3400,6 +3529,7 @@ export class HarnessApp {
 		this.currentToolSummary = undefined;
 		this.currentUserText = undefined;
 		this.pendingUserEchoes = [];
+		this.pendingUnsendPrompt = undefined;
 		this.pendingPromptDisplay = undefined;
 		this.lastAssistantText = "";
 	}
@@ -4148,20 +4278,28 @@ export class HarnessApp {
 	}
 
 	handleBackendEvent(event) {
-		if (event.type === "text") {
+		if (event.type === "backend_activity") {
+			this.disarmPendingUnsendPrompt();
+		} else if (event.type === "text") {
+			this.disarmPendingUnsendPrompt();
 			this.appendAssistantText(event.text);
 		} else if (event.type === "line") {
+			this.disarmPendingUnsendPrompt();
 			this.addNotice(event.text);
 		} else if (event.type === "user_text") {
+			this.disarmPendingUnsendPrompt();
 			const text = this.consumePendingUserEcho(event.text);
 			if (text) this.appendUserText(text);
 		} else if (event.type === "tool") {
+			this.disarmPendingUnsendPrompt();
 			this.trackToolStatus(event.id, event.status, { startsTool: true });
 			this.addTool(event.title, event.status, event.id);
 		} else if (event.type === "tool_update") {
+			this.disarmPendingUnsendPrompt();
 			this.trackToolStatus(event.id, event.status, { startsTool: false });
 			this.updateTool(event.status, event.id, event.title);
 		} else if (event.type === "error") {
+			this.disarmPendingUnsendPrompt();
 			this.addError(event.message);
 		} else if (event.type === "backend_exit") {
 			// The backend died unexpectedly. Mark it dead so queued prompts are
@@ -4173,9 +4311,11 @@ export class HarnessApp {
 			this.busy = false;
 			this.cancelRequested = false;
 			this.afterToolCancelPending = false;
+			this.pendingUnsendPrompt = undefined;
 			this.statusState = "";
 			this.updateSpinner();
 		} else if (event.type === "cursor_todos") {
+			this.disarmPendingUnsendPrompt();
 			this.addNotice(cursorTodosText(event.todos));
 		} else if (event.type === "commands") {
 			this.availableCommands.set(this.activeKey, event.commands);
@@ -4183,6 +4323,7 @@ export class HarnessApp {
 			this.updateAutocomplete();
 		} else if (event.type === "session_info") {
 			this.sessionStates.set(this.activeKey, event.sessionInfo);
+			this.refreshCodexThreadStateSnapshot(event.sessionInfo);
 			this.updateAutocomplete();
 		}
 		this.ui.requestRender();
@@ -4277,12 +4418,14 @@ export class HarnessApp {
 	addUserMessage(text, options = {}) {
 		if (options.compactCommand) {
 			this.addCommandMessage(text);
-			return;
+			return undefined;
 		}
 		this.currentUserText = undefined;
 		this.currentToolSummary = undefined;
-		this.addHistorySpacer("user");
-		this.chat.addChild(new UserMessage(text));
+		const spacer = this.addHistorySpacer("user");
+		const message = new UserMessage(text);
+		this.chat.addChild(message);
+		return { spacer, message };
 	}
 
 	appendUserText(text) {
@@ -4373,7 +4516,9 @@ export class HarnessApp {
 		if (last instanceof CommandMessage) {
 			if (kind === "command" || kind === "assistant" || kind === "notice" || kind === "tool") return;
 		}
-		this.chat.addChild(new Spacer(1));
+		const spacer = new Spacer(1);
+		this.chat.addChild(spacer);
+		return spacer;
 	}
 
 	stop() {
@@ -5445,6 +5590,68 @@ function isWsl(env = process.env, release = os.release()) {
 
 function codexHome() {
 	return process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
+}
+
+function codexStateDbPath() {
+	return path.join(codexHome(), "state_5.sqlite");
+}
+
+function sqlString(value) {
+	return `'${String(value).replaceAll("'", "''")}'`;
+}
+
+export function readCodexThreadState(sessionId, dbPath = codexStateDbPath()) {
+	if (!sessionId) return undefined;
+	if (!fs.existsSync(dbPath)) return undefined;
+	const sessionsRoot = path.join(path.dirname(dbPath), "sessions");
+	const sql = [
+		"select id, rollout_path, updated_at, updated_at_ms, has_user_event, archived,",
+		"tokens_used, title, first_user_message, preview, model, reasoning_effort",
+		"from threads",
+		`where id = ${sqlString(sessionId)}`,
+		"limit 1;",
+	].join(" ");
+	const result = spawnSync("sqlite3", ["-json", dbPath, sql], {
+		encoding: "utf8",
+		timeout: 1000,
+		windowsHide: true,
+	});
+	if (result.error || result.status !== 0) return undefined;
+	let rows;
+	try {
+		rows = JSON.parse(result.stdout || "[]");
+	} catch {
+		return undefined;
+	}
+	const row = rows?.[0];
+	if (!row) {
+		const rolloutPath = findCodexRolloutPath(sessionId, sessionsRoot);
+		return {
+			sessionId,
+			row: null,
+			rollout: codexRolloutStat(rolloutPath) ?? null,
+		};
+	}
+	const rollout = codexRolloutStat(row.rollout_path) ?? null;
+	return {
+		sessionId,
+		row,
+		rollout,
+	};
+}
+
+function codexRolloutStat(rolloutPath) {
+	if (!rolloutPath) return undefined;
+	try {
+		const stat = fs.statSync(rolloutPath);
+		return { size: stat.size, mtimeMs: Math.trunc(stat.mtimeMs) };
+	} catch {
+		return undefined;
+	}
+}
+
+function codexThreadStatesEqual(a, b) {
+	return Boolean(a && b && JSON.stringify(a) === JSON.stringify(b));
 }
 
 // Locate a Codex rollout file for a thread id by scanning $CODEX_HOME/sessions
