@@ -94,6 +94,38 @@ function busyPromptHarness(agentName = "codex-acp") {
 	return { app, prompts, cancelCount: () => cancelCount };
 }
 
+function voiceKeyHarness(controllerOverrides = {}) {
+	const calls = [];
+	const editor = {
+		onSubmit(text) {
+			calls.push(["submit", text]);
+		},
+	};
+	const controller = {
+		isRecording: () => true,
+		isTranscribing: () => false,
+		toggle() {
+			calls.push("toggle");
+		},
+		queue() {
+			calls.push("queue");
+		},
+		finish() {
+			calls.push("finish");
+		},
+		cancel() {
+			calls.push("cancel");
+		},
+		...controllerOverrides,
+	};
+	const app = Object.create(HarnessApp.prototype);
+	app.voiceController = controller;
+	app.voiceModeEnabled = true;
+	app.editor = editor;
+	app.ui = { requestRender() {} };
+	return { app, calls };
+}
+
 function normalizedToolStatusEvents(statuses) {
 	const events = [];
 	const client = Object.create(AcpClient.prototype);
@@ -163,6 +195,114 @@ const config = {
 	app.flushBufferedClipboardPasteInput({ allowSubmit: false });
 	assert.deepEqual(replayed, ["a", "b", "c"]);
 	assert.deepEqual(app.bufferedClipboardPasteInput, []);
+}
+
+{
+	const { app, calls } = voiceKeyHarness();
+	const consumed = app.handleVoiceKey("", {
+		isSpace: false,
+		isModifiedSpace: false,
+		isCtrlSpace: false,
+		isSubmit: true,
+		isTab: false,
+		isCancel: false,
+	});
+	assert.equal(consumed, true);
+	assert.deepEqual(calls, ["toggle"]);
+	assert.equal(typeof app.voiceOriginalOnSubmit, "function");
+}
+
+{
+	const { app, calls } = voiceKeyHarness({
+		isRecording: () => false,
+	});
+	const consumed = app.handleVoiceKey("", {
+		isSpace: false,
+		isModifiedSpace: false,
+		isCtrlSpace: false,
+		isSubmit: true,
+		isTab: false,
+		isCancel: false,
+	});
+	assert.equal(consumed, false);
+	assert.deepEqual(calls, []);
+}
+
+{
+	const { app, calls } = voiceKeyHarness();
+	const consumed = app.handleVoiceKey("", {
+		isSpace: false,
+		isModifiedSpace: false,
+		isCtrlSpace: false,
+		isSubmit: false,
+		isTab: true,
+		isCancel: false,
+	});
+	assert.equal(consumed, true);
+	assert.deepEqual(calls, ["queue"]);
+	assert.equal(typeof app.voiceOriginalOnSubmit, "function");
+}
+
+{
+	const { app, calls } = voiceKeyHarness({
+		isRecording: () => false,
+		isTranscribing: () => true,
+	});
+	const consumed = app.handleVoiceKey("", {
+		isSpace: false,
+		isModifiedSpace: false,
+		isCtrlSpace: false,
+		isSubmit: false,
+		isTab: true,
+		isCancel: false,
+	});
+	assert.equal(consumed, true);
+	assert.deepEqual(calls, []);
+}
+
+{
+	const submitted = [];
+	const app = Object.create(HarnessApp.prototype);
+	app.voicePendingSubmit = "typed suffix";
+	app.handleSubmit = (text, opts) => {
+		submitted.push({ text, opts });
+	};
+	app.handleVoiceQueue("spoken text");
+	assert.deepEqual(submitted, [{ text: "spoken text typed suffix", opts: { queueTiming: "afterTurn" } }]);
+	assert.equal(app.voicePendingSubmit, undefined);
+}
+
+{
+	const submitted = [];
+	const app = Object.create(HarnessApp.prototype);
+	app.voicePendingSubmit = "typed only";
+	app.handleSubmit = (text, opts) => {
+		submitted.push({ text, opts });
+	};
+	app.handleVoiceQueue("");
+	assert.deepEqual(submitted, [{ text: "typed only", opts: { queueTiming: "afterTurn" } }]);
+	assert.equal(app.voicePendingSubmit, undefined);
+}
+
+{
+	const { app, calls } = voiceKeyHarness();
+	app.focusedThread = "main";
+	app.busy = true;
+	app.btwThread = undefined;
+	app.clipboardPasteInProgress = false;
+	app.editor.getText = () => "typed";
+	app.editor.setText = () => {
+		calls.push("setText");
+	};
+	app.editor.autocompleteState = undefined;
+	app.handlePageScroll = () => false;
+	app.queueCurrentInput = () => {
+		calls.push("queueCurrentInput");
+		return true;
+	};
+	const result = app.handleGlobalInput("\t");
+	assert.deepEqual(result, { consume: true });
+	assert.deepEqual(calls, ["queue"]);
 }
 
 {

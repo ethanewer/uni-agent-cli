@@ -1996,6 +1996,11 @@ class VoiceController {
 		this.startRecording();
 	}
 
+	queue() {
+		if (this.state !== "recording") return;
+		this.stopAndTranscribe({ intent: "queue" });
+	}
+
 	finish() {
 		if (this.state !== "recording") return;
 		this.stopAndTranscribe({ intent: "edit" });
@@ -2067,6 +2072,9 @@ class VoiceController {
 				if (intent === "edit") {
 					outcome = "finish";
 					this.options.onFinish(text ?? "");
+				} else if (intent === "queue") {
+					outcome = "queue";
+					this.options.onQueue(text ?? "");
 				} else if (text?.trim()) {
 					outcome = "result";
 					this.options.onResult(text);
@@ -2082,6 +2090,7 @@ class VoiceController {
 				outcome = "error";
 				this.emitError(error instanceof Error ? error.message : "Transcription failed");
 				if (intent === "edit") this.options.onFinish("");
+				else if (intent === "queue") this.options.onQueue("");
 			})
 			.finally(() => {
 				clearTimeout(timer);
@@ -2486,6 +2495,17 @@ export class HarnessApp {
 				return { consume: true };
 			}
 		}
+		const voiceWasRecording = this.voiceController?.isRecording();
+		const voiceWasActive = voiceWasRecording || this.voiceController?.isTranscribing();
+		const voiceKeyInfo = {
+			isSpace: isPlainSpaceInput(data),
+			isModifiedSpace: isModifiedSpaceInput(data),
+			isCtrlSpace: matchesKey(data, "ctrl+space"),
+			isSubmit: isSubmitInput(data),
+			isTab: isTabInput(data),
+			isCancel: isCtrlC(data) || isEscape(data),
+		};
+		if (voiceWasActive && this.handleVoiceKey(data, voiceKeyInfo)) return { consume: true };
 		// Busy-input steering applies to the focused main thread only.
 		if (this.focusedThread === "main" && this.busy && isEscape(data)) {
 			this.interruptViaEscape();
@@ -2495,14 +2515,7 @@ export class HarnessApp {
 			this.queueCurrentInput("afterTurn");
 			return { consume: true };
 		}
-		const voiceWasRecording = this.voiceController?.isRecording();
-		const voiceConsumed = this.handleVoiceKey(data, {
-			isSpace: isPlainSpaceInput(data),
-			isModifiedSpace: isModifiedSpaceInput(data),
-			isCtrlSpace: matchesKey(data, "ctrl+space"),
-			isCancel: isCtrlC(data) || isEscape(data),
-		});
-		if (voiceConsumed) return { consume: true };
+		if (!voiceWasActive && this.handleVoiceKey(data, voiceKeyInfo)) return { consume: true };
 		if (this.clipboardPasteInProgress) {
 			this.bufferClipboardPasteInput(data);
 			return { consume: true };
@@ -2738,6 +2751,7 @@ export class HarnessApp {
 			getBaseUrl: async () => process.env.OPENAI_BASE_URL?.trim() || process.env.OPENAI_API_BASE?.trim(),
 			model: process.env.CC_TRANSCRIPTION_MODEL?.trim() || process.env.OPENAI_TRANSCRIPTION_MODEL?.trim() || undefined,
 			onResult: (text) => this.handleVoiceResult(text),
+			onQueue: (text) => this.handleVoiceQueue(text),
 			onFinish: (text) => this.handleVoiceFinish(text),
 			onTranscriptionEnd: () => this.finalizeVoiceSession(),
 			onStateChange: () => this.ui.requestRender(),
@@ -2754,7 +2768,7 @@ export class HarnessApp {
 		if (controller.isRecording()) {
 			const circle = controller.getTick() % 2 === 0 ? "●" : "○";
 			const elapsed = formatDuration(controller.getElapsedSeconds());
-			return `${chalk.cyan(circle)} ${chalk.cyan(elapsed)}   ${chalk.dim("Space to send · type to edit")}`;
+			return `${chalk.cyan(circle)} ${chalk.cyan(elapsed)}   ${chalk.dim("Space/Enter to send · Tab to queue · type to edit")}`;
 		}
 		return `${chalk.cyan("○")}   ${chalk.dim("Space to record · Ctrl+Space for text")}`;
 	}
@@ -2788,7 +2802,7 @@ export class HarnessApp {
 		}
 
 		if (controller.isTranscribing()) {
-			if (keyInfo.isSpace || keyInfo.isModifiedSpace || keyInfo.isCtrlSpace) return true;
+			if (keyInfo.isSpace || keyInfo.isModifiedSpace || keyInfo.isCtrlSpace || keyInfo.isSubmit || keyInfo.isTab) return true;
 			return false;
 		}
 
@@ -2806,6 +2820,18 @@ export class HarnessApp {
 		if (keyInfo.isSpace) {
 			if (controller.isRecording()) this.beginVoiceSession();
 			controller.toggle();
+			return true;
+		}
+
+		if (keyInfo.isSubmit && controller.isRecording()) {
+			this.beginVoiceSession();
+			controller.toggle();
+			return true;
+		}
+
+		if (keyInfo.isTab && controller.isRecording()) {
+			this.beginVoiceSession();
+			controller.queue();
 			return true;
 		}
 
@@ -2855,6 +2881,16 @@ export class HarnessApp {
 		this.voicePendingSubmit = undefined;
 		const combined = pending?.trim() ? `${trimmed} ${pending}` : trimmed;
 		submit(combined);
+	}
+
+	handleVoiceQueue(text) {
+		const trimmed = text.trim();
+		const pending = this.voicePendingSubmit;
+		this.voicePendingSubmit = undefined;
+		const sep = pending?.startsWith(" ") || pending?.startsWith("\n") || !pending ? "" : " ";
+		const combined = pending !== undefined ? (trimmed ? `${trimmed}${sep}${pending}` : pending) : trimmed;
+		if (!combined.trim()) return;
+		void this.handleSubmit(combined, { queueTiming: "afterTurn" });
 	}
 
 	handleVoiceFinish(text) {
