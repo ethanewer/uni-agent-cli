@@ -4820,21 +4820,27 @@ export function streamingMutableTail(text, renderedLineCount, options = {}) {
 	let fenceOpen = false;
 	let fenceStart = -1;
 	let fenceChar = "";
+	let fenceLen = 0;
 	for (let index = 0; index < sourceLines.length; index += 1) {
-		const fence = /^\s{0,3}(```+|~~~+)/.exec(sourceLines[index]);
+		const fence = /^\s{0,3}(`{3,}|~{3,})(.*)$/.exec(sourceLines[index]);
 		if (!fence) continue;
 		const marker = fence[1][0];
+		const runLength = fence[1].length;
 		if (fenceOpen) {
-			// CommonMark: a fence only closes on the same marker character. A `~~~`
-			// line inside a ```-opened block (or vice versa) is content, not a close.
-			if (marker !== fenceChar) continue;
+			// CommonMark: a closing fence must use the same marker character, be at
+			// least as long as the opener, and carry no info string. Anything else
+			// (a different marker, a shorter run, or trailing text) is block content,
+			// so the fence stays open — the conservative, freeze-avoiding direction.
+			if (marker !== fenceChar || runLength < fenceLen || fence[2].trim() !== "") continue;
 			fenceOpen = false;
 			fenceStart = -1;
 			fenceChar = "";
+			fenceLen = 0;
 		} else {
 			fenceOpen = true;
 			fenceStart = index;
 			fenceChar = marker;
+			fenceLen = runLength;
 		}
 	}
 	if (fenceOpen && fenceStart >= 0) {

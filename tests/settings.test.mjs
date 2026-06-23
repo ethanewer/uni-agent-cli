@@ -1364,6 +1364,25 @@ assert.equal(
 	streamingMutableTail("```js\nconst a = 1;\n```\nplain text after\nmore\nlines\nhere", 9),
 	4,
 );
+// CommonMark: a closing fence must be at least as long as the opener. A 3-backtick
+// line inside a 4-backtick-opened block does NOT close it, so the open block stays
+// mutable (openSourceLines from line 0 = 7, tail = 7 + 2 = 9), not the default 4.
+assert.equal(
+	streamingMutableTail("````js\nconst a = 1;\n```\nconst b = 2;\nconst c = 3;\nconst d = 4;\nconst e = 5;", 9),
+	9,
+);
+// A longer (or equal) matching fence does close it: a 4-backtick close ends a
+// 4-backtick-opened block, so trailing plain text falls back to the default 4.
+assert.equal(
+	streamingMutableTail("````js\nconst a = 1;\n````\nplain text after\nmore\nlines\nhere", 9),
+	4,
+);
+// A close-looking line carrying an info string is content, not a close (CommonMark),
+// so the block stays mutable rather than freezing early.
+assert.equal(
+	streamingMutableTail("```\nconst a = 1;\n```js\nconst b = 2;\nconst c = 3;\nconst d = 4;\nconst e = 5;", 8),
+	8,
+);
 assert.equal(hideCursorDuringRender("\x1b[?2026hrendered"), "\x1b[?2026h\x1b[?25lrendered");
 assert.equal(hideCursorDuringRender("\x1b[?2026h\x1b[?25lrendered"), "\x1b[?2026h\x1b[?25lrendered");
 assert.equal(hideCursorDuringRender("plain cursor move"), "plain cursor move");
