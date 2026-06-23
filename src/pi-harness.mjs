@@ -3720,6 +3720,10 @@ export class HarnessApp {
 			return;
 		}
 		this.statusState = "resuming";
+		// Guard the in-flight load like startNewSession does: until the new sessionId
+		// is live, a prompt submitted mid-load would otherwise be sent against the
+		// session being abandoned. The guard makes such a prompt queue and drain after.
+		this.sessionSwitchInProgress = true;
 		this.updateSpinner();
 		this.ui.requestRender();
 		try {
@@ -3735,9 +3739,11 @@ export class HarnessApp {
 		} catch (error) {
 			this.addError(error.message ?? String(error));
 		} finally {
+			this.sessionSwitchInProgress = false;
 			this.statusState = "";
 			this.updateSpinner();
 			this.ui.requestRender();
+			this.schedulePromptQueueDrain();
 		}
 	}
 
