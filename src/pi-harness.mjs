@@ -2989,7 +2989,6 @@ export class HarnessApp {
 			void this.btwThread.submit(text, promptParts);
 			return;
 		}
-		const promptParts = this.consumeImagePromptParts(text);
 		const displayText = this.consumePromptDisplay(text);
 		this.editor.addToHistory(text);
 		this.editor.onSubmit = undefined;
@@ -3007,6 +3006,9 @@ export class HarnessApp {
 			compactCommand = handled === "backend";
 			if (handled === true) return;
 		}
+		// Consume staged images only once we know this is a real backend prompt — a
+		// locally-handled command must not silently swallow a pending attachment.
+		const promptParts = this.consumeImagePromptParts(text);
 		await this.submitBackendPrompt(text, { displayText, compactCommand, promptParts, queueTiming: opts.queueTiming });
 	}
 
