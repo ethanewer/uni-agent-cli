@@ -4814,15 +4814,22 @@ export function streamingMutableTail(text, renderedLineCount, options = {}) {
 	const sourceLines = String(text).split("\n");
 	let fenceOpen = false;
 	let fenceStart = -1;
+	let fenceChar = "";
 	for (let index = 0; index < sourceLines.length; index += 1) {
-		if (/^\s{0,3}(```|~~~)/.test(sourceLines[index])) {
-			if (fenceOpen) {
-				fenceOpen = false;
-				fenceStart = -1;
-			} else {
-				fenceOpen = true;
-				fenceStart = index;
-			}
+		const fence = /^\s{0,3}(```+|~~~+)/.exec(sourceLines[index]);
+		if (!fence) continue;
+		const marker = fence[1][0];
+		if (fenceOpen) {
+			// CommonMark: a fence only closes on the same marker character. A `~~~`
+			// line inside a ```-opened block (or vice versa) is content, not a close.
+			if (marker !== fenceChar) continue;
+			fenceOpen = false;
+			fenceStart = -1;
+			fenceChar = "";
+		} else {
+			fenceOpen = true;
+			fenceStart = index;
+			fenceChar = marker;
 		}
 	}
 	if (fenceOpen && fenceStart >= 0) {

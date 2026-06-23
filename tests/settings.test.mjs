@@ -1327,6 +1327,18 @@ assert.equal(
 	streamingMutableTail("- | A | B |\n  |---|---|\n  | x | y |", 5, { width: 80, renderer: "plain" }),
 	5,
 );
+// A ~~~ line inside a ```-opened code fence is content, not a close (CommonMark):
+// the open block stays mutable (tail = openSourceLines + 2 = 8), not the default 4.
+assert.equal(
+	streamingMutableTail("```js\nconst a = 1;\n~~~\nconst b = 2;\nconst c = 3;\nconst d = 4;\nconst e = 5;", 8),
+	8,
+);
+// A matching ``` fence still closes the block, so the (non-table) trailing text
+// falls back to the default mutable tail of 4.
+assert.equal(
+	streamingMutableTail("```js\nconst a = 1;\n```\nplain text after\nmore\nlines\nhere", 9),
+	4,
+);
 assert.equal(hideCursorDuringRender("\x1b[?2026hrendered"), "\x1b[?2026h\x1b[?25lrendered");
 assert.equal(hideCursorDuringRender("\x1b[?2026h\x1b[?25lrendered"), "\x1b[?2026h\x1b[?25lrendered");
 assert.equal(hideCursorDuringRender("plain cursor move"), "plain cursor move");
