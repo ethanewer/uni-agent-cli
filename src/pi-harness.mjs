@@ -69,6 +69,7 @@ const VS_CODE_AUTO_ACTIVATION_MAX_INPUT_GAP_MS = 15;
 const VS_CODE_AUTO_ACTIVATION_MAX_SUBMIT_AGE_MS = 75;
 const CLIPBOARD_IMAGE_TIMEOUT_MS = 2_500;
 const STREAMING_MARKDOWN_MUTABLE_TAIL_LINES = 4;
+const PI_TUI_FULL_CLEAR = "\x1b[2J\x1b[H\x1b[3J";
 let MarkdownComponent;
 let markdownLoadPromise;
 let CombinedAutocompleteProviderClass;
@@ -2294,8 +2295,8 @@ export class HarnessApp {
 			if (this.resizeActive) {
 				if (!force) return;
 				// A forced render slipped through mid-resize (e.g. theme preview).
-				// Prime the relative-move clear so it doesn't use the stale DECRC
-				// restore that mis-clears after the terminal reflowed.
+				// Prime the resize-aware full clear so it doesn't use the stale
+				// DECRC restore that mis-clears after the terminal reflowed.
 				this.prepareResizeFullClear();
 			}
 			requestRender(force);
@@ -2325,6 +2326,10 @@ export class HarnessApp {
 	prepareResizeFullClear() {
 		const terminal = this.ui.terminal;
 		if (typeof terminal.useFullClearReplacementOnce !== "function") return;
+		if (shouldUseNativeResizeFullClear(this.ui, terminal)) {
+			terminal.useFullClearReplacementOnce(PI_TUI_FULL_CLEAR);
+			return;
+		}
 		const height = Math.max(1, this.ui.previousHeight || terminal.rows || 1);
 		const screenRow = Math.max(
 			0,
@@ -4554,8 +4559,17 @@ class MutableMarkdown {
 		const text = this.text.trimEnd();
 		const renderer = MarkdownComponent ? "markdown" : (this.cache?.renderer ?? "plain");
 		if (this.cache?.width === width && this.cache.text === text && this.cache.renderer === renderer) return this.cache.lines.slice();
-		const rendered = renderMarkdown(text, width, 0, 0, { color: (content) => chalk.text(content) }, renderer);
-		const lines = stabilizeGrowingRenderedLines(this.cache, { width, text, lines: rendered, renderer }, streamingMutableTail(text, rendered.length));
+		const defaultTextStyle = { color: (content) => chalk.text(content) };
+		const rendered = renderMarkdown(text, width, 0, 0, defaultTextStyle, renderer);
+		const mutableTailLines = streamingMutableTail(text, rendered.length, {
+			width,
+			renderer,
+			defaultTextStyle,
+			previousText: this.cache?.text,
+			previousRenderer: this.cache?.renderer,
+			previousRenderedLineCount: this.cache?.lines.length,
+		});
+		const lines = stabilizeGrowingRenderedLines(this.cache, { width, text, lines: rendered, renderer }, mutableTailLines);
 		this.cache = { width, text, lines, renderer };
 		return lines.slice();
 	}
@@ -4770,7 +4784,7 @@ export function stabilizeGrowingRenderedLines(previous, next, mutableTailLines =
 // How many trailing rendered lines may still restructure as more text streams.
 // Closed markdown blocks never change, so only the open trailing block needs to
 // stay mutable; freezing everything before it keeps scrolled-off lines stable.
-export function streamingMutableTail(text, renderedLineCount) {
+export function streamingMutableTail(text, renderedLineCount, options = {}) {
 	const sourceLines = String(text).split("\n");
 	let fenceOpen = false;
 	let fenceStart = -1;
@@ -4790,7 +4804,80 @@ export function streamingMutableTail(text, renderedLineCount) {
 		const openSourceLines = sourceLines.length - fenceStart;
 		return Math.min(renderedLineCount, Math.max(STREAMING_MARKDOWN_MUTABLE_TAIL_LINES, openSourceLines + 2));
 	}
+
+	const activeTableStartLine = activeMarkdownTableStartLine(sourceLines);
+	const tableStartLine = activeTableStartLine >= 0
+		? activeTableStartLine
+		: previousActiveMarkdownTableStartLine(options.previousText, sourceLines);
+	if (tableStartLine >= 0) {
+		if (!options.width || !options.renderer) return renderedLineCount;
+		if (options.previousRenderer && options.previousRenderer !== options.renderer) return renderedLineCount;
+		const prefixText = sourceLines.slice(0, tableStartLine).join("\n").trimEnd();
+		const prefixLineCount = prefixText
+			? renderMarkdown(prefixText, options.width, 0, 0, options.defaultTextStyle, options.renderer).length
+			: 0;
+		// A pipe table's terminal rendering is width-aware across the whole table:
+		// adding a wider row can change every earlier border/header line. Keep the
+		// active or just-active table mutable while it can still be remeasured.
+		const lineCountForTail = options.previousRenderedLineCount ?? renderedLineCount;
+		return Math.min(renderedLineCount, Math.max(STREAMING_MARKDOWN_MUTABLE_TAIL_LINES, lineCountForTail - prefixLineCount));
+	}
 	return STREAMING_MARKDOWN_MUTABLE_TAIL_LINES;
+}
+
+function previousActiveMarkdownTableStartLine(previousText, sourceLines) {
+	if (previousText === undefined) return -1;
+	const previousStart = activeMarkdownTableStartLine(String(previousText).split("\n"));
+	if (previousStart < 0) return -1;
+	return hasMarkdownTableAtLine(sourceLines, previousStart) ? previousStart : -1;
+}
+
+function activeMarkdownTableStartLine(sourceLines) {
+	let end = sourceLines.length - 1;
+	let trailingBlankLines = 0;
+	while (end >= 0 && sourceLines[end].trim() === "") {
+		trailingBlankLines += 1;
+		end -= 1;
+	}
+	if (end < 0 || trailingBlankLines >= 2) return -1;
+
+	let blockStart = end;
+	while (blockStart > 0 && sourceLines[blockStart - 1].trim() !== "") {
+		blockStart -= 1;
+	}
+
+	for (let index = blockStart + 1; index <= end; index += 1) {
+		if (isMarkdownTableDelimiterLine(sourceLines[index]) && isMarkdownTableRowLine(sourceLines[index - 1])) {
+			return index - 1;
+		}
+	}
+	return -1;
+}
+
+function hasMarkdownTableAtLine(sourceLines, startLine) {
+	if (!isMarkdownTableRowLine(sourceLines[startLine])) return false;
+	for (let index = startLine + 1; index < sourceLines.length && String(sourceLines[index]).trim() !== ""; index += 1) {
+		if (isMarkdownTableDelimiterLine(sourceLines[index])) return true;
+	}
+	return false;
+}
+
+function isMarkdownTableRowLine(line) {
+	const trimmed = markdownTableSyntaxText(line);
+	return trimmed.length > 0 && /(^|[^\\])\|/.test(trimmed);
+}
+
+function isMarkdownTableDelimiterLine(line) {
+	const trimmed = markdownTableSyntaxText(line).replace(/^\|/, "").replace(/\|$/, "");
+	const cells = trimmed.split("|").map((cell) => cell.trim()).filter((cell) => cell.length > 0);
+	return cells.length > 0 && cells.every((cell) => /^:?-+:?$/.test(cell));
+}
+
+function markdownTableSyntaxText(line) {
+	let text = String(line);
+	while (/^\s{0,3}>\s?/.test(text)) text = text.replace(/^\s{0,3}>\s?/, "");
+	text = text.replace(/^\s{0,3}(?:[-+*]|\d+[.)])\s+/, "");
+	return text.trim();
 }
 
 export function stabilizeMutableRenderedLines(previous, next, mutableTailLines = 0) {
@@ -5976,11 +6063,26 @@ export function hideCursorDuringRender(data) {
 }
 
 export function rewriteFullScreenClear(data, options = {}) {
-	const fullClear = "\x1b[2J\x1b[H\x1b[3J";
+	const fullClear = PI_TUI_FULL_CLEAR;
 	if (!data.includes("\x1b[3J")) return data;
 	if (!data.includes(fullClear)) return data.replaceAll("\x1b[3J", "");
 	if (options.alternateScreen) return data.replaceAll(fullClear, "\x1b[2J\x1b[H");
 	return data.replaceAll(fullClear, options.fullClearReplacement ?? "\x1b8\x1b[J\x1b7");
+}
+
+function shouldUseNativeResizeFullClear(ui, terminal) {
+	if ((ui.previousViewportTop || 0) > 0) return true;
+	const previousLines = ui.previousLines ?? [];
+	if (previousLines.length === 0) return false;
+	const width = Math.max(1, terminal.columns || ui.previousWidth || 1);
+	const height = Math.max(1, terminal.rows || ui.previousHeight || 1);
+	const reflowedRows = estimatedTerminalRowsAfterReflow(previousLines, width);
+	return reflowedRows !== previousLines.length || reflowedRows > height;
+}
+
+function estimatedTerminalRowsAfterReflow(lines, width) {
+	const safeWidth = Math.max(1, width);
+	return lines.reduce((rowCount, line) => rowCount + Math.max(1, Math.ceil(visibleWidth(line) / safeWidth)), 0);
 }
 
 export function isVsCodeTerminal(env = process.env) {

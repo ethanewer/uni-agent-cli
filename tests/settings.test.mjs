@@ -26,6 +26,7 @@ import {
 	shouldDropVsCodeAutoActivationInput,
 	stabilizeGrowingRenderedLines,
 	stabilizeMutableRenderedLines,
+	streamingMutableTail,
 	themeNames,
 } from "../src/pi-harness.mjs";
 
@@ -1059,6 +1060,66 @@ assert.equal(rewriteFullScreenClear(`${fullClear}rendered`), "\x1b8\x1b[J\x1b7re
 assert.equal(rewriteFullScreenClear(`${fullClear}rendered`, { alternateScreen: true }), "\x1b[2J\x1b[Hrendered");
 assert.equal(rewriteFullScreenClear(`${fullClear}rendered`, { fullClearReplacement: "\r\x1b[4A\x1b[J\x1b7" }), "\r\x1b[4A\x1b[J\x1b7rendered");
 assert.equal(rewriteFullScreenClear(`before\x1b[3Jafter`), "beforeafter");
+
+{
+	let replacement;
+	const app = Object.create(HarnessApp.prototype);
+	app.ui = {
+		previousLines: ["question", "answer"],
+		previousHeight: 10,
+		previousViewportTop: 0,
+		hardwareCursorRow: 1,
+		terminal: {
+			rows: 10,
+			columns: 80,
+			useFullClearReplacementOnce(value) {
+				replacement = value;
+			},
+		},
+	};
+	app.prepareResizeFullClear();
+	assert.equal(replacement, "\r\x1b[1A\x1b[J\x1b7");
+}
+
+{
+	let replacement;
+	const app = Object.create(HarnessApp.prototype);
+	app.ui = {
+		previousLines: Array.from({ length: 14 }, (_, index) => `line ${index}`),
+		previousHeight: 10,
+		previousViewportTop: 4,
+		hardwareCursorRow: 13,
+		terminal: {
+			rows: 10,
+			columns: 80,
+			useFullClearReplacementOnce(value) {
+				replacement = value;
+			},
+		},
+	};
+	app.prepareResizeFullClear();
+	assert.equal(replacement, fullClear);
+}
+
+{
+	let replacement;
+	const app = Object.create(HarnessApp.prototype);
+	app.ui = {
+		previousLines: ["x".repeat(20), "y".repeat(20)],
+		previousHeight: 10,
+		previousViewportTop: 0,
+		hardwareCursorRow: 1,
+		terminal: {
+			rows: 10,
+			columns: 5,
+			useFullClearReplacementOnce(value) {
+				replacement = value;
+			},
+		},
+	};
+	app.prepareResizeFullClear();
+	assert.equal(replacement, fullClear);
+}
 assert.deepEqual(
 	stabilizeGrowingRenderedLines(
 		{ width: 20, text: "old", lines: ["a", "b", "c", "d", "tail"] },
@@ -1090,6 +1151,115 @@ assert.deepEqual(
 		1,
 	),
 	["old running", "old complete", "tail", "new tail"],
+);
+assert.equal(
+	streamingMutableTail("Intro\n\n| A | B |\n| --- | --- |\n| x | y |\n", 8),
+	8,
+);
+assert.equal(
+	streamingMutableTail("Intro\n\n| A | B |\n| --- | --- |\n| x | y |\n", 7, { width: 80, renderer: "plain" }),
+	6,
+);
+assert.equal(
+	streamingMutableTail("Intro\n\n| A | B |\n| --- | --- |\n| x | y |\n\n", 8),
+	4,
+);
+assert.equal(
+	streamingMutableTail("| A | B |\n|-|-|\n| x | y |", 5, { width: 80, renderer: "plain" }),
+	5,
+);
+assert.equal(
+	streamingMutableTail("Intro\n\n| A | B |\n| --- | --- |\n| x | y |\n", 9, {
+		width: 80,
+		renderer: "markdown",
+		previousRenderer: "plain",
+		previousText: "Intro\n\n| A | B |\n| --- | --- |\n| x | y |",
+		previousRenderedLineCount: 7,
+	}),
+	9,
+);
+assert.deepEqual(
+	stabilizeGrowingRenderedLines(
+		{
+			width: 80,
+			text: "Intro\n\n| A | B |\n| --- | --- |\n| x | y |\n",
+			lines: ["Intro", "", "┌───┬───┐", "│ A │ B │", "├───┼───┤", "│ x │ y │", "└───┴───┘"],
+		},
+		{
+			width: 80,
+			text: "Intro\n\n| A | B |\n| --- | --- |\n| x | y |\n| longer value | y |\n",
+			lines: ["Intro", "", "┌──────────────┬───┐", "│ A            │ B │", "├──────────────┼───┤", "│ x            │ y │", "├──────────────┼───┤", "│ longer value │ y │", "└──────────────┴───┘"],
+		},
+		streamingMutableTail("Intro\n\n| A | B |\n| --- | --- |\n| x | y |\n| longer value | y |\n", 9, { width: 80, renderer: "plain" }),
+	),
+	["Intro", "", "┌──────────────┬───┐", "│ A            │ B │", "├──────────────┼───┤", "│ x            │ y │", "├──────────────┼───┤", "│ longer value │ y │", "└──────────────┴───┘"],
+);
+assert.deepEqual(
+	stabilizeGrowingRenderedLines(
+		{
+			width: 80,
+			text: "Intro\n\n| A | B |\n| --- | --- |\n| x | y |",
+			lines: ["Intro", "", "┌───┬───┐", "│ A │ B │", "├───┼───┤", "│ x │ y │", "└───┴───┘"],
+		},
+		{
+			width: 80,
+			text: "Intro\n\n| A | B |\n| --- | --- |\n| x | y |\n| longer value | y |\n\nNext",
+			lines: ["Intro", "", "┌──────────────┬───┐", "│ A            │ B │", "├──────────────┼───┤", "│ x            │ y │", "├──────────────┼───┤", "│ longer value │ y │", "└──────────────┴───┘", "", "Next"],
+		},
+		streamingMutableTail("Intro\n\n| A | B |\n| --- | --- |\n| x | y |\n| longer value | y |\n\nNext", 11, {
+			width: 80,
+			renderer: "plain",
+			previousText: "Intro\n\n| A | B |\n| --- | --- |\n| x | y |",
+			previousRenderedLineCount: 7,
+		}),
+	),
+	["Intro", "", "┌──────────────┬───┐", "│ A            │ B │", "├──────────────┼───┤", "│ x            │ y │", "├──────────────┼───┤", "│ longer value │ y │", "└──────────────┴───┘", "", "Next"],
+);
+assert.deepEqual(
+	stabilizeGrowingRenderedLines(
+		{
+			width: 80,
+			text: "| A | B |\n| --- | --- |\nshort",
+			lines: ["┌───────┬───┐", "│ A     │ B │", "├───────┼───┤", "│ short │   │", "└───────┴───┘"],
+		},
+		{
+			width: 80,
+			text: "| A | B |\n| --- | --- |\nsubstantially longer value",
+			lines: ["┌────────────────────────────┬───┐", "│ A                          │ B │", "├────────────────────────────┼───┤", "│ substantially longer value │   │", "└────────────────────────────┴───┘"],
+		},
+		streamingMutableTail("| A | B |\n| --- | --- |\nsubstantially longer value", 5, {
+			width: 80,
+			renderer: "plain",
+			previousText: "| A | B |\n| --- | --- |\nshort",
+			previousRenderedLineCount: 5,
+		}),
+	),
+	["┌────────────────────────────┬───┐", "│ A                          │ B │", "├────────────────────────────┼───┤", "│ substantially longer value │   │", "└────────────────────────────┴───┘"],
+);
+assert.deepEqual(
+	stabilizeGrowingRenderedLines(
+		{
+			width: 80,
+			text: "> | A | B |\n> |---|---|\n> | x | y |",
+			lines: ["│ ┌───┬───┐", "│ │ A │ B │", "│ ├───┼───┤", "│ │ x │ y │", "│ └───┴───┘"],
+		},
+		{
+			width: 80,
+			text: "> | A | B |\n> |---|---|\n> | x | y |\n> | substantially longer value | y |",
+			lines: ["│ ┌────────────────────────────┬───┐", "│ │ A                          │ B │", "│ ├────────────────────────────┼───┤", "│ │ x                          │ y │", "│ ├────────────────────────────┼───┤", "│ │ substantially longer value │ y │", "│ └────────────────────────────┴───┘"],
+		},
+		streamingMutableTail("> | A | B |\n> |---|---|\n> | x | y |\n> | substantially longer value | y |", 7, {
+			width: 80,
+			renderer: "plain",
+			previousText: "> | A | B |\n> |---|---|\n> | x | y |",
+			previousRenderedLineCount: 5,
+		}),
+	),
+	["│ ┌────────────────────────────┬───┐", "│ │ A                          │ B │", "│ ├────────────────────────────┼───┤", "│ │ x                          │ y │", "│ ├────────────────────────────┼───┤", "│ │ substantially longer value │ y │", "│ └────────────────────────────┴───┘"],
+);
+assert.equal(
+	streamingMutableTail("- | A | B |\n  |---|---|\n  | x | y |", 5, { width: 80, renderer: "plain" }),
+	5,
 );
 assert.equal(hideCursorDuringRender("\x1b[?2026hrendered"), "\x1b[?2026h\x1b[?25lrendered");
 assert.equal(hideCursorDuringRender("\x1b[?2026h\x1b[?25lrendered"), "\x1b[?2026h\x1b[?25lrendered");
