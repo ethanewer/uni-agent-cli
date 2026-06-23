@@ -2910,7 +2910,8 @@ export class HarnessApp {
 		if (!submit) return;
 		const pending = this.voicePendingSubmit;
 		this.voicePendingSubmit = undefined;
-		const combined = pending?.trim() ? `${trimmed} ${pending}` : trimmed;
+		const sep = !pending || pending.startsWith(" ") || pending.startsWith("\n") ? "" : " ";
+		const combined = pending?.trim() ? `${trimmed}${sep}${pending}` : trimmed;
 		submit(combined);
 	}
 
