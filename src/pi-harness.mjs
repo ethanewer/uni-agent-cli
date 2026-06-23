@@ -2975,12 +2975,20 @@ export class HarnessApp {
 			}
 			if (text.startsWith("/")) {
 				const { name, argument } = parseSlashCommand(text);
-				// Reserved UI commands and any other recognized local command (/model,
-				// /effort, /new, /resume, …) run on the main path rather than being sent
-				// to the fork's model as literal chat text. Backend/unknown commands fall
-				// through to the fork.
+				// Mirror the main dispatcher's precedence (handleSlashCommand) so the fork
+				// behaves like the main thread: reserved UI commands always run locally; a
+				// command the backend actually advertises stays reachable (falls through to
+				// the fork); only a non-advertised local command (/model, /effort, /new,
+				// /resume, …) runs on the main path instead of being sent to the fork as
+				// literal chat text. A fork is the same agent as main, so main's advertised
+				// command set applies to it.
+				const backendNames = new Set((this.availableCommands.get(this.activeKey) ?? []).map((command) => command.name));
 				const localNames = new Set(localSlashCommands(this).map((command) => command.name));
-				if (RESERVED_LOCAL_COMMANDS.has(name) || localNames.has(name)) {
+				if (RESERVED_LOCAL_COMMANDS.has(name)) {
+					await this.runLocalSlashCommand(name, argument);
+					return;
+				}
+				if (!backendNames.has(name) && localNames.has(name)) {
 					await this.runLocalSlashCommand(name, argument);
 					return;
 				}

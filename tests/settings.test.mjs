@@ -442,6 +442,32 @@ const config = {
 	assert.deepEqual(app.bufferedClipboardPasteInput, ["\t", "\x1b", "hello"]);
 }
 
+// /btw command routing must mirror the main dispatcher's precedence: a command the
+// backend advertises stays reachable (sent to the fork) even when it shares a name
+// with a local command; a non-advertised local command runs on the main path; and
+// reserved UI commands always run locally. The /model case exercises the overlap
+// that the precedence fix addresses (it must reach the fork, not be shadowed locally).
+await (async () => {
+	const submitted = [];
+	const localRan = [];
+	const app = Object.create(HarnessApp.prototype);
+	app.focusedThread = "btw";
+	app.activeKey = "codex";
+	app.config = config;
+	app.sessionStates = new Map([["codex", {}]]);
+	app.availableCommands = new Map([["codex", [{ name: "model" }]]]);
+	app.btwThread = { submit: (text) => submitted.push(text) };
+	app.editor = { addToHistory() {}, getText: () => "", setText() {} };
+	app.consumeImagePromptParts = () => undefined;
+	app.runLocalSlashCommand = async (name) => localRan.push(name);
+	app.lastKnownEditorText = "";
+	await app.handleSubmit("/model"); // backend advertises "model" -> fork (not shadowed)
+	await app.handleSubmit("/effort"); // local, not advertised -> main path
+	await app.handleSubmit("/diff"); // reserved UI command -> always local
+	assert.deepEqual(submitted, ["/model"]);
+	assert.deepEqual(localRan, ["effort", "diff"]);
+})();
+
 // A local command (/model, /effort, …) deferred while a /resume load is in
 // flight must be flushed when the switch completes, not left stuck in the queue.
 await (async () => {
