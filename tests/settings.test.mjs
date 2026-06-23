@@ -442,6 +442,31 @@ const config = {
 	assert.deepEqual(app.bufferedClipboardPasteInput, ["\t", "\x1b", "hello"]);
 }
 
+// A local command (/model, /effort, …) deferred while a /resume load is in
+// flight must be flushed when the switch completes, not left stuck in the queue.
+await (async () => {
+	const ran = [];
+	const app = Object.create(HarnessApp.prototype);
+	app.client = {
+		sessionId: "old-session",
+		capabilities: { loadSession: true },
+		loadSession: async () => {},
+	};
+	app.sessionSwitchInProgress = false;
+	app.deferredLocalSlashCommands = [{ name: "model", argument: "" }];
+	app.resetConversationView = () => {};
+	app.addCommandMessage = () => {};
+	app.updateAutocomplete = () => {};
+	app.updateSpinner = () => {};
+	app.schedulePromptQueueDrain = () => {};
+	app.ui = { requestRender() {} };
+	app.runLocalSlashCommand = async (name, argument) => ran.push({ name, argument });
+	await app.resumeSelectedSession({ sessionId: "new-session", title: "New" });
+	assert.deepEqual(ran, [{ name: "model", argument: "" }]);
+	assert.deepEqual(app.deferredLocalSlashCommands, []);
+	assert.equal(app.sessionSwitchInProgress, false);
+})();
+
 {
 	const { app, cancelCount } = afterToolHarness();
 	app.trackToolStatus("read-1", "running");

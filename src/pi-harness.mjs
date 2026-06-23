@@ -3743,6 +3743,11 @@ export class HarnessApp {
 			this.statusState = "";
 			this.updateSpinner();
 			this.ui.requestRender();
+			// Mirror startNewSession: a local command (/model, /mode, /effort, /plan,
+			// /resume) submitted mid-resume is deferred while the switch flag is set,
+			// so it must be flushed once the flag clears or it stays queued until the
+			// next session switch.
+			await this.flushDeferredLocalSlashCommands();
 			this.schedulePromptQueueDrain();
 		}
 	}
