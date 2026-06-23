@@ -411,6 +411,37 @@ const config = {
 	assert.deepEqual(calls, ["queue"]);
 }
 
+// While a clipboard paste is resolving, busy-steering must not consume input:
+// Tab/Esc are buffered for in-order replay so they act on the post-paste editor
+// state rather than the still-stale current text.
+{
+	const calls = [];
+	const app = Object.create(HarnessApp.prototype);
+	app.menuHandle = undefined;
+	app.btwThread = undefined;
+	app.focusedThread = "main";
+	app.busy = true;
+	app.clipboardPasteInProgress = true;
+	app.bufferedClipboardPasteInput = [];
+	app.voiceController = undefined;
+	app.editor = { getText: () => "typed", autocompleteState: undefined };
+	app.handlePageScroll = () => false;
+	app.queueCurrentInput = () => calls.push("queueCurrentInput");
+	app.interruptViaEscape = () => calls.push("interruptViaEscape");
+	app.tryUnsendPendingPrompt = () => {
+		calls.push("tryUnsend");
+		return false;
+	};
+	app.ui = { requestRender() {}, handleInput() {} };
+
+	assert.deepEqual(app.handleGlobalInput("\t"), { consume: true });
+	assert.deepEqual(app.handleGlobalInput("\x1b"), { consume: true });
+	assert.deepEqual(app.handleGlobalInput("hello"), { consume: true });
+	// Nothing was steered or interrupted; every keystroke went to the paste buffer.
+	assert.deepEqual(calls, []);
+	assert.deepEqual(app.bufferedClipboardPasteInput, ["\t", "\x1b", "hello"]);
+}
+
 {
 	const { app, cancelCount } = afterToolHarness();
 	app.trackToolStatus("read-1", "running");

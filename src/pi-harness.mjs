@@ -2494,6 +2494,15 @@ export class HarnessApp {
 			this.ui.requestRender();
 			return { consume: true };
 		}
+		// While a clipboard paste is resolving (an async image read kicked off by
+		// Ctrl+V), buffer every subsequent keystroke and replay it in order once the
+		// read settles. This must precede all interactive interpretation below —
+		// otherwise busy-steering would consume a buffered Tab/Esc and act on stale
+		// editor text (the not-yet-applied buffered input), scrambling the result.
+		if (this.clipboardPasteInProgress) {
+			this.bufferClipboardPasteInput(data);
+			return { consume: true };
+		}
 		// Shift+Tab toggles focus between the main thread and the /btw fork.
 		if (this.btwThread && matchesKey(data, "shift+tab")) {
 			this.focusedThread = this.focusedThread === "btw" ? "main" : "btw";
@@ -2542,10 +2551,6 @@ export class HarnessApp {
 			return { consume: true };
 		}
 		if (!voiceWasActive && this.handleVoiceKey(data, voiceKeyInfo)) return { consume: true };
-		if (this.clipboardPasteInProgress) {
-			this.bufferClipboardPasteInput(data);
-			return { consume: true };
-		}
 		if (isClipboardPasteInput(data)) {
 			void this.handleClipboardPaste();
 			return { consume: true };
