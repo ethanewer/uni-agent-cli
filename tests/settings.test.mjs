@@ -216,6 +216,41 @@ function normalizedToolStatusEvents(statuses) {
 	return events.map((event) => event.status);
 }
 
+// handleLine must classify an incoming message by the absence of `method`, not by
+// pending-id membership: a backend request whose id collides with one of our
+// in-flight request ids must be routed as a request, not mis-resolved as a reply.
+{
+	const client = Object.create(AcpClient.prototype);
+	client.sessionId = "s";
+	client.pending = new Map();
+	const eventTypes = [];
+	client.onEvent = (event) => eventTypes.push(event.type);
+	let resolved = false;
+	let rejected = false;
+	client.pending.set(3, { method: "session/prompt", resolve: () => (resolved = true), reject: () => (rejected = true) });
+	let terminalHandled = false;
+	client.handleTerminalRequest = async () => (terminalHandled = true);
+	// Backend reuses id 3 for its OWN request while our prompt (id 3) is in flight.
+	client.handleLine(JSON.stringify({ jsonrpc: "2.0", id: 3, method: "terminal/create", params: {} }));
+	assert.equal(resolved, false);
+	assert.equal(rejected, false);
+	assert.equal(client.pending.has(3), true);
+	assert.equal(terminalHandled, true);
+	assert.ok(eventTypes.includes("backend_activity"));
+}
+
+// A genuine response (id present, no method) still resolves the matching pending request.
+{
+	const client = Object.create(AcpClient.prototype);
+	client.pending = new Map();
+	client.onEvent = () => {};
+	let resolvedWith;
+	client.pending.set(3, { method: "session/prompt", resolve: (value) => (resolvedWith = value), reject: () => {} });
+	client.handleLine(JSON.stringify({ jsonrpc: "2.0", id: 3, result: { stopReason: "end_turn" } }));
+	assert.deepEqual(resolvedWith, { stopReason: "end_turn" });
+	assert.equal(client.pending.has(3), false);
+}
+
 const config = {
 	defaultAgent: "codex",
 	agents: {

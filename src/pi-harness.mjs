@@ -1760,7 +1760,14 @@ export class AcpClient {
 			if (line.trim()) this.onEvent({ type: "line", text: line });
 			return;
 		}
-		if (message.id !== undefined && this.pending.has(message.id)) {
+		// A JSON-RPC response is distinguished from a request solely by the absence
+		// of `method`: the backend numbers its own outbound requests independently of
+		// ours, so an incoming request id can collide with one of our in-flight
+		// request ids. Without the `method === undefined` guard such a request would
+		// be misrouted as a response — resolving our prompt early and leaving the
+		// backend's request unanswered (a hang). Real backends never put `method` on
+		// a response, so this guard never rejects a genuine reply.
+		if (message.id !== undefined && message.method === undefined && this.pending.has(message.id)) {
 			const pending = this.pending.get(message.id);
 			this.pending.delete(message.id);
 			if (message.error) pending.reject(new Error(formatRpcError(pending.method, message.error)));
