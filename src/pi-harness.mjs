@@ -2975,7 +2975,12 @@ export class HarnessApp {
 			}
 			if (text.startsWith("/")) {
 				const { name, argument } = parseSlashCommand(text);
-				if (RESERVED_LOCAL_COMMANDS.has(name)) {
+				// Reserved UI commands and any other recognized local command (/model,
+				// /effort, /new, /resume, …) run on the main path rather than being sent
+				// to the fork's model as literal chat text. Backend/unknown commands fall
+				// through to the fork.
+				const localNames = new Set(localSlashCommands(this).map((command) => command.name));
+				if (RESERVED_LOCAL_COMMANDS.has(name) || localNames.has(name)) {
 					await this.runLocalSlashCommand(name, argument);
 					return;
 				}
