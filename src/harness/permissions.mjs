@@ -381,7 +381,21 @@ export function policyNeedsGating(policy = {}) {
 //                pre-existing native bypass a user already wrote, for back-compat)
 // Each shape may set startupMode/settings/config/args/removeArgs; the engine adds
 // autoApprove for auto. A harness with no dialect is decided entirely cc-side.
+// `removeArgs` entries match a CLI flag in both its bare (`--force`) and valued
+// (`--force=true`) forms, so neutralization and inference stay consistent.
 // ---------------------------------------------------------------------------
+
+const CURSOR_FORCE_FLAGS = ["--force", "-f", "--yolo"];
+
+/** Whether `arg` is `flag` or its `flag=value` form (e.g. `--force` / `--force=true`). */
+export function flagMatches(arg, flag) {
+	return typeof arg === "string" && (arg === flag || arg.startsWith(`${flag}=`));
+}
+
+/** Remove every arg that matches any flag in `flags` (bare or `flag=value` form). */
+export function stripFlags(args, flags = []) {
+	return (args ?? []).filter((arg) => !flags.some((flag) => flagMatches(arg, flag)));
+}
 
 const PERMISSION_DIALECTS = {
 	claude: {
@@ -408,17 +422,18 @@ const PERMISSION_DIALECTS = {
 	},
 	cursor: {
 		auto: { args: ["--force"] },
-		gatedAuto: { removeArgs: ["--force", "-f", "--yolo"] },
-		prompt: { removeArgs: ["--force", "-f", "--yolo"] },
+		gatedAuto: { removeArgs: CURSOR_FORCE_FLAGS },
+		prompt: { removeArgs: CURSOR_FORCE_FLAGS },
 		infer(agentSettings, appliedArgs) {
 			// The FINAL applied args (base config + settings + acpArgs) so a --force
-			// baked into the base acp.args (not just settings) is still detected.
+			// baked into the base acp.args (not just settings) is still detected. Match
+			// both bare (`--force`) and valued (`--force=true`) forms.
 			const args = [
 				...stringArray(agentSettings.args ?? agentSettings.nativeArgs),
 				...stringArray(agentSettings.acpArgs),
 				...stringArray(appliedArgs),
 			];
-			return args.includes("--force") || args.includes("-f") || args.includes("--yolo") ? "auto" : undefined;
+			return args.some((arg) => CURSOR_FORCE_FLAGS.some((flag) => flagMatches(arg, flag))) ? "auto" : undefined;
 		},
 	},
 };

@@ -33,6 +33,7 @@ import {
 	recordGrant,
 	resolvePermissionPolicy,
 	selectedOutcome,
+	stripFlags,
 } from "./harness/permissions.mjs";
 
 const HARNESS = "/harness";
@@ -6666,7 +6667,7 @@ function applyGeneratedNativeConfig(key, agent, native) {
 		command.args = args;
 	}
 	if (Array.isArray(native.removeArgs) && native.removeArgs.length > 0) {
-		command.args = (command.args ?? []).filter((arg) => !native.removeArgs.includes(arg));
+		command.args = stripFlags(command.args ?? [], native.removeArgs);
 	}
 	if (Array.isArray(native.args) && native.args.length > 0) {
 		const args = command.args ?? [];

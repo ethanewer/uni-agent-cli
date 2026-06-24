@@ -14,6 +14,7 @@ import {
 	outcomeForDecision,
 	policyNeedsGating,
 	resolvePermissionPolicy,
+	stripFlags,
 } from "./permissions.mjs";
 import { clonePlain, isPlainObject, stringArray } from "./util.mjs";
 
@@ -199,7 +200,7 @@ export class BaseAcpAdapter {
 			command.args = this.translateConfig(command.args, native.config);
 		}
 		if (Array.isArray(native.removeArgs) && native.removeArgs.length > 0) {
-			command.args = (command.args ?? []).filter((arg) => !native.removeArgs.includes(arg));
+			command.args = stripFlags(command.args ?? [], native.removeArgs);
 		}
 		if (Array.isArray(native.args) && native.args.length > 0) {
 			const existing = command.args ?? [];

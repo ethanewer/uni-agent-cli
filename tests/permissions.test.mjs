@@ -7,6 +7,7 @@ import {
 	classifyOption,
 	coercePermissionMode,
 	decidePermission,
+	flagMatches,
 	forgetGrants,
 	inferModeFromNative,
 	isAlwaysOption,
@@ -30,6 +31,7 @@ import {
 	ruleKey,
 	saveGrants,
 	selectedOutcome,
+	stripFlags,
 } from "../src/harness/permissions.mjs";
 
 let passed = 0;
@@ -418,6 +420,13 @@ function stringArrayIncludes(value, needle) {
 	return Array.isArray(value) && value.includes(needle);
 }
 
+check("stripFlags / flagMatches handle bare and valued flag forms", () => {
+	assert.equal(flagMatches("--force", "--force"), true);
+	assert.equal(flagMatches("--force=true", "--force"), true);
+	assert.equal(flagMatches("--forceful", "--force"), false);
+	assert.deepEqual(stripFlags(["--model", "x", "--force=true", "--yolo", "acp"], ["--force", "-f", "--yolo"]), ["--model", "x", "acp"]);
+});
+
 check("inferModeFromNative mirrors the old per-name triggers", () => {
 	assert.equal(inferModeFromNative("claude", { settings: { permissions: { defaultMode: "bypassPermissions" } } }), "auto");
 	assert.equal(inferModeFromNative("claude", { settings: { permissions: { defaultMode: "bypass" } } }), "auto");
@@ -433,6 +442,10 @@ check("inferModeFromNative mirrors the old per-name triggers", () => {
 	assert.equal(inferModeFromNative("cursor", { args: ["--no-yolo"] }), undefined);
 	// --force in acpArgs is also detected (parity with the old final-args check)
 	assert.equal(inferModeFromNative("cursor", { acpArgs: ["--force"] }), "auto");
+	// valued flag forms (--force=true / --yolo=true) are detected too
+	assert.equal(inferModeFromNative("cursor", { args: ["--force=true"] }), "auto");
+	assert.equal(inferModeFromNative("cursor", {}, ["--yolo=1", "acp"]), "auto");
+	assert.equal(inferModeFromNative("cursor", { args: ["--forceful"] }), undefined); // not a force flag
 	// --force baked into the FINAL applied args (e.g. base config acp.args) is detected
 	assert.equal(inferModeFromNative("cursor", {}, ["--force", "acp"]), "auto");
 	assert.equal(inferModeFromNative("cursor", {}, ["acp"]), undefined);

@@ -1105,6 +1105,12 @@ assert.deepEqual(autoDeny.agents.claude._sessionMeta, {
 });
 // cursor is gated (no --force) so it prompts.
 assert.ok(!autoDeny.agents.cursor.acp.args.includes("--force"));
+
+// cursor force-flag VARIANTS (--force=true) are inferred AND neutralized too.
+const cursorVariant = { agents: { cursor: { label: "Cursor", transport: "acp", acp: { command: "cursor-agent", args: ["--force=true", "acp"] } } } };
+assert.equal(applyHarnessSettings(cursorVariant, {}).agents.cursor._permissionMode, "auto"); // inferred
+const cursorVariantAsk = applyHarnessSettings(cursorVariant, { agents: { cursor: { permissions: { mode: "ask" } } } });
+assert.ok(!cursorVariantAsk.agents.cursor.acp.args.some((a) => a.startsWith("--force")), "--force=true neutralized under unified ask");
 // (the deny rule actually denying shell is covered by tests/permissions.test.mjs)
 
 // _nativeBypass marks a genuine no-prompt launch (so /yolo knows a runtime tighten
