@@ -233,6 +233,34 @@ export function pickDenyOption(options = []) {
 	return deny.find((option) => optionScope(option) === "once") ?? deny[0];
 }
 
+/**
+ * Narrowest NON-persistent allow (once, then session) — never an always/bypass
+ * option. cc's AUTOMATIC decisions (mode/rule/grant) use this so cc never silently
+ * makes the backend persist a broad grant; cc owns "always" via its own store.
+ * Returns undefined when the backend offers no non-persistent allow.
+ */
+export function pickNonPersistentAllowOption(options = []) {
+	const allow = options.filter((option) => classifyOption(option) === "allow");
+	const byScope = (scope) => allow.find((option) => optionScope(option) === scope);
+	return byScope("once") ?? byScope("session");
+}
+
+/** Whether the request offers any allow option at all (of any scope). */
+function hasAllowOption(options = []) {
+	return options.some((option) => classifyOption(option) === "allow");
+}
+
+// An automatic "allow" decision: prefer a non-persistent option; if the backend
+// offers ONLY always/bypass allows, surface the prompt (action "ask") rather than
+// silently causing backend-side persistence; if it offers no allow at all, resolve
+// to a cancel (nothing to approve).
+function autoAllowDecision(info, extra = {}) {
+	const option = pickNonPersistentAllowOption(info.options);
+	if (option) return { action: "allow", optionId: option.optionId, ...extra };
+	if (hasAllowOption(info.options)) return { action: "ask", ...extra };
+	return { action: "allow", optionId: undefined, ...extra };
+}
+
 // ---------------------------------------------------------------------------
 // The decision
 // ---------------------------------------------------------------------------
@@ -250,13 +278,14 @@ export function decidePermission(policy = {}, params = {}, ctx = {}) {
 	const rule = matchRule(policy.rules ?? [], info, ctx.agentKey);
 	if (rule) {
 		if (rule.action === "deny") return { action: "deny", optionId: pickDenyOption(info.options)?.optionId, rule };
-		// A scoped allow rule/grant authorizes only THIS tool: answer with the
-		// narrowest allow option so the backend keeps asking about everything else.
-		// cc itself enforces the "always" via the persisted rule. (The user can
-		// still pick a broad option directly in an interactive prompt.)
-		return { action: "allow", optionId: pickAllowOption(info.options)?.optionId, rule };
+		// A scoped allow rule/grant authorizes only THIS tool with a NON-persistent
+		// option, so the backend keeps asking about everything else and does not
+		// persist a broad grant (cc owns "always" via its store). If the backend
+		// offers only always/bypass allows, surface the prompt instead of silently
+		// escalating.
+		return autoAllowDecision(info, { rule });
 	}
-	if (policy.mode === "auto") return { action: "allow", optionId: pickAllowOption(info.options)?.optionId };
+	if (policy.mode === "auto") return autoAllowDecision(info);
 	if (policy.mode === "deny") return { action: "deny", optionId: pickDenyOption(info.options)?.optionId };
 	return { action: "ask" };
 }
@@ -359,8 +388,13 @@ export function nativePermissionConfig(agentKey, mode, { gated = false } = {}) {
  * Back-compat: derive a unified mode from native settings a user already wrote,
  * so existing settings.json files keep working. Mirrors the old
  * applyNativePermissionSetting exactly.
+ *
+ * `appliedArgs` is the FINAL resolved command args (base config + settings),
+ * passed by the callers so a cursor `--force` baked into the base `acp.args` (not
+ * just settings) is still detected — matching the old check that read the applied
+ * agent's args.
  */
-export function inferModeFromNative(agentKey, agentSettings = {}) {
+export function inferModeFromNative(agentKey, agentSettings = {}, appliedArgs = []) {
 	if (!isPlainObject(agentSettings)) return undefined;
 	if (agentKey === "claude") {
 		const mode = agentSettings.settings?.permissions?.defaultMode;
@@ -372,9 +406,11 @@ export function inferModeFromNative(agentKey, agentSettings = {}) {
 		return undefined;
 	}
 	if (agentKey === "cursor") {
-		// Match the old check, which inspected the final command args — including
-		// acpArgs appended after the native args.
-		const args = [...stringArray(agentSettings.args ?? agentSettings.nativeArgs), ...stringArray(agentSettings.acpArgs)];
+		const args = [
+			...stringArray(agentSettings.args ?? agentSettings.nativeArgs),
+			...stringArray(agentSettings.acpArgs),
+			...stringArray(appliedArgs),
+		];
 		if (args.includes("--force") || args.includes("-f") || args.includes("--yolo")) return "auto";
 		return undefined;
 	}

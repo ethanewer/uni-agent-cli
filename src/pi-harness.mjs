@@ -6557,7 +6557,10 @@ function applyNativeSettings(key, agent, settings) {
 function applyNativePermissionSetting(key, agent, settings, globalPermissions, grants = []) {
 	const explicitMode =
 		normalizePermissionSettings(settings.permissions).mode ?? normalizePermissionSettings(globalPermissions).mode;
-	const mode = explicitMode ?? inferModeFromNative(key, settings);
+	// Pass the FINAL applied command args so a cursor --force baked into the base
+	// acp.args (not just settings) is still inferred as auto.
+	const appliedArgs = (agent.acp ?? agent).args ?? [];
+	const mode = explicitMode ?? inferModeFromNative(key, settings, appliedArgs);
 	if (mode) agent._permissionMode = mode;
 	if (!mode) return;
 	// auto with any deny rule/grant must NOT use a native bypass that stops the

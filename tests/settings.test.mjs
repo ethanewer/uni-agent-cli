@@ -1022,6 +1022,15 @@ assert.deepEqual(applied.agents["mini-swe-agent"].acp.args, [
 	"--no-yolo",
 ]);
 
+// Back-compat: a cursor --force baked into the BASE config acp.args (not settings)
+// must still infer auto, or cc desyncs from a force-mode backend.
+const bakedForce = applyHarnessSettings(
+	{ agents: { cursor: { label: "Cursor", transport: "acp", acp: { command: "cursor-agent", args: ["--force", "acp"] } } } },
+	{},
+);
+assert.equal(bakedForce.agents.cursor._permissionMode, "auto");
+assert.equal(bakedForce.agents.cursor._autoPermissionRequests, true);
+
 // Back-compat: native settings now also resolve a unified _permissionMode.
 assert.equal(applied.agents.claude._permissionMode, "auto");
 assert.equal(applied.agents.codex._permissionMode, "auto");

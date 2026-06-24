@@ -162,7 +162,10 @@ export class BaseAcpAdapter {
 	applyPermissionMode(applied, settings = {}) {
 		const explicitMode =
 			normalizePermissionSettings(settings.permissions).mode ?? normalizePermissionSettings(this.globalPermissions).mode;
-		const mode = explicitMode ?? inferModeFromNative(this.key, settings);
+		// Pass the FINAL applied command args so a cursor --force baked into the base
+		// acp.args (not just settings) is still inferred as auto.
+		const appliedArgs = (applied.acp ?? applied).args ?? [];
+		const mode = explicitMode ?? inferModeFromNative(this.key, settings, appliedArgs);
 		if (mode) applied._permissionMode = mode;
 		if (!mode) return;
 		// auto with a deny rule/grant must keep the backend prompting so cc can

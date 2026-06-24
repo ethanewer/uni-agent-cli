@@ -371,6 +371,16 @@ async function main() {
 		ok("settings-equivalence:persisted-deny-grant-gates");
 	}
 
+	// A cursor --force baked into the BASE config acp.args (no settings) must still
+	// infer auto on the adapter path, or capabilities/policy desync from the backend.
+	{
+		const cfg = { label: "Cursor", transport: "acp", acp: { command: "cursor-agent", args: ["--force", "acp"] } };
+		const cursor = createAdapter("cursor", cfg, noopHost(), { connectionFactory: factoryFor(PROFILES.cursor) });
+		assert.equal(cursor.launchSpec._permissionMode, "auto");
+		assert.equal(cursor.capabilities.autoApprove, true);
+		ok("settings-equivalence:cursor-baked-force-detected");
+	}
+
 	// =====================================================================
 	// (2c) NO FEATURES LOST — the per-harness branches collapse into uniform
 	//      adapter calls (cc connects to the interface, names no harness).

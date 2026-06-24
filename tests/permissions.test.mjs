@@ -19,6 +19,7 @@ import {
 	outcomeForDecision,
 	permissionRequestInfo,
 	pickAllowOption,
+	pickNonPersistentAllowOption,
 	policyNeedsGating,
 	pickDenyOption,
 	recordGrant,
@@ -221,6 +222,35 @@ check("decidePermission deny rule overrides auto mode", () => {
 	assert.equal(decision.action, "deny");
 });
 
+// Backend offers ONLY persistent allow options (no allow-once/session).
+const ONLY_ALWAYS_ALLOW = [
+	{ kind: "reject_once", name: "Reject", optionId: "r" },
+	{ kind: "allow_always", name: "Allow always", optionId: "aa" },
+	{ kind: "allow_always", name: "Bypass", optionId: "bypassPermissions" },
+];
+
+check("pickNonPersistentAllowOption refuses always/bypass", () => {
+	assert.equal(pickNonPersistentAllowOption(FAKE_OPTIONS)?.optionId, "allow");
+	assert.equal(pickNonPersistentAllowOption(ONLY_ALWAYS_ALLOW), undefined);
+	assert.equal(pickNonPersistentAllowOption([{ kind: "allow_session", optionId: "s" }])?.optionId, "s");
+});
+
+check("scoped allow rule with only-always options ASKS (no silent backend persistence)", () => {
+	const policy = { mode: "ask", rules: [{ tool: "run tests", action: "allow" }] };
+	const decision = decidePermission(policy, params(ONLY_ALWAYS_ALLOW), { agentKey: "claude" });
+	assert.equal(decision.action, "ask");
+});
+
+check("mode auto with only-always options ASKS rather than sending a bypass", () => {
+	const decision = decidePermission({ mode: "auto", rules: [] }, params(ONLY_ALWAYS_ALLOW), { agentKey: "claude" });
+	assert.equal(decision.action, "ask");
+});
+
+check("mode auto with no allow option resolves to cancel (nothing to approve)", () => {
+	const decision = decidePermission({ mode: "auto", rules: [] }, params([{ kind: "reject_once", optionId: "r" }]), { agentKey: "claude" });
+	assert.deepEqual(outcomeForDecision(decision), { outcome: "cancelled" });
+});
+
 check("outcomeForDecision builds wire shapes", () => {
 	assert.deepEqual(outcomeForDecision({ action: "allow", optionId: "allow" }), { outcome: "selected", optionId: "allow" });
 	assert.deepEqual(outcomeForDecision({ action: "allow" }), { outcome: "cancelled" });
@@ -296,6 +326,9 @@ check("inferModeFromNative mirrors the old per-name triggers", () => {
 	assert.equal(inferModeFromNative("cursor", { args: ["--no-yolo"] }), undefined);
 	// --force in acpArgs is also detected (parity with the old final-args check)
 	assert.equal(inferModeFromNative("cursor", { acpArgs: ["--force"] }), "auto");
+	// --force baked into the FINAL applied args (e.g. base config acp.args) is detected
+	assert.equal(inferModeFromNative("cursor", {}, ["--force", "acp"]), "auto");
+	assert.equal(inferModeFromNative("cursor", {}, ["acp"]), undefined);
 	assert.equal(inferModeFromNative("opencode", { args: ["--whatever"] }), undefined);
 });
 
