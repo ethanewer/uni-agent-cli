@@ -20,7 +20,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { isPlainObject, stringArray } from "./util.mjs";
+import { clonePlain, isPlainObject, stringArray } from "./util.mjs";
 
 // ---------------------------------------------------------------------------
 // Unified modes
@@ -365,105 +365,103 @@ export function policyNeedsGating(policy = {}) {
 	return (policy.rules ?? []).some((rule) => rule.action === "deny");
 }
 
+// ---------------------------------------------------------------------------
+// Per-harness native dialects (the ONE place harness-specific permission
+// knowledge lives — DATA, not branching logic). The engine below is generic over
+// these descriptors and names no harness. Register a new harness's dialect with
+// registerPermissionDialect() — no engine edit needed (parity with registerAdapter).
+// A dialect declares spawn-config shapes for each intent + a back-compat inferer:
+//   auto      -> full no-prompt native bypass
+//   gatedAuto -> auto that keeps the backend PROMPTING (so a deny rule is
+//                enforceable) while keeping full capability where that is a
+//                separate knob (e.g. the codex sandbox)
+//   prompt    -> NEUTRALIZER for ask/deny: undo any native auto/bypass so the
+//                backend prompts (orthogonal settings are left to the user)
+//   infer(agentSettings, appliedArgs) -> "auto" | undefined  (recognize a
+//                pre-existing native bypass a user already wrote, for back-compat)
+// Each shape may set startupMode/settings/config/args/removeArgs; the engine adds
+// autoApprove for auto. A harness with no dialect is decided entirely cc-side.
+// ---------------------------------------------------------------------------
+
+const PERMISSION_DIALECTS = {
+	claude: {
+		auto: { startupMode: "bypassPermissions", settings: { permissions: { defaultMode: "bypassPermissions" } } },
+		gatedAuto: { settings: { permissions: { defaultMode: "default" } } },
+		prompt: { settings: { permissions: { defaultMode: "default" } } },
+		infer(agentSettings) {
+			// Only the genuine bypass values mean auto. The broad aliases
+			// coercePermissionMode accepts (allow/full/yolo) are NOT valid Claude
+			// defaultMode values, so inferring auto from them would auto-approve cc
+			// while Claude still enforces. Those belong to unified `permissions.mode`.
+			const mode = String(agentSettings.settings?.permissions?.defaultMode ?? "").trim().toLowerCase();
+			return mode === "bypasspermissions" || mode === "bypass" ? "auto" : undefined;
+		},
+	},
+	codex: {
+		auto: { config: { approval_policy: "never", sandbox_mode: "danger-full-access" } },
+		gatedAuto: { config: { approval_policy: "on-request", sandbox_mode: "danger-full-access" } },
+		prompt: { config: { approval_policy: "on-request" } },
+		infer(agentSettings) {
+			const config = agentSettings.config;
+			return config?.approval_policy === "never" && config?.sandbox_mode === "danger-full-access" ? "auto" : undefined;
+		},
+	},
+	cursor: {
+		auto: { args: ["--force"] },
+		gatedAuto: { removeArgs: ["--force", "-f", "--yolo"] },
+		prompt: { removeArgs: ["--force", "-f", "--yolo"] },
+		infer(agentSettings, appliedArgs) {
+			// The FINAL applied args (base config + settings + acpArgs) so a --force
+			// baked into the base acp.args (not just settings) is still detected.
+			const args = [
+				...stringArray(agentSettings.args ?? agentSettings.nativeArgs),
+				...stringArray(agentSettings.acpArgs),
+				...stringArray(appliedArgs),
+			];
+			return args.includes("--force") || args.includes("-f") || args.includes("--yolo") ? "auto" : undefined;
+		},
+	},
+};
+
+/** Register (or override) a harness's native permission dialect at runtime. */
+export function registerPermissionDialect(key, dialect) {
+	PERMISSION_DIALECTS[key] = dialect;
+}
+
+/** The native dialect for a harness, or undefined (cc-side decisioning only). */
+export function getPermissionDialect(key) {
+	return PERMISSION_DIALECTS[key];
+}
+
 /**
- * Map a unified mode to a harness's native settings. `autoApprove` tells cc to
- * auto-accept; `startupMode`/`settings`/`config`/`args`/`removeArgs` are the spawn
- * inputs that configure (or neutralize) the backend itself so the two never
- * disagree. A harness with no native knob just gets `autoApprove` for auto (and cc
- * decides for ask/deny). The ask/deny shapes are NEUTRALIZERS: they undo any native
- * auto/bypass on the agent so the backend prompts and cc's decision is honored
- * (ask and deny share the same native shape; the difference is cc-side only).
- *
- * `gated: true` (auto with deny rules) keeps the backend PROMPTING — full native
- * bypass would stop it asking, so cc could never apply the denial — while keeping
- * full capability where that is a separate knob (the codex sandbox). cc then
- * auto-approves everything except the denied tools.
+ * Map a unified mode to a harness's native settings — generic over the harness's
+ * registered dialect. `autoApprove` tells cc to auto-accept; the spawn-config keys
+ * (startupMode/settings/config/args/removeArgs) configure or neutralize the backend
+ * so cc and it never disagree. A harness with no dialect just gets `autoApprove`
+ * for auto and {} for ask/deny (cc decides). `gated: true` (auto + deny rule) uses
+ * the dialect's prompting variant so cc can still enforce the denial.
  */
 export function nativePermissionConfig(agentKey, mode, { gated = false } = {}) {
+	const dialect = getPermissionDialect(agentKey);
 	if (mode === "auto") {
-		if (gated) {
-			switch (agentKey) {
-				case "claude":
-					return { autoApprove: true, settings: { permissions: { defaultMode: "default" } } };
-				case "codex":
-					return { autoApprove: true, config: { approval_policy: "on-request", sandbox_mode: "danger-full-access" } };
-				case "cursor":
-					return { autoApprove: true, removeArgs: ["--force", "-f", "--yolo"] };
-				default:
-					return { autoApprove: true };
-			}
-		}
-		switch (agentKey) {
-			case "claude":
-				return {
-					autoApprove: true,
-					startupMode: "bypassPermissions",
-					settings: { permissions: { defaultMode: "bypassPermissions" } },
-				};
-			case "codex":
-				return { autoApprove: true, config: { approval_policy: "never", sandbox_mode: "danger-full-access" } };
-			case "cursor":
-				return { autoApprove: true, args: ["--force"] };
-			default:
-				return { autoApprove: true };
-		}
+		const shape = gated ? dialect?.gatedAuto : dialect?.auto;
+		return { autoApprove: true, ...clonePlain(shape ?? {}) };
 	}
 	if (mode === "ask" || mode === "deny") {
-		// ask and deny share the SAME native shape: both make the backend prompt
-		// (neutralizing any native auto/bypass); the ask-vs-deny difference is purely
-		// cc-side (mode drives decidePermission), so there is no native auto-deny.
-		// Flip the prompting switch back on; leave orthogonal settings (the codex
-		// sandbox, claude's other options) to the user.
-		switch (agentKey) {
-			case "claude":
-				return { settings: { permissions: { defaultMode: "default" } } };
-			case "codex":
-				return { config: { approval_policy: "on-request" } };
-			case "cursor":
-				return { removeArgs: ["--force", "-f", "--yolo"] };
-			default:
-				return {};
-		}
+		// ask and deny share the SAME native shape (both make the backend prompt);
+		// the difference is purely cc-side (mode drives decidePermission).
+		return clonePlain(dialect?.prompt ?? {});
 	}
 	return {};
 }
 
 /**
  * Back-compat: derive a unified mode from native settings a user already wrote,
- * so existing settings.json files keep working. Mirrors the old
- * applyNativePermissionSetting exactly.
- *
- * `appliedArgs` is the FINAL resolved command args (base config + settings),
- * passed by the callers so a cursor `--force` baked into the base `acp.args` (not
- * just settings) is still detected — matching the old check that read the applied
- * agent's args.
+ * so existing settings.json files keep working — generic over the dialect's infer().
  */
 export function inferModeFromNative(agentKey, agentSettings = {}, appliedArgs = []) {
 	if (!isPlainObject(agentSettings)) return undefined;
-	if (agentKey === "claude") {
-		// Only the genuine bypass values mean auto here. The broad aliases that
-		// coercePermissionMode accepts (allow/full/yolo) are NOT valid Claude
-		// defaultMode bypass values, so inferring auto from them would make cc
-		// auto-approve while Claude still enforces. Those aliases belong to the
-		// unified `permissions.mode`, not native back-compat inference.
-		const mode = String(agentSettings.settings?.permissions?.defaultMode ?? "").trim().toLowerCase();
-		return mode === "bypasspermissions" || mode === "bypass" ? "auto" : undefined;
-	}
-	if (agentKey === "codex") {
-		const config = agentSettings.config;
-		if (config?.approval_policy === "never" && config?.sandbox_mode === "danger-full-access") return "auto";
-		return undefined;
-	}
-	if (agentKey === "cursor") {
-		const args = [
-			...stringArray(agentSettings.args ?? agentSettings.nativeArgs),
-			...stringArray(agentSettings.acpArgs),
-			...stringArray(appliedArgs),
-		];
-		if (args.includes("--force") || args.includes("-f") || args.includes("--yolo")) return "auto";
-		return undefined;
-	}
-	return undefined;
+	return getPermissionDialect(agentKey)?.infer?.(agentSettings, appliedArgs) ?? undefined;
 }
 
 // ---------------------------------------------------------------------------

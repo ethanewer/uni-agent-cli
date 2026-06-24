@@ -13,6 +13,7 @@ import {
 	loadGrants,
 	matchRule,
 	nativePermissionConfig,
+	getPermissionDialect,
 	normalizePermissionSettings,
 	normalizeRule,
 	optionScope,
@@ -24,6 +25,7 @@ import {
 	policyNeedsGating,
 	pickDenyOption,
 	recordGrant,
+	registerPermissionDialect,
 	resolvePermissionPolicy,
 	ruleKey,
 	saveGrants,
@@ -385,6 +387,36 @@ check("nativePermissionConfig emits NEUTRALIZERS for ask/deny", () => {
 	assert.deepEqual(nativePermissionConfig("cursor", "deny"), nativePermissionConfig("cursor", "ask"));
 	assert.deepEqual(nativePermissionConfig("opencode", "deny"), {});
 });
+
+check("a new harness dialect can be registered without editing the engine", () => {
+	// A harness with no dialect is decided entirely cc-side (no native bypass).
+	assert.deepEqual(nativePermissionConfig("brand-new", "auto"), { autoApprove: true });
+	assert.deepEqual(nativePermissionConfig("brand-new", "ask"), {});
+	assert.equal(inferModeFromNative("brand-new", { args: ["--whatever"] }), undefined);
+	assert.equal(getPermissionDialect("brand-new"), undefined);
+
+	// Registering a dialect makes the generic engine generate/infer its native form.
+	registerPermissionDialect("brand-new", {
+		auto: { args: ["--bypass"] },
+		gatedAuto: { removeArgs: ["--bypass"] },
+		prompt: { removeArgs: ["--bypass"] },
+		infer: (settings) => (stringArrayIncludes(settings.args, "--bypass") ? "auto" : undefined),
+	});
+	assert.deepEqual(nativePermissionConfig("brand-new", "auto"), { autoApprove: true, args: ["--bypass"] });
+	assert.deepEqual(nativePermissionConfig("brand-new", "auto", { gated: true }), { autoApprove: true, removeArgs: ["--bypass"] });
+	assert.deepEqual(nativePermissionConfig("brand-new", "deny"), { removeArgs: ["--bypass"] });
+	assert.equal(inferModeFromNative("brand-new", { args: ["--bypass"] }), "auto");
+	assert.equal(inferModeFromNative("brand-new", { args: [] }), undefined);
+
+	// The returned shape is a copy — mutating it must not corrupt the registered dialect.
+	const got = nativePermissionConfig("brand-new", "auto");
+	got.args.push("mutated");
+	assert.deepEqual(nativePermissionConfig("brand-new", "auto").args, ["--bypass"]);
+});
+
+function stringArrayIncludes(value, needle) {
+	return Array.isArray(value) && value.includes(needle);
+}
 
 check("inferModeFromNative mirrors the old per-name triggers", () => {
 	assert.equal(inferModeFromNative("claude", { settings: { permissions: { defaultMode: "bypassPermissions" } } }), "auto");

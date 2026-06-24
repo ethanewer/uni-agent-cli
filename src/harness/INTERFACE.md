@@ -26,9 +26,13 @@ Adding a harness that needs *any* of these means editing those switches.
 > **Permissions are no longer per-name.** A single harness-agnostic engine
 > (`src/harness/permissions.mjs`) owns the policy: it *generates* each backend's
 > native auto-approve dialect from one unified `permissions.mode`, persists "allow
-> always" grants cc-side, and decides allow/deny/ask uniformly. `BaseAcpAdapter`
-> calls it (`applyPermissionMode`), so adapters carry zero permission code. See
-> `docs/permissions-audit.md`.
+> always" grants cc-side, and decides allow/deny/ask uniformly. The engine logic
+> names no harness — the only per-harness knowledge is a **data** dialect table
+> (`auto`/`gatedAuto`/`prompt`/`infer`), extensible at runtime via
+> `registerPermissionDialect(key, dialect)` (parity with `registerAdapter`), so a
+> new harness's native dialect needs no engine edit. `BaseAcpAdapter` calls the
+> engine (`applyPermissionMode` / `#onPermission` / `handleExtensionRequest`), so
+> adapters carry zero permission code. See `docs/permissions-audit.md`.
 
 ## The abstraction
 
