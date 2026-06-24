@@ -6,6 +6,8 @@ import { BaseAcpAdapter } from "./acp-base.mjs";
 import { ClaudeAdapter } from "./adapters/claude.mjs";
 import { CodexAdapter } from "./adapters/codex.mjs";
 import { CursorAdapter } from "./adapters/cursor.mjs";
+import { OpenCodeAdapter } from "./adapters/opencode.mjs";
+import { PiAdapter } from "./adapters/pi.mjs";
 
 /** key -> adapter class. Anything absent falls back to BaseAcpAdapter. */
 export const ADAPTER_REGISTRY = {
@@ -14,6 +16,8 @@ export const ADAPTER_REGISTRY = {
 	cursor: CursorAdapter,
 	"terminus-2": BaseAcpAdapter, // pure generic-ACP — no custom adapter needed
 	"mini-swe-agent": BaseAcpAdapter, // pure generic-ACP — no custom adapter needed
+	opencode: OpenCodeAdapter,
+	pi: PiAdapter,
 };
 
 /** Register (or override) an adapter at runtime — used to prove addability. */

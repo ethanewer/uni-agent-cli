@@ -153,6 +153,27 @@ const PROFILES = {
 		capabilities: {},
 		configOptions: [],
 	},
+	opencode: {
+		agentInfo: { name: "opencode" },
+		capabilities: {
+			loadSession: true,
+			sessionCapabilities: { list: {}, resume: {}, fork: {} },
+			promptCapabilities: { image: true },
+			mcpCapabilities: { http: true },
+		},
+		configOptions: [{ id: "model", category: "model" }, { id: "mode", category: "mode" }],
+		modes: { availableModes: [{ id: "build" }, { id: "plan" }] },
+	},
+	pi: {
+		// pi-acp exposes thinking levels (off/minimal/.../xhigh) as session modes per
+		// research, so /mode binds and /effort stays dark. The PiAdapter is fully
+		// wire-derived: if pi-acp instead advertised a `thought_level` configOption,
+		// reasoningEffort would light up automatically with no adapter change.
+		agentInfo: { name: "pi-acp" },
+		capabilities: { loadSession: true, sessionCapabilities: { list: {}, resume: {} }, promptCapabilities: { image: true } },
+		configOptions: [{ id: "model", category: "model" }, { id: "mode", category: "mode" }],
+		modes: { availableModes: [{ id: "off" }, { id: "high" }] },
+	},
 };
 
 const CONFIGS = {
@@ -197,6 +218,8 @@ async function main() {
 		cursor: { fork: false, resume: false, sessionList: false, models: true, modes: true, reasoningEffort: false, image: true, retractPrompt: false, interactiveRequests: true },
 		"terminus-2": { fork: false, resume: false, sessionList: false, models: false, modes: true, reasoningEffort: false, image: false, retractPrompt: false, interactiveRequests: false },
 		"mini-swe-agent": { fork: false, resume: false, sessionList: false, models: false, modes: false, reasoningEffort: false, image: false, retractPrompt: false, interactiveRequests: false },
+		opencode: { fork: "native", resume: true, sessionList: true, models: true, modes: true, reasoningEffort: false, image: true, retractPrompt: false, interactiveRequests: false, mcp: true },
+		pi: { fork: false, resume: true, sessionList: true, models: true, modes: true, reasoningEffort: false, image: true, retractPrompt: false, interactiveRequests: false },
 	};
 	for (const [key, expected] of Object.entries(EXPECTED)) {
 		const adapter = createAdapter(key, CONFIGS[key], noopHost(), { connectionFactory: factoryFor(PROFILES[key]) });
@@ -396,24 +419,39 @@ async function main() {
 	}
 
 	// =====================================================================
-	// (3) ADDABILITY — a brand-new harness with no interface/base/cc change.
+	// (3) ADDABILITY — opencode + pi + a brand-new harness, no core changes.
 	// =====================================================================
 	{
-		const acmeProfile = {
-			agentInfo: { name: "acme" },
-			capabilities: { loadSession: true, sessionCapabilities: { list: {}, resume: {}, fork: {} }, promptCapabilities: { image: true } },
-			configOptions: [{ id: "model", category: "model" }],
-		};
-		// A brand-new harness registered at runtime — no interface/base/cc edit, and
-		// resolved from its own defaultAgentConfig (no DEFAULT_CONFIG edit either).
+		// opencode/pi resolve from their own defaultAgentConfig (no DEFAULT_CONFIG edit).
+		const oc = createAdapter("opencode", undefined, noopHost(), { connectionFactory: factoryFor(PROFILES.opencode) });
+		assertAdapterConformance(oc);
+		assert.deepEqual(oc.launchSpec.acp, { command: "opencode", args: ["acp"] });
+		await oc.connect();
+		assert.equal(oc.capabilities.fork, "native");
+		assert.equal(oc.capabilities.mcp, true);
+		ok("addability:opencode");
+
+		const pi = createAdapter("pi", undefined, noopHost(), { connectionFactory: factoryFor(PROFILES.pi) });
+		assertAdapterConformance(pi);
+		await pi.connect();
+		assert.equal(pi.capabilities.fork, false); // pi-acp advertises no fork -> /btw dark
+		assert.equal(pi.capabilities.models, true);
+		ok("addability:pi");
+
+		// opencode/pi are *thin*: zero overridden prototype methods beyond constructor.
+		for (const adapter of [oc, pi]) {
+			const overrides = Object.getOwnPropertyNames(Object.getPrototypeOf(adapter).constructor.prototype).filter((n) => n !== "constructor");
+			assert.deepEqual(overrides, [], `${adapter.key} adapter should override nothing`);
+		}
+		ok("addability:thin-adapters");
+
+		// a brand-new harness registered at runtime — no interface/base/cc edit.
 		class AcmeAdapter extends BaseAcpAdapter {
 			static defaultAgentConfig = { label: "Acme", transport: "acp", acp: { command: "acme", args: ["acp"] } };
 		}
 		registerAdapter("acme", AcmeAdapter);
-		const acme = createAdapter("acme", undefined, noopHost(), { connectionFactory: factoryFor(acmeProfile) });
+		const acme = createAdapter("acme", undefined, noopHost(), { connectionFactory: factoryFor(PROFILES.opencode) });
 		assertAdapterConformance(acme);
-		// The adapter is *thin*: zero overridden prototype methods beyond constructor.
-		assert.deepEqual(Object.getOwnPropertyNames(Object.getPrototypeOf(acme).constructor.prototype).filter((n) => n !== "constructor"), []);
 		await acme.connect();
 		assert.equal(acme.capabilities.fork, "native");
 		ok("addability:runtime-registration");
