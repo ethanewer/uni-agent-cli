@@ -14,10 +14,31 @@ import { isKeyRelease, matchesKey } from "@mariozechner/pi-tui/dist/keys.js";
 import { ProcessTerminal } from "@mariozechner/pi-tui/dist/terminal.js";
 import { Container, TUI } from "@mariozechner/pi-tui/dist/tui.js";
 import { normalizeTerminalOutput, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui/dist/utils.js";
+import {
+	cancelledOutcome,
+	classifyOption,
+	coercePermissionMode,
+	decidePermission,
+	forgetGrants,
+	inferModeFromNative,
+	isAlwaysOption,
+	loadGrants,
+	nativePermissionConfig,
+	nonPersistentSameDirection,
+	normalizePermissionSettings,
+	outcomeForDecision,
+	permissionRequestInfo,
+	pickAllowOption,
+	policyNeedsGating,
+	recordGrant,
+	resolvePermissionPolicy,
+	selectedOutcome,
+	stripFlags,
+} from "./harness/permissions.mjs";
 
 const HARNESS = "/harness";
 // Commands the shared UI always owns, even if a backend advertises the same name.
-const RESERVED_LOCAL_COMMANDS = new Set(["harness", "help", "status", "clear", "voice", "theme", "btw", "diff", "copy"]);
+const RESERVED_LOCAL_COMMANDS = new Set(["harness", "help", "status", "clear", "voice", "theme", "btw", "diff", "copy", "yolo", "auto", "permissions"]);
 const SOURCE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const HARNESS_ROOT = path.join(SOURCE_DIR, "harnesses");
 const HARNESS_PYTHON = resolveHarnessPython();
@@ -2175,6 +2196,10 @@ export class HarnessApp {
 		this.deferredLocalSlashCommands = [];
 		this.permissionQueue = [];
 		this.permissionPromptActive = false;
+		// Persisted "allow always" grants (harness-agnostic, survive restarts) and
+		// the per-agent runtime mode override set by /yolo. See src/harness/permissions.mjs.
+		this.permissionGrants = loadGrants();
+		this.runtimePermissionMode = new Map();
 		this.cancelRequested = false;
 		this.afterToolCancelPending = false;
 		this.cancelGraceTimer = undefined;
@@ -2440,14 +2465,12 @@ export class HarnessApp {
 			if (this.client === client) this.handleBackendEvent(event);
 		}, {
 			onPermissionRequest: (params) => {
-				if (this.client !== client) return { outcome: "cancelled" };
-				if (agent._autoPermissionRequests) return autoPermissionOutcome(params);
-				return this.requestPermission(params);
+				if (this.client !== client) return cancelledOutcome();
+				return this.resolvePermissionOutcome(key, agent, params);
 			},
 			onCursorRequest: (method, params) => {
 				if (this.client !== client) return cursorCancelResult(method);
-				if (agent._autoPermissionRequests) return autoCursorOutcome(method, params);
-				return this.requestCursorInteraction(method, params);
+				return this.resolveCursorOutcome(key, agent, method, params);
 			},
 		});
 		this.client = client;
@@ -3540,7 +3563,79 @@ export class HarnessApp {
 		}
 		if (name === "plan") {
 			await this.setPlanMode(name);
+			return;
 		}
+		if (name === "yolo" || name === "auto") {
+			this.toggleAutoApprove(name, argument);
+			return;
+		}
+		if (name === "permissions") {
+			this.runPermissions(name, argument);
+		}
+	}
+
+	// Flip the active harness's permission mode at runtime, harness-agnostically.
+	// `/yolo` toggles auto<->ask; `/yolo ask|auto|deny` sets it explicitly.
+	toggleAutoApprove(name, argument) {
+		this.addCommandMessage(slashCommandText(name, argument));
+		const agentKey = this.activeKey;
+		const agent = this.config.agents[agentKey];
+		const current = this.permissionPolicyFor(agentKey, agent).mode;
+		let next;
+		if (argument) {
+			next = coercePermissionMode(argument);
+			if (!next) {
+				this.addNotice(`Unknown permission mode: ${oneLine(argument)} (try ask, auto, or deny)`);
+				return;
+			}
+		} else {
+			next = current === "auto" ? "ask" : "auto";
+		}
+		this.runtimePermissionMode.set(agentKey, next);
+		const label = next === "auto" ? "auto-approve ON" : next === "deny" ? "auto-deny ON" : "ask on every request";
+		this.addNotice(`Permissions for ${agentKey}: ${label}`);
+		// Only a genuine native-bypass launch can't be tightened at runtime: it emits
+		// no permission requests, and /new reuses the same process + spawn args. Gated
+		// auto and generic harnesses keep prompting, so /yolo ask|deny DOES take effect
+		// for them — don't warn there. Be honest: only re-launching with the mode in
+		// settings re-spawns a native-bypass backend in a prompting configuration.
+		if (next !== "auto" && agent?._nativeBypass) {
+			this.addNotice(
+				`Note: ${agentKey} was launched in auto mode and won't emit requests to gate this session. ` +
+					`Set "permissions" for ${agentKey} in settings.json and restart cc to fully enforce ${next}.`,
+			);
+		}
+		this.ui.requestRender();
+	}
+
+	// Show the effective policy + remembered grants; `/permissions clear` forgets them.
+	runPermissions(name, argument) {
+		this.addCommandMessage(slashCommandText(name, argument));
+		const arg = oneLine(argument).toLowerCase();
+		const agentKey = this.activeKey;
+		if (arg === "clear") {
+			try {
+				this.permissionGrants = forgetGrants(() => true);
+				this.addNotice("Cleared all remembered permission grants.");
+			} catch (error) {
+				this.addNotice(`Could not clear permission grants: ${error.message ?? error}`);
+			}
+			this.ui.requestRender();
+			return;
+		}
+		const policy = this.permissionPolicyFor(agentKey, this.config.agents[agentKey]);
+		const lines = [`Permissions — ${agentKey}: mode=${policy.mode}, remember=${policy.remember ? "on" : "off"}`];
+		if (policy.rules.length === 0) {
+			lines.push("  (no rules or remembered grants)");
+		} else {
+			for (const rule of policy.rules) {
+				const scope = rule.agent ? `${rule.agent}:` : "*:";
+				lines.push(`  ${rule.action === "deny" ? "deny " : "allow"} ${scope}${rule.tool}`);
+			}
+		}
+		lines.push("Use /yolo [ask|auto|deny] to change mode, /permissions clear to forget grants.");
+		this.addNotice(lines.join("\n"));
+		this.ui.requestRender();
 	}
 
 	deferLocalSlashCommand(name, argument = "") {
@@ -4007,14 +4102,12 @@ export class HarnessApp {
 			},
 			{
 				onPermissionRequest: (params) => {
-					if (this.btwThread !== thread) return { outcome: "cancelled" };
-					if (agent._autoPermissionRequests) return autoPermissionOutcome(params);
-					return this.requestPermission(params);
+					if (this.btwThread !== thread) return cancelledOutcome();
+					return this.resolvePermissionOutcome(this.activeKey, agent, params);
 				},
 				onCursorRequest: (method, params) => {
 					if (this.btwThread !== thread) return cursorCancelResult(method);
-					if (agent._autoPermissionRequests) return autoCursorOutcome(method, params);
-					return this.requestCursorInteraction(method, params);
+					return this.resolveCursorOutcome(this.activeKey, agent, method, params);
 				},
 			},
 		);
@@ -4219,9 +4312,57 @@ export class HarnessApp {
 		this.editor.setText(query);
 	}
 
-	requestPermission(params = {}) {
+	// The single decision point shared by every connection (main + /btw + future
+	// /remote). Resolves the harness-agnostic policy, lets the engine decide, and
+	// only opens a dialog when the policy says "ask".
+	resolvePermissionOutcome(agentKey, agent, params) {
+		const policy = this.permissionPolicyFor(agentKey, agent);
+		const decision = decidePermission(policy, params, { agentKey });
+		if (decision.action !== "ask") return outcomeForDecision(decision);
+		return this.requestPermission(params, { agentKey, policy });
+	}
+
+	// Cursor's interactive extension prompts (create_plan / ask_question) run through
+	// the SAME policy engine as tool permissions: a matching deny rule/grant or deny
+	// mode rejects them, auto accepts, otherwise the user is asked. (Mode alone is not
+	// enough — a deny rule under auto mode must still reject.)
+	resolveCursorOutcome(agentKey, agent, method, params) {
+		const policy = this.permissionPolicyFor(agentKey, agent);
+		const synthetic = { toolCall: { title: cursorActionName(params), kind: method }, options: [] };
+		const decision = decidePermission(policy, synthetic, { agentKey });
+		if (decision.action === "deny") return cursorCancelResult(method);
+		if (decision.action === "allow") return autoCursorOutcome(method, params);
+		return this.requestCursorInteraction(method, params);
+	}
+
+	// Effective policy for a harness: runtime /yolo override > the spawn-time mode
+	// (agent._permissionMode, already = explicit settings ?? native-inferred) >
+	// "ask". Rules come from settings + persisted grants.
+	permissionPolicyFor(agentKey, agent) {
+		const policy = resolvePermissionPolicy(this.config.settings ?? {}, agentKey, this.permissionGrants);
+		const runtime = this.runtimePermissionMode.get(agentKey);
+		policy.mode = runtime ?? agent?._permissionMode ?? policy.mode;
+		return policy;
+	}
+
+	// Record a user's "always" choice as a persistent, harness-agnostic grant.
+	// Best-effort: a failed store write must NOT prevent the backend reply, or the
+	// permission request would hang and the queue stall.
+	rememberPermissionChoice(agentKey, params, option) {
+		const tool = permissionRequestInfo(params).toolName;
+		if (!tool || !option?.optionId) return;
+		const action = classifyOption(option) === "deny" ? "deny" : "allow";
+		try {
+			this.permissionGrants = recordGrant({ agent: agentKey, tool, action });
+			this.addNotice(`Remembered: ${action === "deny" ? "deny" : "allow"} "${oneLine(tool)}" for ${agentKey} (see /permissions)`);
+		} catch (error) {
+			this.addNotice(`Could not save permission grant: ${error.message ?? error}`);
+		}
+	}
+
+	requestPermission(params = {}, context = {}) {
 		return new Promise((resolve) => {
-			this.permissionQueue.push({ kind: "permission", params, resolve });
+			this.permissionQueue.push({ kind: "permission", params, context, resolve });
 			this.drainPermissionQueue();
 		});
 	}
@@ -4238,8 +4379,27 @@ export class HarnessApp {
 		const request = this.permissionQueue.shift();
 		if (!request) return;
 		this.permissionPromptActive = true;
-		if (request.kind === "cursor") this.openCursorInteraction(request);
-		else this.openPermissionRequest(request);
+		if (request.kind === "cursor") {
+			this.openCursorInteraction(request);
+			return;
+		}
+		// Re-evaluate against the CURRENT policy before prompting: a grant just
+		// recorded for an overlapping request (or a runtime /yolo change) may now
+		// auto-resolve this one, so the user isn't re-asked about a tool they just
+		// chose "always" for.
+		const agentKey = request.context?.agentKey;
+		if (agentKey) {
+			const policy = this.permissionPolicyFor(agentKey, this.config.agents[agentKey]);
+			const decision = decidePermission(policy, request.params, { agentKey });
+			if (decision.action !== "ask") {
+				request.resolve(outcomeForDecision(decision));
+				this.permissionPromptActive = false;
+				this.drainPermissionQueue();
+				return;
+			}
+			request.context = { ...request.context, policy };
+		}
+		this.openPermissionRequest(request);
 	}
 
 	openCursorInteraction(request) {
@@ -4285,10 +4445,12 @@ export class HarnessApp {
 		askNext(0);
 	}
 
-	openPermissionRequest({ params, resolve }) {
+	openPermissionRequest({ params, resolve, context = {} }) {
 		const options = Array.isArray(params.options) ? params.options : [];
 		if (options.length === 0) {
-			resolve({ outcome: "cancelled" });
+			// Surface it rather than silently cancelling against the user.
+			this.addNotice(`${permissionTitle(params)}: no options offered — cancelling`);
+			resolve(cancelledOutcome());
 			this.permissionPromptActive = false;
 			this.drainPermissionQueue();
 			return;
@@ -4304,7 +4466,36 @@ export class HarnessApp {
 			settled = true;
 			this.closeMenu();
 			const option = entry?.value;
-			resolve(option?.optionId ? { outcome: "selected", optionId: option.optionId } : { outcome: "cancelled" });
+			// An "always" pick should never make BOTH cc and the backend persist it.
+			// cc downgrades the backend reply to a one-time (non-persistent) option so
+			// the backend doesn't persist, and records its own grant ONLY when
+			// remembering is enabled (so remember:false truly persists nothing). If the
+			// backend offers no non-persistent option in that direction, cc can't own
+			// it — honor the user's pick but DON'T record a grant it couldn't revoke,
+			// and tell the user the backend owns it.
+			let toRemember = null;
+			if (!option?.optionId) {
+				resolve(cancelledOutcome());
+			} else if (isAlwaysOption(option)) {
+				const once = nonPersistentSameDirection(option, options);
+				if (once) {
+					resolve(selectedOutcome(once.optionId));
+					if (context.policy?.remember !== false) toRemember = option;
+				} else {
+					resolve(selectedOutcome(option.optionId));
+					this.addNotice(
+						`${context.agentKey ?? "the backend"} will remember this itself — /permissions clear can't revoke it ` +
+							"(no one-time option was offered).",
+					);
+				}
+			} else {
+				resolve(selectedOutcome(option.optionId));
+			}
+			// Record BEFORE draining so an overlapping queued request for the same tool
+			// is re-evaluated against the new grant (drainPermissionQueue re-runs the
+			// decision). Best-effort: rememberPermissionChoice catches write failures,
+			// and the backend reply already happened above, so this can't block.
+			if (toRemember) this.rememberPermissionChoice(context.agentKey, params, toRemember);
 			this.permissionPromptActive = false;
 			this.drainPermissionQueue();
 		};
@@ -4453,7 +4644,7 @@ export class HarnessApp {
 		// Rebuilding the provider tears down any open autocomplete popup, so skip
 		// it when the effective command set is unchanged (a frequent no-op on
 		// every config/mode/session-info update while the user is mid-type).
-		const key = `${this.activeKey} ${JSON.stringify(commands.map((command) => [command.name, command.description, command.argumentHint]))}`;
+		const key = `${this.activeKey}\t${JSON.stringify(commands.map((command) => [command.name, command.description, command.argumentHint]))}`;
 		if (key === this.lastAutocompleteKey) return;
 		this.lastAutocompleteKey = key;
 		this.editor.setAutocompleteProvider(new LazyCombinedAutocompleteProvider(commands, process.cwd(), null));
@@ -5005,26 +5196,11 @@ function permissionOptionDescription(option = {}) {
 	return parts.length > 0 ? parts.map(oneLine).join(" · ") : undefined;
 }
 
+// Retained as the auto-accept entry point for the adapter prototype
+// (src/harness/acp-base.mjs). It now delegates to the shared engine, which picks
+// the narrowest safe allow option rather than escalating to the broadest grant.
 export function autoPermissionOutcome(params = {}) {
-	const option = autoPermissionOption(Array.isArray(params.options) ? params.options : []);
-	return option?.optionId ? { outcome: "selected", optionId: option.optionId } : { outcome: "cancelled" };
-}
-
-function autoPermissionOption(options) {
-	const allowed = options.filter(isAllowPermissionOption);
-	return (
-		allowed.find((option) => option.optionId === "bypassPermissions") ??
-		allowed.find((option) => String(option.kind ?? "").toLowerCase() === "allow_always") ??
-		allowed[0]
-	);
-}
-
-function isAllowPermissionOption(option = {}) {
-	const kind = String(option.kind ?? "").toLowerCase();
-	if (kind.includes("reject") || kind.includes("deny") || kind.includes("cancel")) return false;
-	if (kind.includes("allow") || kind.includes("approve")) return true;
-	const text = `${option.optionId ?? ""} ${option.name ?? ""} ${option.label ?? ""}`.toLowerCase();
-	return /\b(allow|approve|yes|accept|bypass)\b/.test(text) && !/\b(reject|deny|cancel|no)\b/.test(text);
+	return selectedOutcome(pickAllowOption(Array.isArray(params.options) ? params.options : [])?.optionId);
 }
 
 function humanizePermissionKind(kind) {
@@ -5034,10 +5210,16 @@ function humanizePermissionKind(kind) {
 		.replace(/\b\w/g, (char) => char.toUpperCase());
 }
 
-function cursorCancelResult(method) {
+export function cursorCancelResult(method) {
 	if (method === "cursor/create_plan") return { outcome: { outcome: "rejected", reason: "Cancelled" } };
 	if (method === "cursor/ask_question") return { outcome: { outcome: "cancelled" } };
 	return {};
+}
+
+// A human-ish name for a cursor extension request, used as the "tool" when matching
+// permission rules against an interactive cursor prompt.
+export function cursorActionName(params = {}) {
+	return params.name ?? params.title ?? params.overview ?? params.prompt;
 }
 
 export function autoCursorOutcome(method, params = {}) {
@@ -5327,6 +5509,9 @@ function localSlashCommands(app) {
 	addIfMissing({ name: "reasoning", description: "Change reasoning effort" });
 	addIfMissing({ name: "thinking", description: "Change reasoning effort" });
 	addIfMissing({ name: "plan", description: "Switch to plan mode" });
+	addIfMissing({ name: "yolo", description: "Toggle auto-approve for this harness", argumentHint: "[ask|auto|deny]" });
+	addIfMissing({ name: "auto", description: "Toggle auto-approve for this harness", argumentHint: "[ask|auto|deny]" });
+	addIfMissing({ name: "permissions", description: "Show or clear remembered permission grants", argumentHint: "[clear]" });
 
 	if (supportsSessionList(state)) {
 		addIfMissing({ name: "resume", description: "Resume a previous ACP session" });
@@ -6273,7 +6458,9 @@ export function loadConfig() {
 	const user = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : {};
 	const config = deepMerge(DEFAULT_CONFIG, user);
 	const settings = normalizeSettings(deepMerge(config.settings ?? {}, loadSettings()), config.theme);
-	return applyHarnessSettings(config, settings);
+	// Persisted grants participate in spawn-time gating: a remembered deny means an
+	// auto-mode backend must keep prompting so cc can enforce it.
+	return applyHarnessSettings(config, settings, loadGrants());
 }
 
 function configPath() {
@@ -6347,12 +6534,12 @@ function isHarnessPython(command) {
 	return result.status === 0;
 }
 
-export function applyHarnessSettings(config, settings = {}) {
+export function applyHarnessSettings(config, settings = {}, grants = []) {
 	settings = normalizeSettings(settings, config.theme ?? config.settings?.theme);
 	const normalized = normalizeHarnessSettings(settings);
 	const agents = {};
 	for (const [key, agent] of Object.entries(config.agents ?? {})) {
-		agents[key] = applyAgentSettings(key, agent, normalized[key] ?? {});
+		agents[key] = applyAgentSettings(key, agent, normalized[key] ?? {}, settings.permissions, grants);
 	}
 	// A harness persisted from a prior session (via /harness) becomes the default
 	// when no harness is named on the command line. Ignore stale keys.
@@ -6382,9 +6569,12 @@ function normalizeHarnessSettings(settings) {
 	return isPlainObject(settings?.agents) ? settings.agents : {};
 }
 
-function applyAgentSettings(key, agent, settings) {
+function applyAgentSettings(key, agent, settings, globalPermissions, grants = []) {
 	const applied = clonePlain(agent);
-	if (!isPlainObject(settings)) return applied;
+	if (!isPlainObject(settings)) {
+		applyNativePermissionSetting(key, applied, {}, globalPermissions, grants);
+		return applied;
+	}
 	applied.env = { ...(applied.env ?? {}), ...(settings.env ?? {}) };
 	if (applied.acp) applied.acp = clonePlain(applied.acp);
 
@@ -6397,7 +6587,7 @@ function applyAgentSettings(key, agent, settings) {
 
 	if (isPlainObject(settings.config)) command.args = applyConfigSettings(key, command.args ?? [], settings.config);
 	if (isPlainObject(settings.settings)) applyNativeSettings(key, applied, settings.settings);
-	applyNativePermissionSetting(key, applied, settings);
+	applyNativePermissionSetting(key, applied, settings, globalPermissions, grants);
 	return applied;
 }
 
@@ -6428,32 +6618,77 @@ function applyNativeSettings(key, agent, settings) {
 	});
 }
 
-function applyNativePermissionSetting(key, agent, settings) {
-	if (key === "claude") {
-		const mode = settings.settings?.permissions?.defaultMode;
-		if (isBypassPermissionMode(mode)) {
-			agent._startupMode = "bypassPermissions";
-			agent._autoPermissionRequests = true;
-		}
-		return;
+// Resolve the harness-agnostic permission mode for an agent and apply it. An
+// explicit unified `permissions.mode` (per-agent, then global) wins; otherwise it
+// is inferred from native settings for back-compat. When the user expressed the
+// unified mode directly, the backend's native dialect is generated too so cc and
+// the backend never disagree. The decisioning side reads `agent._permissionMode`.
+function applyNativePermissionSetting(key, agent, settings, globalPermissions, grants = []) {
+	const explicitMode =
+		normalizePermissionSettings(settings.permissions).mode ?? normalizePermissionSettings(globalPermissions).mode;
+	// Pass the FINAL applied command args so a cursor --force baked into the base
+	// acp.args (not just settings) is still inferred as auto.
+	const appliedArgs = (agent.acp ?? agent).args ?? [];
+	const mode = explicitMode ?? inferModeFromNative(key, settings, appliedArgs);
+	if (mode) agent._permissionMode = mode;
+	if (!mode) return;
+	// auto with any deny rule/grant must NOT use a native bypass that stops the
+	// backend asking — cc would never get to apply the denial. Gate it instead.
+	const fullSettings = { permissions: globalPermissions, agents: { [key]: { permissions: settings.permissions } } };
+	const gated = mode === "auto" && policyNeedsGating(resolvePermissionPolicy(fullSettings, key, grants));
+	const native = nativePermissionConfig(key, mode, { gated });
+	if (native.autoApprove) agent._autoPermissionRequests = true;
+	if (native.startupMode) agent._startupMode = native.startupMode;
+	// True iff the backend is launched in a real native bypass (no prompts): non-
+	// gated auto on a harness that has a bypass dialect. Gated auto keeps prompting,
+	// and generic harnesses have no bypass, so for those a runtime /yolo tighten
+	// DOES take effect — only set this for the genuine can't-tighten-at-runtime case.
+	if (mode === "auto" && !gated && (native.startupMode || native.config || native.args)) {
+		agent._nativeBypass = true;
 	}
-	if (key === "codex") {
-		const config = settings.config;
-		if (config?.approval_policy === "never" && config?.sandbox_mode === "danger-full-access") {
-			agent._autoPermissionRequests = true;
+	// Generate the backend's native dialect when the user chose the unified mode
+	// directly (also neutralizing any conflicting native auto/bypass), OR when we
+	// must gate an inferred auto so a deny rule is actually enforceable. Pure
+	// back-compat (inferred, no gating) keeps the spawn spec byte-identical.
+	if (explicitMode || gated) applyGeneratedNativeConfig(key, agent, native);
+}
+
+// Fold engine-generated native config into the spawn spec. Generated config keys
+// OVERRIDE any conflicting user value (an explicit unified `mode: auto` must win,
+// or cc and the backend would disagree); generated args are de-duplicated.
+function applyGeneratedNativeConfig(key, agent, native) {
+	const command = agent.acp ?? agent;
+	if (native.settings) applyNativeSettings(key, agent, native.settings);
+	if (native.config) {
+		let args = command.args ?? [];
+		for (const [name, value] of Object.entries(native.config)) {
+			args = overrideConfigArg(args, name, value);
 		}
-		return;
+		command.args = args;
 	}
-	if (key === "cursor") {
-		const args = (agent.acp ?? agent).args ?? [];
-		if (args.includes("--force") || args.includes("-f") || args.includes("--yolo")) {
-			agent._autoPermissionRequests = true;
-		}
+	if (Array.isArray(native.removeArgs) && native.removeArgs.length > 0) {
+		command.args = stripFlags(command.args ?? [], native.removeArgs);
+	}
+	if (Array.isArray(native.args) && native.args.length > 0) {
+		const args = command.args ?? [];
+		const missing = native.args.filter((arg) => !args.includes(arg));
+		if (missing.length > 0) command.args = applyNativeArgs(key, args, missing);
 	}
 }
 
-function isBypassPermissionMode(mode) {
-	return typeof mode === "string" && ["bypasspermissions", "bypass"].includes(mode.trim().toLowerCase());
+// Force a generated `-c name=value`: drop any existing `-c name=...` pair (so a
+// stale user value cannot win over an explicit unified auto), then append it.
+function overrideConfigArg(args, name, value) {
+	const next = [];
+	for (let index = 0; index < args.length; index++) {
+		if (args[index] === "-c" && typeof args[index + 1] === "string" && args[index + 1].startsWith(`${name}=`)) {
+			index++;
+			continue;
+		}
+		next.push(args[index]);
+	}
+	next.push("-c", `${name}=${tomlValue(value)}`);
+	return next;
 }
 
 function insertArgsBefore(baseArgs, marker, inserted) {

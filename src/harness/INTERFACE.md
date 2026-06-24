@@ -16,12 +16,23 @@ name-keyed `switch` statements:
 | Codex prompt **unsend** | `isCodexAcpActive` + `readCodexThreadState` + `tryUnsendPendingPrompt` |
 | Codex `/review` preset dialog | `shouldOpenCodexReviewDialog` / `openCodexReviewDialog` |
 | Codex `-c key=value` config | `applyConfigSettings` (key === "codex") |
-| Claude `_meta` settings + bypass startup mode | `applyNativeSettings` / `applyNativePermissionSetting` (key === "claude") |
-| Cursor arg-insert-before-`acp` + `--yolo` auto-accept | `applyNativeArgs` / `applyNativePermissionSetting` (key === "cursor") |
+| Claude `_meta` settings | `applyNativeSettings` (key === "claude") |
+| Cursor arg-insert-before-`acp` | `applyNativeArgs` (key === "cursor") |
 | Cursor `/btw` refusal | `runBtw` (key === "cursor") |
-| Permission auto-accept inference | `applyNativePermissionSetting` (per-name) |
+| Permission auto-accept inference | ~~`applyNativePermissionSetting` (per-name)~~ → now the unified engine (`permissions.mjs`) |
 
 Adding a harness that needs *any* of these means editing those switches.
+
+> **Permissions are no longer per-name.** A single harness-agnostic engine
+> (`src/harness/permissions.mjs`) owns the policy: it *generates* each backend's
+> native auto-approve dialect from one unified `permissions.mode`, persists "allow
+> always" grants cc-side, and decides allow/deny/ask uniformly. The engine logic
+> names no harness — the only per-harness knowledge is a **data** dialect table
+> (`auto`/`gatedAuto`/`prompt`/`infer`), extensible at runtime via
+> `registerPermissionDialect(key, dialect)` (parity with `registerAdapter`), so a
+> new harness's native dialect needs no engine edit. `BaseAcpAdapter` calls the
+> engine (`applyPermissionMode` / `#onPermission` / `handleExtensionRequest`), so
+> adapters carry zero permission code. See `docs/permissions-audit.md`.
 
 ## The abstraction
 
@@ -70,7 +81,7 @@ degrades gracefully. Flags are either **declared** by the adapter (static) or
 | `retractPrompt` | bool | declared | unsend (Esc retract) |
 | `commandPresets` | string[] | declared | local preset dialogs (e.g. `/review`) |
 | `interactiveRequests` | bool | declared | backend-initiated prompts (`ask_question`…) |
-| `autoApprove` | bool | declared (from settings) | permission auto-accept |
+| `autoApprove` | bool | unified engine (`permissions.mjs`, from mode) | permission auto-accept |
 | `terminal` | bool | always true (cc executes) | shared terminal |
 | `mcp` | bool | wire (future) | MCP servers |
 | `audio` | bool | wire (future) | audio prompt parts |
@@ -131,8 +142,8 @@ consumes.
 | `forkCodexSession` | `CodexAdapter.fork()` (`fork: "copy"`) |
 | unsend `isCodexAcpActive`/state | `adapter.snapshotRetractionState()` / `adapter.canRetract()` |
 | `/review` dialog | `adapter.interceptCommand("review", …)` → `PresetDialog` |
-| `-c` / `_meta` / arg-insert / yolo | `adapter.buildLaunchSpec(settings)` |
-| auto-accept inference | `buildLaunchSpec().autoApprove` → `capabilities.autoApprove` |
+| `-c` / `_meta` / arg-insert | `adapter.buildLaunchSpec(settings)` |
+| auto-accept inference + auto/ask/deny + "allow always" | unified `permissions.mjs` engine (mode → native config + cc-side decision + persisted grants) → `capabilities.autoApprove` |
 | cursor/* extensions | already wire-method-gated in transport; surfaced via `handleExtensionRequest` |
 | cursor `/btw` refusal | falls out of `capabilities.fork === false` (no special case) |
 
@@ -170,8 +181,11 @@ This prototype is verified standalone (and via `host-example.mjs`), but `cc`
 (`pi-harness.mjs`) does not yet consume it. Integration is mechanical:
 
 1. In `HarnessApp`, replace `new AcpClient(agent, …)` with
-   `createAdapter(activeKey, agent, host, { settings })`; route all calls through
-   the adapter; drop `applyAgentSettings` in favor of `adapter.buildLaunchSpec`.
+   `createAdapter(activeKey, agent, host, { settings, globalPermissions, grants: loadGrants() })`;
+   route all calls through the adapter; drop `applyAgentSettings` in favor of
+   `adapter.buildLaunchSpec`. Pass `grants` so a persisted deny gates the launch
+   spec (an auto backend stays prompting), matching the live path; refresh runtime
+   grants with `adapter.setPermissionGrants(...)` after recording a new one.
 2. `runBtw`: replace the cursor refusal + `supportsFork()`/`forkCodexSession`
    ladder with `openSideThread(forkAdapter, parentId)`.
 3. `handleSlashCommand`: replace `shouldOpenCodexReviewDialog`/`isKnownCodexReviewCommand`

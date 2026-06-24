@@ -1022,6 +1022,151 @@ assert.deepEqual(applied.agents["mini-swe-agent"].acp.args, [
 	"--no-yolo",
 ]);
 
+// Back-compat: a cursor --force baked into the BASE config acp.args (not settings)
+// must still infer auto, or cc desyncs from a force-mode backend.
+const bakedForce = applyHarnessSettings(
+	{ agents: { cursor: { label: "Cursor", transport: "acp", acp: { command: "cursor-agent", args: ["--force", "acp"] } } } },
+	{},
+);
+assert.equal(bakedForce.agents.cursor._permissionMode, "auto");
+assert.equal(bakedForce.agents.cursor._autoPermissionRequests, true);
+
+// Back-compat: native settings now also resolve a unified _permissionMode.
+assert.equal(applied.agents.claude._permissionMode, "auto");
+assert.equal(applied.agents.codex._permissionMode, "auto");
+assert.equal(applied.agents.cursor._permissionMode, "auto");
+assert.equal(applied.agents["terminus-2"]._permissionMode, undefined);
+
+// Unified, harness-agnostic permission mode: a single global `permissions.mode`
+// generates each backend's native dialect (the inversion of fragile inference).
+const unified = applyHarnessSettings(config, { permissions: { mode: "auto" } });
+assert.equal(unified.agents.claude._permissionMode, "auto");
+assert.equal(unified.agents.claude._autoPermissionRequests, true);
+assert.equal(unified.agents.claude._startupMode, "bypassPermissions");
+assert.deepEqual(unified.agents.claude._sessionMeta, {
+	claudeCode: { options: { settings: { permissions: { defaultMode: "bypassPermissions" } } } },
+});
+assert.equal(unified.agents.codex._autoPermissionRequests, true);
+assert.deepEqual(unified.agents.codex.acp.args, [
+	"-c",
+	"approval_policy=\"never\"",
+	"-c",
+	"sandbox_mode=\"danger-full-access\"",
+]);
+assert.equal(unified.agents.cursor._autoPermissionRequests, true);
+assert.deepEqual(unified.agents.cursor.acp.args, ["--force", "acp"]);
+// Generic harnesses with no native knob still auto-approve cc-side.
+assert.equal(unified.agents["terminus-2"]._permissionMode, "auto");
+assert.equal(unified.agents["terminus-2"]._autoPermissionRequests, true);
+
+// Unified `mode: auto` must OVERRIDE a conflicting/stale Codex native config so cc
+// and the backend agree (regression: generated keys used to be skipped if present).
+const conflicting = applyHarnessSettings(config, {
+	permissions: { mode: "auto" },
+	agents: { codex: { config: { approval_policy: "on-request", sandbox_mode: "workspace-write", model: "gpt-5" } } },
+});
+const codexArgs = conflicting.agents.codex.acp.args.join(" ");
+assert.ok(!codexArgs.includes('approval_policy="on-request"'), "stale approval_policy removed");
+assert.ok(!codexArgs.includes('sandbox_mode="workspace-write"'), "stale sandbox_mode removed");
+assert.ok(codexArgs.includes('approval_policy="never"'), "generated approval_policy wins");
+assert.ok(codexArgs.includes('sandbox_mode="danger-full-access"'), "generated sandbox_mode wins");
+assert.ok(codexArgs.includes('model="gpt-5"'), "unrelated config keys preserved");
+// Each overridden key appears exactly once.
+assert.equal((codexArgs.match(/approval_policy=/g) || []).length, 1);
+assert.equal((codexArgs.match(/sandbox_mode=/g) || []).length, 1);
+assert.equal(conflicting.agents.codex._autoPermissionRequests, true);
+
+// Per-agent mode overrides the global default.
+const mixed = applyHarnessSettings(config, {
+	permissions: { mode: "auto" },
+	agents: { codex: { permissions: { mode: "ask" } } },
+});
+assert.equal(mixed.agents.codex._permissionMode, "ask");
+assert.equal(mixed.agents.codex._autoPermissionRequests, undefined);
+assert.equal(mixed.agents.claude._autoPermissionRequests, true);
+
+// mode "auto" WITH a deny rule must NOT put the backend in a native bypass that
+// stops it asking — cc would never get to enforce the denial. Gate it: the backend
+// keeps prompting (codex on-request) with full capability (danger sandbox), and cc
+// auto-approves all but the denied tool.
+const autoDeny = applyHarnessSettings(config, {
+	permissions: { mode: "auto", rules: [{ tool: "shell", action: "deny" }] },
+});
+const adCodex = autoDeny.agents.codex.acp.args.join(" ");
+assert.ok(!adCodex.includes('approval_policy="never"'), "codex not in no-prompt bypass when a deny rule exists");
+assert.ok(adCodex.includes('approval_policy="on-request"'), "codex still prompts so cc can deny");
+assert.ok(adCodex.includes('sandbox_mode="danger-full-access"'), "codex keeps full capability");
+assert.equal(autoDeny.agents.codex._permissionMode, "auto");
+assert.equal(autoDeny.agents.codex._autoPermissionRequests, true);
+// claude is gated to default (prompting) mode, not bypass.
+assert.equal(autoDeny.agents.claude._startupMode, undefined);
+assert.deepEqual(autoDeny.agents.claude._sessionMeta, {
+	claudeCode: { options: { settings: { permissions: { defaultMode: "default" } } } },
+});
+// cursor is gated (no --force) so it prompts.
+assert.ok(!autoDeny.agents.cursor.acp.args.includes("--force"));
+
+// cursor force-flag VARIANTS (--force=true) are inferred AND neutralized too.
+const cursorVariant = { agents: { cursor: { label: "Cursor", transport: "acp", acp: { command: "cursor-agent", args: ["--force=true", "acp"] } } } };
+assert.equal(applyHarnessSettings(cursorVariant, {}).agents.cursor._permissionMode, "auto"); // inferred
+const cursorVariantAsk = applyHarnessSettings(cursorVariant, { agents: { cursor: { permissions: { mode: "ask" } } } });
+assert.ok(!cursorVariantAsk.agents.cursor.acp.args.some((a) => a.startsWith("--force")), "--force=true neutralized under unified ask");
+// (the deny rule actually denying shell is covered by tests/permissions.test.mjs)
+
+// _nativeBypass marks a genuine no-prompt launch (so /yolo knows a runtime tighten
+// needs a respawn). Non-gated auto on a bypass-capable harness -> true; gated auto
+// and generic harnesses keep prompting -> not set.
+const bypassFlags = applyHarnessSettings(config, { permissions: { mode: "auto" } });
+assert.equal(bypassFlags.agents.claude._nativeBypass, true);
+assert.equal(bypassFlags.agents.codex._nativeBypass, true);
+assert.equal(bypassFlags.agents.cursor._nativeBypass, true);
+assert.equal(bypassFlags.agents["terminus-2"]._nativeBypass, undefined); // generic: no native bypass
+const gatedFlags = applyHarnessSettings(config, { permissions: { mode: "auto", rules: [{ tool: "shell", action: "deny" }] } });
+assert.equal(gatedFlags.agents.codex._nativeBypass, undefined); // gated keeps prompting
+const askFlags = applyHarnessSettings(config, { permissions: { mode: "ask" } });
+assert.equal(askFlags.agents.codex._nativeBypass, undefined);
+
+// A deny rule scoped to ANOTHER agent must NOT gate unrelated harnesses: claude
+// keeps its full native bypass when only codex has a deny rule.
+const scopedDeny = applyHarnessSettings(config, {
+	permissions: { mode: "auto", rules: [{ agent: "codex", tool: "shell", action: "deny" }] },
+});
+assert.equal(scopedDeny.agents.claude._startupMode, "bypassPermissions"); // claude NOT gated
+assert.ok(scopedDeny.agents.codex.acp.args.join(" ").includes('approval_policy="on-request"')); // codex IS gated
+
+// A PERSISTED deny grant (no config rule) also forces gating at spawn.
+const autoGrant = applyHarnessSettings(config, { permissions: { mode: "auto" } }, [{ agent: "codex", tool: "shell", action: "deny" }]);
+assert.ok(autoGrant.agents.codex.acp.args.join(" ").includes('approval_policy="on-request"'), "persisted deny grant gates auto");
+// without the grant, pure auto still uses the full bypass.
+assert.ok(applyHarnessSettings(config, { permissions: { mode: "auto" } }).agents.codex.acp.args.join(" ").includes('approval_policy="never"'));
+
+// Explicit unified "ask"/"deny" must NEUTRALIZE conflicting native auto/bypass on
+// the same agent, or cc (asking) and the backend (silently auto-running) disagree.
+const neutralized = applyHarnessSettings(config, {
+	agents: {
+		claude: { settings: { permissions: { defaultMode: "bypassPermissions" }, model: "sonnet" }, permissions: { mode: "ask" } },
+		codex: { config: { approval_policy: "never", sandbox_mode: "danger-full-access" }, permissions: { mode: "ask" } },
+		cursor: { args: ["--force", "--model", "gpt-5"], permissions: { mode: "deny" } },
+	},
+});
+// claude: bypass startup mode/auto cleared; defaultMode flipped to "default"; model kept.
+assert.equal(neutralized.agents.claude._permissionMode, "ask");
+assert.equal(neutralized.agents.claude._autoPermissionRequests, undefined);
+assert.equal(neutralized.agents.claude._startupMode, undefined);
+assert.deepEqual(neutralized.agents.claude._sessionMeta, {
+	claudeCode: { options: { settings: { permissions: { defaultMode: "default" }, model: "sonnet" } } },
+});
+// codex: approval_policy "never" flipped to "on-request" (prompting back on); auto cleared.
+const ncodex = neutralized.agents.codex.acp.args.join(" ");
+assert.ok(!ncodex.includes('approval_policy="never"'), "codex auto approval_policy neutralized");
+assert.ok(ncodex.includes('approval_policy="on-request"'), "codex now prompts");
+assert.equal(neutralized.agents.codex._autoPermissionRequests, undefined);
+// cursor: --force removed (deny), unrelated args kept; cc decides deny-side.
+assert.ok(!neutralized.agents.cursor.acp.args.includes("--force"), "cursor force flag removed");
+assert.ok(neutralized.agents.cursor.acp.args.includes("gpt-5"), "cursor unrelated args kept");
+assert.equal(neutralized.agents.cursor._permissionMode, "deny");
+assert.equal(neutralized.agents.cursor._autoPermissionRequests, undefined);
+
 const previousDefaultCcConfig = process.env.CC_CONFIG;
 const previousDefaultCcSettings = process.env.CC_SETTINGS;
 process.env.CC_CONFIG = path.join(os.tmpdir(), `cc-missing-config-${process.pid}.json`);
@@ -1154,6 +1299,9 @@ assert.deepEqual(
 	{ outcome: "selected", optionId: "allow" },
 );
 
+// Auto-accept no longer escalates to the broadest grant: when every allow option
+// is "always", it takes the first/narrower one ("auto" mode) rather than hunting
+// for the all-bypassing option. (Pre-overhaul this preferred bypassPermissions.)
 assert.deepEqual(
 	autoPermissionOutcome({
 		options: [
@@ -1162,7 +1310,7 @@ assert.deepEqual(
 			{ kind: "reject_once", name: "No, keep planning", optionId: "plan" },
 		],
 	}),
-	{ outcome: "selected", optionId: "bypassPermissions" },
+	{ outcome: "selected", optionId: "auto" },
 );
 
 assert.deepEqual(

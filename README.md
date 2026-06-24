@@ -117,7 +117,47 @@ Recording uses `rec` from sox when available, otherwise `ffmpeg`. Transcription 
 
 ## Permissions
 
-ACP permission requests are shown as TUI selection prompts. `cc` waits for you to approve or reject unless the active agent's native settings imply a bypass/force mode (see Settings), in which case it auto-accepts. `cc` advertises ACP terminal support and implements `terminal/*` so backend commands that need shell execution run inside the shared UI.
+ACP permission requests are shown as TUI selection prompts. `cc` owns one
+harness-agnostic permission policy that applies to **every** backend, so you never
+have to learn each agent's native dialect just to change how it asks.
+
+- **Mode** — `ask` (default, prompt every time), `auto` (approve automatically),
+  or `deny` (refuse automatically). Set it in `settings.json` (global or
+  per-agent, below) or flip it at runtime with `/yolo` / `/auto`:
+  - `/yolo` toggles the active harness between `ask` and `auto`.
+  - `/yolo ask|auto|deny` sets the mode explicitly.
+  - Tightening the mode at runtime (e.g. `auto` → `ask`) only gates *new* backend
+    requests. A backend launched in `auto` was spawned with native bypass and emits
+    none, and `/new` reuses that same process, so it can't be tightened mid-session:
+    set `permissions` in `settings.json` and restart `cc` to fully enforce the
+    stricter mode (`cc` says so when this applies).
+- **"Allow always" persists.** When you pick an *allow always* (or *bypass*)
+  option in a prompt, `cc` records a grant in `~/.config/cc/permissions.json`
+  (next to `settings.json`; override with `CC_PERMISSIONS`) and replies to the
+  backend with only a *one-time* option, so `cc` owns the persistence — matching
+  requests are then approved automatically across restarts, and `/permissions
+  clear` fully revokes them, regardless of what the backend remembers.
+  - *Caveat:* if the backend offers **only** a persistent option in that direction
+    (no allow-once / reject-once), `cc` can't own it — it forwards your persistent
+    choice as-is and does **not** record a `cc` grant (so it won't appear in
+    `/permissions` and `/permissions clear` can't revoke it). `cc` says so at the
+    time; the backend's own settings then govern that grant.
+- **`/permissions`** shows the effective mode and remembered grants;
+  `/permissions clear` forgets them.
+
+When you set an explicit mode, `cc` also aligns the backend's own native dialect so
+the two never disagree: `auto` enables it (claude `bypassPermissions`, codex
+`approval_policy=never` + `sandbox_mode=danger-full-access`, cursor `--force`),
+while `ask`/`deny` *neutralize* any conflicting native auto/bypass on that agent
+(restoring claude `defaultMode=default`, codex `approval_policy=on-request`, and
+dropping cursor `--force`/`-f`/`--yolo`) so the backend prompts and `cc`'s decision
+is honored. Orthogonal settings (e.g. the codex sandbox) are left alone, and
+harnesses with no such knob are decided entirely by `cc`. Existing native settings
+(below) with no explicit mode are still honored and continue to imply `auto` for
+back-compat.
+
+`cc` advertises ACP terminal support and implements `terminal/*` so backend
+commands that need shell execution run inside the shared UI.
 
 ## Configuration
 
@@ -153,13 +193,42 @@ Create `~/.config/cc/settings.json` (or point `CC_SETTINGS` at another file) to 
 
 These mirror each backend as closely as the ACP wrapper allows: Claude uses its `settings.permissions.defaultMode`, Codex uses `-c key=value` config overrides, and Cursor uses command-line args before the `acp` subcommand. When these imply bypass/force mode, `cc` also auto-accepts ACP permission requests the backend still emits. `args` are appended to the backend command (Cursor args are inserted before the `acp` subcommand).
 
+### Unified permissions
+
+Instead of (or in addition to) the native dialects above, you can set one
+harness-agnostic policy that works for every backend:
+
+```json
+{
+  "permissions": {
+    "mode": "ask",
+    "remember": true,
+    "rules": [
+      { "tool": "read", "action": "allow" },
+      { "tool": "*", "action": "allow", "agent": "codex" }
+    ]
+  },
+  "agents": {
+    "claude": { "permissions": { "mode": "auto" } }
+  }
+}
+```
+
+- `mode`: `ask` | `auto` | `deny`. A per-agent `permissions.mode` overrides the
+  global one. Setting `auto` also generates the backend's native config so cc and
+  the backend agree.
+- `remember`: whether "allow always" choices are persisted (default `true`).
+- `rules`: explicit allow/deny rules. `tool` matches a tool's title or kind (or
+  `*` for all); `agent` (optional) scopes the rule to one harness. Remembered
+  "always" grants are stored as rules in `~/.config/cc/permissions.json`.
+
 ## Development
 
 ```sh
 npm test
 ```
 
-This runs syntax/compile checks, the settings/queue unit tests, and the tmux-driven TUI smoke test (resize, scroll-during-streaming, the message queue, slash commands, permissions, and the new `/btw` / `/diff` / `/copy` commands).
+This runs syntax/compile checks, the settings/queue unit tests, the permission-engine unit tests (`tests/permissions.test.mjs`), and the tmux-driven TUI smoke tests (resize, scroll-during-streaming, the message queue, slash commands, permission auto-accept, "allow always" persistence + `/yolo`, and the `/btw` / `/diff` / `/copy` commands).
 
 ## Notes
 

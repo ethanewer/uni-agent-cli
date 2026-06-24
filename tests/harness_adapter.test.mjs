@@ -295,6 +295,92 @@ async function main() {
 	assert.deepEqual(settingsConfig.agents.cursor.acp.args, ["acp"]);
 	ok("settings-equivalence:no-mutation");
 
+	// Unified `mode: auto` overrides a conflicting/stale Codex native config on the
+	// adapter path too (parity with applyHarnessSettings).
+	{
+		const codex = createAdapter("codex", CONFIGS.codex, noopHost(), {
+			settings: { permissions: { mode: "auto" }, config: { approval_policy: "on-request", model: "gpt-5" } },
+			connectionFactory: factoryFor(PROFILES.codex),
+		});
+		const args = codex.launchSpec.acp.args.join(" ");
+		assert.ok(!args.includes('approval_policy="on-request"'), "stale approval_policy removed (adapter)");
+		assert.ok(args.includes('approval_policy="never"'), "generated approval_policy wins (adapter)");
+		assert.ok(args.includes('sandbox_mode="danger-full-access"'), "generated sandbox_mode added (adapter)");
+		assert.ok(args.includes('model="gpt-5"'), "unrelated config preserved (adapter)");
+		assert.equal((args.match(/approval_policy=/g) || []).length, 1);
+		assert.equal(codex.capabilities.autoApprove, true);
+		ok("settings-equivalence:unified-auto-overrides-codex");
+	}
+
+	// Explicit unified "ask" neutralizes a native auto/bypass already on the agent
+	// (adapter parity with applyHarnessSettings): backend prompts, cc stays in sync.
+	{
+		const codex = createAdapter("codex", CONFIGS.codex, noopHost(), {
+			settings: { permissions: { mode: "ask" }, config: { approval_policy: "never", sandbox_mode: "danger-full-access" } },
+			connectionFactory: factoryFor(PROFILES.codex),
+		});
+		const args = codex.launchSpec.acp.args.join(" ");
+		assert.ok(!args.includes('approval_policy="never"'), "codex auto neutralized (adapter)");
+		assert.ok(args.includes('approval_policy="on-request"'), "codex prompts again (adapter)");
+		assert.equal(codex.launchSpec._autoPermissionRequests, undefined);
+		assert.equal(codex.capabilities.autoApprove, false);
+
+		const cursor = createAdapter("cursor", CONFIGS.cursor, noopHost(), {
+			settings: { permissions: { mode: "ask" }, args: ["--force", "--model", "gpt-5"] },
+			connectionFactory: factoryFor(PROFILES.cursor),
+		});
+		assert.ok(!cursor.launchSpec.acp.args.includes("--force"), "cursor force flag removed (adapter)");
+		assert.ok(cursor.launchSpec.acp.args.includes("gpt-5"), "cursor unrelated args kept (adapter)");
+		assert.equal(cursor.capabilities.autoApprove, false);
+		ok("settings-equivalence:unified-ask-neutralizes");
+	}
+
+	// mode auto WITH a deny rule gates the backend (prompts) instead of full bypass,
+	// so cc can enforce the denial — adapter parity with applyHarnessSettings.
+	{
+		const codex = createAdapter("codex", CONFIGS.codex, noopHost(), {
+			settings: { permissions: { mode: "auto", rules: [{ tool: "shell", action: "deny" }] } },
+			connectionFactory: factoryFor(PROFILES.codex),
+		});
+		const args = codex.launchSpec.acp.args.join(" ");
+		assert.ok(!args.includes('approval_policy="never"'), "codex not in no-prompt bypass when a deny rule exists (adapter)");
+		assert.ok(args.includes('approval_policy="on-request"'), "codex still prompts (adapter)");
+		assert.ok(args.includes('sandbox_mode="danger-full-access"'), "codex keeps full capability (adapter)");
+		assert.equal(codex.capabilities.autoApprove, true);
+		ok("settings-equivalence:auto-with-deny-gates");
+	}
+
+	// A PERSISTED deny grant (host-provided via options.grants) must gate the launch
+	// spec too — not just config rules. Without grants the same setup full-bypasses.
+	{
+		const grants = [{ agent: "codex", tool: "shell", action: "deny" }];
+		const gated = createAdapter("codex", CONFIGS.codex, noopHost(), {
+			settings: { permissions: { mode: "auto" } },
+			grants,
+			connectionFactory: factoryFor(PROFILES.codex),
+		});
+		const gargs = gated.launchSpec.acp.args.join(" ");
+		assert.ok(!gargs.includes('approval_policy="never"'), "persisted deny grant gates auto (adapter)");
+		assert.ok(gargs.includes('approval_policy="on-request"'), "codex prompts under a persisted deny grant (adapter)");
+
+		const ungated = createAdapter("codex", CONFIGS.codex, noopHost(), {
+			settings: { permissions: { mode: "auto" } },
+			connectionFactory: factoryFor(PROFILES.codex),
+		});
+		assert.ok(ungated.launchSpec.acp.args.join(" ").includes('approval_policy="never"'), "no grant -> full bypass (adapter)");
+		ok("settings-equivalence:persisted-deny-grant-gates");
+	}
+
+	// A cursor --force baked into the BASE config acp.args (no settings) must still
+	// infer auto on the adapter path, or capabilities/policy desync from the backend.
+	{
+		const cfg = { label: "Cursor", transport: "acp", acp: { command: "cursor-agent", args: ["--force", "acp"] } };
+		const cursor = createAdapter("cursor", cfg, noopHost(), { connectionFactory: factoryFor(PROFILES.cursor) });
+		assert.equal(cursor.launchSpec._permissionMode, "auto");
+		assert.equal(cursor.capabilities.autoApprove, true);
+		ok("settings-equivalence:cursor-baked-force-detected");
+	}
+
 	// =====================================================================
 	// (2c) NO FEATURES LOST — the per-harness branches collapse into uniform
 	//      adapter calls (cc connects to the interface, names no harness).
@@ -429,6 +515,44 @@ async function main() {
 		ok("permission:manual-routed-to-host");
 	}
 
+	// The adapter decides allow/deny/ask UNIFORMLY via the engine — not just
+	// autoApprove. Locks in that deny mode and explicit rules work over the adapter
+	// path (regression guard for "moving cc onto adapters keeps behavior").
+	{
+		const options = [{ kind: "reject_once", optionId: "r" }, { kind: "allow_once", optionId: "a" }];
+		const denyHost = () => { let asked = false; return { host: { onEvent() {}, requestPermission: () => { asked = true; return { outcome: "cancelled" }; }, requestInteraction: () => undefined }, asked: () => asked }; };
+
+		// mode: deny -> actively reject without asking the host.
+		const d = denyHost();
+		const denyAdapter = createAdapter("terminus-2", CONFIGS["terminus-2"], d.host, {
+			settings: { permissions: { mode: "deny" } },
+			connectionFactory: factoryFor(PROFILES["terminus-2"]),
+		});
+		denyAdapter.setPermissionGrants([]);
+		await denyAdapter.connect();
+		const denied = await denyAdapter.connection.emitPermission({ options });
+		assert.deepEqual(denied, { outcome: "selected", optionId: "r" });
+		assert.equal(d.asked(), false);
+		ok("permission:adapter-deny-mode");
+
+		// An explicit allow rule resolves a matching tool to the NARROW allow option
+		// (no bypass escalation); a non-matching tool still asks the host.
+		const r = denyHost();
+		const ruleAdapter = createAdapter("terminus-2", CONFIGS["terminus-2"], r.host, {
+			settings: { permissions: { mode: "ask", rules: [{ tool: "Run tests", action: "allow" }] } },
+			connectionFactory: factoryFor(PROFILES["terminus-2"]),
+		});
+		ruleAdapter.setPermissionGrants([]);
+		await ruleAdapter.connect();
+		const ruled = await ruleAdapter.connection.emitPermission({ toolCall: { title: "Run tests" }, options });
+		assert.deepEqual(ruled, { outcome: "selected", optionId: "a" });
+		assert.equal(r.asked(), false);
+		const other = await ruleAdapter.connection.emitPermission({ toolCall: { title: "Delete repo" }, options });
+		assert.equal(r.asked(), true);
+		assert.deepEqual(other, { outcome: "cancelled" });
+		ok("permission:adapter-rule-narrow-and-ask");
+	}
+
 	// auto-accept must ALSO cover interactive cursor prompts (ask_question /
 	// create_plan) — the YOLO-mode behavior, not just tool permissions.
 	{
@@ -440,6 +564,36 @@ async function main() {
 		const answered = await cursor.connection.emitCursor("cursor/ask_question", { questions: [{ id: "q1", options: [{ id: "o1" }, { id: "o2" }] }] });
 		assert.deepEqual(answered, { outcome: { outcome: "answered", answers: [{ questionId: "q1", selectedOptionIds: ["o1"] }] } });
 		ok("extension:auto-accept-interactive");
+	}
+
+	// deny mode must AUTO-REJECT cursor extension prompts, not fall through to the host.
+	{
+		let asked = false;
+		const host = { onEvent() {}, requestPermission: () => ({ outcome: "cancelled" }), requestInteraction: () => { asked = true; return { picked: true }; } };
+		const cursor = createAdapter("cursor", CONFIGS.cursor, host, { settings: { permissions: { mode: "deny" } }, connectionFactory: factoryFor(PROFILES.cursor) });
+		await cursor.connect();
+		const plan = await cursor.connection.emitCursor("cursor/create_plan", { name: "P" });
+		assert.deepEqual(plan, { outcome: { outcome: "rejected", reason: "Cancelled" } });
+		const q = await cursor.connection.emitCursor("cursor/ask_question", { questions: [{ id: "q1", options: [{ id: "o1" }] }] });
+		assert.deepEqual(q, { outcome: { outcome: "cancelled" } });
+		assert.equal(asked, false, "deny mode must not prompt the host for cursor extensions");
+		ok("extension:deny-auto-rejects");
+	}
+
+	// A deny RULE under auto mode must also reject cursor extension prompts (mode
+	// alone is not enough — cursor prompts run through the policy engine).
+	{
+		let asked = false;
+		const host = { onEvent() {}, requestPermission: () => ({ outcome: "cancelled" }), requestInteraction: () => { asked = true; return { picked: true }; } };
+		const cursor = createAdapter("cursor", CONFIGS.cursor, host, {
+			settings: { permissions: { mode: "auto", rules: [{ tool: "*", action: "deny" }] } },
+			connectionFactory: factoryFor(PROFILES.cursor),
+		});
+		await cursor.connect();
+		const plan = await cursor.connection.emitCursor("cursor/create_plan", { name: "P" });
+		assert.deepEqual(plan, { outcome: { outcome: "rejected", reason: "Cancelled" } });
+		assert.equal(asked, false);
+		ok("extension:deny-rule-rejects-under-auto");
 	}
 
 	// =====================================================================

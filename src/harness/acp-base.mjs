@@ -3,13 +3,39 @@
 // real AcpClient from pi-harness.mjs; tests inject a fake. Most harnesses are a
 // ~10-line subclass that overrides only the hooks for their niceties.
 
-import { AcpClient, autoCursorOutcome, autoPermissionOutcome } from "../pi-harness.mjs";
+import { AcpClient, autoCursorOutcome, cursorActionName, cursorCancelResult } from "../pi-harness.mjs";
 import { capabilitiesFromWire, emptyCapabilities } from "./interface.mjs";
+import {
+	cancelledOutcome,
+	decidePermission,
+	inferModeFromNative,
+	nativePermissionConfig,
+	normalizePermissionSettings,
+	outcomeForDecision,
+	policyNeedsGating,
+	resolvePermissionPolicy,
+	stripFlags,
+} from "./permissions.mjs";
 import { clonePlain, isPlainObject, stringArray } from "./util.mjs";
 
 /** The transport contract the base adapter depends on (satisfied by AcpClient). */
 export function defaultConnectionFactory(agent, onEvent, options) {
 	return new AcpClient(agent, onEvent, options);
+}
+
+/** Remove every `-c name=...` pair whose name is in `names` (codex `-c` form). */
+function stripConfigArgs(args, names) {
+	const drop = names.map((name) => `${name}=`);
+	const next = [];
+	for (let index = 0; index < args.length; index++) {
+		const value = args[index + 1];
+		if (args[index] === "-c" && typeof value === "string" && drop.some((prefix) => value.startsWith(prefix))) {
+			index++;
+			continue;
+		}
+		next.push(args[index]);
+	}
+	return next;
 }
 
 /**
@@ -33,7 +59,7 @@ export class BaseAcpAdapter {
 	 * @param {string} key            registry key (e.g. "codex")
 	 * @param {object} agentConfig    the registry entry { label, acp:{command,args}, ... }
 	 * @param {object} host           { onEvent, requestPermission, requestInteraction }
-	 * @param {object} [options]      { settings, connectionFactory }
+	 * @param {object} [options]      { settings, globalPermissions, grants, connectionFactory }
 	 */
 	constructor(key, agentConfig, host, options = {}) {
 		this.key = key;
@@ -41,6 +67,13 @@ export class BaseAcpAdapter {
 		this.label = this.agentConfig.label ?? key;
 		this.host = host ?? {};
 		this.settings = options.settings ?? {};
+		// Global (cross-harness) permissions block, if the host threads it in.
+		this.globalPermissions = options.globalPermissions;
+		// Persisted permission grants, owned by the host (it owns the store). They
+		// participate in BOTH spawn-time gating (buildLaunchSpec, below) and runtime
+		// decisions (permissionPolicy), so a remembered deny gates an auto launch.
+		// Default [] keeps the adapter deterministic — no implicit fs reads.
+		this.permissionGrants = Array.isArray(options.grants) ? options.grants : [];
 		this.connectionFactory = options.connectionFactory ?? defaultConnectionFactory;
 		this.connection = undefined;
 
@@ -100,7 +133,10 @@ export class BaseAcpAdapter {
 	 */
 	buildLaunchSpec(settings) {
 		const applied = clonePlain(this.agentConfig);
-		if (!isPlainObject(settings)) return applied;
+		if (!isPlainObject(settings)) {
+			this.applyPermissionMode(applied, {});
+			return applied;
+		}
 		applied.env = { ...(applied.env ?? {}), ...(settings.env ?? {}) };
 		if (applied.acp) applied.acp = clonePlain(applied.acp);
 
@@ -113,8 +149,64 @@ export class BaseAcpAdapter {
 
 		if (isPlainObject(settings.config)) command.args = this.translateConfig(command.args ?? [], settings.config);
 		if (isPlainObject(settings.settings)) this.translateNativeSettings(applied, settings.settings);
-		this.inferNativePermission(applied, settings);
+		this.applyPermissionMode(applied, settings);
 		return applied;
+	}
+
+	/**
+	 * Resolve and apply the harness-agnostic permission mode. Replaces every
+	 * per-harness `inferNativePermission` override: the unified engine knows each
+	 * harness's native dialect, so the subclasses no longer branch on permissions.
+	 * Explicit `permissions.mode` (per-agent then global) wins; otherwise it is
+	 * inferred from native settings for back-compat.
+	 */
+	applyPermissionMode(applied, settings = {}) {
+		const explicitMode =
+			normalizePermissionSettings(settings.permissions).mode ?? normalizePermissionSettings(this.globalPermissions).mode;
+		// Pass the FINAL applied command args so a cursor --force baked into the base
+		// acp.args (not just settings) is still inferred as auto.
+		const appliedArgs = (applied.acp ?? applied).args ?? [];
+		const mode = explicitMode ?? inferModeFromNative(this.key, settings, appliedArgs);
+		if (mode) applied._permissionMode = mode;
+		if (!mode) return;
+		// auto with a deny rule/grant must keep the backend prompting so cc can
+		// enforce the denial — full native bypass would silence it. Persisted grants
+		// (host-provided via options.grants) gate the launch spec, same as the live
+		// pi-harness path threading them through applyHarnessSettings.
+		const fullSettings = { permissions: this.globalPermissions, agents: { [this.key]: { permissions: settings.permissions } } };
+		const gated = mode === "auto" && policyNeedsGating(resolvePermissionPolicy(fullSettings, this.key, this.permissionGrants));
+		const native = nativePermissionConfig(this.key, mode, { gated });
+		if (native.autoApprove) applied._autoPermissionRequests = true;
+		if (native.startupMode) applied._startupMode = native.startupMode;
+		// Mark a genuine native-bypass launch (non-gated auto on a harness that has a
+		// bypass dialect) so the host can tell when a runtime tighten needs a respawn.
+		if (mode === "auto" && !gated && (native.startupMode || native.config || native.args)) {
+			applied._nativeBypass = true;
+		}
+		// Generate the native dialect when the user chose the unified mode directly
+		// (also neutralizing any conflicting native auto/bypass), OR when we must gate
+		// an inferred auto so a deny rule is enforceable. Pure back-compat (inferred,
+		// no gating) stays byte-identical — flags only.
+		if (explicitMode || gated) this.applyGeneratedNativeConfig(applied, native);
+	}
+
+	applyGeneratedNativeConfig(applied, native) {
+		const command = applied.acp ?? applied;
+		if (native.settings) this.translateNativeSettings(applied, native.settings);
+		if (native.config) {
+			// Drop any existing `-c key=...` the user set so the generated values
+			// win, then let the harness's own translateConfig append them.
+			command.args = stripConfigArgs(command.args ?? [], Object.keys(native.config));
+			command.args = this.translateConfig(command.args, native.config);
+		}
+		if (Array.isArray(native.removeArgs) && native.removeArgs.length > 0) {
+			command.args = stripFlags(command.args ?? [], native.removeArgs);
+		}
+		if (Array.isArray(native.args) && native.args.length > 0) {
+			const existing = command.args ?? [];
+			const missing = native.args.filter((arg) => !existing.includes(arg));
+			if (missing.length > 0) command.args = this.applyNativeArgs(existing, missing);
+		}
 	}
 
 	/** Hook: how native CLI args are merged. Base appends. */
@@ -129,9 +221,6 @@ export class BaseAcpAdapter {
 
 	/** Hook: fold a `settings` block into native session meta. Base ignores it. */
 	translateNativeSettings() {}
-
-	/** Hook: infer auto-accept / startup mode from native settings. Base: none. */
-	inferNativePermission() {}
 
 	// ---- lifecycle (required) -------------------------------------------------
 
@@ -226,12 +315,17 @@ export class BaseAcpAdapter {
 
 	/**
 	 * Handle a backend-initiated interactive request (e.g. cursor/ask_question,
-	 * cursor/create_plan). When auto-accept is on, resolve it with the generic
-	 * auto-outcome (mirrors pi-harness using autoCursorOutcome under _autoPermissionRequests);
-	 * otherwise route to the host for a real answer.
+	 * cursor/create_plan) through the SAME policy engine as tool permissions: a
+	 * matching deny rule/grant or deny mode rejects; allow/auto accepts; otherwise
+	 * route to the host. (Mode alone is not enough — a deny rule under auto must
+	 * still reject.)
 	 */
 	async handleExtensionRequest(method, params) {
-		if (this.capabilities.autoApprove) return autoCursorOutcome(method, params);
+		const policy = this.permissionPolicy();
+		const synthetic = { toolCall: { title: cursorActionName(params), kind: method }, options: [] };
+		const decision = decidePermission(policy, synthetic, { agentKey: this.key });
+		if (decision.action === "deny") return cursorCancelResult(method);
+		if (decision.action === "allow") return autoCursorOutcome(method, params);
 		if (typeof this.host.requestInteraction === "function") {
 			return this.host.requestInteraction(method, params);
 		}
@@ -240,10 +334,42 @@ export class BaseAcpAdapter {
 
 	// ---- internals ------------------------------------------------------------
 
+	/**
+	 * The effective, harness-agnostic policy for this adapter: settings.permissions
+	 * (per-agent + global) + persisted grants (host-provided via options.grants /
+	 * setPermissionGrants), with the mode resolved by applyPermissionMode (explicit
+	 * > native-inferred). The host owns persistence; the adapter never reads fs.
+	 */
+	permissionPolicy() {
+		const settings = {
+			permissions: this.globalPermissions,
+			agents: { [this.key]: { permissions: this.settings?.permissions } },
+		};
+		const policy = resolvePermissionPolicy(settings, this.key, this.permissionGrants);
+		policy.mode = this.launchSpec?._permissionMode ?? policy.mode;
+		return policy;
+	}
+
+	/**
+	 * Refresh the persisted grants for runtime decisions (the host owns the store).
+	 * Note: the launch spec was already gated from the grants passed at construction;
+	 * changing grants here does not re-gate an already-spawned backend.
+	 */
+	setPermissionGrants(grants) {
+		this.permissionGrants = Array.isArray(grants) ? grants : [];
+	}
+
+	// Decide allow/deny/ask uniformly via the shared engine; only "ask" reaches the
+	// host. This mirrors pi-harness HarnessApp.resolvePermissionOutcome exactly, so
+	// moving cc onto adapters keeps identical behavior.
 	#onPermission(params) {
-		if (this.capabilities.autoApprove) return autoPermissionOutcome(params);
-		if (typeof this.host.requestPermission === "function") return this.host.requestPermission(params);
-		return { outcome: "cancelled" };
+		const policy = this.permissionPolicy();
+		const decision = decidePermission(policy, params, { agentKey: this.key });
+		if (decision.action !== "ask") return outcomeForDecision(decision);
+		if (typeof this.host.requestPermission === "function") {
+			return this.host.requestPermission(params, { agentKey: this.key, policy });
+		}
+		return cancelledOutcome();
 	}
 
 	#onConnectionEvent(event) {
