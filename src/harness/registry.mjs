@@ -37,7 +37,10 @@ export function adapterClassFor(key) {
  * @param {object} [agentConfig]  registry entry; falls back to the adapter's
  *                                static defaultAgentConfig when omitted.
  * @param {object} host           { onEvent, requestPermission, requestInteraction }
- * @param {object} [options]      { settings, connectionFactory }
+ * @param {object} [options]      { settings, globalPermissions, grants, connectionFactory }
+ *                                `grants` are the host's persisted permission grants
+ *                                (loadGrants()); they gate the launch spec, so a
+ *                                remembered deny keeps an auto backend prompting.
  */
 export function createAdapter(key, agentConfig, host, options = {}) {
 	const AdapterClass = adapterClassFor(key);

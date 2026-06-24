@@ -350,6 +350,27 @@ async function main() {
 		ok("settings-equivalence:auto-with-deny-gates");
 	}
 
+	// A PERSISTED deny grant (host-provided via options.grants) must gate the launch
+	// spec too — not just config rules. Without grants the same setup full-bypasses.
+	{
+		const grants = [{ agent: "codex", tool: "shell", action: "deny" }];
+		const gated = createAdapter("codex", CONFIGS.codex, noopHost(), {
+			settings: { permissions: { mode: "auto" } },
+			grants,
+			connectionFactory: factoryFor(PROFILES.codex),
+		});
+		const gargs = gated.launchSpec.acp.args.join(" ");
+		assert.ok(!gargs.includes('approval_policy="never"'), "persisted deny grant gates auto (adapter)");
+		assert.ok(gargs.includes('approval_policy="on-request"'), "codex prompts under a persisted deny grant (adapter)");
+
+		const ungated = createAdapter("codex", CONFIGS.codex, noopHost(), {
+			settings: { permissions: { mode: "auto" } },
+			connectionFactory: factoryFor(PROFILES.codex),
+		});
+		assert.ok(ungated.launchSpec.acp.args.join(" ").includes('approval_policy="never"'), "no grant -> full bypass (adapter)");
+		ok("settings-equivalence:persisted-deny-grant-gates");
+	}
+
 	// =====================================================================
 	// (2c) NO FEATURES LOST — the per-harness branches collapse into uniform
 	//      adapter calls (cc connects to the interface, names no harness).

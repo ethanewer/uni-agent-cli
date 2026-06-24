@@ -177,8 +177,11 @@ This prototype is verified standalone (and via `host-example.mjs`), but `cc`
 (`pi-harness.mjs`) does not yet consume it. Integration is mechanical:
 
 1. In `HarnessApp`, replace `new AcpClient(agent, …)` with
-   `createAdapter(activeKey, agent, host, { settings })`; route all calls through
-   the adapter; drop `applyAgentSettings` in favor of `adapter.buildLaunchSpec`.
+   `createAdapter(activeKey, agent, host, { settings, globalPermissions, grants: loadGrants() })`;
+   route all calls through the adapter; drop `applyAgentSettings` in favor of
+   `adapter.buildLaunchSpec`. Pass `grants` so a persisted deny gates the launch
+   spec (an auto backend stays prompting), matching the live path; refresh runtime
+   grants with `adapter.setPermissionGrants(...)` after recording a new one.
 2. `runBtw`: replace the cursor refusal + `supportsFork()`/`forkCodexSession`
    ladder with `openSideThread(forkAdapter, parentId)`.
 3. `handleSlashCommand`: replace `shouldOpenCodexReviewDialog`/`isKnownCodexReviewCommand`

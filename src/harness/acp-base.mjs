@@ -9,7 +9,6 @@ import {
 	cancelledOutcome,
 	decidePermission,
 	inferModeFromNative,
-	loadGrants,
 	nativePermissionConfig,
 	normalizePermissionSettings,
 	outcomeForDecision,
@@ -59,7 +58,7 @@ export class BaseAcpAdapter {
 	 * @param {string} key            registry key (e.g. "codex")
 	 * @param {object} agentConfig    the registry entry { label, acp:{command,args}, ... }
 	 * @param {object} host           { onEvent, requestPermission, requestInteraction }
-	 * @param {object} [options]      { settings, connectionFactory }
+	 * @param {object} [options]      { settings, globalPermissions, grants, connectionFactory }
 	 */
 	constructor(key, agentConfig, host, options = {}) {
 		this.key = key;
@@ -69,6 +68,11 @@ export class BaseAcpAdapter {
 		this.settings = options.settings ?? {};
 		// Global (cross-harness) permissions block, if the host threads it in.
 		this.globalPermissions = options.globalPermissions;
+		// Persisted permission grants, owned by the host (it owns the store). They
+		// participate in BOTH spawn-time gating (buildLaunchSpec, below) and runtime
+		// decisions (permissionPolicy), so a remembered deny gates an auto launch.
+		// Default [] keeps the adapter deterministic — no implicit fs reads.
+		this.permissionGrants = Array.isArray(options.grants) ? options.grants : [];
 		this.connectionFactory = options.connectionFactory ?? defaultConnectionFactory;
 		this.connection = undefined;
 
@@ -161,11 +165,12 @@ export class BaseAcpAdapter {
 		const mode = explicitMode ?? inferModeFromNative(this.key, settings);
 		if (mode) applied._permissionMode = mode;
 		if (!mode) return;
-		// auto with a deny rule must keep the backend prompting so cc can enforce the
-		// denial — full native bypass would silence it. (Config rules only here; the
-		// host threads persisted grants into the live pi-harness path.)
+		// auto with a deny rule/grant must keep the backend prompting so cc can
+		// enforce the denial — full native bypass would silence it. Persisted grants
+		// (host-provided via options.grants) gate the launch spec, same as the live
+		// pi-harness path threading them through applyHarnessSettings.
 		const fullSettings = { permissions: this.globalPermissions, agents: { [this.key]: { permissions: settings.permissions } } };
-		const gated = mode === "auto" && policyNeedsGating(resolvePermissionPolicy(fullSettings, this.key, []));
+		const gated = mode === "auto" && policyNeedsGating(resolvePermissionPolicy(fullSettings, this.key, this.permissionGrants));
 		const native = nativePermissionConfig(this.key, mode, { gated });
 		if (native.autoApprove) applied._autoPermissionRequests = true;
 		if (native.startupMode) applied._startupMode = native.startupMode;
@@ -317,12 +322,11 @@ export class BaseAcpAdapter {
 
 	/**
 	 * The effective, harness-agnostic policy for this adapter: settings.permissions
-	 * (per-agent + global) + persisted grants, with the mode resolved by
-	 * applyPermissionMode (explicit > native-inferred). Grants are loaded once and
-	 * may be refreshed via setPermissionGrants() (the host owns persistence).
+	 * (per-agent + global) + persisted grants (host-provided via options.grants /
+	 * setPermissionGrants), with the mode resolved by applyPermissionMode (explicit
+	 * > native-inferred). The host owns persistence; the adapter never reads fs.
 	 */
 	permissionPolicy() {
-		if (!this.permissionGrants) this.permissionGrants = loadGrants();
 		const settings = {
 			permissions: this.globalPermissions,
 			agents: { [this.key]: { permissions: this.settings?.permissions } },
@@ -332,7 +336,11 @@ export class BaseAcpAdapter {
 		return policy;
 	}
 
-	/** Refresh the persisted grants the policy draws on (host-owned store). */
+	/**
+	 * Refresh the persisted grants for runtime decisions (the host owns the store).
+	 * Note: the launch spec was already gated from the grants passed at construction;
+	 * changing grants here does not re-gate an already-spawned backend.
+	 */
 	setPermissionGrants(grants) {
 		this.permissionGrants = Array.isArray(grants) ? grants : [];
 	}
