@@ -7,6 +7,7 @@ import {
 	classifyOption,
 	coercePermissionMode,
 	decidePermission,
+	flagEnabled,
 	flagMatches,
 	forgetGrants,
 	inferModeFromNative,
@@ -420,11 +421,19 @@ function stringArrayIncludes(value, needle) {
 	return Array.isArray(value) && value.includes(needle);
 }
 
-check("stripFlags / flagMatches handle bare and valued flag forms", () => {
+check("stripFlags / flagMatches / flagEnabled handle bare and valued flag forms", () => {
 	assert.equal(flagMatches("--force", "--force"), true);
 	assert.equal(flagMatches("--force=true", "--force"), true);
+	assert.equal(flagMatches("--force=false", "--force"), true); // strip matches either truthiness
 	assert.equal(flagMatches("--forceful", "--force"), false);
+	// flagEnabled is truthiness-aware (for inference)
+	assert.equal(flagEnabled("--force", "--force"), true);
+	assert.equal(flagEnabled("--force=true", "--force"), true);
+	assert.equal(flagEnabled("--force=false", "--force"), false);
+	assert.equal(flagEnabled("--force=0", "--force"), false);
+	// stripping removes the flag regardless of value (result is non-force either way)
 	assert.deepEqual(stripFlags(["--model", "x", "--force=true", "--yolo", "acp"], ["--force", "-f", "--yolo"]), ["--model", "x", "acp"]);
+	assert.deepEqual(stripFlags(["--force=false", "acp"], ["--force"]), ["acp"]);
 });
 
 check("inferModeFromNative mirrors the old per-name triggers", () => {
@@ -446,6 +455,10 @@ check("inferModeFromNative mirrors the old per-name triggers", () => {
 	assert.equal(inferModeFromNative("cursor", { args: ["--force=true"] }), "auto");
 	assert.equal(inferModeFromNative("cursor", {}, ["--yolo=1", "acp"]), "auto");
 	assert.equal(inferModeFromNative("cursor", { args: ["--forceful"] }), undefined); // not a force flag
+	// valued-FALSE forms explicitly disable bypass -> NOT auto
+	assert.equal(inferModeFromNative("cursor", { args: ["--force=false"] }), undefined);
+	assert.equal(inferModeFromNative("cursor", { args: ["--force=0"] }), undefined);
+	assert.equal(inferModeFromNative("cursor", { args: ["--yolo=off"] }), undefined);
 	// --force baked into the FINAL applied args (e.g. base config acp.args) is detected
 	assert.equal(inferModeFromNative("cursor", {}, ["--force", "acp"]), "auto");
 	assert.equal(inferModeFromNative("cursor", {}, ["acp"]), undefined);

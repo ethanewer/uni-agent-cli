@@ -392,6 +392,21 @@ export function flagMatches(arg, flag) {
 	return typeof arg === "string" && (arg === flag || arg.startsWith(`${flag}=`));
 }
 
+const FALSY_FLAG_VALUES = new Set(["false", "0", "no", "off", ""]);
+
+/**
+ * Whether `arg` ENABLES `flag`: the bare flag, or `flag=<truthy>`. A valued-false
+ * form (`--force=false`/`=0`/`=no`/`=off`) is NOT enabled — used for inference so a
+ * config that explicitly disables bypass isn't mistaken for auto.
+ */
+export function flagEnabled(arg, flag) {
+	if (arg === flag) return true;
+	if (typeof arg === "string" && arg.startsWith(`${flag}=`)) {
+		return !FALSY_FLAG_VALUES.has(arg.slice(flag.length + 1).trim().toLowerCase());
+	}
+	return false;
+}
+
 /** Remove every arg that matches any flag in `flags` (bare or `flag=value` form). */
 export function stripFlags(args, flags = []) {
 	return (args ?? []).filter((arg) => !flags.some((flag) => flagMatches(arg, flag)));
@@ -433,7 +448,7 @@ const PERMISSION_DIALECTS = {
 				...stringArray(agentSettings.acpArgs),
 				...stringArray(appliedArgs),
 			];
-			return args.some((arg) => CURSOR_FORCE_FLAGS.some((flag) => flagMatches(arg, flag))) ? "auto" : undefined;
+			return args.some((arg) => CURSOR_FORCE_FLAGS.some((flag) => flagEnabled(arg, flag))) ? "auto" : undefined;
 		},
 	},
 };
