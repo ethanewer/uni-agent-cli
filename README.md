@@ -133,9 +133,15 @@ have to learn each agent's native dialect just to change how it asks.
     stricter mode (`cc` says so when this applies).
 - **"Allow always" persists.** When you pick an *allow always* (or *bypass*)
   option in a prompt, `cc` records a grant in `~/.config/cc/permissions.json`
-  (next to `settings.json`; override with `CC_PERMISSIONS`). Matching requests are
-  then approved automatically — across restarts and consistently regardless of
-  whether the backend remembers anything.
+  (next to `settings.json`; override with `CC_PERMISSIONS`) and replies to the
+  backend with only a *one-time* option, so `cc` owns the persistence — matching
+  requests are then approved automatically across restarts, and `/permissions
+  clear` fully revokes them, regardless of what the backend remembers.
+  - *Caveat:* if the backend offers **only** a persistent option in that direction
+    (no allow-once / reject-once), `cc` can't own it — it forwards your persistent
+    choice as-is and does **not** record a `cc` grant (so it won't appear in
+    `/permissions` and `/permissions clear` can't revoke it). `cc` says so at the
+    time; the backend's own settings then govern that grant.
 - **`/permissions`** shows the effective mode and remembered grants;
   `/permissions clear` forgets them.
 
