@@ -5,6 +5,7 @@
 
 import { AcpClient, autoCursorOutcome, autoPermissionOutcome } from "../pi-harness.mjs";
 import { capabilitiesFromWire, emptyCapabilities } from "./interface.mjs";
+import { inferModeFromNative, nativePermissionConfig, normalizePermissionSettings } from "./permissions.mjs";
 import { clonePlain, isPlainObject, stringArray } from "./util.mjs";
 
 /** The transport contract the base adapter depends on (satisfied by AcpClient). */
@@ -41,6 +42,8 @@ export class BaseAcpAdapter {
 		this.label = this.agentConfig.label ?? key;
 		this.host = host ?? {};
 		this.settings = options.settings ?? {};
+		// Global (cross-harness) permissions block, if the host threads it in.
+		this.globalPermissions = options.globalPermissions;
 		this.connectionFactory = options.connectionFactory ?? defaultConnectionFactory;
 		this.connection = undefined;
 
@@ -100,7 +103,10 @@ export class BaseAcpAdapter {
 	 */
 	buildLaunchSpec(settings) {
 		const applied = clonePlain(this.agentConfig);
-		if (!isPlainObject(settings)) return applied;
+		if (!isPlainObject(settings)) {
+			this.applyPermissionMode(applied, {});
+			return applied;
+		}
 		applied.env = { ...(applied.env ?? {}), ...(settings.env ?? {}) };
 		if (applied.acp) applied.acp = clonePlain(applied.acp);
 
@@ -113,8 +119,40 @@ export class BaseAcpAdapter {
 
 		if (isPlainObject(settings.config)) command.args = this.translateConfig(command.args ?? [], settings.config);
 		if (isPlainObject(settings.settings)) this.translateNativeSettings(applied, settings.settings);
-		this.inferNativePermission(applied, settings);
+		this.applyPermissionMode(applied, settings);
 		return applied;
+	}
+
+	/**
+	 * Resolve and apply the harness-agnostic permission mode. Replaces every
+	 * per-harness `inferNativePermission` override: the unified engine knows each
+	 * harness's native dialect, so the subclasses no longer branch on permissions.
+	 * Explicit `permissions.mode` (per-agent then global) wins; otherwise it is
+	 * inferred from native settings for back-compat.
+	 */
+	applyPermissionMode(applied, settings = {}) {
+		const explicitMode =
+			normalizePermissionSettings(settings.permissions).mode ?? normalizePermissionSettings(this.globalPermissions).mode;
+		const mode = explicitMode ?? inferModeFromNative(this.key, settings);
+		if (mode) applied._permissionMode = mode;
+		if (!mode || mode === "ask") return;
+		const native = nativePermissionConfig(this.key, mode);
+		if (native.autoApprove) applied._autoPermissionRequests = true;
+		if (native.startupMode) applied._startupMode = native.startupMode;
+		// Generate the native backend config only when the user chose the unified
+		// mode directly (back-compat native settings must stay byte-identical).
+		if (explicitMode === "auto") this.applyGeneratedNativeConfig(applied, native);
+	}
+
+	applyGeneratedNativeConfig(applied, native) {
+		const command = applied.acp ?? applied;
+		if (native.settings) this.translateNativeSettings(applied, native.settings);
+		if (native.config) command.args = this.translateConfig(command.args ?? [], native.config);
+		if (Array.isArray(native.args) && native.args.length > 0) {
+			const existing = command.args ?? [];
+			const missing = native.args.filter((arg) => !existing.includes(arg));
+			if (missing.length > 0) command.args = this.applyNativeArgs(existing, missing);
+		}
 	}
 
 	/** Hook: how native CLI args are merged. Base appends. */
@@ -129,9 +167,6 @@ export class BaseAcpAdapter {
 
 	/** Hook: fold a `settings` block into native session meta. Base ignores it. */
 	translateNativeSettings() {}
-
-	/** Hook: infer auto-accept / startup mode from native settings. Base: none. */
-	inferNativePermission() {}
 
 	// ---- lifecycle (required) -------------------------------------------------
 

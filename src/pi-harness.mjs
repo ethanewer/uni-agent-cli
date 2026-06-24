@@ -14,10 +14,28 @@ import { isKeyRelease, matchesKey } from "@mariozechner/pi-tui/dist/keys.js";
 import { ProcessTerminal } from "@mariozechner/pi-tui/dist/terminal.js";
 import { Container, TUI } from "@mariozechner/pi-tui/dist/tui.js";
 import { normalizeTerminalOutput, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui/dist/utils.js";
+import {
+	cancelledOutcome,
+	classifyOption,
+	coercePermissionMode,
+	decidePermission,
+	forgetGrants,
+	inferModeFromNative,
+	isAlwaysOption,
+	loadGrants,
+	nativePermissionConfig,
+	normalizePermissionSettings,
+	outcomeForDecision,
+	permissionRequestInfo,
+	pickAllowOption,
+	recordGrant,
+	resolvePermissionPolicy,
+	selectedOutcome,
+} from "./harness/permissions.mjs";
 
 const HARNESS = "/harness";
 // Commands the shared UI always owns, even if a backend advertises the same name.
-const RESERVED_LOCAL_COMMANDS = new Set(["harness", "help", "status", "clear", "voice", "theme", "btw", "diff", "copy"]);
+const RESERVED_LOCAL_COMMANDS = new Set(["harness", "help", "status", "clear", "voice", "theme", "btw", "diff", "copy", "yolo", "auto", "permissions"]);
 const SOURCE_DIR = path.dirname(fileURLToPath(import.meta.url));
 const HARNESS_ROOT = path.join(SOURCE_DIR, "harnesses");
 const HARNESS_PYTHON = resolveHarnessPython();
@@ -2175,6 +2193,10 @@ export class HarnessApp {
 		this.deferredLocalSlashCommands = [];
 		this.permissionQueue = [];
 		this.permissionPromptActive = false;
+		// Persisted "allow always" grants (harness-agnostic, survive restarts) and
+		// the per-agent runtime mode override set by /yolo. See src/harness/permissions.mjs.
+		this.permissionGrants = loadGrants();
+		this.runtimePermissionMode = new Map();
 		this.cancelRequested = false;
 		this.afterToolCancelPending = false;
 		this.cancelGraceTimer = undefined;
@@ -2440,13 +2462,12 @@ export class HarnessApp {
 			if (this.client === client) this.handleBackendEvent(event);
 		}, {
 			onPermissionRequest: (params) => {
-				if (this.client !== client) return { outcome: "cancelled" };
-				if (agent._autoPermissionRequests) return autoPermissionOutcome(params);
-				return this.requestPermission(params);
+				if (this.client !== client) return cancelledOutcome();
+				return this.resolvePermissionOutcome(key, agent, params);
 			},
 			onCursorRequest: (method, params) => {
 				if (this.client !== client) return cursorCancelResult(method);
-				if (agent._autoPermissionRequests) return autoCursorOutcome(method, params);
+				if (this.permissionPolicyFor(key, agent).mode === "auto") return autoCursorOutcome(method, params);
 				return this.requestCursorInteraction(method, params);
 			},
 		});
@@ -3540,7 +3561,66 @@ export class HarnessApp {
 		}
 		if (name === "plan") {
 			await this.setPlanMode(name);
+			return;
 		}
+		if (name === "yolo" || name === "auto") {
+			this.toggleAutoApprove(name, argument);
+			return;
+		}
+		if (name === "permissions") {
+			this.runPermissions(name, argument);
+		}
+	}
+
+	// Flip the active harness's permission mode at runtime, harness-agnostically.
+	// `/yolo` toggles auto<->ask; `/yolo ask|auto|deny` sets it explicitly.
+	toggleAutoApprove(name, argument) {
+		this.addCommandMessage(slashCommandText(name, argument));
+		const agentKey = this.activeKey;
+		const agent = this.config.agents[agentKey];
+		const current = this.permissionPolicyFor(agentKey, agent).mode;
+		let next;
+		if (argument) {
+			next = coercePermissionMode(argument);
+			if (!next) {
+				this.addNotice(`Unknown permission mode: ${oneLine(argument)} (try ask, auto, or deny)`);
+				return;
+			}
+		} else {
+			next = current === "auto" ? "ask" : "auto";
+		}
+		this.runtimePermissionMode.set(agentKey, next);
+		// Keep the legacy flag in sync for any path that still reads it.
+		if (agent) agent._autoPermissionRequests = next === "auto";
+		const label = next === "auto" ? "auto-approve ON" : next === "deny" ? "auto-deny ON" : "ask on every request";
+		this.addNotice(`Permissions for ${agentKey}: ${label}`);
+		this.ui.requestRender();
+	}
+
+	// Show the effective policy + remembered grants; `/permissions clear` forgets them.
+	runPermissions(name, argument) {
+		this.addCommandMessage(slashCommandText(name, argument));
+		const arg = oneLine(argument).toLowerCase();
+		const agentKey = this.activeKey;
+		if (arg === "clear") {
+			this.permissionGrants = forgetGrants(() => true);
+			this.addNotice("Cleared all remembered permission grants.");
+			this.ui.requestRender();
+			return;
+		}
+		const policy = this.permissionPolicyFor(agentKey, this.config.agents[agentKey]);
+		const lines = [`Permissions — ${agentKey}: mode=${policy.mode}, remember=${policy.remember ? "on" : "off"}`];
+		if (policy.rules.length === 0) {
+			lines.push("  (no rules or remembered grants)");
+		} else {
+			for (const rule of policy.rules) {
+				const scope = rule.agent ? `${rule.agent}:` : "*:";
+				lines.push(`  ${rule.action === "deny" ? "deny " : "allow"} ${scope}${rule.tool}`);
+			}
+		}
+		lines.push("Use /yolo [ask|auto|deny] to change mode, /permissions clear to forget grants.");
+		this.addNotice(lines.join("\n"));
+		this.ui.requestRender();
 	}
 
 	deferLocalSlashCommand(name, argument = "") {
@@ -4007,13 +4087,12 @@ export class HarnessApp {
 			},
 			{
 				onPermissionRequest: (params) => {
-					if (this.btwThread !== thread) return { outcome: "cancelled" };
-					if (agent._autoPermissionRequests) return autoPermissionOutcome(params);
-					return this.requestPermission(params);
+					if (this.btwThread !== thread) return cancelledOutcome();
+					return this.resolvePermissionOutcome(this.activeKey, agent, params);
 				},
 				onCursorRequest: (method, params) => {
 					if (this.btwThread !== thread) return cursorCancelResult(method);
-					if (agent._autoPermissionRequests) return autoCursorOutcome(method, params);
+					if (this.permissionPolicyFor(this.activeKey, agent).mode === "auto") return autoCursorOutcome(method, params);
 					return this.requestCursorInteraction(method, params);
 				},
 			},
@@ -4219,9 +4298,43 @@ export class HarnessApp {
 		this.editor.setText(query);
 	}
 
-	requestPermission(params = {}) {
+	// The single decision point shared by every connection (main + /btw + future
+	// /remote). Resolves the harness-agnostic policy, lets the engine decide, and
+	// only opens a dialog when the policy says "ask".
+	resolvePermissionOutcome(agentKey, agent, params) {
+		const policy = this.permissionPolicyFor(agentKey, agent);
+		const decision = decidePermission(policy, params, { agentKey });
+		if (decision.action !== "ask") return outcomeForDecision(decision);
+		return this.requestPermission(params, { agentKey, policy });
+	}
+
+	// Effective policy for a harness: runtime /yolo override > explicit unified
+	// settings.permissions.mode > native-inferred mode > "ask". Rules come from
+	// settings + persisted grants.
+	permissionPolicyFor(agentKey, agent) {
+		const settings = this.config.settings ?? {};
+		const policy = resolvePermissionPolicy(settings, agentKey, this.permissionGrants);
+		const explicit =
+			normalizePermissionSettings(settings.agents?.[agentKey]?.permissions).mode ??
+			normalizePermissionSettings(settings.permissions).mode;
+		const runtime = this.runtimePermissionMode.get(agentKey);
+		const inferred = agent?._permissionMode;
+		policy.mode = runtime ?? explicit ?? inferred ?? policy.mode;
+		return policy;
+	}
+
+	// Record a user's "always" choice as a persistent, harness-agnostic grant.
+	rememberPermissionChoice(agentKey, params, option) {
+		const tool = permissionRequestInfo(params).toolName;
+		if (!tool || !option?.optionId) return;
+		const action = classifyOption(option) === "deny" ? "deny" : "allow";
+		this.permissionGrants = recordGrant({ agent: agentKey, tool, action });
+		this.addNotice(`Remembered: ${action === "deny" ? "deny" : "allow"} "${oneLine(tool)}" for ${agentKey} (see /permissions)`);
+	}
+
+	requestPermission(params = {}, context = {}) {
 		return new Promise((resolve) => {
-			this.permissionQueue.push({ kind: "permission", params, resolve });
+			this.permissionQueue.push({ kind: "permission", params, context, resolve });
 			this.drainPermissionQueue();
 		});
 	}
@@ -4285,10 +4398,12 @@ export class HarnessApp {
 		askNext(0);
 	}
 
-	openPermissionRequest({ params, resolve }) {
+	openPermissionRequest({ params, resolve, context = {} }) {
 		const options = Array.isArray(params.options) ? params.options : [];
 		if (options.length === 0) {
-			resolve({ outcome: "cancelled" });
+			// Surface it rather than silently cancelling against the user.
+			this.addNotice(`${permissionTitle(params)}: no options offered — cancelling`);
+			resolve(cancelledOutcome());
 			this.permissionPromptActive = false;
 			this.drainPermissionQueue();
 			return;
@@ -4304,7 +4419,10 @@ export class HarnessApp {
 			settled = true;
 			this.closeMenu();
 			const option = entry?.value;
-			resolve(option?.optionId ? { outcome: "selected", optionId: option.optionId } : { outcome: "cancelled" });
+			if (option?.optionId && isAlwaysOption(option) && context.policy?.remember !== false) {
+				this.rememberPermissionChoice(context.agentKey, params, option);
+			}
+			resolve(option?.optionId ? selectedOutcome(option.optionId) : cancelledOutcome());
 			this.permissionPromptActive = false;
 			this.drainPermissionQueue();
 		};
@@ -5005,26 +5123,11 @@ function permissionOptionDescription(option = {}) {
 	return parts.length > 0 ? parts.map(oneLine).join(" · ") : undefined;
 }
 
+// Retained as the auto-accept entry point for the adapter prototype
+// (src/harness/acp-base.mjs). It now delegates to the shared engine, which picks
+// the narrowest safe allow option rather than escalating to the broadest grant.
 export function autoPermissionOutcome(params = {}) {
-	const option = autoPermissionOption(Array.isArray(params.options) ? params.options : []);
-	return option?.optionId ? { outcome: "selected", optionId: option.optionId } : { outcome: "cancelled" };
-}
-
-function autoPermissionOption(options) {
-	const allowed = options.filter(isAllowPermissionOption);
-	return (
-		allowed.find((option) => option.optionId === "bypassPermissions") ??
-		allowed.find((option) => String(option.kind ?? "").toLowerCase() === "allow_always") ??
-		allowed[0]
-	);
-}
-
-function isAllowPermissionOption(option = {}) {
-	const kind = String(option.kind ?? "").toLowerCase();
-	if (kind.includes("reject") || kind.includes("deny") || kind.includes("cancel")) return false;
-	if (kind.includes("allow") || kind.includes("approve")) return true;
-	const text = `${option.optionId ?? ""} ${option.name ?? ""} ${option.label ?? ""}`.toLowerCase();
-	return /\b(allow|approve|yes|accept|bypass)\b/.test(text) && !/\b(reject|deny|cancel|no)\b/.test(text);
+	return selectedOutcome(pickAllowOption(Array.isArray(params.options) ? params.options : [])?.optionId);
 }
 
 function humanizePermissionKind(kind) {
@@ -5327,6 +5430,9 @@ function localSlashCommands(app) {
 	addIfMissing({ name: "reasoning", description: "Change reasoning effort" });
 	addIfMissing({ name: "thinking", description: "Change reasoning effort" });
 	addIfMissing({ name: "plan", description: "Switch to plan mode" });
+	addIfMissing({ name: "yolo", description: "Toggle auto-approve for this harness", argumentHint: "[ask|auto|deny]" });
+	addIfMissing({ name: "auto", description: "Toggle auto-approve for this harness", argumentHint: "[ask|auto|deny]" });
+	addIfMissing({ name: "permissions", description: "Show or clear remembered permission grants", argumentHint: "[clear]" });
 
 	if (supportsSessionList(state)) {
 		addIfMissing({ name: "resume", description: "Resume a previous ACP session" });
@@ -6352,7 +6458,7 @@ export function applyHarnessSettings(config, settings = {}) {
 	const normalized = normalizeHarnessSettings(settings);
 	const agents = {};
 	for (const [key, agent] of Object.entries(config.agents ?? {})) {
-		agents[key] = applyAgentSettings(key, agent, normalized[key] ?? {});
+		agents[key] = applyAgentSettings(key, agent, normalized[key] ?? {}, settings.permissions);
 	}
 	// A harness persisted from a prior session (via /harness) becomes the default
 	// when no harness is named on the command line. Ignore stale keys.
@@ -6382,9 +6488,12 @@ function normalizeHarnessSettings(settings) {
 	return isPlainObject(settings?.agents) ? settings.agents : {};
 }
 
-function applyAgentSettings(key, agent, settings) {
+function applyAgentSettings(key, agent, settings, globalPermissions) {
 	const applied = clonePlain(agent);
-	if (!isPlainObject(settings)) return applied;
+	if (!isPlainObject(settings)) {
+		applyNativePermissionSetting(key, applied, {}, globalPermissions);
+		return applied;
+	}
 	applied.env = { ...(applied.env ?? {}), ...(settings.env ?? {}) };
 	if (applied.acp) applied.acp = clonePlain(applied.acp);
 
@@ -6397,7 +6506,7 @@ function applyAgentSettings(key, agent, settings) {
 
 	if (isPlainObject(settings.config)) command.args = applyConfigSettings(key, command.args ?? [], settings.config);
 	if (isPlainObject(settings.settings)) applyNativeSettings(key, applied, settings.settings);
-	applyNativePermissionSetting(key, applied, settings);
+	applyNativePermissionSetting(key, applied, settings, globalPermissions);
 	return applied;
 }
 
@@ -6428,32 +6537,48 @@ function applyNativeSettings(key, agent, settings) {
 	});
 }
 
-function applyNativePermissionSetting(key, agent, settings) {
-	if (key === "claude") {
-		const mode = settings.settings?.permissions?.defaultMode;
-		if (isBypassPermissionMode(mode)) {
-			agent._startupMode = "bypassPermissions";
-			agent._autoPermissionRequests = true;
+// Resolve the harness-agnostic permission mode for an agent and apply it. An
+// explicit unified `permissions.mode` (per-agent, then global) wins; otherwise it
+// is inferred from native settings for back-compat. When the user expressed the
+// unified mode directly, the backend's native dialect is generated too so cc and
+// the backend never disagree. The decisioning side reads `agent._permissionMode`.
+function applyNativePermissionSetting(key, agent, settings, globalPermissions) {
+	const explicitMode =
+		normalizePermissionSettings(settings.permissions).mode ?? normalizePermissionSettings(globalPermissions).mode;
+	const mode = explicitMode ?? inferModeFromNative(key, settings);
+	if (mode) agent._permissionMode = mode;
+	if (!mode || mode === "ask") return;
+	const native = nativePermissionConfig(key, mode);
+	if (native.autoApprove) agent._autoPermissionRequests = true;
+	if (native.startupMode) agent._startupMode = native.startupMode;
+	// Only generate native backend config when the user chose the unified mode;
+	// for pure back-compat (native settings already written) the spawn spec must
+	// stay byte-identical, so we only set the cc-side flags above.
+	if (explicitMode === "auto") applyGeneratedNativeConfig(key, agent, native);
+}
+
+// Fold engine-generated native config into the spawn spec, skipping anything the
+// user already supplied so nothing is duplicated.
+function applyGeneratedNativeConfig(key, agent, native) {
+	const command = agent.acp ?? agent;
+	if (native.settings) applyNativeSettings(key, agent, native.settings);
+	if (native.config) {
+		const args = command.args ?? [];
+		for (const [name, value] of Object.entries(native.config)) {
+			if (configArgPresent(args, name)) continue;
+			args.push("-c", `${name}=${tomlValue(value)}`);
 		}
-		return;
+		command.args = args;
 	}
-	if (key === "codex") {
-		const config = settings.config;
-		if (config?.approval_policy === "never" && config?.sandbox_mode === "danger-full-access") {
-			agent._autoPermissionRequests = true;
-		}
-		return;
-	}
-	if (key === "cursor") {
-		const args = (agent.acp ?? agent).args ?? [];
-		if (args.includes("--force") || args.includes("-f") || args.includes("--yolo")) {
-			agent._autoPermissionRequests = true;
-		}
+	if (Array.isArray(native.args) && native.args.length > 0) {
+		const args = command.args ?? [];
+		const missing = native.args.filter((arg) => !args.includes(arg));
+		if (missing.length > 0) command.args = applyNativeArgs(key, args, missing);
 	}
 }
 
-function isBypassPermissionMode(mode) {
-	return typeof mode === "string" && ["bypasspermissions", "bypass"].includes(mode.trim().toLowerCase());
+function configArgPresent(args, name) {
+	return args.some((arg, index) => args[index - 1] === "-c" && typeof arg === "string" && arg.startsWith(`${name}=`));
 }
 
 function insertArgsBefore(baseArgs, marker, inserted) {

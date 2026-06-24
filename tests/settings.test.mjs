@@ -1022,6 +1022,43 @@ assert.deepEqual(applied.agents["mini-swe-agent"].acp.args, [
 	"--no-yolo",
 ]);
 
+// Back-compat: native settings now also resolve a unified _permissionMode.
+assert.equal(applied.agents.claude._permissionMode, "auto");
+assert.equal(applied.agents.codex._permissionMode, "auto");
+assert.equal(applied.agents.cursor._permissionMode, "auto");
+assert.equal(applied.agents["terminus-2"]._permissionMode, undefined);
+
+// Unified, harness-agnostic permission mode: a single global `permissions.mode`
+// generates each backend's native dialect (the inversion of fragile inference).
+const unified = applyHarnessSettings(config, { permissions: { mode: "auto" } });
+assert.equal(unified.agents.claude._permissionMode, "auto");
+assert.equal(unified.agents.claude._autoPermissionRequests, true);
+assert.equal(unified.agents.claude._startupMode, "bypassPermissions");
+assert.deepEqual(unified.agents.claude._sessionMeta, {
+	claudeCode: { options: { settings: { permissions: { defaultMode: "bypassPermissions" } } } },
+});
+assert.equal(unified.agents.codex._autoPermissionRequests, true);
+assert.deepEqual(unified.agents.codex.acp.args, [
+	"-c",
+	"approval_policy=\"never\"",
+	"-c",
+	"sandbox_mode=\"danger-full-access\"",
+]);
+assert.equal(unified.agents.cursor._autoPermissionRequests, true);
+assert.deepEqual(unified.agents.cursor.acp.args, ["--force", "acp"]);
+// Generic harnesses with no native knob still auto-approve cc-side.
+assert.equal(unified.agents["terminus-2"]._permissionMode, "auto");
+assert.equal(unified.agents["terminus-2"]._autoPermissionRequests, true);
+
+// Per-agent mode overrides the global default.
+const mixed = applyHarnessSettings(config, {
+	permissions: { mode: "auto" },
+	agents: { codex: { permissions: { mode: "ask" } } },
+});
+assert.equal(mixed.agents.codex._permissionMode, "ask");
+assert.equal(mixed.agents.codex._autoPermissionRequests, undefined);
+assert.equal(mixed.agents.claude._autoPermissionRequests, true);
+
 const previousDefaultCcConfig = process.env.CC_CONFIG;
 const previousDefaultCcSettings = process.env.CC_SETTINGS;
 process.env.CC_CONFIG = path.join(os.tmpdir(), `cc-missing-config-${process.pid}.json`);

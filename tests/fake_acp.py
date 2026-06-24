@@ -169,6 +169,7 @@ def handle_message(message):
                             {"name": "review-branch", "description": "Review against a branch"},
                             {"name": "review-commit", "description": "Review a commit"},
                             {"name": "permission-test", "description": "Exercise ACP permission requests"},
+                            {"name": "permission-always", "description": "Exercise an allow_always permission option"},
                             {"name": "permission-overlap", "description": "Exercise overlapping ACP permission requests"},
                             {"name": "permission-exit", "description": "Exit while a permission request is open"},
                             {"name": "rpc-parse-error", "description": "Return a structured JSON-RPC parse error"},
@@ -325,6 +326,39 @@ def handle_prompt(message):
                 "options": [
                     {"kind": "reject_once", "name": "Reject", "optionId": "reject"},
                     {"kind": "allow_once", "name": "Allow", "optionId": "allow"},
+                ],
+            },
+        )
+        send(
+            {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "fake-session",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": json.dumps(permission, sort_keys=True)},
+                    },
+                },
+            }
+        )
+        send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "end_turn"}})
+        return
+
+    if prompt == "/permission-always":
+        permission = request(
+            "session/request_permission",
+            {
+                "sessionId": "fake-session",
+                "toolCall": {
+                    "toolCallId": "permission-always-1",
+                    "title": "Always Test",
+                    "status": "pending",
+                },
+                "options": [
+                    {"kind": "reject_once", "name": "Reject", "optionId": "reject"},
+                    {"kind": "allow_once", "name": "Allow once", "optionId": "allow-once"},
+                    {"kind": "allow_always", "name": "Allow always", "optionId": "allow-always"},
                 ],
             },
         )

@@ -32,13 +32,9 @@ export class CodexAdapter extends BaseAcpAdapter {
 		return args;
 	}
 
-	// approval_policy=never + sandbox_mode=danger-full-access => auto-accept.
-	inferNativePermission(agent, settings) {
-		const config = settings.config;
-		if (config?.approval_policy === "never" && config?.sandbox_mode === "danger-full-access") {
-			agent._autoPermissionRequests = true;
-		}
-	}
+	// Permissions (auto-accept from approval_policy=never + sandbox_mode=
+	// danger-full-access, and generation of those keys from the unified mode) are
+	// handled generically by BaseAcpAdapter via the unified engine.
 
 	// codex-acp exposes no session/fork. Copy the parent's rollout JSONL to a new
 	// id and session/load the copy: an isolated branch, parent untouched.

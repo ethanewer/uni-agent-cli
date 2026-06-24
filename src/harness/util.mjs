@@ -43,10 +43,6 @@ export function tomlValue(value) {
 	return JSON.stringify(value);
 }
 
-export function isBypassPermissionMode(mode) {
-	return typeof mode === "string" && ["bypasspermissions", "bypass"].includes(mode.trim().toLowerCase());
-}
-
 export function insertArgsBefore(baseArgs, marker, inserted) {
 	const index = baseArgs.indexOf(marker);
 	if (index === -1) return [...baseArgs, ...inserted];
