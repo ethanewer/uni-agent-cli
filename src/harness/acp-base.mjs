@@ -3,7 +3,7 @@
 // real AcpClient from pi-harness.mjs; tests inject a fake. Most harnesses are a
 // ~10-line subclass that overrides only the hooks for their niceties.
 
-import { AcpClient, autoCursorOutcome, cursorCancelResult } from "../pi-harness.mjs";
+import { AcpClient, autoCursorOutcome, cursorActionName, cursorCancelResult } from "../pi-harness.mjs";
 import { capabilitiesFromWire, emptyCapabilities } from "./interface.mjs";
 import {
 	cancelledOutcome,
@@ -314,13 +314,17 @@ export class BaseAcpAdapter {
 
 	/**
 	 * Handle a backend-initiated interactive request (e.g. cursor/ask_question,
-	 * cursor/create_plan). auto -> auto-accept; deny -> auto-reject/cancel; otherwise
-	 * route to the host for a real answer.
+	 * cursor/create_plan) through the SAME policy engine as tool permissions: a
+	 * matching deny rule/grant or deny mode rejects; allow/auto accepts; otherwise
+	 * route to the host. (Mode alone is not enough — a deny rule under auto must
+	 * still reject.)
 	 */
 	async handleExtensionRequest(method, params) {
-		const mode = this.permissionPolicy().mode;
-		if (mode === "auto") return autoCursorOutcome(method, params);
-		if (mode === "deny") return cursorCancelResult(method);
+		const policy = this.permissionPolicy();
+		const synthetic = { toolCall: { title: cursorActionName(params), kind: method }, options: [] };
+		const decision = decidePermission(policy, synthetic, { agentKey: this.key });
+		if (decision.action === "deny") return cursorCancelResult(method);
+		if (decision.action === "allow") return autoCursorOutcome(method, params);
 		if (typeof this.host.requestInteraction === "function") {
 			return this.host.requestInteraction(method, params);
 		}

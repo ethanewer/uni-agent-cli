@@ -203,9 +203,16 @@ export function classifyOption(option = {}) {
  * persistence: a session-scoped choice must NOT be saved as a forever grant.
  */
 export function optionScope(option = {}) {
-	const text = `${String(option.kind ?? "")} ${String(option.optionId ?? "")}`.toLowerCase();
-	if (text.includes("always") || text.includes("bypass")) return "always";
-	if (text.includes("session")) return "session";
+	// kind/optionId are authoritative when they carry a scope signal.
+	const strong = `${String(option.kind ?? "")} ${String(option.optionId ?? "")}`.toLowerCase();
+	if (strong.includes("always") || strong.includes("bypass")) return "always";
+	if (strong.includes("session")) return "session";
+	// Otherwise fall back to the user-facing label/name, so a backend that only
+	// encodes permanence there (e.g. name "Allow always") is still detected and cc
+	// won't silently treat it as a one-time option.
+	const weak = `${String(option.name ?? "")} ${String(option.label ?? "")}`.toLowerCase();
+	if (/\balways\b/.test(weak) || /\bbypass\b/.test(weak)) return "always";
+	if (/\bsession\b/.test(weak)) return "session";
 	return "once";
 }
 

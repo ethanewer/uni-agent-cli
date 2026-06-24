@@ -2469,10 +2469,7 @@ export class HarnessApp {
 			},
 			onCursorRequest: (method, params) => {
 				if (this.client !== client) return cursorCancelResult(method);
-				const mode = this.permissionPolicyFor(key, agent).mode;
-				if (mode === "auto") return autoCursorOutcome(method, params);
-				if (mode === "deny") return cursorCancelResult(method);
-				return this.requestCursorInteraction(method, params);
+				return this.resolveCursorOutcome(key, agent, method, params);
 			},
 		});
 		this.client = client;
@@ -4109,10 +4106,7 @@ export class HarnessApp {
 				},
 				onCursorRequest: (method, params) => {
 					if (this.btwThread !== thread) return cursorCancelResult(method);
-					const mode = this.permissionPolicyFor(this.activeKey, agent).mode;
-					if (mode === "auto") return autoCursorOutcome(method, params);
-					if (mode === "deny") return cursorCancelResult(method);
-					return this.requestCursorInteraction(method, params);
+					return this.resolveCursorOutcome(this.activeKey, agent, method, params);
 				},
 			},
 		);
@@ -4325,6 +4319,19 @@ export class HarnessApp {
 		const decision = decidePermission(policy, params, { agentKey });
 		if (decision.action !== "ask") return outcomeForDecision(decision);
 		return this.requestPermission(params, { agentKey, policy });
+	}
+
+	// Cursor's interactive extension prompts (create_plan / ask_question) run through
+	// the SAME policy engine as tool permissions: a matching deny rule/grant or deny
+	// mode rejects them, auto accepts, otherwise the user is asked. (Mode alone is not
+	// enough — a deny rule under auto mode must still reject.)
+	resolveCursorOutcome(agentKey, agent, method, params) {
+		const policy = this.permissionPolicyFor(agentKey, agent);
+		const synthetic = { toolCall: { title: cursorActionName(params), kind: method }, options: [] };
+		const decision = decidePermission(policy, synthetic, { agentKey });
+		if (decision.action === "deny") return cursorCancelResult(method);
+		if (decision.action === "allow") return autoCursorOutcome(method, params);
+		return this.requestCursorInteraction(method, params);
 	}
 
 	// Effective policy for a harness: runtime /yolo override > the spawn-time mode
@@ -5206,6 +5213,12 @@ export function cursorCancelResult(method) {
 	if (method === "cursor/create_plan") return { outcome: { outcome: "rejected", reason: "Cancelled" } };
 	if (method === "cursor/ask_question") return { outcome: { outcome: "cancelled" } };
 	return {};
+}
+
+// A human-ish name for a cursor extension request, used as the "tool" when matching
+// permission rules against an interactive cursor prompt.
+export function cursorActionName(params = {}) {
+	return params.name ?? params.title ?? params.overview ?? params.prompt;
 }
 
 export function autoCursorOutcome(method, params = {}) {

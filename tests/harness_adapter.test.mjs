@@ -580,6 +580,22 @@ async function main() {
 		ok("extension:deny-auto-rejects");
 	}
 
+	// A deny RULE under auto mode must also reject cursor extension prompts (mode
+	// alone is not enough — cursor prompts run through the policy engine).
+	{
+		let asked = false;
+		const host = { onEvent() {}, requestPermission: () => ({ outcome: "cancelled" }), requestInteraction: () => { asked = true; return { picked: true }; } };
+		const cursor = createAdapter("cursor", CONFIGS.cursor, host, {
+			settings: { permissions: { mode: "auto", rules: [{ tool: "*", action: "deny" }] } },
+			connectionFactory: factoryFor(PROFILES.cursor),
+		});
+		await cursor.connect();
+		const plan = await cursor.connection.emitCursor("cursor/create_plan", { name: "P" });
+		assert.deepEqual(plan, { outcome: { outcome: "rejected", reason: "Cancelled" } });
+		assert.equal(asked, false);
+		ok("extension:deny-rule-rejects-under-auto");
+	}
+
 	// =====================================================================
 	// (3) ADDABILITY — opencode + pi + a brand-new harness, no core changes.
 	// =====================================================================

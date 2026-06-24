@@ -178,6 +178,16 @@ check("optionScope orders once < session < always", () => {
 	assert.equal(optionScope({ optionId: "bypassPermissions" }), "always");
 });
 
+check("optionScope falls back to name/label when kind/optionId carry no scope signal", () => {
+	// permanence only in the label -> still detected (not misclassified as once)
+	assert.equal(optionScope({ kind: "allow", optionId: "allow", name: "Allow always" }), "always");
+	assert.equal(isAlwaysOption({ kind: "allow", optionId: "ok", name: "Approve always" }), true);
+	assert.equal(optionScope({ label: "Allow for this session" }), "session");
+	// authoritative kind/optionId still win (no regression for the common case)
+	assert.equal(optionScope({ kind: "allow_once", optionId: "allow", name: "Allow" }), "once");
+	assert.equal(pickNonPersistentAllowOption([{ kind: "allow", optionId: "a", name: "Allow always" }]), undefined);
+});
+
 check("pickAllowOption prefers narrowest by default, broadest when asked", () => {
 	assert.equal(pickAllowOption(FAKE_OPTIONS)?.optionId, "allow");
 	assert.equal(pickAllowOption(ALWAYS_OPTIONS)?.optionId, "allow-once");
