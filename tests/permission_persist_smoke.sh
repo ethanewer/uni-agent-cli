@@ -64,7 +64,11 @@ tmux send-keys -t "$PERSIST_SESSION" / p e r m i s s i o n - a l w a y s Enter
 wait_for_text "$PERSIST_SESSION" "Permission: Always Test"
 # entries: Reject, Allow once, Allow always -> Down Down lands on "Allow always"
 tmux send-keys -t "$PERSIST_SESSION" Down Down Enter
-wait_for_text "$PERSIST_SESSION" '"optionId": "allow-always"'
+# cc OWNS the "always": it records its own grant but replies to the backend with the
+# narrowest allow (allow-once), NOT allow-always — so the backend doesn't also
+# persist it and /permissions clear can fully revoke.
+wait_for_text "$PERSIST_SESSION" '"optionId": "allow-once"'
+assert_without_text "$PERSIST_SESSION" '"optionId": "allow-always"'
 # The cc-side store records the grant, keyed on the tool title.
 wait_for_file_text "Always Test"
 

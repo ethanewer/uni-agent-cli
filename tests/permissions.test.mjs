@@ -19,6 +19,7 @@ import {
 	outcomeForDecision,
 	permissionRequestInfo,
 	pickAllowOption,
+	policyNeedsGating,
 	pickDenyOption,
 	recordGrant,
 	resolvePermissionPolicy,
@@ -242,6 +243,34 @@ check("nativePermissionConfig generates per-harness native dialect for auto", ()
 	assert.deepEqual(nativePermissionConfig("cursor", "auto"), { autoApprove: true, args: ["--force"] });
 	assert.deepEqual(nativePermissionConfig("opencode", "auto"), { autoApprove: true });
 	assert.deepEqual(nativePermissionConfig("pi", "auto"), { autoApprove: true });
+});
+
+check("gated auto keeps the backend prompting (no full bypass) so deny rules fire", () => {
+	// claude: prompt via default mode, no bypass startup.
+	assert.deepEqual(nativePermissionConfig("claude", "auto", { gated: true }), {
+		autoApprove: true,
+		settings: { permissions: { defaultMode: "default" } },
+	});
+	// codex: prompt (on-request) but keep full capability (danger sandbox).
+	assert.deepEqual(nativePermissionConfig("codex", "auto", { gated: true }), {
+		autoApprove: true,
+		config: { approval_policy: "on-request", sandbox_mode: "danger-full-access" },
+	});
+	assert.deepEqual(nativePermissionConfig("cursor", "auto", { gated: true }), {
+		autoApprove: true,
+		removeArgs: ["--force", "-f", "--yolo"],
+	});
+	assert.deepEqual(nativePermissionConfig("opencode", "auto", { gated: true }), { autoApprove: true });
+});
+
+check("policyNeedsGating is true iff a deny rule/grant is present", () => {
+	assert.equal(policyNeedsGating({ rules: [{ tool: "*", action: "allow" }] }), false);
+	assert.equal(policyNeedsGating({ rules: [{ tool: "shell", action: "deny" }] }), true);
+	assert.equal(policyNeedsGating({ rules: [] }), false);
+	assert.equal(policyNeedsGating({}), false);
+	// a deny grant surfaced through resolvePermissionPolicy triggers gating
+	const policy = resolvePermissionPolicy({ permissions: { mode: "auto" } }, "codex", [{ agent: "codex", tool: "shell", action: "deny" }]);
+	assert.equal(policyNeedsGating(policy), true);
 });
 
 check("nativePermissionConfig emits NEUTRALIZERS for ask/deny", () => {

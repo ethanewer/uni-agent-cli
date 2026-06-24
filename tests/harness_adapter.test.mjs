@@ -335,6 +335,21 @@ async function main() {
 		ok("settings-equivalence:unified-ask-neutralizes");
 	}
 
+	// mode auto WITH a deny rule gates the backend (prompts) instead of full bypass,
+	// so cc can enforce the denial — adapter parity with applyHarnessSettings.
+	{
+		const codex = createAdapter("codex", CONFIGS.codex, noopHost(), {
+			settings: { permissions: { mode: "auto", rules: [{ tool: "shell", action: "deny" }] } },
+			connectionFactory: factoryFor(PROFILES.codex),
+		});
+		const args = codex.launchSpec.acp.args.join(" ");
+		assert.ok(!args.includes('approval_policy="never"'), "codex not in no-prompt bypass when a deny rule exists (adapter)");
+		assert.ok(args.includes('approval_policy="on-request"'), "codex still prompts (adapter)");
+		assert.ok(args.includes('sandbox_mode="danger-full-access"'), "codex keeps full capability (adapter)");
+		assert.equal(codex.capabilities.autoApprove, true);
+		ok("settings-equivalence:auto-with-deny-gates");
+	}
+
 	// =====================================================================
 	// (2c) NO FEATURES LOST — the per-harness branches collapse into uniform
 	//      adapter calls (cc connects to the interface, names no harness).

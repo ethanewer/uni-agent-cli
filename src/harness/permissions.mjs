@@ -284,6 +284,15 @@ export function outcomeForDecision(decision = {}) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Whether a resolved policy carries any deny rule/grant cc must enforce per
+ * request. A `mode: "auto"` backend therefore cannot be put in a native bypass
+ * that silences it — cc would never be asked, so the denial could never fire.
+ */
+export function policyNeedsGating(policy = {}) {
+	return (policy.rules ?? []).some((rule) => rule.action === "deny");
+}
+
+/**
  * Map a unified mode to a harness's native settings. `autoApprove` tells cc to
  * auto-accept; `startupMode`/`settings`/`config`/`args`/`removeArgs` are the spawn
  * inputs that configure (or neutralize) the backend itself so the two never
@@ -291,9 +300,26 @@ export function outcomeForDecision(decision = {}) {
  * decides for ask/deny). The ask/deny shapes are NEUTRALIZERS: they undo any native
  * auto/bypass on the agent so the backend prompts and cc's decision is honored
  * (ask and deny share the same native shape; the difference is cc-side only).
+ *
+ * `gated: true` (auto with deny rules) keeps the backend PROMPTING — full native
+ * bypass would stop it asking, so cc could never apply the denial — while keeping
+ * full capability where that is a separate knob (the codex sandbox). cc then
+ * auto-approves everything except the denied tools.
  */
-export function nativePermissionConfig(agentKey, mode) {
+export function nativePermissionConfig(agentKey, mode, { gated = false } = {}) {
 	if (mode === "auto") {
+		if (gated) {
+			switch (agentKey) {
+				case "claude":
+					return { autoApprove: true, settings: { permissions: { defaultMode: "default" } } };
+				case "codex":
+					return { autoApprove: true, config: { approval_policy: "on-request", sandbox_mode: "danger-full-access" } };
+				case "cursor":
+					return { autoApprove: true, removeArgs: ["--force", "-f", "--yolo"] };
+				default:
+					return { autoApprove: true };
+			}
+		}
 		switch (agentKey) {
 			case "claude":
 				return {

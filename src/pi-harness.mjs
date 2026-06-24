@@ -28,6 +28,8 @@ import {
 	outcomeForDecision,
 	permissionRequestInfo,
 	pickAllowOption,
+	pickDenyOption,
+	policyNeedsGating,
 	recordGrant,
 	resolvePermissionPolicy,
 	selectedOutcome,
@@ -4418,10 +4420,19 @@ export class HarnessApp {
 			settled = true;
 			this.closeMenu();
 			const option = entry?.value;
-			if (option?.optionId && isAlwaysOption(option) && context.policy?.remember !== false) {
+			if (!option?.optionId) {
+				resolve(cancelledOutcome());
+			} else if (isAlwaysOption(option) && context.policy?.remember !== false) {
+				// cc OWNS this "always": record the grant, but answer the backend with
+				// only a one-time decision (the narrowest same-direction option) so the
+				// backend does not ALSO persist it — otherwise /permissions clear could
+				// not fully revoke. Fall back to the picked option if no narrower one.
 				this.rememberPermissionChoice(context.agentKey, params, option);
+				const once = classifyOption(option) === "deny" ? pickDenyOption(options) : pickAllowOption(options);
+				resolve(selectedOutcome((once ?? option).optionId));
+			} else {
+				resolve(selectedOutcome(option.optionId));
 			}
-			resolve(option?.optionId ? selectedOutcome(option.optionId) : cancelledOutcome());
 			this.permissionPromptActive = false;
 			this.drainPermissionQueue();
 		};
@@ -6378,7 +6389,9 @@ export function loadConfig() {
 	const user = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : {};
 	const config = deepMerge(DEFAULT_CONFIG, user);
 	const settings = normalizeSettings(deepMerge(config.settings ?? {}, loadSettings()), config.theme);
-	return applyHarnessSettings(config, settings);
+	// Persisted grants participate in spawn-time gating: a remembered deny means an
+	// auto-mode backend must keep prompting so cc can enforce it.
+	return applyHarnessSettings(config, settings, loadGrants());
 }
 
 function configPath() {
@@ -6452,12 +6465,12 @@ function isHarnessPython(command) {
 	return result.status === 0;
 }
 
-export function applyHarnessSettings(config, settings = {}) {
+export function applyHarnessSettings(config, settings = {}, grants = []) {
 	settings = normalizeSettings(settings, config.theme ?? config.settings?.theme);
 	const normalized = normalizeHarnessSettings(settings);
 	const agents = {};
 	for (const [key, agent] of Object.entries(config.agents ?? {})) {
-		agents[key] = applyAgentSettings(key, agent, normalized[key] ?? {}, settings.permissions);
+		agents[key] = applyAgentSettings(key, agent, normalized[key] ?? {}, settings.permissions, grants);
 	}
 	// A harness persisted from a prior session (via /harness) becomes the default
 	// when no harness is named on the command line. Ignore stale keys.
@@ -6487,10 +6500,10 @@ function normalizeHarnessSettings(settings) {
 	return isPlainObject(settings?.agents) ? settings.agents : {};
 }
 
-function applyAgentSettings(key, agent, settings, globalPermissions) {
+function applyAgentSettings(key, agent, settings, globalPermissions, grants = []) {
 	const applied = clonePlain(agent);
 	if (!isPlainObject(settings)) {
-		applyNativePermissionSetting(key, applied, {}, globalPermissions);
+		applyNativePermissionSetting(key, applied, {}, globalPermissions, grants);
 		return applied;
 	}
 	applied.env = { ...(applied.env ?? {}), ...(settings.env ?? {}) };
@@ -6505,7 +6518,7 @@ function applyAgentSettings(key, agent, settings, globalPermissions) {
 
 	if (isPlainObject(settings.config)) command.args = applyConfigSettings(key, command.args ?? [], settings.config);
 	if (isPlainObject(settings.settings)) applyNativeSettings(key, applied, settings.settings);
-	applyNativePermissionSetting(key, applied, settings, globalPermissions);
+	applyNativePermissionSetting(key, applied, settings, globalPermissions, grants);
 	return applied;
 }
 
@@ -6541,21 +6554,24 @@ function applyNativeSettings(key, agent, settings) {
 // is inferred from native settings for back-compat. When the user expressed the
 // unified mode directly, the backend's native dialect is generated too so cc and
 // the backend never disagree. The decisioning side reads `agent._permissionMode`.
-function applyNativePermissionSetting(key, agent, settings, globalPermissions) {
+function applyNativePermissionSetting(key, agent, settings, globalPermissions, grants = []) {
 	const explicitMode =
 		normalizePermissionSettings(settings.permissions).mode ?? normalizePermissionSettings(globalPermissions).mode;
 	const mode = explicitMode ?? inferModeFromNative(key, settings);
 	if (mode) agent._permissionMode = mode;
 	if (!mode) return;
-	const native = nativePermissionConfig(key, mode);
+	// auto with any deny rule/grant must NOT use a native bypass that stops the
+	// backend asking — cc would never get to apply the denial. Gate it instead.
+	const fullSettings = { permissions: globalPermissions, agents: { [key]: { permissions: settings.permissions } } };
+	const gated = mode === "auto" && policyNeedsGating(resolvePermissionPolicy(fullSettings, key, grants));
+	const native = nativePermissionConfig(key, mode, { gated });
 	if (native.autoApprove) agent._autoPermissionRequests = true;
 	if (native.startupMode) agent._startupMode = native.startupMode;
-	// When the user chose the unified mode directly, generate the backend's native
-	// dialect AND neutralize any conflicting native auto/bypass on the same agent
-	// (e.g. unified "ask" must clear a stale codex approval_policy="never"), so cc
-	// and the backend never disagree. Pure back-compat (mode only inferred from
-	// native settings) keeps the spawn spec byte-identical — flags only.
-	if (explicitMode) applyGeneratedNativeConfig(key, agent, native);
+	// Generate the backend's native dialect when the user chose the unified mode
+	// directly (also neutralizing any conflicting native auto/bypass), OR when we
+	// must gate an inferred auto so a deny rule is actually enforceable. Pure
+	// back-compat (inferred, no gating) keeps the spawn spec byte-identical.
+	if (explicitMode || gated) applyGeneratedNativeConfig(key, agent, native);
 }
 
 // Fold engine-generated native config into the spawn spec. Generated config keys

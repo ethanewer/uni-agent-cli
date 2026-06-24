@@ -13,6 +13,7 @@ import {
 	nativePermissionConfig,
 	normalizePermissionSettings,
 	outcomeForDecision,
+	policyNeedsGating,
 	resolvePermissionPolicy,
 } from "./permissions.mjs";
 import { clonePlain, isPlainObject, stringArray } from "./util.mjs";
@@ -160,14 +161,19 @@ export class BaseAcpAdapter {
 		const mode = explicitMode ?? inferModeFromNative(this.key, settings);
 		if (mode) applied._permissionMode = mode;
 		if (!mode) return;
-		const native = nativePermissionConfig(this.key, mode);
+		// auto with a deny rule must keep the backend prompting so cc can enforce the
+		// denial — full native bypass would silence it. (Config rules only here; the
+		// host threads persisted grants into the live pi-harness path.)
+		const fullSettings = { permissions: this.globalPermissions, agents: { [this.key]: { permissions: settings.permissions } } };
+		const gated = mode === "auto" && policyNeedsGating(resolvePermissionPolicy(fullSettings, this.key, []));
+		const native = nativePermissionConfig(this.key, mode, { gated });
 		if (native.autoApprove) applied._autoPermissionRequests = true;
 		if (native.startupMode) applied._startupMode = native.startupMode;
-		// When the user chose the unified mode directly, generate the native dialect
-		// AND neutralize any conflicting native auto/bypass (e.g. unified "ask" must
-		// clear a stale codex approval_policy="never"). Pure back-compat (mode only
-		// inferred from native settings) stays byte-identical — flags only.
-		if (explicitMode) this.applyGeneratedNativeConfig(applied, native);
+		// Generate the native dialect when the user chose the unified mode directly
+		// (also neutralizing any conflicting native auto/bypass), OR when we must gate
+		// an inferred auto so a deny rule is enforceable. Pure back-compat (inferred,
+		// no gating) stays byte-identical — flags only.
+		if (explicitMode || gated) this.applyGeneratedNativeConfig(applied, native);
 	}
 
 	applyGeneratedNativeConfig(applied, native) {

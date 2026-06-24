@@ -1076,6 +1076,34 @@ assert.equal(mixed.agents.codex._permissionMode, "ask");
 assert.equal(mixed.agents.codex._autoPermissionRequests, undefined);
 assert.equal(mixed.agents.claude._autoPermissionRequests, true);
 
+// mode "auto" WITH a deny rule must NOT put the backend in a native bypass that
+// stops it asking — cc would never get to enforce the denial. Gate it: the backend
+// keeps prompting (codex on-request) with full capability (danger sandbox), and cc
+// auto-approves all but the denied tool.
+const autoDeny = applyHarnessSettings(config, {
+	permissions: { mode: "auto", rules: [{ tool: "shell", action: "deny" }] },
+});
+const adCodex = autoDeny.agents.codex.acp.args.join(" ");
+assert.ok(!adCodex.includes('approval_policy="never"'), "codex not in no-prompt bypass when a deny rule exists");
+assert.ok(adCodex.includes('approval_policy="on-request"'), "codex still prompts so cc can deny");
+assert.ok(adCodex.includes('sandbox_mode="danger-full-access"'), "codex keeps full capability");
+assert.equal(autoDeny.agents.codex._permissionMode, "auto");
+assert.equal(autoDeny.agents.codex._autoPermissionRequests, true);
+// claude is gated to default (prompting) mode, not bypass.
+assert.equal(autoDeny.agents.claude._startupMode, undefined);
+assert.deepEqual(autoDeny.agents.claude._sessionMeta, {
+	claudeCode: { options: { settings: { permissions: { defaultMode: "default" } } } },
+});
+// cursor is gated (no --force) so it prompts.
+assert.ok(!autoDeny.agents.cursor.acp.args.includes("--force"));
+// (the deny rule actually denying shell is covered by tests/permissions.test.mjs)
+
+// A PERSISTED deny grant (no config rule) also forces gating at spawn.
+const autoGrant = applyHarnessSettings(config, { permissions: { mode: "auto" } }, [{ agent: "codex", tool: "shell", action: "deny" }]);
+assert.ok(autoGrant.agents.codex.acp.args.join(" ").includes('approval_policy="on-request"'), "persisted deny grant gates auto");
+// without the grant, pure auto still uses the full bypass.
+assert.ok(applyHarnessSettings(config, { permissions: { mode: "auto" } }).agents.codex.acp.args.join(" ").includes('approval_policy="never"'));
+
 // Explicit unified "ask"/"deny" must NEUTRALIZE conflicting native auto/bypass on
 // the same agent, or cc (asking) and the backend (silently auto-running) disagree.
 const neutralized = applyHarnessSettings(config, {
