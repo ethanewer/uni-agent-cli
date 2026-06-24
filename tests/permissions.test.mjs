@@ -56,6 +56,8 @@ check("coercePermissionMode canonicalizes aliases", () => {
 	assert.equal(coercePermissionMode("off"), "deny");
 	assert.equal(coercePermissionMode("nonsense"), undefined);
 	assert.equal(coercePermissionMode(42), undefined);
+	// claude's edits-only mode must NOT be silently escalated to full auto.
+	assert.equal(coercePermissionMode("acceptEdits"), undefined);
 });
 
 // ---- rules ----------------------------------------------------------------
@@ -263,6 +265,8 @@ check("inferModeFromNative mirrors the old per-name triggers", () => {
 	assert.equal(inferModeFromNative("cursor", { args: ["--force"] }), "auto");
 	assert.equal(inferModeFromNative("cursor", { args: ["--yolo"] }), "auto");
 	assert.equal(inferModeFromNative("cursor", { args: ["--no-yolo"] }), undefined);
+	// --force in acpArgs is also detected (parity with the old final-args check)
+	assert.equal(inferModeFromNative("cursor", { acpArgs: ["--force"] }), "auto");
 	assert.equal(inferModeFromNative("opencode", { args: ["--whatever"] }), undefined);
 });
 

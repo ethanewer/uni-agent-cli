@@ -45,8 +45,9 @@ const MODE_ALIASES = {
 	"full-access": "auto",
 	allow: "auto",
 	"allow-all": "auto",
-	accept: "auto",
-	acceptedits: "auto",
+	// NOTE: claude's "acceptEdits" is deliberately NOT mapped — it is narrower than
+	// full auto, so treating it as auto would silently escalate. It falls through to
+	// the default (ask); use claude's native settings.permissions.defaultMode for it.
 	deny: "deny",
 	reject: "deny",
 	"deny-all": "deny",
@@ -345,7 +346,9 @@ export function inferModeFromNative(agentKey, agentSettings = {}) {
 		return undefined;
 	}
 	if (agentKey === "cursor") {
-		const args = stringArray(agentSettings.args ?? agentSettings.nativeArgs);
+		// Match the old check, which inspected the final command args — including
+		// acpArgs appended after the native args.
+		const args = [...stringArray(agentSettings.args ?? agentSettings.nativeArgs), ...stringArray(agentSettings.acpArgs)];
 		if (args.includes("--force") || args.includes("-f") || args.includes("--yolo")) return "auto";
 		return undefined;
 	}
