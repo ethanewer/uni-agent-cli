@@ -3,9 +3,18 @@
 // real AcpClient from pi-harness.mjs; tests inject a fake. Most harnesses are a
 // ~10-line subclass that overrides only the hooks for their niceties.
 
-import { AcpClient, autoCursorOutcome, autoPermissionOutcome } from "../pi-harness.mjs";
+import { AcpClient, autoCursorOutcome } from "../pi-harness.mjs";
 import { capabilitiesFromWire, emptyCapabilities } from "./interface.mjs";
-import { inferModeFromNative, nativePermissionConfig, normalizePermissionSettings } from "./permissions.mjs";
+import {
+	cancelledOutcome,
+	decidePermission,
+	inferModeFromNative,
+	loadGrants,
+	nativePermissionConfig,
+	normalizePermissionSettings,
+	outcomeForDecision,
+	resolvePermissionPolicy,
+} from "./permissions.mjs";
 import { clonePlain, isPlainObject, stringArray } from "./util.mjs";
 
 /** The transport contract the base adapter depends on (satisfied by AcpClient). */
@@ -261,12 +270,12 @@ export class BaseAcpAdapter {
 
 	/**
 	 * Handle a backend-initiated interactive request (e.g. cursor/ask_question,
-	 * cursor/create_plan). When auto-accept is on, resolve it with the generic
-	 * auto-outcome (mirrors pi-harness using autoCursorOutcome under _autoPermissionRequests);
-	 * otherwise route to the host for a real answer.
+	 * cursor/create_plan). When the mode auto-approves, resolve it with the generic
+	 * auto-outcome; otherwise route to the host for a real answer. (Interactive
+	 * questions have no meaningful "deny" outcome, so only auto is short-circuited.)
 	 */
 	async handleExtensionRequest(method, params) {
-		if (this.capabilities.autoApprove) return autoCursorOutcome(method, params);
+		if (this.permissionPolicy().mode === "auto") return autoCursorOutcome(method, params);
 		if (typeof this.host.requestInteraction === "function") {
 			return this.host.requestInteraction(method, params);
 		}
@@ -275,10 +284,39 @@ export class BaseAcpAdapter {
 
 	// ---- internals ------------------------------------------------------------
 
+	/**
+	 * The effective, harness-agnostic policy for this adapter: settings.permissions
+	 * (per-agent + global) + persisted grants, with the mode resolved by
+	 * applyPermissionMode (explicit > native-inferred). Grants are loaded once and
+	 * may be refreshed via setPermissionGrants() (the host owns persistence).
+	 */
+	permissionPolicy() {
+		if (!this.permissionGrants) this.permissionGrants = loadGrants();
+		const settings = {
+			permissions: this.globalPermissions,
+			agents: { [this.key]: { permissions: this.settings?.permissions } },
+		};
+		const policy = resolvePermissionPolicy(settings, this.key, this.permissionGrants);
+		policy.mode = this.launchSpec?._permissionMode ?? policy.mode;
+		return policy;
+	}
+
+	/** Refresh the persisted grants the policy draws on (host-owned store). */
+	setPermissionGrants(grants) {
+		this.permissionGrants = Array.isArray(grants) ? grants : [];
+	}
+
+	// Decide allow/deny/ask uniformly via the shared engine; only "ask" reaches the
+	// host. This mirrors pi-harness HarnessApp.resolvePermissionOutcome exactly, so
+	// moving cc onto adapters keeps identical behavior.
 	#onPermission(params) {
-		if (this.capabilities.autoApprove) return autoPermissionOutcome(params);
-		if (typeof this.host.requestPermission === "function") return this.host.requestPermission(params);
-		return { outcome: "cancelled" };
+		const policy = this.permissionPolicy();
+		const decision = decidePermission(policy, params, { agentKey: this.key });
+		if (decision.action !== "ask") return outcomeForDecision(decision);
+		if (typeof this.host.requestPermission === "function") {
+			return this.host.requestPermission(params, { agentKey: this.key, policy });
+		}
+		return cancelledOutcome();
 	}
 
 	#onConnectionEvent(event) {

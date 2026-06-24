@@ -429,6 +429,44 @@ async function main() {
 		ok("permission:manual-routed-to-host");
 	}
 
+	// The adapter decides allow/deny/ask UNIFORMLY via the engine — not just
+	// autoApprove. Locks in that deny mode and explicit rules work over the adapter
+	// path (regression guard for "moving cc onto adapters keeps behavior").
+	{
+		const options = [{ kind: "reject_once", optionId: "r" }, { kind: "allow_once", optionId: "a" }];
+		const denyHost = () => { let asked = false; return { host: { onEvent() {}, requestPermission: () => { asked = true; return { outcome: "cancelled" }; }, requestInteraction: () => undefined }, asked: () => asked }; };
+
+		// mode: deny -> actively reject without asking the host.
+		const d = denyHost();
+		const denyAdapter = createAdapter("terminus-2", CONFIGS["terminus-2"], d.host, {
+			settings: { permissions: { mode: "deny" } },
+			connectionFactory: factoryFor(PROFILES["terminus-2"]),
+		});
+		denyAdapter.setPermissionGrants([]);
+		await denyAdapter.connect();
+		const denied = await denyAdapter.connection.emitPermission({ options });
+		assert.deepEqual(denied, { outcome: "selected", optionId: "r" });
+		assert.equal(d.asked(), false);
+		ok("permission:adapter-deny-mode");
+
+		// An explicit allow rule resolves a matching tool to the NARROW allow option
+		// (no bypass escalation); a non-matching tool still asks the host.
+		const r = denyHost();
+		const ruleAdapter = createAdapter("terminus-2", CONFIGS["terminus-2"], r.host, {
+			settings: { permissions: { mode: "ask", rules: [{ tool: "Run tests", action: "allow" }] } },
+			connectionFactory: factoryFor(PROFILES["terminus-2"]),
+		});
+		ruleAdapter.setPermissionGrants([]);
+		await ruleAdapter.connect();
+		const ruled = await ruleAdapter.connection.emitPermission({ toolCall: { title: "Run tests" }, options });
+		assert.deepEqual(ruled, { outcome: "selected", optionId: "a" });
+		assert.equal(r.asked(), false);
+		const other = await ruleAdapter.connection.emitPermission({ toolCall: { title: "Delete repo" }, options });
+		assert.equal(r.asked(), true);
+		assert.deepEqual(other, { outcome: "cancelled" });
+		ok("permission:adapter-rule-narrow-and-ask");
+	}
+
 	// auto-accept must ALSO cover interactive cursor prompts (ask_question /
 	// create_plan) — the YOLO-mode behavior, not just tool permissions.
 	{

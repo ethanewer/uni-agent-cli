@@ -122,9 +122,12 @@ export function normalizePermissionSettings(raw) {
 }
 
 /**
- * Resolve the effective policy for one harness. Per-agent mode wins over global;
- * rules stack (grants first so a user can override a persisted grant in config,
- * then global, then per-agent). `grants` are persisted "always" decisions.
+ * Resolve the effective policy for one harness. Per-agent mode wins over global.
+ * Rules are matched first-match-wins (see matchRule), so order is precedence:
+ * explicit config rules (most-specific first: per-agent, then global) come BEFORE
+ * persisted grants, so a user can override a remembered "always" decision in
+ * config (e.g. a deny rule beats a stored allow). `grants` are persisted
+ * "always" decisions, the least authoritative layer.
  */
 export function resolvePermissionPolicy(settings = {}, agentKey, grants = []) {
 	const global = normalizePermissionSettings(settings.permissions);
@@ -135,7 +138,7 @@ export function resolvePermissionPolicy(settings = {}, agentKey, grants = []) {
 	return {
 		mode,
 		remember,
-		rules: [...grantRules, ...global.rules, ...perAgent.rules],
+		rules: [...perAgent.rules, ...global.rules, ...grantRules],
 	};
 }
 
@@ -216,7 +219,11 @@ export function decidePermission(policy = {}, params = {}, ctx = {}) {
 	const rule = matchRule(policy.rules ?? [], info, ctx.agentKey);
 	if (rule) {
 		if (rule.action === "deny") return { action: "deny", optionId: pickDenyOption(info.options)?.optionId, rule };
-		return { action: "allow", optionId: pickAllowOption(info.options, { broad: true })?.optionId, rule };
+		// A scoped allow rule/grant authorizes only THIS tool: answer with the
+		// narrowest allow option so the backend keeps asking about everything else.
+		// cc itself enforces the "always" via the persisted rule. (The user can
+		// still pick a broad option directly in an interactive prompt.)
+		return { action: "allow", optionId: pickAllowOption(info.options)?.optionId, rule };
 	}
 	if (policy.mode === "auto") return { action: "allow", optionId: pickAllowOption(info.options)?.optionId };
 	if (policy.mode === "deny") return { action: "deny", optionId: pickDenyOption(info.options)?.optionId };

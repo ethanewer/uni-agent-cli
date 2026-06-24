@@ -102,8 +102,8 @@ check("resolvePermissionPolicy: per-agent overrides global, rules stack", () => 
 	};
 	const codex = resolvePermissionPolicy(settings, "codex", [{ tool: "ls", action: "allow" }]);
 	assert.equal(codex.mode, "auto");
-	// grants first, then global, then per-agent
-	assert.deepEqual(codex.rules.map((r) => r.tool), ["ls", "read", "write"]);
+	// precedence (first-match-wins): per-agent, then global, then persisted grants
+	assert.deepEqual(codex.rules.map((r) => r.tool), ["write", "read", "ls"]);
 
 	const other = resolvePermissionPolicy(settings, "claude");
 	assert.equal(other.mode, "ask"); // falls back to global
@@ -174,12 +174,21 @@ check("decidePermission deny mode denies", () => {
 	assert.equal(decision.optionId, "reject");
 });
 
-check("decidePermission rule overrides mode and uses broad allow", () => {
+check("decidePermission allow rule overrides mode but stays narrow (no bypass escalation)", () => {
 	const policy = { mode: "ask", rules: [{ tool: "run tests", action: "allow" }] };
 	const decision = decidePermission(policy, params(ALWAYS_OPTIONS), { agentKey: "claude" });
 	assert.equal(decision.action, "allow");
-	// remembered grants sync the backend with a broad option when available
-	assert.equal(decision.optionId, "bypassPermissions");
+	// A scoped allow rule must NOT answer with the backend-wide bypass option.
+	assert.equal(decision.optionId, "allow-once");
+	assert.notEqual(decision.optionId, "bypassPermissions");
+});
+
+check("config deny rule overrides a persisted allow grant", () => {
+	const settings = { agents: { codex: { permissions: { rules: [{ tool: "Read", action: "deny" }] } } } };
+	const grants = [{ agent: "codex", tool: "read", action: "allow" }];
+	const policy = resolvePermissionPolicy(settings, "codex", grants);
+	const decision = decidePermission(policy, { toolCall: { title: "Read" }, options: FAKE_OPTIONS }, { agentKey: "codex" });
+	assert.equal(decision.action, "deny");
 });
 
 check("decidePermission deny rule overrides auto mode", () => {
