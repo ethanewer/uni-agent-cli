@@ -133,6 +133,17 @@ check("resolvePermissionPolicy: grants scoped to other agents are dropped", () =
 	assert.equal(policy.rules.length, 0);
 });
 
+check("resolvePermissionPolicy: CONFIG rules scoped to other agents are dropped too", () => {
+	// a global rule scoped to codex must not appear (or gate) for claude
+	const settings = { permissions: { mode: "auto", rules: [{ agent: "codex", tool: "shell", action: "deny" }] } };
+	const claude = resolvePermissionPolicy(settings, "claude");
+	assert.equal(claude.rules.length, 0);
+	assert.equal(policyNeedsGating(claude), false);
+	const codex = resolvePermissionPolicy(settings, "codex");
+	assert.deepEqual(codex.rules, [{ agent: "codex", tool: "shell", action: "deny" }]);
+	assert.equal(policyNeedsGating(codex), true);
+});
+
 // ---- request inspection + classification ----------------------------------
 
 check("permissionRequestInfo extracts tool name/kind/options", () => {

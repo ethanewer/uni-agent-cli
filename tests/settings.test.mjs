@@ -1107,6 +1107,14 @@ assert.deepEqual(autoDeny.agents.claude._sessionMeta, {
 assert.ok(!autoDeny.agents.cursor.acp.args.includes("--force"));
 // (the deny rule actually denying shell is covered by tests/permissions.test.mjs)
 
+// A deny rule scoped to ANOTHER agent must NOT gate unrelated harnesses: claude
+// keeps its full native bypass when only codex has a deny rule.
+const scopedDeny = applyHarnessSettings(config, {
+	permissions: { mode: "auto", rules: [{ agent: "codex", tool: "shell", action: "deny" }] },
+});
+assert.equal(scopedDeny.agents.claude._startupMode, "bypassPermissions"); // claude NOT gated
+assert.ok(scopedDeny.agents.codex.acp.args.join(" ").includes('approval_policy="on-request"')); // codex IS gated
+
 // A PERSISTED deny grant (no config rule) also forces gating at spawn.
 const autoGrant = applyHarnessSettings(config, { permissions: { mode: "auto" } }, [{ agent: "codex", tool: "shell", action: "deny" }]);
 assert.ok(autoGrant.agents.codex.acp.args.join(" ").includes('approval_policy="on-request"'), "persisted deny grant gates auto");

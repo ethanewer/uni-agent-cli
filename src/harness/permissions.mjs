@@ -148,11 +148,15 @@ export function resolvePermissionPolicy(settings = {}, agentKey, grants = []) {
 	// `remember` resolves independently of `mode`: a per-agent `remember:false`
 	// disables persistence even when only the global block sets `mode`.
 	const remember = perAgent.remember ?? global.remember ?? true;
-	const grantRules = normalizeRules(grants).filter((rule) => !rule.agent || rule.agent === agentKey);
+	// Keep ONLY rules that can apply to this agent (no agent scope, or scoped to it).
+	// This must hold for config rules too, not just grants: otherwise a global rule
+	// scoped to another agent (e.g. {agent:"codex",...}) would still count toward
+	// gating/decisions for unrelated harnesses even though it can never match.
+	const applies = (rule) => !rule.agent || rule.agent === agentKey;
 	return {
 		mode,
 		remember,
-		rules: [...perAgent.rules, ...global.rules, ...grantRules],
+		rules: [...perAgent.rules.filter(applies), ...global.rules.filter(applies), ...normalizeRules(grants).filter(applies)],
 	};
 }
 

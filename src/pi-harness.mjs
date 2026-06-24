@@ -3594,11 +3594,16 @@ export class HarnessApp {
 		this.runtimePermissionMode.set(agentKey, next);
 		const label = next === "auto" ? "auto-approve ON" : next === "deny" ? "auto-deny ON" : "ask on every request";
 		this.addNotice(`Permissions for ${agentKey}: ${label}`);
-		// A backend spawned in auto/bypass (its native config) emits no permission
-		// requests, so tightening cc's mode at runtime cannot retroactively gate it.
-		// Be honest: a fresh session is needed for a stricter mode to fully apply.
+		// A backend spawned in native auto/bypass (its process-level config) emits no
+		// permission requests, so cc has nothing to gate at runtime. /new reuses the
+		// same process + spawn args, so it does NOT make a stricter mode enforceable.
+		// Be honest: only re-launching with the mode in settings re-spawns the backend
+		// in a prompting configuration.
 		if (next !== "auto" && agent?._permissionMode === "auto") {
-			this.addNotice(`${agentKey} was started in auto mode — run /new for ${next} to fully apply to the backend.`);
+			this.addNotice(
+				`Note: ${agentKey} was launched in auto mode and won't emit requests to gate this session. ` +
+					`Set "permissions" for ${agentKey} in settings.json and restart cc to fully enforce ${next}.`,
+			);
 		}
 		this.ui.requestRender();
 	}
@@ -3609,8 +3614,12 @@ export class HarnessApp {
 		const arg = oneLine(argument).toLowerCase();
 		const agentKey = this.activeKey;
 		if (arg === "clear") {
-			this.permissionGrants = forgetGrants(() => true);
-			this.addNotice("Cleared all remembered permission grants.");
+			try {
+				this.permissionGrants = forgetGrants(() => true);
+				this.addNotice("Cleared all remembered permission grants.");
+			} catch (error) {
+				this.addNotice(`Could not clear permission grants: ${error.message ?? error}`);
+			}
 			this.ui.requestRender();
 			return;
 		}
@@ -4325,12 +4334,18 @@ export class HarnessApp {
 	}
 
 	// Record a user's "always" choice as a persistent, harness-agnostic grant.
+	// Best-effort: a failed store write must NOT prevent the backend reply, or the
+	// permission request would hang and the queue stall.
 	rememberPermissionChoice(agentKey, params, option) {
 		const tool = permissionRequestInfo(params).toolName;
 		if (!tool || !option?.optionId) return;
 		const action = classifyOption(option) === "deny" ? "deny" : "allow";
-		this.permissionGrants = recordGrant({ agent: agentKey, tool, action });
-		this.addNotice(`Remembered: ${action === "deny" ? "deny" : "allow"} "${oneLine(tool)}" for ${agentKey} (see /permissions)`);
+		try {
+			this.permissionGrants = recordGrant({ agent: agentKey, tool, action });
+			this.addNotice(`Remembered: ${action === "deny" ? "deny" : "allow"} "${oneLine(tool)}" for ${agentKey} (see /permissions)`);
+		} catch (error) {
+			this.addNotice(`Could not save permission grant: ${error.message ?? error}`);
+		}
 	}
 
 	requestPermission(params = {}, context = {}) {
@@ -4420,14 +4435,14 @@ export class HarnessApp {
 			settled = true;
 			this.closeMenu();
 			const option = entry?.value;
+			const remember = option?.optionId && isAlwaysOption(option) && context.policy?.remember !== false;
+			// Reply to the backend FIRST, so nothing (including a store write) can leave
+			// the request hanging. When cc records the "always" itself, answer with only
+			// a one-time decision (narrowest same-direction option) so the backend does
+			// not ALSO persist it — otherwise /permissions clear couldn't fully revoke.
 			if (!option?.optionId) {
 				resolve(cancelledOutcome());
-			} else if (isAlwaysOption(option) && context.policy?.remember !== false) {
-				// cc OWNS this "always": record the grant, but answer the backend with
-				// only a one-time decision (the narrowest same-direction option) so the
-				// backend does not ALSO persist it — otherwise /permissions clear could
-				// not fully revoke. Fall back to the picked option if no narrower one.
-				this.rememberPermissionChoice(context.agentKey, params, option);
+			} else if (remember) {
 				const once = classifyOption(option) === "deny" ? pickDenyOption(options) : pickAllowOption(options);
 				resolve(selectedOutcome((once ?? option).optionId));
 			} else {
@@ -4435,6 +4450,8 @@ export class HarnessApp {
 			}
 			this.permissionPromptActive = false;
 			this.drainPermissionQueue();
+			// Persistence is best-effort and happens after the reply.
+			if (remember) this.rememberPermissionChoice(context.agentKey, params, option);
 		};
 		this.openSelection(permissionTitle(params), entries, finish, { emptyText: "No permission options" });
 	}
