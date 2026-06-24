@@ -173,10 +173,12 @@ Numbered for reference; severity in brackets.
 
 ### Maintainability
 
-17. **[med] `pi-harness.mjs` contains a literal `\0` byte** (line 4456, a map-key
-    separator `` `${this.activeKey}\0…` ``). It makes `grep`/`ripgrep` treat the
-    file as binary and **silently skip it** — a real impediment to auditing the
-    permission code (hit immediately during this audit; use `rg -a`).
+17. **[med] `pi-harness.mjs` contained a literal `\0` byte** (an autocomplete
+    cache-key separator `` `${this.activeKey}\0…` ``). It made `grep`/`ripgrep`
+    treat the file as binary and **silently skip it** — a real impediment to
+    auditing the permission code (hit immediately during this audit; needed `rg -a`).
+    *Resolved in this branch:* the separator is now a `\t`, so the file reads as
+    plain text to `rg`/`grep`.
 
 18. **[low] Ad-hoc underscore-prefixed properties** (`_autoPermissionRequests`,
     `_startupMode`, `_sessionMeta`) are stuffed onto the agent-config object and

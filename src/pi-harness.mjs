@@ -4570,7 +4570,7 @@ export class HarnessApp {
 		// Rebuilding the provider tears down any open autocomplete popup, so skip
 		// it when the effective command set is unchanged (a frequent no-op on
 		// every config/mode/session-info update while the user is mid-type).
-		const key = `${this.activeKey} ${JSON.stringify(commands.map((command) => [command.name, command.description, command.argumentHint]))}`;
+		const key = `${this.activeKey}\t${JSON.stringify(commands.map((command) => [command.name, command.description, command.argumentHint]))}`;
 		if (key === this.lastAutocompleteKey) return;
 		this.lastAutocompleteKey = key;
 		this.editor.setAutocompleteProvider(new LazyCombinedAutocompleteProvider(commands, process.cwd(), null));
