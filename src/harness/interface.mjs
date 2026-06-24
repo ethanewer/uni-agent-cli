@@ -114,7 +114,7 @@ export function checkAdapterConformance(adapter) {
 		for (const key of Object.keys(caps)) {
 			if (!CAPABILITY_KEYS.includes(key)) problems.push(`unknown capability key: ${key}`);
 		}
-		if (!["boolean"].includes(typeof caps.fork) && !["native", "copy"].includes(caps.fork) && caps.fork !== false) {
+		if (caps.fork !== false && caps.fork !== "native" && caps.fork !== "copy") {
 			problems.push("`fork` must be false | 'native' | 'copy'");
 		}
 		if (!Array.isArray(caps.commandPresets)) problems.push("`commandPresets` must be an array");

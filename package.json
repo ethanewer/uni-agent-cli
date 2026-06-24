@@ -10,6 +10,8 @@
     "src/cc",
     "src/cc.mjs",
     "src/pi-harness.mjs",
+    "src/harness/**/*.mjs",
+    "src/harness/**/*.md",
     "src/harnesses/**/*.py",
     "src/harnesses/**/*.txt",
     "scripts/postinstall.mjs",

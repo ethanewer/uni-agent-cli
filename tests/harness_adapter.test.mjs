@@ -19,7 +19,7 @@ import os from "node:os";
 import path from "node:path";
 import { applyHarnessSettings } from "../src/pi-harness.mjs";
 import { BaseAcpAdapter } from "../src/harness/acp-base.mjs";
-import { assertAdapterConformance, REQUIRED_METHODS } from "../src/harness/interface.mjs";
+import { assertAdapterConformance, checkAdapterConformance, emptyCapabilities, REQUIRED_METHODS } from "../src/harness/interface.mjs";
 import { ADAPTER_REGISTRY, createAdapter, registerAdapter } from "../src/harness/registry.mjs";
 import { armUnsend, canUnsend, dispatchSlashCommand, openSideThread } from "../src/harness/host-example.mjs";
 
@@ -208,6 +208,18 @@ async function main() {
 		assert.equal(new Set(surfaces).size, 1, "all adapters expose the identical required interface");
 		ok("single-interface:uniform-surface");
 	}
+	// conformance must reject an invalid fork value (true is not false|native|copy).
+	{
+		const required = {};
+		for (const m of REQUIRED_METHODS) required[m] = () => {};
+		const bogus = { key: "bogus", label: "Bogus", capabilities: { ...emptyCapabilities(), fork: true }, fork: () => {}, ...required };
+		const report = checkAdapterConformance(bogus);
+		assert.equal(report.ok, false);
+		assert.ok(report.problems.some((p) => p.toLowerCase().includes("fork")), "fork:true must be rejected");
+		const good = { key: "good", label: "Good", capabilities: { ...emptyCapabilities(), fork: "native" }, fork: () => {}, ...required };
+		assert.equal(checkAdapterConformance(good).ok, true);
+		ok("conformance:fork-value-validated");
+	}
 
 	// =====================================================================
 	// (2a) NO FEATURES LOST — capability gating matches the audit.
@@ -233,6 +245,18 @@ async function main() {
 	assert.deepEqual(createAdapter("codex", CONFIGS.codex, noopHost(), { connectionFactory: factoryFor(PROFILES.codex) }).capabilities.commandPresets, ["review"]);
 	assert.deepEqual(createAdapter("terminus-2", CONFIGS["terminus-2"], noopHost(), { connectionFactory: factoryFor(PROFILES["terminus-2"]) }).capabilities.commandPresets, []);
 	ok("capabilities:commandPresets");
+	// pre-connect capabilities expose the DECLARED subset (contract): codex unsend is
+	// declared true before connect, then narrowed to the live wire identity after.
+	{
+		const codex = createAdapter("codex", CONFIGS.codex, noopHost(), { connectionFactory: factoryFor(PROFILES.codex) });
+		assert.equal(codex.capabilities.retractPrompt, true); // declared, pre-connect
+		const impostorProfile = { agentInfo: { name: "not-codex-acp" }, capabilities: { loadSession: true, sessionCapabilities: { list: {}, resume: {} } }, configOptions: [] };
+		const impostor = createAdapter("codex", CONFIGS.codex, noopHost(), { connectionFactory: factoryFor(impostorProfile) });
+		assert.equal(impostor.capabilities.retractPrompt, true); // still declared pre-connect
+		await impostor.connect();
+		assert.equal(impostor.capabilities.retractPrompt, false); // narrowed by live wire identity
+		ok("capabilities:codex-retract-preconnect-then-wire-gated");
+	}
 
 	// =====================================================================
 	// (2b) NO FEATURES LOST — native-settings translation is byte-identical

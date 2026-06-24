@@ -14,10 +14,12 @@ export class CodexAdapter extends BaseAcpAdapter {
 	}
 
 	// Unsend is only safe against the real codex-acp backend (matches isCodexAcpActive:
-	// agentInfo.name === "codex-acp"). Pointing the codex key at another bridge keeps
-	// it off, rather than advertising a feature that backend can't honor.
+	// agentInfo.name === "codex-acp"). Narrow only once connected to a live backend;
+	// pre-connect, keep the declared capability (the contract says pre-connect caps
+	// expose the declared subset). Pointing the codex key at another bridge then keeps
+	// unsend off rather than advertising a feature that backend can't honor.
 	refineCapabilities(caps) {
-		caps.retractPrompt = this.connection?.agentInfo?.name === "codex-acp";
+		if (this.connection) caps.retractPrompt = this.connection.agentInfo?.name === "codex-acp";
 		return caps;
 	}
 
