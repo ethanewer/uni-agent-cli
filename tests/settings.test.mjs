@@ -1050,6 +1050,23 @@ assert.deepEqual(unified.agents.cursor.acp.args, ["--force", "acp"]);
 assert.equal(unified.agents["terminus-2"]._permissionMode, "auto");
 assert.equal(unified.agents["terminus-2"]._autoPermissionRequests, true);
 
+// Unified `mode: auto` must OVERRIDE a conflicting/stale Codex native config so cc
+// and the backend agree (regression: generated keys used to be skipped if present).
+const conflicting = applyHarnessSettings(config, {
+	permissions: { mode: "auto" },
+	agents: { codex: { config: { approval_policy: "on-request", sandbox_mode: "workspace-write", model: "gpt-5" } } },
+});
+const codexArgs = conflicting.agents.codex.acp.args.join(" ");
+assert.ok(!codexArgs.includes('approval_policy="on-request"'), "stale approval_policy removed");
+assert.ok(!codexArgs.includes('sandbox_mode="workspace-write"'), "stale sandbox_mode removed");
+assert.ok(codexArgs.includes('approval_policy="never"'), "generated approval_policy wins");
+assert.ok(codexArgs.includes('sandbox_mode="danger-full-access"'), "generated sandbox_mode wins");
+assert.ok(codexArgs.includes('model="gpt-5"'), "unrelated config keys preserved");
+// Each overridden key appears exactly once.
+assert.equal((codexArgs.match(/approval_policy=/g) || []).length, 1);
+assert.equal((codexArgs.match(/sandbox_mode=/g) || []).length, 1);
+assert.equal(conflicting.agents.codex._autoPermissionRequests, true);
+
 // Per-agent mode overrides the global default.
 const mixed = applyHarnessSettings(config, {
 	permissions: { mode: "auto" },

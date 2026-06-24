@@ -22,6 +22,21 @@ export function defaultConnectionFactory(agent, onEvent, options) {
 	return new AcpClient(agent, onEvent, options);
 }
 
+/** Remove every `-c name=...` pair whose name is in `names` (codex `-c` form). */
+function stripConfigArgs(args, names) {
+	const drop = names.map((name) => `${name}=`);
+	const next = [];
+	for (let index = 0; index < args.length; index++) {
+		const value = args[index + 1];
+		if (args[index] === "-c" && typeof value === "string" && drop.some((prefix) => value.startsWith(prefix))) {
+			index++;
+			continue;
+		}
+		next.push(args[index]);
+	}
+	return next;
+}
+
 /**
  * The /review preset picker. Generic: any backend advertising review +
  * review-branch + review-commit gets it (matching the current
@@ -156,7 +171,12 @@ export class BaseAcpAdapter {
 	applyGeneratedNativeConfig(applied, native) {
 		const command = applied.acp ?? applied;
 		if (native.settings) this.translateNativeSettings(applied, native.settings);
-		if (native.config) command.args = this.translateConfig(command.args ?? [], native.config);
+		if (native.config) {
+			// Drop any existing `-c key=...` the user set so the generated (auto)
+			// values win, then let the harness's own translateConfig append them.
+			command.args = stripConfigArgs(command.args ?? [], Object.keys(native.config));
+			command.args = this.translateConfig(command.args, native.config);
+		}
 		if (Array.isArray(native.args) && native.args.length > 0) {
 			const existing = command.args ?? [];
 			const missing = native.args.filter((arg) => !existing.includes(arg));

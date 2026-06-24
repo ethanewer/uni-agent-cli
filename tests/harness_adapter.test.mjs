@@ -295,6 +295,23 @@ async function main() {
 	assert.deepEqual(settingsConfig.agents.cursor.acp.args, ["acp"]);
 	ok("settings-equivalence:no-mutation");
 
+	// Unified `mode: auto` overrides a conflicting/stale Codex native config on the
+	// adapter path too (parity with applyHarnessSettings).
+	{
+		const codex = createAdapter("codex", CONFIGS.codex, noopHost(), {
+			settings: { permissions: { mode: "auto" }, config: { approval_policy: "on-request", model: "gpt-5" } },
+			connectionFactory: factoryFor(PROFILES.codex),
+		});
+		const args = codex.launchSpec.acp.args.join(" ");
+		assert.ok(!args.includes('approval_policy="on-request"'), "stale approval_policy removed (adapter)");
+		assert.ok(args.includes('approval_policy="never"'), "generated approval_policy wins (adapter)");
+		assert.ok(args.includes('sandbox_mode="danger-full-access"'), "generated sandbox_mode added (adapter)");
+		assert.ok(args.includes('model="gpt-5"'), "unrelated config preserved (adapter)");
+		assert.equal((args.match(/approval_policy=/g) || []).length, 1);
+		assert.equal(codex.capabilities.autoApprove, true);
+		ok("settings-equivalence:unified-auto-overrides-codex");
+	}
+
 	// =====================================================================
 	// (2c) NO FEATURES LOST — the per-harness branches collapse into uniform
 	//      adapter calls (cc connects to the interface, names no harness).

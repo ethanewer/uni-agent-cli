@@ -6557,16 +6557,16 @@ function applyNativePermissionSetting(key, agent, settings, globalPermissions) {
 	if (explicitMode === "auto") applyGeneratedNativeConfig(key, agent, native);
 }
 
-// Fold engine-generated native config into the spawn spec, skipping anything the
-// user already supplied so nothing is duplicated.
+// Fold engine-generated native config into the spawn spec. Generated config keys
+// OVERRIDE any conflicting user value (an explicit unified `mode: auto` must win,
+// or cc and the backend would disagree); generated args are de-duplicated.
 function applyGeneratedNativeConfig(key, agent, native) {
 	const command = agent.acp ?? agent;
 	if (native.settings) applyNativeSettings(key, agent, native.settings);
 	if (native.config) {
-		const args = command.args ?? [];
+		let args = command.args ?? [];
 		for (const [name, value] of Object.entries(native.config)) {
-			if (configArgPresent(args, name)) continue;
-			args.push("-c", `${name}=${tomlValue(value)}`);
+			args = overrideConfigArg(args, name, value);
 		}
 		command.args = args;
 	}
@@ -6577,8 +6577,19 @@ function applyGeneratedNativeConfig(key, agent, native) {
 	}
 }
 
-function configArgPresent(args, name) {
-	return args.some((arg, index) => args[index - 1] === "-c" && typeof arg === "string" && arg.startsWith(`${name}=`));
+// Force a generated `-c name=value`: drop any existing `-c name=...` pair (so a
+// stale user value cannot win over an explicit unified auto), then append it.
+function overrideConfigArg(args, name, value) {
+	const next = [];
+	for (let index = 0; index < args.length; index++) {
+		if (args[index] === "-c" && typeof args[index + 1] === "string" && args[index + 1].startsWith(`${name}=`)) {
+			index++;
+			continue;
+		}
+		next.push(args[index]);
+	}
+	next.push("-c", `${name}=${tomlValue(value)}`);
+	return next;
 }
 
 function insertArgsBefore(baseArgs, marker, inserted) {
