@@ -177,6 +177,11 @@ export class BaseAcpAdapter {
 		const native = nativePermissionConfig(this.key, mode, { gated });
 		if (native.autoApprove) applied._autoPermissionRequests = true;
 		if (native.startupMode) applied._startupMode = native.startupMode;
+		// Mark a genuine native-bypass launch (non-gated auto on a harness that has a
+		// bypass dialect) so the host can tell when a runtime tighten needs a respawn.
+		if (mode === "auto" && !gated && (native.startupMode || native.config || native.args)) {
+			applied._nativeBypass = true;
+		}
 		// Generate the native dialect when the user chose the unified mode directly
 		// (also neutralizing any conflicting native auto/bypass), OR when we must gate
 		// an inferred auto so a deny rule is enforceable. Pure back-compat (inferred,

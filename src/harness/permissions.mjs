@@ -309,7 +309,12 @@ export function decidePermission(policy = {}, params = {}, ctx = {}) {
 			: policy.rules ?? [];
 	const rule = matchRule(candidates, info, ctx.agentKey);
 	if (rule) {
-		if (rule.action === "deny") return { action: "deny", optionId: pickDenyOption(info.options)?.optionId, rule };
+		// Automatic denials, like automatic allows, must not select a persistent
+		// (reject_always) option — that would create backend-owned state cc can't
+		// revoke. Use a one-time reject; if none exists, cancel (also a denial, but
+		// nothing persists). cancel happens via outcomeForDecision when optionId is
+		// undefined.
+		if (rule.action === "deny") return { action: "deny", optionId: pickNonPersistentDenyOption(info.options)?.optionId, rule };
 		// A scoped allow rule/grant authorizes only THIS tool with a NON-persistent
 		// option, so the backend keeps asking about everything else and does not
 		// persist a broad grant (cc owns "always" via its store). If the backend
@@ -318,7 +323,7 @@ export function decidePermission(policy = {}, params = {}, ctx = {}) {
 		return autoAllowDecision(info, { rule });
 	}
 	if (policy.mode === "auto") return autoAllowDecision(info);
-	if (policy.mode === "deny") return { action: "deny", optionId: pickDenyOption(info.options)?.optionId };
+	if (policy.mode === "deny") return { action: "deny", optionId: pickNonPersistentDenyOption(info.options)?.optionId };
 	return { action: "ask" };
 }
 

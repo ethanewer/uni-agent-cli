@@ -295,6 +295,22 @@ check("mode auto with no allow option resolves to cancel (nothing to approve)", 
 	assert.deepEqual(outcomeForDecision(decision), { outcome: "cancelled" });
 });
 
+check("auto-deny never sends a persistent reject_always (cancels instead)", () => {
+	const onlyAlwaysReject = [{ kind: "reject_always", optionId: "ra" }, { kind: "allow_once", optionId: "a" }];
+	// mode deny: a one-time reject is unavailable -> cancel (a denial that persists nothing)
+	const modeDecision = decidePermission({ mode: "deny", rules: [] }, params(onlyAlwaysReject), { agentKey: "claude" });
+	assert.equal(modeDecision.action, "deny");
+	assert.deepEqual(outcomeForDecision(modeDecision), { outcome: "cancelled" });
+	// deny rule, same: never forwards reject_always
+	const rulePolicy = { mode: "ask", rules: [{ tool: "run tests", action: "deny" }] };
+	const ruleDecision = decidePermission(rulePolicy, params(onlyAlwaysReject), { agentKey: "claude" });
+	assert.notEqual(ruleDecision.optionId, "ra");
+	assert.deepEqual(outcomeForDecision(ruleDecision), { outcome: "cancelled" });
+	// when a one-time reject IS offered, it is used
+	const withOnce = decidePermission({ mode: "deny", rules: [] }, params(FAKE_OPTIONS), { agentKey: "claude" });
+	assert.equal(withOnce.optionId, "reject");
+});
+
 check("outcomeForDecision builds wire shapes", () => {
 	assert.deepEqual(outcomeForDecision({ action: "allow", optionId: "allow" }), { outcome: "selected", optionId: "allow" });
 	assert.deepEqual(outcomeForDecision({ action: "allow" }), { outcome: "cancelled" });

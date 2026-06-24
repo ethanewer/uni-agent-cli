@@ -3596,12 +3596,12 @@ export class HarnessApp {
 		this.runtimePermissionMode.set(agentKey, next);
 		const label = next === "auto" ? "auto-approve ON" : next === "deny" ? "auto-deny ON" : "ask on every request";
 		this.addNotice(`Permissions for ${agentKey}: ${label}`);
-		// A backend spawned in native auto/bypass (its process-level config) emits no
-		// permission requests, so cc has nothing to gate at runtime. /new reuses the
-		// same process + spawn args, so it does NOT make a stricter mode enforceable.
-		// Be honest: only re-launching with the mode in settings re-spawns the backend
-		// in a prompting configuration.
-		if (next !== "auto" && agent?._permissionMode === "auto") {
+		// Only a genuine native-bypass launch can't be tightened at runtime: it emits
+		// no permission requests, and /new reuses the same process + spawn args. Gated
+		// auto and generic harnesses keep prompting, so /yolo ask|deny DOES take effect
+		// for them — don't warn there. Be honest: only re-launching with the mode in
+		// settings re-spawns a native-bypass backend in a prompting configuration.
+		if (next !== "auto" && agent?._nativeBypass) {
 			this.addNotice(
 				`Note: ${agentKey} was launched in auto mode and won't emit requests to gate this session. ` +
 					`Set "permissions" for ${agentKey} in settings.json and restart cc to fully enforce ${next}.`,
@@ -4458,21 +4458,21 @@ export class HarnessApp {
 			settled = true;
 			this.closeMenu();
 			const option = entry?.value;
-			const wantsAlways = option?.optionId && isAlwaysOption(option) && context.policy?.remember !== false;
-			// When the user asks to remember an "always" choice, cc wants to OWN the
-			// persistence: reply to the backend with only a one-time (non-persistent)
-			// option so the backend does not ALSO persist it, and record cc's grant. If
-			// the backend offers no non-persistent option in that direction, cc cannot
-			// own it — honor the user's pick (forward the persistent option) but DON'T
-			// record a grant we couldn't actually revoke; tell the user the backend owns it.
+			// An "always" pick should never make BOTH cc and the backend persist it.
+			// cc downgrades the backend reply to a one-time (non-persistent) option so
+			// the backend doesn't persist, and records its own grant ONLY when
+			// remembering is enabled (so remember:false truly persists nothing). If the
+			// backend offers no non-persistent option in that direction, cc can't own
+			// it — honor the user's pick but DON'T record a grant it couldn't revoke,
+			// and tell the user the backend owns it.
 			let toRemember = null;
 			if (!option?.optionId) {
 				resolve(cancelledOutcome());
-			} else if (wantsAlways) {
+			} else if (isAlwaysOption(option)) {
 				const once = nonPersistentSameDirection(option, options);
 				if (once) {
 					resolve(selectedOutcome(once.optionId));
-					toRemember = option;
+					if (context.policy?.remember !== false) toRemember = option;
 				} else {
 					resolve(selectedOutcome(option.optionId));
 					this.addNotice(
@@ -6625,6 +6625,13 @@ function applyNativePermissionSetting(key, agent, settings, globalPermissions, g
 	const native = nativePermissionConfig(key, mode, { gated });
 	if (native.autoApprove) agent._autoPermissionRequests = true;
 	if (native.startupMode) agent._startupMode = native.startupMode;
+	// True iff the backend is launched in a real native bypass (no prompts): non-
+	// gated auto on a harness that has a bypass dialect. Gated auto keeps prompting,
+	// and generic harnesses have no bypass, so for those a runtime /yolo tighten
+	// DOES take effect — only set this for the genuine can't-tighten-at-runtime case.
+	if (mode === "auto" && !gated && (native.startupMode || native.config || native.args)) {
+		agent._nativeBypass = true;
+	}
 	// Generate the backend's native dialect when the user chose the unified mode
 	// directly (also neutralizing any conflicting native auto/bypass), OR when we
 	// must gate an inferred auto so a deny rule is actually enforceable. Pure

@@ -1107,6 +1107,19 @@ assert.deepEqual(autoDeny.agents.claude._sessionMeta, {
 assert.ok(!autoDeny.agents.cursor.acp.args.includes("--force"));
 // (the deny rule actually denying shell is covered by tests/permissions.test.mjs)
 
+// _nativeBypass marks a genuine no-prompt launch (so /yolo knows a runtime tighten
+// needs a respawn). Non-gated auto on a bypass-capable harness -> true; gated auto
+// and generic harnesses keep prompting -> not set.
+const bypassFlags = applyHarnessSettings(config, { permissions: { mode: "auto" } });
+assert.equal(bypassFlags.agents.claude._nativeBypass, true);
+assert.equal(bypassFlags.agents.codex._nativeBypass, true);
+assert.equal(bypassFlags.agents.cursor._nativeBypass, true);
+assert.equal(bypassFlags.agents["terminus-2"]._nativeBypass, undefined); // generic: no native bypass
+const gatedFlags = applyHarnessSettings(config, { permissions: { mode: "auto", rules: [{ tool: "shell", action: "deny" }] } });
+assert.equal(gatedFlags.agents.codex._nativeBypass, undefined); // gated keeps prompting
+const askFlags = applyHarnessSettings(config, { permissions: { mode: "ask" } });
+assert.equal(askFlags.agents.codex._nativeBypass, undefined);
+
 // A deny rule scoped to ANOTHER agent must NOT gate unrelated harnesses: claude
 // keeps its full native bypass when only codex has a deny rule.
 const scopedDeny = applyHarnessSettings(config, {

@@ -12,13 +12,16 @@ fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PERSIST_SESSION="cc-permission-persist-$$"
 YOLO_SESSION="cc-permission-yolo-$$"
+REMEMBER_OFF_SESSION="cc-permission-remember-off-$$"
 PERMS_FILE="$(mktemp -t cc-perms-XXXXXX.json)"
-rm -f "$PERMS_FILE"
+REMEMBER_OFF_PERMS="$(mktemp -t cc-perms-roff-XXXXXX.json)"
+rm -f "$PERMS_FILE" "$REMEMBER_OFF_PERMS"
 
 cleanup() {
 	tmux kill-session -t "$PERSIST_SESSION" >/dev/null 2>&1 || true
 	tmux kill-session -t "$YOLO_SESSION" >/dev/null 2>&1 || true
-	rm -f "$PERMS_FILE"
+	tmux kill-session -t "$REMEMBER_OFF_SESSION" >/dev/null 2>&1 || true
+	rm -f "$PERMS_FILE" "$REMEMBER_OFF_PERMS"
 }
 trap cleanup EXIT
 
@@ -57,11 +60,11 @@ assert_without_text() {
 
 # Give any pending best-effort store write a beat, then assert it never landed.
 assert_without_file_text() {
-	local needle="$1"
+	local file="$1" needle="$2"
 	sleep 0.5
-	if [ -f "$PERMS_FILE" ] && grep -Fq "$needle" "$PERMS_FILE"; then
-		echo "Unexpected grant recorded: $needle" >&2
-		cat "$PERMS_FILE" >&2
+	if [ -f "$file" ] && grep -Fq "$needle" "$file"; then
+		echo "Unexpected grant recorded in $file: $needle" >&2
+		cat "$file" >&2
 		exit 1
 	fi
 }
@@ -92,7 +95,7 @@ wait_for_text "$PERSIST_SESSION" "Permission: Only Always Test"
 tmux send-keys -t "$PERSIST_SESSION" Down Enter
 # Forwarded as-is (no narrower option exists), and NOT recorded by cc.
 wait_for_text "$PERSIST_SESSION" '"optionId": "allow-always"'
-assert_without_file_text "Only Always Test"
+assert_without_file_text "$PERMS_FILE" "Only Always Test"
 
 # --- 2. /yolo flips ask-mode to auto-approve ------------------------------
 tmux new-session -d -s "$YOLO_SESSION" -c "$ROOT" -x 100 -y 30 \
@@ -105,5 +108,19 @@ tmux send-keys -t "$YOLO_SESSION" / p e r m i s s i o n - t e s t Enter
 wait_for_text "$YOLO_SESSION" '"optionId": "allow"'
 # No dialog should have been shown — /yolo auto-approved it.
 assert_without_text "$YOLO_SESSION" "Permission: Permission Test"
+
+# --- 3. remember:false downgrades an "always" pick and records nothing -----
+tmux new-session -d -s "$REMEMBER_OFF_SESSION" -c "$ROOT" -x 100 -y 30 \
+	"env CC_CONFIG=tests/fake_config.json CC_SETTINGS=tests/fake_remember_off_settings.json CC_PERMISSIONS=$REMEMBER_OFF_PERMS CC_BACKGROUND_CONNECT_DELAY_MS=0 ./src/cc fake"
+wait_for_text "$REMEMBER_OFF_SESSION" "Space to record"
+sleep 0.5
+tmux send-keys -t "$REMEMBER_OFF_SESSION" / p e r m i s s i o n - a l w a y s Enter
+wait_for_text "$REMEMBER_OFF_SESSION" "Permission: Always Test"
+# Pick "Allow always" with remember:false -> backend gets the one-time option and
+# cc records NOTHING (persistence disabled).
+tmux send-keys -t "$REMEMBER_OFF_SESSION" Down Down Enter
+wait_for_text "$REMEMBER_OFF_SESSION" '"optionId": "allow-once"'
+assert_without_text "$REMEMBER_OFF_SESSION" '"optionId": "allow-always"'
+assert_without_file_text "$REMEMBER_OFF_PERMS" "Always Test"
 
 echo "permission persistence + /yolo smoke test passed"
