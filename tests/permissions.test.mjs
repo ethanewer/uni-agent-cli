@@ -240,8 +240,19 @@ check("nativePermissionConfig generates per-harness native dialect for auto", ()
 	assert.deepEqual(nativePermissionConfig("cursor", "auto"), { autoApprove: true, args: ["--force"] });
 	assert.deepEqual(nativePermissionConfig("opencode", "auto"), { autoApprove: true });
 	assert.deepEqual(nativePermissionConfig("pi", "auto"), { autoApprove: true });
-	assert.deepEqual(nativePermissionConfig("claude", "deny"), { autoDeny: true });
-	assert.deepEqual(nativePermissionConfig("claude", "ask"), {});
+});
+
+check("nativePermissionConfig emits NEUTRALIZERS for ask/deny", () => {
+	// ask: flip the prompting switch back on, leaving orthogonal settings alone.
+	assert.deepEqual(nativePermissionConfig("claude", "ask"), { settings: { permissions: { defaultMode: "default" } } });
+	assert.deepEqual(nativePermissionConfig("codex", "ask"), { config: { approval_policy: "on-request" } });
+	assert.deepEqual(nativePermissionConfig("cursor", "ask"), { removeArgs: ["--force", "-f", "--yolo"] });
+	assert.deepEqual(nativePermissionConfig("opencode", "ask"), {});
+	// deny neutralizes identically to ask (the ask/deny difference is cc-side only).
+	assert.deepEqual(nativePermissionConfig("claude", "deny"), nativePermissionConfig("claude", "ask"));
+	assert.deepEqual(nativePermissionConfig("codex", "deny"), nativePermissionConfig("codex", "ask"));
+	assert.deepEqual(nativePermissionConfig("cursor", "deny"), nativePermissionConfig("cursor", "ask"));
+	assert.deepEqual(nativePermissionConfig("opencode", "deny"), {});
 });
 
 check("inferModeFromNative mirrors the old per-name triggers", () => {

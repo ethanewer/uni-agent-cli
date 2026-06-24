@@ -312,6 +312,29 @@ async function main() {
 		ok("settings-equivalence:unified-auto-overrides-codex");
 	}
 
+	// Explicit unified "ask" neutralizes a native auto/bypass already on the agent
+	// (adapter parity with applyHarnessSettings): backend prompts, cc stays in sync.
+	{
+		const codex = createAdapter("codex", CONFIGS.codex, noopHost(), {
+			settings: { permissions: { mode: "ask" }, config: { approval_policy: "never", sandbox_mode: "danger-full-access" } },
+			connectionFactory: factoryFor(PROFILES.codex),
+		});
+		const args = codex.launchSpec.acp.args.join(" ");
+		assert.ok(!args.includes('approval_policy="never"'), "codex auto neutralized (adapter)");
+		assert.ok(args.includes('approval_policy="on-request"'), "codex prompts again (adapter)");
+		assert.equal(codex.launchSpec._autoPermissionRequests, undefined);
+		assert.equal(codex.capabilities.autoApprove, false);
+
+		const cursor = createAdapter("cursor", CONFIGS.cursor, noopHost(), {
+			settings: { permissions: { mode: "ask" }, args: ["--force", "--model", "gpt-5"] },
+			connectionFactory: factoryFor(PROFILES.cursor),
+		});
+		assert.ok(!cursor.launchSpec.acp.args.includes("--force"), "cursor force flag removed (adapter)");
+		assert.ok(cursor.launchSpec.acp.args.includes("gpt-5"), "cursor unrelated args kept (adapter)");
+		assert.equal(cursor.capabilities.autoApprove, false);
+		ok("settings-equivalence:unified-ask-neutralizes");
+	}
+
 	// =====================================================================
 	// (2c) NO FEATURES LOST — the per-harness branches collapse into uniform
 	//      adapter calls (cc connects to the interface, names no harness).

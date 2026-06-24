@@ -1076,6 +1076,33 @@ assert.equal(mixed.agents.codex._permissionMode, "ask");
 assert.equal(mixed.agents.codex._autoPermissionRequests, undefined);
 assert.equal(mixed.agents.claude._autoPermissionRequests, true);
 
+// Explicit unified "ask"/"deny" must NEUTRALIZE conflicting native auto/bypass on
+// the same agent, or cc (asking) and the backend (silently auto-running) disagree.
+const neutralized = applyHarnessSettings(config, {
+	agents: {
+		claude: { settings: { permissions: { defaultMode: "bypassPermissions" }, model: "sonnet" }, permissions: { mode: "ask" } },
+		codex: { config: { approval_policy: "never", sandbox_mode: "danger-full-access" }, permissions: { mode: "ask" } },
+		cursor: { args: ["--force", "--model", "gpt-5"], permissions: { mode: "deny" } },
+	},
+});
+// claude: bypass startup mode/auto cleared; defaultMode flipped to "default"; model kept.
+assert.equal(neutralized.agents.claude._permissionMode, "ask");
+assert.equal(neutralized.agents.claude._autoPermissionRequests, undefined);
+assert.equal(neutralized.agents.claude._startupMode, undefined);
+assert.deepEqual(neutralized.agents.claude._sessionMeta, {
+	claudeCode: { options: { settings: { permissions: { defaultMode: "default" }, model: "sonnet" } } },
+});
+// codex: approval_policy "never" flipped to "on-request" (prompting back on); auto cleared.
+const ncodex = neutralized.agents.codex.acp.args.join(" ");
+assert.ok(!ncodex.includes('approval_policy="never"'), "codex auto approval_policy neutralized");
+assert.ok(ncodex.includes('approval_policy="on-request"'), "codex now prompts");
+assert.equal(neutralized.agents.codex._autoPermissionRequests, undefined);
+// cursor: --force removed (deny), unrelated args kept; cc decides deny-side.
+assert.ok(!neutralized.agents.cursor.acp.args.includes("--force"), "cursor force flag removed");
+assert.ok(neutralized.agents.cursor.acp.args.includes("gpt-5"), "cursor unrelated args kept");
+assert.equal(neutralized.agents.cursor._permissionMode, "deny");
+assert.equal(neutralized.agents.cursor._autoPermissionRequests, undefined);
+
 const previousDefaultCcConfig = process.env.CC_CONFIG;
 const previousDefaultCcSettings = process.env.CC_SETTINGS;
 process.env.CC_CONFIG = path.join(os.tmpdir(), `cc-missing-config-${process.pid}.json`);

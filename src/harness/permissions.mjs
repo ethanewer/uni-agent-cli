@@ -283,10 +283,13 @@ export function outcomeForDecision(decision = {}) {
 // ---------------------------------------------------------------------------
 
 /**
- * Map a unified mode to a harness's native settings. `autoApprove`/`autoDeny`
- * tell cc how to decide; `startupMode`/`settings`/`config`/`args` are the spawn
- * inputs that also configure the backend itself so the two never disagree. A
- * harness with no native knob just gets `autoApprove`/`autoDeny` (cc decides).
+ * Map a unified mode to a harness's native settings. `autoApprove` tells cc to
+ * auto-accept; `startupMode`/`settings`/`config`/`args`/`removeArgs` are the spawn
+ * inputs that configure (or neutralize) the backend itself so the two never
+ * disagree. A harness with no native knob just gets `autoApprove` for auto (and cc
+ * decides for ask/deny). The ask/deny shapes are NEUTRALIZERS: they undo any native
+ * auto/bypass on the agent so the backend prompts and cc's decision is honored
+ * (ask and deny share the same native shape; the difference is cc-side only).
  */
 export function nativePermissionConfig(agentKey, mode) {
 	if (mode === "auto") {
@@ -305,7 +308,23 @@ export function nativePermissionConfig(agentKey, mode) {
 				return { autoApprove: true };
 		}
 	}
-	if (mode === "deny") return { autoDeny: true };
+	if (mode === "ask" || mode === "deny") {
+		// ask and deny share the SAME native shape: both make the backend prompt
+		// (neutralizing any native auto/bypass); the ask-vs-deny difference is purely
+		// cc-side (mode drives decidePermission), so there is no native auto-deny.
+		// Flip the prompting switch back on; leave orthogonal settings (the codex
+		// sandbox, claude's other options) to the user.
+		switch (agentKey) {
+			case "claude":
+				return { settings: { permissions: { defaultMode: "default" } } };
+			case "codex":
+				return { config: { approval_policy: "on-request" } };
+			case "cursor":
+				return { removeArgs: ["--force", "-f", "--yolo"] };
+			default:
+				return {};
+		}
+	}
 	return {};
 }
 

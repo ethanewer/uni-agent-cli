@@ -173,8 +173,8 @@ Numbered for reference; severity in brackets.
 
 ### Maintainability
 
-17. **[med] `pi-harness.mjs` contains a literal ` ` byte** (line 4456, a map-key
-    separator `` `${this.activeKey} …` ``). It makes `grep`/`ripgrep` treat the
+17. **[med] `pi-harness.mjs` contains a literal `\0` byte** (line 4456, a map-key
+    separator `` `${this.activeKey}\0…` ``). It makes `grep`/`ripgrep` treat the
     file as binary and **silently skip it** — a real impediment to auditing the
     permission code (hit immediately during this audit; use `rg -a`).
 

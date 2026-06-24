@@ -126,6 +126,9 @@ have to learn each agent's native dialect just to change how it asks.
   per-agent, below) or flip it at runtime with `/yolo` / `/auto`:
   - `/yolo` toggles the active harness between `ask` and `auto`.
   - `/yolo ask|auto|deny` sets the mode explicitly.
+  - Tightening the mode at runtime (e.g. `auto` → `ask`) only gates *new* backend
+    requests; a backend that was started in `auto` emits none, so `cc` tells you to
+    run `/new` for the stricter mode to fully apply.
 - **"Allow always" persists.** When you pick an *allow always* (or *bypass*)
   option in a prompt, `cc` records a grant in `~/.config/cc/permissions.json`
   (next to `settings.json`; override with `CC_PERMISSIONS`). Matching requests are
@@ -134,11 +137,16 @@ have to learn each agent's native dialect just to change how it asks.
 - **`/permissions`** shows the effective mode and remembered grants;
   `/permissions clear` forgets them.
 
-When the mode is `auto`, `cc` also configures the backend's own native dialect so
-the two never disagree (claude `bypassPermissions`, codex `approval_policy=never`
-+ `sandbox_mode=danger-full-access`, cursor `--force`); harnesses with no such
-knob are simply auto-approved by `cc`. Existing native settings (below) are still
-honored and continue to imply `auto` for back-compat.
+When you set an explicit mode, `cc` also aligns the backend's own native dialect so
+the two never disagree: `auto` enables it (claude `bypassPermissions`, codex
+`approval_policy=never` + `sandbox_mode=danger-full-access`, cursor `--force`),
+while `ask`/`deny` *neutralize* any conflicting native auto/bypass on that agent
+(restoring claude `defaultMode=default`, codex `approval_policy=on-request`, and
+dropping cursor `--force`/`-f`/`--yolo`) so the backend prompts and `cc`'s decision
+is honored. Orthogonal settings (e.g. the codex sandbox) are left alone, and
+harnesses with no such knob are decided entirely by `cc`. Existing native settings
+(below) with no explicit mode are still honored and continue to imply `auto` for
+back-compat.
 
 `cc` advertises ACP terminal support and implements `terminal/*` so backend
 commands that need shell execution run inside the shared UI.

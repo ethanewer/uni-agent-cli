@@ -3590,10 +3590,14 @@ export class HarnessApp {
 			next = current === "auto" ? "ask" : "auto";
 		}
 		this.runtimePermissionMode.set(agentKey, next);
-		// Keep the legacy flag in sync for any path that still reads it.
-		if (agent) agent._autoPermissionRequests = next === "auto";
 		const label = next === "auto" ? "auto-approve ON" : next === "deny" ? "auto-deny ON" : "ask on every request";
 		this.addNotice(`Permissions for ${agentKey}: ${label}`);
+		// A backend spawned in auto/bypass (its native config) emits no permission
+		// requests, so tightening cc's mode at runtime cannot retroactively gate it.
+		// Be honest: a fresh session is needed for a stricter mode to fully apply.
+		if (next !== "auto" && agent?._permissionMode === "auto") {
+			this.addNotice(`${agentKey} was started in auto mode — run /new for ${next} to fully apply to the backend.`);
+		}
 		this.ui.requestRender();
 	}
 
@@ -4308,18 +4312,13 @@ export class HarnessApp {
 		return this.requestPermission(params, { agentKey, policy });
 	}
 
-	// Effective policy for a harness: runtime /yolo override > explicit unified
-	// settings.permissions.mode > native-inferred mode > "ask". Rules come from
-	// settings + persisted grants.
+	// Effective policy for a harness: runtime /yolo override > the spawn-time mode
+	// (agent._permissionMode, already = explicit settings ?? native-inferred) >
+	// "ask". Rules come from settings + persisted grants.
 	permissionPolicyFor(agentKey, agent) {
-		const settings = this.config.settings ?? {};
-		const policy = resolvePermissionPolicy(settings, agentKey, this.permissionGrants);
-		const explicit =
-			normalizePermissionSettings(settings.agents?.[agentKey]?.permissions).mode ??
-			normalizePermissionSettings(settings.permissions).mode;
+		const policy = resolvePermissionPolicy(this.config.settings ?? {}, agentKey, this.permissionGrants);
 		const runtime = this.runtimePermissionMode.get(agentKey);
-		const inferred = agent?._permissionMode;
-		policy.mode = runtime ?? explicit ?? inferred ?? policy.mode;
+		policy.mode = runtime ?? agent?._permissionMode ?? policy.mode;
 		return policy;
 	}
 
@@ -6547,14 +6546,16 @@ function applyNativePermissionSetting(key, agent, settings, globalPermissions) {
 		normalizePermissionSettings(settings.permissions).mode ?? normalizePermissionSettings(globalPermissions).mode;
 	const mode = explicitMode ?? inferModeFromNative(key, settings);
 	if (mode) agent._permissionMode = mode;
-	if (!mode || mode === "ask") return;
+	if (!mode) return;
 	const native = nativePermissionConfig(key, mode);
 	if (native.autoApprove) agent._autoPermissionRequests = true;
 	if (native.startupMode) agent._startupMode = native.startupMode;
-	// Only generate native backend config when the user chose the unified mode;
-	// for pure back-compat (native settings already written) the spawn spec must
-	// stay byte-identical, so we only set the cc-side flags above.
-	if (explicitMode === "auto") applyGeneratedNativeConfig(key, agent, native);
+	// When the user chose the unified mode directly, generate the backend's native
+	// dialect AND neutralize any conflicting native auto/bypass on the same agent
+	// (e.g. unified "ask" must clear a stale codex approval_policy="never"), so cc
+	// and the backend never disagree. Pure back-compat (mode only inferred from
+	// native settings) keeps the spawn spec byte-identical — flags only.
+	if (explicitMode) applyGeneratedNativeConfig(key, agent, native);
 }
 
 // Fold engine-generated native config into the spawn spec. Generated config keys
@@ -6569,6 +6570,9 @@ function applyGeneratedNativeConfig(key, agent, native) {
 			args = overrideConfigArg(args, name, value);
 		}
 		command.args = args;
+	}
+	if (Array.isArray(native.removeArgs) && native.removeArgs.length > 0) {
+		command.args = (command.args ?? []).filter((arg) => !native.removeArgs.includes(arg));
 	}
 	if (Array.isArray(native.args) && native.args.length > 0) {
 		const args = command.args ?? [];

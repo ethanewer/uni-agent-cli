@@ -159,23 +159,28 @@ export class BaseAcpAdapter {
 			normalizePermissionSettings(settings.permissions).mode ?? normalizePermissionSettings(this.globalPermissions).mode;
 		const mode = explicitMode ?? inferModeFromNative(this.key, settings);
 		if (mode) applied._permissionMode = mode;
-		if (!mode || mode === "ask") return;
+		if (!mode) return;
 		const native = nativePermissionConfig(this.key, mode);
 		if (native.autoApprove) applied._autoPermissionRequests = true;
 		if (native.startupMode) applied._startupMode = native.startupMode;
-		// Generate the native backend config only when the user chose the unified
-		// mode directly (back-compat native settings must stay byte-identical).
-		if (explicitMode === "auto") this.applyGeneratedNativeConfig(applied, native);
+		// When the user chose the unified mode directly, generate the native dialect
+		// AND neutralize any conflicting native auto/bypass (e.g. unified "ask" must
+		// clear a stale codex approval_policy="never"). Pure back-compat (mode only
+		// inferred from native settings) stays byte-identical — flags only.
+		if (explicitMode) this.applyGeneratedNativeConfig(applied, native);
 	}
 
 	applyGeneratedNativeConfig(applied, native) {
 		const command = applied.acp ?? applied;
 		if (native.settings) this.translateNativeSettings(applied, native.settings);
 		if (native.config) {
-			// Drop any existing `-c key=...` the user set so the generated (auto)
-			// values win, then let the harness's own translateConfig append them.
+			// Drop any existing `-c key=...` the user set so the generated values
+			// win, then let the harness's own translateConfig append them.
 			command.args = stripConfigArgs(command.args ?? [], Object.keys(native.config));
 			command.args = this.translateConfig(command.args, native.config);
+		}
+		if (Array.isArray(native.removeArgs) && native.removeArgs.length > 0) {
+			command.args = (command.args ?? []).filter((arg) => !native.removeArgs.includes(arg));
 		}
 		if (Array.isArray(native.args) && native.args.length > 0) {
 			const existing = command.args ?? [];
