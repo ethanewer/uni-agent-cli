@@ -1191,6 +1191,9 @@ assert.deepEqual(
 	{ outcome: "selected", optionId: "allow" },
 );
 
+// Auto-accept no longer escalates to the broadest grant: when every allow option
+// is "always", it takes the first/narrower one ("auto" mode) rather than hunting
+// for the all-bypassing option. (Pre-overhaul this preferred bypassPermissions.)
 assert.deepEqual(
 	autoPermissionOutcome({
 		options: [
@@ -1199,7 +1202,7 @@ assert.deepEqual(
 			{ kind: "reject_once", name: "No, keep planning", optionId: "plan" },
 		],
 	}),
-	{ outcome: "selected", optionId: "bypassPermissions" },
+	{ outcome: "selected", optionId: "auto" },
 );
 
 assert.deepEqual(

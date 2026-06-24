@@ -15,6 +15,7 @@ import {
 	nativePermissionConfig,
 	normalizePermissionSettings,
 	normalizeRule,
+	optionScope,
 	outcomeForDecision,
 	permissionRequestInfo,
 	pickAllowOption,
@@ -91,7 +92,8 @@ check("ruleKey is stable and case-insensitive on tool", () => {
 // ---- settings -> policy ---------------------------------------------------
 
 check("normalizePermissionSettings defaults", () => {
-	assert.deepEqual(normalizePermissionSettings(undefined), { mode: undefined, remember: true, rules: [] });
+	// remember is undefined when absent so it can fall through independently of mode
+	assert.deepEqual(normalizePermissionSettings(undefined), { mode: undefined, remember: undefined, rules: [] });
 	assert.deepEqual(normalizePermissionSettings({ mode: "yolo", remember: false }), { mode: "auto", remember: false, rules: [] });
 });
 
@@ -111,6 +113,15 @@ check("resolvePermissionPolicy: per-agent overrides global, rules stack", () => 
 
 check("resolvePermissionPolicy: default mode is ask", () => {
 	assert.equal(resolvePermissionPolicy({}, "claude").mode, "ask");
+	assert.equal(resolvePermissionPolicy({}, "claude").remember, true);
+});
+
+check("resolvePermissionPolicy: per-agent remember:false honored without a mode", () => {
+	const policy = resolvePermissionPolicy({ agents: { codex: { permissions: { remember: false } } } }, "codex");
+	assert.equal(policy.remember, false);
+	assert.equal(policy.mode, "ask"); // mode still falls back to default
+	// global remember:false also applies to agents that set no permissions block
+	assert.equal(resolvePermissionPolicy({ permissions: { remember: false } }, "claude").remember, false);
 });
 
 check("resolvePermissionPolicy: grants scoped to other agents are dropped", () => {
@@ -135,10 +146,20 @@ check("classifyOption uses kind then text", () => {
 	assert.equal(classifyOption({ name: "Hmm" }), "unknown");
 });
 
-check("isAlwaysOption detects persistent grants", () => {
+check("isAlwaysOption persists only genuine always grants, not session", () => {
 	assert.equal(isAlwaysOption({ kind: "allow_always" }), true);
 	assert.equal(isAlwaysOption({ optionId: "bypassPermissions" }), true);
 	assert.equal(isAlwaysOption({ kind: "allow_once" }), false);
+	// session-scoped is NOT persisted as a forever grant
+	assert.equal(isAlwaysOption({ kind: "allow_session" }), false);
+	assert.equal(isAlwaysOption({ optionId: "allow-for-session" }), false);
+});
+
+check("optionScope orders once < session < always", () => {
+	assert.equal(optionScope({ kind: "allow_once" }), "once");
+	assert.equal(optionScope({ kind: "allow_session" }), "session");
+	assert.equal(optionScope({ kind: "allow_always" }), "always");
+	assert.equal(optionScope({ optionId: "bypassPermissions" }), "always");
 });
 
 check("pickAllowOption prefers narrowest by default, broadest when asked", () => {
@@ -258,6 +279,24 @@ check("grant store round-trips, de-dupes, and forgets", () => {
 
 		saveGrants([{ tool: "x", action: "allow" }, { tool: "x", action: "allow" }], file);
 		assert.equal(loadGrants(file).length, 1);
+	} finally {
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+check("a fresh grant replaces the opposite action for the same tool", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-perms-flip-"));
+	const file = path.join(dir, "permissions.json");
+	try {
+		recordGrant({ agent: "codex", tool: "Read", action: "allow" }, file);
+		recordGrant({ agent: "codex", tool: "Read", action: "deny" }, file); // user changes their mind
+		const grants = loadGrants(file);
+		assert.equal(grants.length, 1, "only one grant per (agent, tool) scope");
+		assert.equal(grants[0].action, "deny");
+		// the decision reflects the latest choice, not the stale allow
+		const policy = resolvePermissionPolicy({}, "codex", grants);
+		const decision = decidePermission(policy, { toolCall: { title: "Read" }, options: FAKE_OPTIONS }, { agentKey: "codex" });
+		assert.equal(decision.action, "deny");
 	} finally {
 		fs.rmSync(dir, { recursive: true, force: true });
 	}

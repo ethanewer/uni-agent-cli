@@ -84,9 +84,18 @@ function normalizeRules(value) {
 	return value.map(normalizeRule).filter(Boolean);
 }
 
-/** Stable identity for de-duping persisted grants. */
+/** Full identity of a rule (agent + tool + action). */
 export function ruleKey(rule = {}) {
-	return `${rule.agent ?? "*"}${String(rule.tool ?? "").toLowerCase()}${rule.action ?? ""}`;
+	return `${rule.agent ?? "*"}\t${String(rule.tool ?? "").toLowerCase()}\t${rule.action ?? ""}`;
+}
+
+/**
+ * Identity of a grant's SCOPE (agent + tool), ignoring action. A tool has at most
+ * one persisted grant: choosing deny-always for a tool replaces an earlier
+ * allow-always (and vice versa) rather than leaving a stale, higher-priority rule.
+ */
+export function grantScopeKey(rule = {}) {
+	return `${rule.agent ?? "*"}\t${String(rule.tool ?? "").toLowerCase()}`;
 }
 
 function toolMatches(pattern, name, kind) {
@@ -116,7 +125,9 @@ export function normalizePermissionSettings(raw) {
 	const block = isPlainObject(raw) ? raw : {};
 	return {
 		mode: coercePermissionMode(block.mode),
-		remember: block.remember === undefined ? true : Boolean(block.remember),
+		// undefined when absent so per-agent/global can fall through independently
+		// of `mode` (resolvePermissionPolicy applies the default).
+		remember: block.remember === undefined ? undefined : Boolean(block.remember),
 		rules: normalizeRules(block.rules),
 	};
 }
@@ -133,7 +144,9 @@ export function resolvePermissionPolicy(settings = {}, agentKey, grants = []) {
 	const global = normalizePermissionSettings(settings.permissions);
 	const perAgent = normalizePermissionSettings(settings.agents?.[agentKey]?.permissions);
 	const mode = perAgent.mode ?? global.mode ?? DEFAULT_PERMISSION_MODE;
-	const remember = perAgent.mode !== undefined ? perAgent.remember : global.remember;
+	// `remember` resolves independently of `mode`: a per-agent `remember:false`
+	// disables persistence even when only the global block sets `mode`.
+	const remember = perAgent.remember ?? global.remember ?? true;
 	const grantRules = normalizeRules(grants).filter((rule) => !rule.agent || rule.agent === agentKey);
 	return {
 		mode,
@@ -170,36 +183,53 @@ export function classifyOption(option = {}) {
 	return "unknown";
 }
 
-/** Whether an option grants persistently ("always"/bypass) rather than once. */
-export function isAlwaysOption(option = {}) {
+/**
+ * Breadth of an option: "once" (this call) < "session" (this backend session) <
+ * "always" (persistent / bypass). Distinguishing session from always matters for
+ * persistence: a session-scoped choice must NOT be saved as a forever grant.
+ */
+export function optionScope(option = {}) {
 	const text = `${String(option.kind ?? "")} ${String(option.optionId ?? "")}`.toLowerCase();
-	return text.includes("always") || text.includes("bypass") || text.includes("session");
+	if (text.includes("always") || text.includes("bypass")) return "always";
+	if (text.includes("session")) return "session";
+	return "once";
 }
 
 /**
- * Choose an allow option. Default prefers the NARROWEST grant (allow-once) so
- * turning on auto does not silently escalate every decision to "always, for
- * everything" — cc owns persistence via its own grants. `broad: true` flips to
- * preferring the most permissive option (used only when the user explicitly asked
- * for a remembered/always grant and we want the backend in sync).
+ * Whether picking this option should be PERSISTED by cc as a forever grant. Only
+ * genuinely persistent ("always"/bypass) options qualify — a session-scoped option
+ * is remembered by the backend for its session, not saved across cc restarts.
+ */
+export function isAlwaysOption(option = {}) {
+	return optionScope(option) === "always";
+}
+
+/**
+ * Choose an allow option. Default prefers the NARROWEST grant (allow-once, then
+ * session, then always) so turning on auto does not silently escalate every
+ * decision to "always, for everything" — cc owns persistence via its own grants.
+ * `broad: true` flips to the most permissive option, in the reverse order.
  */
 export function pickAllowOption(options = [], { broad = false } = {}) {
 	const allow = options.filter((option) => classifyOption(option) === "allow");
 	if (allow.length === 0) return undefined;
-	const once = allow.find((option) => !isAlwaysOption(option));
-	const always =
-		allow.find((option) => option.optionId === "bypassPermissions") ??
-		allow.find((option) => isAlwaysOption(option)) ??
-		allow[0];
-	if (broad) return always;
-	return once ?? always;
+	const byScope = (scope) => allow.find((option) => optionScope(option) === scope);
+	if (broad) {
+		return (
+			allow.find((option) => option.optionId === "bypassPermissions") ??
+			byScope("always") ??
+			byScope("session") ??
+			allow[0]
+		);
+	}
+	return byScope("once") ?? byScope("session") ?? byScope("always") ?? allow[0];
 }
 
 /** Choose a deny option (narrowest reject preferred). */
 export function pickDenyOption(options = []) {
 	const deny = options.filter((option) => classifyOption(option) === "deny");
 	if (deny.length === 0) return undefined;
-	return deny.find((option) => !isAlwaysOption(option)) ?? deny[0];
+	return deny.find((option) => optionScope(option) === "once") ?? deny[0];
 }
 
 // ---------------------------------------------------------------------------
@@ -326,24 +356,21 @@ export function loadGrants(file = permissionsStorePath()) {
 
 export function saveGrants(grants, file = permissionsStorePath()) {
 	const normalized = normalizeRules(grants);
-	const deduped = [];
-	const seen = new Set();
-	for (const rule of normalized) {
-		const key = ruleKey(rule);
-		if (seen.has(key)) continue;
-		seen.add(key);
-		deduped.push(rule);
-	}
+	// One grant per scope (agent+tool); a later entry replaces an earlier one, so a
+	// fresh deny-always overrides a stale allow-always for the same tool.
+	const byScope = new Map();
+	for (const rule of normalized) byScope.set(grantScopeKey(rule), rule);
+	const deduped = [...byScope.values()];
 	fs.mkdirSync(path.dirname(file), { recursive: true });
 	fs.writeFileSync(file, `${JSON.stringify({ grants: deduped }, null, 2)}\n`);
 	return deduped;
 }
 
-/** Add (or refresh) a remembered grant. Returns the full grant list. */
+/** Add (or replace) a remembered grant for its scope. Returns the full grant list. */
 export function recordGrant(rule, file = permissionsStorePath()) {
 	const normalized = normalizeRule(rule);
 	if (!normalized) return loadGrants(file);
-	const grants = loadGrants(file).filter((existing) => ruleKey(existing) !== ruleKey(normalized));
+	const grants = loadGrants(file).filter((existing) => grantScopeKey(existing) !== grantScopeKey(normalized));
 	grants.push(normalized);
 	return saveGrants(grants, file);
 }
