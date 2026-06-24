@@ -5040,7 +5040,7 @@ function cursorCancelResult(method) {
 	return {};
 }
 
-function autoCursorOutcome(method, params = {}) {
+export function autoCursorOutcome(method, params = {}) {
 	if (method === "cursor/create_plan") return { outcome: { outcome: "accepted" } };
 	if (method === "cursor/ask_question") {
 		const answers = (Array.isArray(params.questions) ? params.questions : []).map((question) => ({
