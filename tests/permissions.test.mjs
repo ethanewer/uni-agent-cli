@@ -18,6 +18,7 @@ import {
 	optionScope,
 	outcomeForDecision,
 	permissionRequestInfo,
+	nonPersistentSameDirection,
 	pickAllowOption,
 	pickNonPersistentAllowOption,
 	policyNeedsGating,
@@ -262,6 +263,22 @@ check("pickNonPersistentAllowOption refuses always/bypass", () => {
 	assert.equal(pickNonPersistentAllowOption([{ kind: "allow_session", optionId: "s" }])?.optionId, "s");
 });
 
+check("nonPersistentSameDirection mirrors the option's direction and refuses always", () => {
+	const allowOpt = { kind: "allow_always", optionId: "aa" };
+	const denyOpt = { kind: "reject_always", optionId: "ra" };
+	const opts = [
+		{ kind: "reject_once", optionId: "r1" },
+		{ kind: "allow_once", optionId: "a1" },
+		allowOpt,
+		denyOpt,
+	];
+	assert.equal(nonPersistentSameDirection(allowOpt, opts)?.optionId, "a1");
+	assert.equal(nonPersistentSameDirection(denyOpt, opts)?.optionId, "r1");
+	// only-always in that direction -> undefined (caller must not record+forward persistently)
+	assert.equal(nonPersistentSameDirection(allowOpt, [allowOpt, { kind: "reject_once", optionId: "r1" }]), undefined);
+	assert.equal(nonPersistentSameDirection(denyOpt, [denyOpt, { kind: "allow_once", optionId: "a1" }]), undefined);
+});
+
 check("scoped allow rule with only-always options ASKS (no silent backend persistence)", () => {
 	const policy = { mode: "ask", rules: [{ tool: "run tests", action: "allow" }] };
 	const decision = decidePermission(policy, params(ONLY_ALWAYS_ALLOW), { agentKey: "claude" });
@@ -345,7 +362,12 @@ check("nativePermissionConfig emits NEUTRALIZERS for ask/deny", () => {
 
 check("inferModeFromNative mirrors the old per-name triggers", () => {
 	assert.equal(inferModeFromNative("claude", { settings: { permissions: { defaultMode: "bypassPermissions" } } }), "auto");
+	assert.equal(inferModeFromNative("claude", { settings: { permissions: { defaultMode: "bypass" } } }), "auto");
 	assert.equal(inferModeFromNative("claude", { settings: { permissions: { defaultMode: "default" } } }), undefined);
+	// broad unified aliases are NOT valid Claude bypass values: inferring auto from
+	// them would auto-approve cc while Claude still enforces (no real bypass).
+	assert.equal(inferModeFromNative("claude", { settings: { permissions: { defaultMode: "allow" } } }), undefined);
+	assert.equal(inferModeFromNative("claude", { settings: { permissions: { defaultMode: "acceptEdits" } } }), undefined);
 	assert.equal(inferModeFromNative("codex", { config: { approval_policy: "never", sandbox_mode: "danger-full-access" } }), "auto");
 	assert.equal(inferModeFromNative("codex", { config: { approval_policy: "never" } }), undefined);
 	assert.equal(inferModeFromNative("cursor", { args: ["--force"] }), "auto");

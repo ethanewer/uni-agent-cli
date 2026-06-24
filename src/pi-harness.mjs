@@ -24,11 +24,11 @@ import {
 	isAlwaysOption,
 	loadGrants,
 	nativePermissionConfig,
+	nonPersistentSameDirection,
 	normalizePermissionSettings,
 	outcomeForDecision,
 	permissionRequestInfo,
 	pickAllowOption,
-	pickDenyOption,
 	policyNeedsGating,
 	recordGrant,
 	resolvePermissionPolicy,
@@ -2469,7 +2469,9 @@ export class HarnessApp {
 			},
 			onCursorRequest: (method, params) => {
 				if (this.client !== client) return cursorCancelResult(method);
-				if (this.permissionPolicyFor(key, agent).mode === "auto") return autoCursorOutcome(method, params);
+				const mode = this.permissionPolicyFor(key, agent).mode;
+				if (mode === "auto") return autoCursorOutcome(method, params);
+				if (mode === "deny") return cursorCancelResult(method);
 				return this.requestCursorInteraction(method, params);
 			},
 		});
@@ -4107,7 +4109,9 @@ export class HarnessApp {
 				},
 				onCursorRequest: (method, params) => {
 					if (this.btwThread !== thread) return cursorCancelResult(method);
-					if (this.permissionPolicyFor(this.activeKey, agent).mode === "auto") return autoCursorOutcome(method, params);
+					const mode = this.permissionPolicyFor(this.activeKey, agent).mode;
+					if (mode === "auto") return autoCursorOutcome(method, params);
+					if (mode === "deny") return cursorCancelResult(method);
 					return this.requestCursorInteraction(method, params);
 				},
 			},
@@ -4367,8 +4371,27 @@ export class HarnessApp {
 		const request = this.permissionQueue.shift();
 		if (!request) return;
 		this.permissionPromptActive = true;
-		if (request.kind === "cursor") this.openCursorInteraction(request);
-		else this.openPermissionRequest(request);
+		if (request.kind === "cursor") {
+			this.openCursorInteraction(request);
+			return;
+		}
+		// Re-evaluate against the CURRENT policy before prompting: a grant just
+		// recorded for an overlapping request (or a runtime /yolo change) may now
+		// auto-resolve this one, so the user isn't re-asked about a tool they just
+		// chose "always" for.
+		const agentKey = request.context?.agentKey;
+		if (agentKey) {
+			const policy = this.permissionPolicyFor(agentKey, this.config.agents[agentKey]);
+			const decision = decidePermission(policy, request.params, { agentKey });
+			if (decision.action !== "ask") {
+				request.resolve(outcomeForDecision(decision));
+				this.permissionPromptActive = false;
+				this.drainPermissionQueue();
+				return;
+			}
+			request.context = { ...request.context, policy };
+		}
+		this.openPermissionRequest(request);
 	}
 
 	openCursorInteraction(request) {
@@ -4435,23 +4458,38 @@ export class HarnessApp {
 			settled = true;
 			this.closeMenu();
 			const option = entry?.value;
-			const remember = option?.optionId && isAlwaysOption(option) && context.policy?.remember !== false;
-			// Reply to the backend FIRST, so nothing (including a store write) can leave
-			// the request hanging. When cc records the "always" itself, answer with only
-			// a one-time decision (narrowest same-direction option) so the backend does
-			// not ALSO persist it — otherwise /permissions clear couldn't fully revoke.
+			const wantsAlways = option?.optionId && isAlwaysOption(option) && context.policy?.remember !== false;
+			// When the user asks to remember an "always" choice, cc wants to OWN the
+			// persistence: reply to the backend with only a one-time (non-persistent)
+			// option so the backend does not ALSO persist it, and record cc's grant. If
+			// the backend offers no non-persistent option in that direction, cc cannot
+			// own it — honor the user's pick (forward the persistent option) but DON'T
+			// record a grant we couldn't actually revoke; tell the user the backend owns it.
+			let toRemember = null;
 			if (!option?.optionId) {
 				resolve(cancelledOutcome());
-			} else if (remember) {
-				const once = classifyOption(option) === "deny" ? pickDenyOption(options) : pickAllowOption(options);
-				resolve(selectedOutcome((once ?? option).optionId));
+			} else if (wantsAlways) {
+				const once = nonPersistentSameDirection(option, options);
+				if (once) {
+					resolve(selectedOutcome(once.optionId));
+					toRemember = option;
+				} else {
+					resolve(selectedOutcome(option.optionId));
+					this.addNotice(
+						`${context.agentKey ?? "the backend"} will remember this itself — /permissions clear can't revoke it ` +
+							"(no one-time option was offered).",
+					);
+				}
 			} else {
 				resolve(selectedOutcome(option.optionId));
 			}
+			// Record BEFORE draining so an overlapping queued request for the same tool
+			// is re-evaluated against the new grant (drainPermissionQueue re-runs the
+			// decision). Best-effort: rememberPermissionChoice catches write failures,
+			// and the backend reply already happened above, so this can't block.
+			if (toRemember) this.rememberPermissionChoice(context.agentKey, params, toRemember);
 			this.permissionPromptActive = false;
 			this.drainPermissionQueue();
-			// Persistence is best-effort and happens after the reply.
-			if (remember) this.rememberPermissionChoice(context.agentKey, params, option);
 		};
 		this.openSelection(permissionTitle(params), entries, finish, { emptyText: "No permission options" });
 	}
@@ -5164,7 +5202,7 @@ function humanizePermissionKind(kind) {
 		.replace(/\b\w/g, (char) => char.toUpperCase());
 }
 
-function cursorCancelResult(method) {
+export function cursorCancelResult(method) {
 	if (method === "cursor/create_plan") return { outcome: { outcome: "rejected", reason: "Cancelled" } };
 	if (method === "cursor/ask_question") return { outcome: { outcome: "cancelled" } };
 	return {};

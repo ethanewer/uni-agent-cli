@@ -3,7 +3,7 @@
 // real AcpClient from pi-harness.mjs; tests inject a fake. Most harnesses are a
 // ~10-line subclass that overrides only the hooks for their niceties.
 
-import { AcpClient, autoCursorOutcome } from "../pi-harness.mjs";
+import { AcpClient, autoCursorOutcome, cursorCancelResult } from "../pi-harness.mjs";
 import { capabilitiesFromWire, emptyCapabilities } from "./interface.mjs";
 import {
 	cancelledOutcome,
@@ -309,12 +309,13 @@ export class BaseAcpAdapter {
 
 	/**
 	 * Handle a backend-initiated interactive request (e.g. cursor/ask_question,
-	 * cursor/create_plan). When the mode auto-approves, resolve it with the generic
-	 * auto-outcome; otherwise route to the host for a real answer. (Interactive
-	 * questions have no meaningful "deny" outcome, so only auto is short-circuited.)
+	 * cursor/create_plan). auto -> auto-accept; deny -> auto-reject/cancel; otherwise
+	 * route to the host for a real answer.
 	 */
 	async handleExtensionRequest(method, params) {
-		if (this.permissionPolicy().mode === "auto") return autoCursorOutcome(method, params);
+		const mode = this.permissionPolicy().mode;
+		if (mode === "auto") return autoCursorOutcome(method, params);
+		if (mode === "deny") return cursorCancelResult(method);
 		if (typeof this.host.requestInteraction === "function") {
 			return this.host.requestInteraction(method, params);
 		}

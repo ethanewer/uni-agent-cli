@@ -258,6 +258,18 @@ export function pickNonPersistentAllowOption(options = []) {
 	return byScope("once") ?? byScope("session");
 }
 
+/** Narrowest NON-persistent deny (once, then session) — never a deny-always. */
+export function pickNonPersistentDenyOption(options = []) {
+	const deny = options.filter((option) => classifyOption(option) === "deny");
+	const byScope = (scope) => deny.find((option) => optionScope(option) === scope);
+	return byScope("once") ?? byScope("session");
+}
+
+/** The narrowest non-persistent option in the SAME direction as `option`. */
+export function nonPersistentSameDirection(option, options = []) {
+	return classifyOption(option) === "deny" ? pickNonPersistentDenyOption(options) : pickNonPersistentAllowOption(options);
+}
+
 /** Whether the request offers any allow option at all (of any scope). */
 function hasAllowOption(options = []) {
 	return options.some((option) => classifyOption(option) === "allow");
@@ -417,8 +429,13 @@ export function nativePermissionConfig(agentKey, mode, { gated = false } = {}) {
 export function inferModeFromNative(agentKey, agentSettings = {}, appliedArgs = []) {
 	if (!isPlainObject(agentSettings)) return undefined;
 	if (agentKey === "claude") {
-		const mode = agentSettings.settings?.permissions?.defaultMode;
-		return coercePermissionMode(mode) === "auto" ? "auto" : undefined;
+		// Only the genuine bypass values mean auto here. The broad aliases that
+		// coercePermissionMode accepts (allow/full/yolo) are NOT valid Claude
+		// defaultMode bypass values, so inferring auto from them would make cc
+		// auto-approve while Claude still enforces. Those aliases belong to the
+		// unified `permissions.mode`, not native back-compat inference.
+		const mode = String(agentSettings.settings?.permissions?.defaultMode ?? "").trim().toLowerCase();
+		return mode === "bypasspermissions" || mode === "bypass" ? "auto" : undefined;
 	}
 	if (agentKey === "codex") {
 		const config = agentSettings.config;

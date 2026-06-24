@@ -566,6 +566,20 @@ async function main() {
 		ok("extension:auto-accept-interactive");
 	}
 
+	// deny mode must AUTO-REJECT cursor extension prompts, not fall through to the host.
+	{
+		let asked = false;
+		const host = { onEvent() {}, requestPermission: () => ({ outcome: "cancelled" }), requestInteraction: () => { asked = true; return { picked: true }; } };
+		const cursor = createAdapter("cursor", CONFIGS.cursor, host, { settings: { permissions: { mode: "deny" } }, connectionFactory: factoryFor(PROFILES.cursor) });
+		await cursor.connect();
+		const plan = await cursor.connection.emitCursor("cursor/create_plan", { name: "P" });
+		assert.deepEqual(plan, { outcome: { outcome: "rejected", reason: "Cancelled" } });
+		const q = await cursor.connection.emitCursor("cursor/ask_question", { questions: [{ id: "q1", options: [{ id: "o1" }] }] });
+		assert.deepEqual(q, { outcome: { outcome: "cancelled" } });
+		assert.equal(asked, false, "deny mode must not prompt the host for cursor extensions");
+		ok("extension:deny-auto-rejects");
+	}
+
 	// =====================================================================
 	// (3) ADDABILITY — opencode + pi + a brand-new harness, no core changes.
 	// =====================================================================
