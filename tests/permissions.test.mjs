@@ -140,7 +140,7 @@ check("resolvePermissionPolicy: CONFIG rules scoped to other agents are dropped 
 	assert.equal(claude.rules.length, 0);
 	assert.equal(policyNeedsGating(claude), false);
 	const codex = resolvePermissionPolicy(settings, "codex");
-	assert.deepEqual(codex.rules, [{ agent: "codex", tool: "shell", action: "deny" }]);
+	assert.deepEqual(codex.rules, [{ agent: "codex", tool: "shell", action: "deny", source: "config" }]);
 	assert.equal(policyNeedsGating(codex), true);
 });
 
@@ -231,6 +231,22 @@ check("decidePermission deny rule overrides auto mode", () => {
 	const policy = { mode: "auto", rules: [{ tool: "run tests", action: "deny" }] };
 	const decision = decidePermission(policy, params(FAKE_OPTIONS), { agentKey: "claude" });
 	assert.equal(decision.action, "deny");
+});
+
+check("deny mode suppresses a persisted allow GRANT but honors a config allow RULE", () => {
+	const req = { toolCall: { title: "Read" }, options: FAKE_OPTIONS };
+	// persisted allow grant + deny mode -> deny (stale convenience must not punch through)
+	const grantPolicy = resolvePermissionPolicy({ permissions: { mode: "deny" } }, "codex", [{ agent: "codex", tool: "Read", action: "allow" }]);
+	assert.equal(decidePermission(grantPolicy, req, { agentKey: "codex" }).action, "deny");
+	// same grant under ask mode still allows (the grant is honored when not tightening)
+	const askPolicy = resolvePermissionPolicy({ permissions: { mode: "ask" } }, "codex", [{ agent: "codex", tool: "Read", action: "allow" }]);
+	assert.equal(decidePermission(askPolicy, req, { agentKey: "codex" }).action, "allow");
+	// a deliberate config allow rule under deny mode IS honored (deny-by-default allowlist)
+	const rulePolicy = resolvePermissionPolicy({ agents: { codex: { permissions: { mode: "deny", rules: [{ tool: "Read", action: "allow" }] } } } }, "codex");
+	assert.equal(decidePermission(rulePolicy, req, { agentKey: "codex" }).action, "allow");
+	// a persisted deny grant under auto mode still denies (round-3 behavior preserved)
+	const denyGrantPolicy = resolvePermissionPolicy({ permissions: { mode: "auto" } }, "codex", [{ agent: "codex", tool: "Read", action: "deny" }]);
+	assert.equal(decidePermission(denyGrantPolicy, req, { agentKey: "codex" }).action, "deny");
 });
 
 // Backend offers ONLY persistent allow options (no allow-once/session).

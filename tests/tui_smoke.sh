@@ -12,16 +12,22 @@ WRITE_LOG="$(mktemp -t cc-tui-write-log.XXXXXX)"
 SETTINGS_FILE="$(mktemp -t cc-tui-settings.XXXXXX)"
 CONFIG_SETTINGS_THEME_FILE="$(mktemp -t cc-tui-config-settings-theme.XXXXXX)"
 CONFIG_TOP_THEME_FILE="$(mktemp -t cc-tui-config-top-theme.XXXXXX)"
+# Isolate the permission grant store so cc never reads the developer's real
+# ~/.config/cc/permissions.json (a stray grant could auto-resolve the permission
+# prompt step). Point at a fresh, nonexistent file -> no grants.
+PERMS_FILE="$(mktemp -t cc-tui-perms.XXXXXX)"
+rm -f "$PERMS_FILE"
 printf '{}\n' > "$SETTINGS_FILE"
 ROOT_Q="$(printf "%q" "$ROOT")"
 WRITE_LOG_Q="$(printf "%q" "$WRITE_LOG")"
 SETTINGS_FILE_Q="$(printf "%q" "$SETTINGS_FILE")"
+PERMS_FILE_Q="$(printf "%q" "$PERMS_FILE")"
 CONFIG_SETTINGS_THEME_FILE_Q="$(printf "%q" "$CONFIG_SETTINGS_THEME_FILE")"
 CONFIG_TOP_THEME_FILE_Q="$(printf "%q" "$CONFIG_TOP_THEME_FILE")"
 TERM_PROGRAM_Q="$(printf "%q" "${TERM_PROGRAM:-}")"
 VSCODE_PID_Q="$(printf "%q" "${VSCODE_PID:-}")"
 VSCODE_INJECTION_Q="$(printf "%q" "${VSCODE_INJECTION:-}")"
-PANE_ENV="env -u TERM_PROGRAM -u VSCODE_PID -u VSCODE_INJECTION"
+PANE_ENV="env -u TERM_PROGRAM -u VSCODE_PID -u VSCODE_INJECTION CC_PERMISSIONS=$PERMS_FILE_Q"
 VSCODE_TERMINAL=0
 if [ "${TERM_PROGRAM:-}" = "vscode" ] || [ -n "${VSCODE_PID:-}" ] || [ -n "${VSCODE_INJECTION:-}" ]; then
 	VSCODE_TERMINAL=1
@@ -38,7 +44,7 @@ fi
 
 cleanup() {
 	tmux kill-session -t "$SESSION" >/dev/null 2>&1 || true
-	rm -f "$WRITE_LOG" "$SETTINGS_FILE" "$CONFIG_SETTINGS_THEME_FILE" "$CONFIG_TOP_THEME_FILE"
+	rm -f "$WRITE_LOG" "$SETTINGS_FILE" "$CONFIG_SETTINGS_THEME_FILE" "$CONFIG_TOP_THEME_FILE" "$PERMS_FILE"
 }
 trap cleanup EXIT
 

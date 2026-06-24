@@ -127,8 +127,10 @@ have to learn each agent's native dialect just to change how it asks.
   - `/yolo` toggles the active harness between `ask` and `auto`.
   - `/yolo ask|auto|deny` sets the mode explicitly.
   - Tightening the mode at runtime (e.g. `auto` → `ask`) only gates *new* backend
-    requests; a backend that was started in `auto` emits none, so `cc` tells you to
-    run `/new` for the stricter mode to fully apply.
+    requests. A backend launched in `auto` was spawned with native bypass and emits
+    none, and `/new` reuses that same process, so it can't be tightened mid-session:
+    set `permissions` in `settings.json` and restart `cc` to fully enforce the
+    stricter mode (`cc` says so when this applies).
 - **"Allow always" persists.** When you pick an *allow always* (or *bypass*)
   option in a prompt, `cc` records a grant in `~/.config/cc/permissions.json`
   (next to `settings.json`; override with `CC_PERMISSIONS`). Matching requests are

@@ -153,10 +153,19 @@ export function resolvePermissionPolicy(settings = {}, agentKey, grants = []) {
 	// scoped to another agent (e.g. {agent:"codex",...}) would still count toward
 	// gating/decisions for unrelated harnesses even though it can never match.
 	const applies = (rule) => !rule.agent || rule.agent === agentKey;
+	const tag = (source) => (rule) => ({ ...rule, source });
 	return {
 		mode,
 		remember,
-		rules: [...perAgent.rules.filter(applies), ...global.rules.filter(applies), ...normalizeRules(grants).filter(applies)],
+		// `source` distinguishes deliberate config rules from remembered grants:
+		// deny mode honors a config allow rule (deny-by-default allowlist) but
+		// suppresses a persisted allow grant (a convenience must not silently punch
+		// through a safety tightening). See decidePermission.
+		rules: [
+			...perAgent.rules.filter(applies).map(tag("config")),
+			...global.rules.filter(applies).map(tag("config")),
+			...normalizeRules(grants).filter(applies).map(tag("grant")),
+		],
 	};
 }
 
@@ -279,7 +288,14 @@ function autoAllowDecision(info, extra = {}) {
  */
 export function decidePermission(policy = {}, params = {}, ctx = {}) {
 	const info = permissionRequestInfo(params);
-	const rule = matchRule(policy.rules ?? [], info, ctx.agentKey);
+	// Under deny mode, a remembered ALLOW grant must not punch through (a stale
+	// convenience can't override a safety tightening). Deliberate config allow rules
+	// still apply (deny-by-default allowlist). Deny grants always apply.
+	const candidates =
+		policy.mode === "deny"
+			? (policy.rules ?? []).filter((rule) => !(rule.source === "grant" && rule.action === "allow"))
+			: policy.rules ?? [];
+	const rule = matchRule(candidates, info, ctx.agentKey);
 	if (rule) {
 		if (rule.action === "deny") return { action: "deny", optionId: pickDenyOption(info.options)?.optionId, rule };
 		// A scoped allow rule/grant authorizes only THIS tool with a NON-persistent
