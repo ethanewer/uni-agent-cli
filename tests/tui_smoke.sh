@@ -632,6 +632,26 @@ sleep 0.3
 tmux send-keys -t "$SESSION" Escape
 wait_without_text "btw (fork)"
 
+# Opening /btw while the main thread is still rendering tools uses an isolated
+# page surface; the fork view should close back to the normal transcript cleanly.
+: > "$WRITE_LOG"
+tmux send-keys -t "$SESSION" s l o w Space t o o l Enter
+wait_for_text "Slow Tool"
+tmux send-keys -t "$SESSION" / b t w Space s i d e Space q u e s t i o n Enter
+wait_for_text "› btw (fork)"
+wait_for_text "echo: side question"
+sleep 0.3
+tmux send-keys -t "$SESSION" Escape
+wait_without_text "btw (fork)"
+wait_for_text "slow done"
+if [ "$VSCODE_TERMINAL" = "0" ]; then
+	if ! grep -Fq "$(printf '\0338\033[?1049h')" "$WRITE_LOG" || ! grep -Fq "$(printf '\033[?1049l\0337')" "$WRITE_LOG"; then
+		echo "/btw did not preserve the normal-buffer anchor around the alternate-screen page view" >&2
+		cat "$WRITE_LOG" >&2
+		exit 1
+	fi
+fi
+
 tmux send-keys -t "$SESSION" / c l e a r Enter
 
 tmux send-keys -t "$SESSION" / v o i c e Enter
@@ -643,6 +663,32 @@ wait_for_text "backend exited"
 wait_without_text "Permission: Permission Exit"
 
 tmux kill-session -t "$SESSION"
+printf '{}\n' > "$SETTINGS_FILE"
+: > "$WRITE_LOG"
+tmux new-session -d -s "$SESSION" -x 100 -y 30 "cd $ROOT_Q && $PANE_ENV PI_TUI_WRITE_LOG=$WRITE_LOG_Q CC_CONFIG=tests/fake_config.json CC_SETTINGS=$SETTINGS_FILE_Q CC_BACKGROUND_CONNECT_DELAY_MS=0 ./src/cc fake"
+wait_for_text "Space to record"
+sleep 0.5
+tmux send-keys -t "$SESSION" / b t w Space q u i t Space f r o m Space f o r k Enter
+wait_for_text "› btw (fork)"
+wait_for_text "echo: quit from fork"
+tmux send-keys -t "$SESSION" C-d
+for _ in {1..50}; do
+	if ! tmux has-session -t "$SESSION" >/dev/null 2>&1; then
+		break
+	fi
+	sleep 0.1
+done
+if tmux has-session -t "$SESSION" >/dev/null 2>&1; then
+	echo "Ctrl-D did not exit while /btw was open" >&2
+	capture >&2
+	exit 1
+fi
+if [ "$VSCODE_TERMINAL" = "0" ] && ! grep -Fq "$(printf '\033[?1049l\0337')" "$WRITE_LOG"; then
+	echo "quitting from /btw did not restore and re-save the normal-buffer anchor before TUI shutdown" >&2
+	cat "$WRITE_LOG" >&2
+	exit 1
+fi
+
 printf '{}\n' > "$SETTINGS_FILE"
 tmux new-session -d -s "$SESSION" -x 100 -y 12 "cd $ROOT_Q && $PANE_ENV PI_TUI_WRITE_LOG=$WRITE_LOG_Q CC_CONFIG=tests/e2e_trace_config.json CC_SETTINGS=$SETTINGS_FILE_Q CC_BACKGROUND_CONNECT_DELAY_MS=0 ./src/cc trace"
 wait_for_text "trace acp"

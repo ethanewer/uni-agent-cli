@@ -1352,10 +1352,9 @@ class BtwThread {
 // menus, queue, editor, status) exactly as before — so the no-fork experience is
 // unchanged. While a /btw fork is open it switches to a Codex-style PAGE VIEW: a
 // frame exactly terminal.rows tall (a header tab-bar + one app-scrolled thread
-// transcript + the pinned menu/queue/editor/status). Because the frame never
-// exceeds the screen height, nothing spills into terminal scrollback and the
-// per-thread scroll offset is the only way to see earlier content — clean,
-// switchable paging without the alternate screen.
+// transcript + the pinned menu/queue/editor/status). The app enters the alternate
+// screen for this page view so the fixed-height frame cannot mix with the natural
+// scrolling transcript behind it.
 class RootView {
 	constructor(app) {
 		this.app = app;
@@ -2374,7 +2373,7 @@ export class HarnessApp {
 	// Hard absolute-clear + renderer reset. Used only on page-view <-> natural-flow
 	// transitions, where the frame height changes drastically and the differential
 	// clear (a relative cursor restore) would leave stale rows on screen.
-	forceFullRepaint() {
+	forceFullRepaint(options = {}) {
 		const ui = this.ui;
 		ui.terminal.write("\x1b[2J\x1b[H");
 		ui.previousLines = [];
@@ -2383,6 +2382,14 @@ export class HarnessApp {
 		ui.hardwareCursorRow = 0;
 		ui.cursorRow = 0;
 		ui.requestRender(true);
+		if (options.immediate && typeof ui.doRender === "function") {
+			if (ui.renderTimer) {
+				clearTimeout(ui.renderTimer);
+				ui.renderTimer = undefined;
+			}
+			ui.renderRequested = false;
+			ui.doRender();
+		}
 	}
 
 	adoptPrepaintedFrame() {
@@ -4115,7 +4122,9 @@ export class HarnessApp {
 		this.btwThread = thread;
 		this.focusedThread = "btw";
 		this.updateSpinner();
-		// Entering the fixed-height page view from natural flow: hard repaint.
+		// Entering the fixed-height page view from natural flow: isolate it from
+		// transcript scrollback, then hard repaint into that clean surface.
+		this.ui.terminal.enterAlternateScreen?.();
 		this.forceFullRepaint();
 		// Queue the initial question (if any) — it sends once the fork is ready.
 		// A bare /btw just opens the focused fork, ready for the first message.
@@ -4152,7 +4161,7 @@ export class HarnessApp {
 		}
 	}
 
-	closeBtw() {
+	closeBtw(options = {}) {
 		const thread = this.btwThread;
 		this.btwThread = undefined;
 		this.focusedThread = "main";
@@ -4163,9 +4172,11 @@ export class HarnessApp {
 			thread.stop();
 		}
 		this.updateSpinner();
-		// Leaving the fixed-height page view back to natural flow: hard repaint so
-		// the main transcript is re-emitted cleanly into the terminal scrollback.
-		this.forceFullRepaint();
+		// Leaving the fixed-height page view back to natural flow: restore the normal
+		// buffer, then hard repaint so main includes anything that arrived while the
+		// fork page was open.
+		this.ui.terminal.exitAlternateScreen?.();
+		this.forceFullRepaint({ immediate: options.immediateRender === true });
 	}
 
 	// Codex's ACP bridge (codex-acp) does not expose session/fork — session/load and
@@ -4762,10 +4773,13 @@ export class HarnessApp {
 		this.clearCancelGraceTimer();
 		this.cancelPermissionPrompts();
 		this.voiceController?.dispose();
+		if (this.btwThread) {
+			// TUI.stop() positions its final cursor relative to the current buffer.
+			// Leave /btw's alternate screen and render main synchronously first so
+			// the shell prompt lands after the restored normal transcript.
+			this.closeBtw({ immediateRender: true });
+		}
 		if (this.client) this.client.stop();
-		// Tear down the /btw fork's backend process too, if one is open.
-		this.btwThread?.stop?.();
-		this.btwThread = undefined;
 		this.ui.stop();
 		process.exit(0);
 	}
@@ -6220,6 +6234,7 @@ function createHarnessTerminal(resizeHooks = {}) {
 	const stop = terminal.stop.bind(terminal);
 	const write = terminal.write.bind(terminal);
 	const useAlternateScreen = isVsCodeTerminal();
+	let dynamicAlternateScreen = false;
 	let resizeTimer;
 	let fullClearReplacementOnce;
 	terminal.useFullClearReplacementOnce = (replacement) => {
@@ -6266,13 +6281,32 @@ function createHarnessTerminal(resizeHooks = {}) {
 		resizeTimer = undefined;
 		resizeHooks.onResizeEnd?.({ render: false });
 		stop();
-		if (useAlternateScreen) write("\x1b[?1049l\x1b[?25h");
+		if (useAlternateScreen || dynamicAlternateScreen) {
+			dynamicAlternateScreen = false;
+			write("\x1b[?1049l\x1b[?25h");
+		}
+	};
+	terminal.enterAlternateScreen = () => {
+		if (useAlternateScreen || dynamicAlternateScreen) return;
+		dynamicAlternateScreen = true;
+		// Xterm 1049 uses the same save/restore slot as DECSC/DECRC on common
+		// terminals. Restore the normal-flow anchor first so 1049 preserves that
+		// anchor instead of the cursor position where /btw was opened.
+		write("\x1b8\x1b[?1049h\x1b[2J\x1b[H");
+	};
+	terminal.exitAlternateScreen = () => {
+		if (useAlternateScreen || !dynamicAlternateScreen) return;
+		dynamicAlternateScreen = false;
+		write("\x1b[?1049l\x1b7\x1b[?25h");
 	};
 	terminal.write = (data) => {
 		const hasFullClear = data.includes("\x1b[2J\x1b[H\x1b[3J");
 		const fullClearReplacement = hasFullClear ? fullClearReplacementOnce : undefined;
 		if (hasFullClear) fullClearReplacementOnce = undefined;
-		const rewritten = rewriteFullScreenClear(data, { alternateScreen: useAlternateScreen, fullClearReplacement });
+		const rewritten = rewriteFullScreenClear(data, {
+			alternateScreen: useAlternateScreen || dynamicAlternateScreen,
+			fullClearReplacement,
+		});
 		write(hideCursorDuringRender(rewritten));
 	};
 	return terminal;
