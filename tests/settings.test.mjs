@@ -913,6 +913,37 @@ await (async () => {
 
 {
 	const events = [];
+	const client = Object.create(AcpClient.prototype);
+	client.sessionId = "codex-session";
+	client.pending = new Map();
+	client.bufferingSessionUpdates = false;
+	client.stdoutBuffer = "";
+	client.onEvent = (event) => events.push(event);
+	const message = {
+		jsonrpc: "2.0",
+		method: "session/update",
+		params: {
+			sessionId: "codex-session",
+			update: {
+				sessionUpdate: "tool_call_update",
+				toolCallId: "read-1",
+				status: "completed",
+				rawOutput: {
+					stdout: "before\u2028after",
+				},
+			},
+		},
+	};
+	client.handleStdoutText(`${JSON.stringify(message)}\n`);
+	assert.deepEqual(events, [
+		{ type: "backend_activity" },
+		{ type: "tool_update", id: "read-1", title: undefined, status: "complete" },
+	]);
+	assert.equal(client.stdoutBuffer, "");
+}
+
+{
+	const events = [];
 	const writes = [];
 	const client = Object.create(AcpClient.prototype);
 	client.sessionId = "codex-session";

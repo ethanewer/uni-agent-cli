@@ -4,7 +4,6 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import readline from "node:readline";
 import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Editor } from "@mariozechner/pi-tui/dist/components/editor.js";
@@ -1510,6 +1509,7 @@ export class AcpClient {
 		this.exited = false;
 		this.stopping = false;
 		this.stderrTail = "";
+		this.stdoutBuffer = "";
 	}
 
 	start() {
@@ -1545,8 +1545,36 @@ export class AcpClient {
 			this.stderrTail = (this.stderrTail + String(chunk)).slice(-4096);
 		});
 		this.child.stdin.on("error", (error) => this.rejectPending(error));
-		const rl = readline.createInterface({ input: this.child.stdout });
-		rl.on("line", (line) => this.handleLine(line));
+		// ACP is newline-delimited JSON. Node readline also splits on U+2028, which
+		// can appear inside raw tool output strings and corrupt an otherwise valid frame.
+		const stdoutDecoder = new StringDecoder("utf8");
+		this.child.stdout.on("data", (chunk) => this.handleStdoutText(stdoutDecoder.write(chunk)));
+		this.child.stdout.on("end", () => {
+			const tail = stdoutDecoder.end();
+			if (tail) this.handleStdoutText(tail);
+			this.flushStdoutLine();
+		});
+	}
+
+	handleStdoutText(text) {
+		if (!text) return;
+		this.stdoutBuffer += text;
+		while (true) {
+			const newlineIndex = this.stdoutBuffer.indexOf("\n");
+			if (newlineIndex < 0) return;
+			this.handleLine(this.normalizeStdoutLine(this.stdoutBuffer.slice(0, newlineIndex)));
+			this.stdoutBuffer = this.stdoutBuffer.slice(newlineIndex + 1);
+		}
+	}
+
+	flushStdoutLine() {
+		if (!this.stdoutBuffer) return;
+		this.handleLine(this.normalizeStdoutLine(this.stdoutBuffer));
+		this.stdoutBuffer = "";
+	}
+
+	normalizeStdoutLine(line) {
+		return line.endsWith("\r") ? line.slice(0, -1) : line;
 	}
 
 	async initialize(options = {}) {
