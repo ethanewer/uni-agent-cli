@@ -197,19 +197,20 @@ function voiceKeyHarness(controllerOverrides = {}) {
 	return { app, calls };
 }
 
-function normalizedToolStatusEvents(statuses) {
+function normalizedToolStatusEvents(statuses, options = {}) {
 	const events = [];
 	const client = Object.create(AcpClient.prototype);
 	client.sessionId = "fake-session";
 	client.onEvent = (event) => events.push(event);
 	client.bufferingSessionUpdates = false;
 	for (const status of statuses) {
+		const statusFields = options.nestedFields ? { fields: { status } } : { status };
 		client.handleSessionUpdate({
 			sessionId: "fake-session",
 			update: {
 				sessionUpdate: "tool_call_update",
 				toolCallId: "tool-1",
-				status,
+				...statusFields,
 			},
 		});
 	}
@@ -531,6 +532,10 @@ await (async () => {
 	assert.deepEqual(
 		normalizedToolStatusEvents(["finished", "finished-successfully", "timed out", "errored"]),
 		["complete", "complete", "canceled", "error"],
+	);
+	assert.deepEqual(
+		normalizedToolStatusEvents(["in_progress", "completed", "failed"], { nestedFields: true }),
+		["running", "complete", "error"],
 	);
 }
 
