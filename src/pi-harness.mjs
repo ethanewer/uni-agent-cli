@@ -2000,12 +2000,14 @@ export class AcpClient {
 			});
 			return;
 		}
-		if (kind === "tool_call_update" && update.status) {
+		const toolUpdateStatus = toolUpdateField(update, "status");
+		if (kind === "tool_call_update" && toolUpdateStatus) {
+			const title = toolUpdateField(update, "title");
 			this.onEvent({
 				type: "tool_update",
 				id: toolId(update),
-				title: update.title ? toolTitle(update) : undefined,
-				status: normalizedToolStatus(update.status),
+				title: title ? normalizeToolTitle(title) : undefined,
+				status: normalizedToolStatus(toolUpdateStatus),
 			});
 			return;
 		}
@@ -5344,6 +5346,11 @@ function normalizedToolStatus(status) {
 
 function toolId(update) {
 	return update.toolCallId ?? update.tool_call_id ?? update.id ?? update.callId ?? update.call_id;
+}
+
+function toolUpdateField(update, name) {
+	const fields = isPlainObject(update?.fields) ? update.fields : undefined;
+	return update?.[name] ?? fields?.[name];
 }
 
 function toolTitle(update) {
