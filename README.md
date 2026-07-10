@@ -12,7 +12,7 @@ One command (requires Node 18+ and `git`):
 npm install -g github:ethanewer/uni-agent-cli
 ```
 
-The post-install step installs the ACP adapters for Claude and Codex (`@agentclientprotocol/claude-agent-acp` and `@zed-industries/codex-acp`) if they aren't already on your `PATH`. To skip that, set `CC_SKIP_ADAPTER_INSTALL=1`.
+The post-install step installs the ACP adapters for Claude and Codex (`@agentclientprotocol/claude-agent-acp` and `@agentclientprotocol/codex-acp`) if they aren't already on your `PATH`. It also replaces the deprecated `@zed-industries/codex-acp`, which `cc` no longer supports. A failed migration restores the prior package non-destructively but reports that the maintained adapter must be installed before Codex can run. To skip adapter installation, set `CC_SKIP_ADAPTER_INSTALL=1`.
 
 Then run:
 
@@ -147,11 +147,11 @@ have to learn each agent's native dialect just to change how it asks.
 
 When you set an explicit mode, `cc` also aligns the backend's own native dialect so
 the two never disagree: `auto` enables it (claude `bypassPermissions`, codex
-`approval_policy=never` + `sandbox_mode=danger-full-access`, cursor `--force`),
+`agent-full-access`, cursor `--force`),
 while `ask`/`deny` *neutralize* any conflicting native auto/bypass on that agent
-(restoring claude `defaultMode=default`, codex `approval_policy=on-request`, and
+(restoring claude `defaultMode=default`, codex `agent`, and
 dropping cursor `--force`/`-f`/`--yolo`) so the backend prompts and `cc`'s decision
-is honored. Orthogonal settings (e.g. the codex sandbox) are left alone, and
+is honored. Orthogonal settings are left alone, and
 harnesses with no such knob are decided entirely by `cc`. Existing native settings
 (below) with no explicit mode are still honored and continue to imply `auto` for
 back-compat.
@@ -191,7 +191,7 @@ Create `~/.config/cc/settings.json` (or point `CC_SETTINGS` at another file) to 
 }
 ```
 
-These mirror each backend as closely as the ACP wrapper allows: Claude uses its `settings.permissions.defaultMode`, Codex uses `-c key=value` config overrides, and Cursor uses command-line args before the `acp` subcommand. When these imply bypass/force mode, `cc` also auto-accepts ACP permission requests the backend still emits. `args` are appended to the backend command (Cursor args are inserted before the `acp` subcommand).
+These mirror each backend as closely as the ACP wrapper allows: Claude uses its `settings.permissions.defaultMode`, Codex passes config through `CODEX_CONFIG` and selects the matching ACP mode, and Cursor uses command-line args before the `acp` subcommand. The Codex adapter uses its bundled compatible Codex by default, avoiding app-server protocol mismatches with an unrelated CLI on `PATH`. Set `env.CODEX_PATH` explicitly only when you want to supply a known-compatible Codex executable. When these imply bypass/force mode, `cc` also auto-accepts ACP permission requests the backend still emits. `args` are appended to the backend command (Cursor args are inserted before the `acp` subcommand).
 
 ### Unified permissions
 

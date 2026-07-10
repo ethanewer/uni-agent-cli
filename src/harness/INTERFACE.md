@@ -7,7 +7,7 @@
 
 Today `cc` mostly talks to backends through one generic `AcpClient`, but a
 handful of harness-specific behaviours are sprinkled through `pi-harness.mjs`
-as `this.activeKey === "codex"` / `agentInfo.name === "codex-acp"` branches and
+as `this.activeKey === "codex"` / Codex ACP wire-identity branches and
 name-keyed `switch` statements:
 
 | Coupling | Where (today) |
@@ -15,7 +15,7 @@ name-keyed `switch` statements:
 | Codex copy-fork (`~/.codex` rollout) | `runBtw` ladder + `forkCodexSession` |
 | Codex prompt **unsend** | `isCodexAcpActive` + `readCodexThreadState` + `tryUnsendPendingPrompt` |
 | Codex `/review` preset dialog | `shouldOpenCodexReviewDialog` / `openCodexReviewDialog` |
-| Codex `-c key=value` config | `applyConfigSettings` (key === "codex") |
+| Codex `CODEX_CONFIG` JSON | `applyConfigSettings` (key === "codex") |
 | Claude `_meta` settings | `applyNativeSettings` (key === "claude") |
 | Cursor arg-insert-before-`acp` | `applyNativeArgs` (key === "cursor") |
 | Cursor `/btw` refusal | `runBtw` (key === "cursor") |
@@ -142,7 +142,7 @@ consumes.
 | `forkCodexSession` | `CodexAdapter.fork()` (`fork: "copy"`) |
 | unsend `isCodexAcpActive`/state | `adapter.snapshotRetractionState()` / `adapter.canRetract()` |
 | `/review` dialog | `adapter.interceptCommand("review", …)` → `PresetDialog` |
-| `-c` / `_meta` / arg-insert | `adapter.buildLaunchSpec(settings)` |
+| config env / `_meta` / arg-insert | `adapter.buildLaunchSpec(settings)` |
 | auto-accept inference + auto/ask/deny + "allow always" | unified `permissions.mjs` engine (mode → native config + cc-side decision + persisted grants) → `capabilities.autoApprove` |
 | cursor/* extensions | already wire-method-gated in transport; surfaced via `handleExtensionRequest` |
 | cursor `/btw` refusal | falls out of `capabilities.fork === false` (no special case) |

@@ -23,12 +23,24 @@ import {
 	resolveThemeName,
 	rewriteFullScreenClear,
 	saveSettingsPatch,
+	SelectionPanel,
 	shouldDropVsCodeAutoActivationInput,
+	singleLineMenuText,
 	stabilizeGrowingRenderedLines,
 	stabilizeMutableRenderedLines,
 	streamingMutableTail,
 	themeNames,
 } from "../src/pi-harness.mjs";
+
+assert.equal(singleLineMenuText("first\nsecond\tthird"), "first second third");
+assert.equal(singleLineMenuText("safe\x1b[2J\x1b]0;owned\x07 title"), "safe title");
+assert.equal(singleLineMenuText("\x1b[31msession\nidentifier\x1b[0m"), "session identifier");
+{
+	const panel = new SelectionPanel("Resume\nsession", [{ label: "first\nsecond", description: "date\npath" }], () => {});
+	const lines = panel.render(80);
+	assert.ok(lines.every((line) => !line.includes("\n") && !line.includes("\r")));
+	assert.ok(lines.some((line) => line.includes("first second") && line.includes("date path")));
+}
 
 function clipboardReplayHarness() {
 	const replayed = [];
@@ -64,7 +76,7 @@ function afterToolHarness() {
 	return { app, cancelCount: () => cancelCount };
 }
 
-function busyPromptHarness(agentName = "codex-acp") {
+function busyPromptHarness(agentName = "@agentclientprotocol/codex-acp") {
 	const prompts = [];
 	let cancelCount = 0;
 	const app = Object.create(HarnessApp.prototype);
@@ -72,7 +84,7 @@ function busyPromptHarness(agentName = "codex-acp") {
 	app.busy = true;
 	app.cancelRequested = false;
 	app.sessionSwitchInProgress = false;
-	app.activeKey = agentName === "codex-acp" ? "codex" : "claude";
+	app.activeKey = agentName === "@agentclientprotocol/codex-acp" ? "codex" : "claude";
 	app.config = config;
 	app.client = {
 		agentInfo: { name: agentName },
@@ -112,7 +124,7 @@ function unsendHarness({ initialState, currentState = initialState } = {}) {
 	app.config = config;
 	app.client = {
 		sessionId: "codex-session",
-		agentInfo: { name: "codex-acp" },
+		agentInfo: { name: "@agentclientprotocol/codex-acp" },
 		exited: false,
 		prompt(prompt) {
 			prompts.push(prompt);
@@ -128,7 +140,7 @@ function unsendHarness({ initialState, currentState = initialState } = {}) {
 			return true;
 		},
 	};
-	app.sessionStates = new Map([["codex", { agentInfo: { name: "codex-acp" } }]]);
+	app.sessionStates = new Map([["codex", { agentInfo: { name: "@agentclientprotocol/codex-acp" } }]]);
 	app.chat = {
 		children: [],
 		addChild(child) {
@@ -252,6 +264,27 @@ function normalizedToolStatusEvents(statuses, options = {}) {
 	assert.equal(client.pending.has(3), false);
 }
 
+await (async () => {
+	let stopped = false;
+	let sessionCreated = false;
+	const client = Object.create(AcpClient.prototype);
+	client.agent = { _requiredAgentName: "@agentclientprotocol/codex-acp" };
+	client.start = () => {};
+	client.stop = () => (stopped = true);
+	client.newSession = async () => (sessionCreated = true);
+	client.request = async () => ({
+		agentInfo: { name: "codex-acp", version: "0.16.0" },
+		agentCapabilities: {},
+		authMethods: [],
+	});
+	await assert.rejects(
+		client.initialize(),
+		/Unsupported Codex ACP adapter.*npm install -g @agentclientprotocol\/codex-acp/,
+	);
+	assert.equal(stopped, true);
+	assert.equal(sessionCreated, false, "legacy identity is rejected before session/new or session/set_mode");
+})();
+
 const config = {
 	defaultAgent: "codex",
 	agents: {
@@ -282,6 +315,43 @@ const config = {
 		},
 	},
 };
+
+await (async () => {
+	let providerSets = 0;
+	let refreshes = 0;
+	const app = Object.create(HarnessApp.prototype);
+	app.activeKey = "codex";
+	app.config = config;
+	app.themeName = "system";
+	app.sessionStates = new Map();
+	app.availableCommands = new Map();
+	app.lastAutocompleteKey = undefined;
+	app.editor = {
+		autocompleteProvider: undefined,
+		setAutocompleteProvider(provider) {
+			providerSets += 1;
+			this.autocompleteProvider = provider;
+		},
+		refreshAutocompleteForCurrentInput() {
+			refreshes += 1;
+		},
+	};
+
+	app.updateAutocomplete();
+	const provider = app.editor.autocompleteProvider;
+	app.availableCommands.set("codex", [{ name: "review", description: "Review changes" }]);
+	app.updateAutocomplete();
+
+	assert.equal(providerSets, 1, "command discovery updates the existing provider without closing autocomplete");
+	assert.equal(app.editor.autocompleteProvider, provider);
+	assert.equal(refreshes, 2, "already-typed slash input is re-evaluated after each command-set change");
+	const suggestions = await provider.getSuggestions(["/r"], 0, 2, { force: false, signal: new AbortController().signal });
+	assert.ok(suggestions.items.some((item) => item.value === "review"));
+})();
+
+function codexConfig(agent) {
+	return JSON.parse(agent.env?.CODEX_CONFIG ?? "{}");
+}
 
 {
 	const { app, replayed } = clipboardReplayHarness();
@@ -1023,14 +1093,13 @@ assert.deepEqual(applied.agents.claude._sessionMeta, {
 	},
 });
 
-assert.deepEqual(applied.agents.codex.acp.args, [
-	"-c",
-	"model=\"gpt-5\"",
-	"-c",
-	"approval_policy=\"never\"",
-	"-c",
-	"sandbox_mode=\"danger-full-access\"",
-]);
+assert.deepEqual(applied.agents.codex.acp.args, []);
+assert.deepEqual(codexConfig(applied.agents.codex), {
+	model: "gpt-5",
+	approval_policy: "never",
+	sandbox_mode: "danger-full-access",
+});
+assert.equal(applied.agents.codex._startupMode, "agent-full-access");
 assert.equal(applied.agents.codex._autoPermissionRequests, true);
 
 assert.deepEqual(applied.agents.cursor.acp.args, [
@@ -1083,33 +1152,23 @@ assert.deepEqual(unified.agents.claude._sessionMeta, {
 	claudeCode: { options: { settings: { permissions: { defaultMode: "bypassPermissions" } } } },
 });
 assert.equal(unified.agents.codex._autoPermissionRequests, true);
-assert.deepEqual(unified.agents.codex.acp.args, [
-	"-c",
-	"approval_policy=\"never\"",
-	"-c",
-	"sandbox_mode=\"danger-full-access\"",
-]);
+assert.deepEqual(unified.agents.codex.acp.args, []);
+assert.deepEqual(codexConfig(unified.agents.codex), {});
+assert.equal(unified.agents.codex._startupMode, "agent-full-access");
 assert.equal(unified.agents.cursor._autoPermissionRequests, true);
 assert.deepEqual(unified.agents.cursor.acp.args, ["--force", "acp"]);
 // Generic harnesses with no native knob still auto-approve cc-side.
 assert.equal(unified.agents["terminus-2"]._permissionMode, "auto");
 assert.equal(unified.agents["terminus-2"]._autoPermissionRequests, true);
 
-// Unified `mode: auto` must OVERRIDE a conflicting/stale Codex native config so cc
-// and the backend agree (regression: generated keys used to be skipped if present).
+// Unified `mode: auto` must remove conflicting legacy Codex permission config and
+// select the maintained adapter's full-access ACP mode. Unrelated config remains.
 const conflicting = applyHarnessSettings(config, {
 	permissions: { mode: "auto" },
 	agents: { codex: { config: { approval_policy: "on-request", sandbox_mode: "workspace-write", model: "gpt-5" } } },
 });
-const codexArgs = conflicting.agents.codex.acp.args.join(" ");
-assert.ok(!codexArgs.includes('approval_policy="on-request"'), "stale approval_policy removed");
-assert.ok(!codexArgs.includes('sandbox_mode="workspace-write"'), "stale sandbox_mode removed");
-assert.ok(codexArgs.includes('approval_policy="never"'), "generated approval_policy wins");
-assert.ok(codexArgs.includes('sandbox_mode="danger-full-access"'), "generated sandbox_mode wins");
-assert.ok(codexArgs.includes('model="gpt-5"'), "unrelated config keys preserved");
-// Each overridden key appears exactly once.
-assert.equal((codexArgs.match(/approval_policy=/g) || []).length, 1);
-assert.equal((codexArgs.match(/sandbox_mode=/g) || []).length, 1);
+assert.deepEqual(codexConfig(conflicting.agents.codex), { model: "gpt-5" });
+assert.equal(conflicting.agents.codex._startupMode, "agent-full-access");
 assert.equal(conflicting.agents.codex._autoPermissionRequests, true);
 
 // Per-agent mode overrides the global default.
@@ -1119,19 +1178,17 @@ const mixed = applyHarnessSettings(config, {
 });
 assert.equal(mixed.agents.codex._permissionMode, "ask");
 assert.equal(mixed.agents.codex._autoPermissionRequests, undefined);
+assert.equal(mixed.agents.codex._startupMode, "agent");
 assert.equal(mixed.agents.claude._autoPermissionRequests, true);
 
 // mode "auto" WITH a deny rule must NOT put the backend in a native bypass that
 // stops it asking — cc would never get to enforce the denial. Gate it: the backend
-// keeps prompting (codex on-request) with full capability (danger sandbox), and cc
+// keeps prompting through the successor adapter's normal agent mode, and cc
 // auto-approves all but the denied tool.
 const autoDeny = applyHarnessSettings(config, {
 	permissions: { mode: "auto", rules: [{ tool: "shell", action: "deny" }] },
 });
-const adCodex = autoDeny.agents.codex.acp.args.join(" ");
-assert.ok(!adCodex.includes('approval_policy="never"'), "codex not in no-prompt bypass when a deny rule exists");
-assert.ok(adCodex.includes('approval_policy="on-request"'), "codex still prompts so cc can deny");
-assert.ok(adCodex.includes('sandbox_mode="danger-full-access"'), "codex keeps full capability");
+assert.equal(autoDeny.agents.codex._startupMode, "agent");
 assert.equal(autoDeny.agents.codex._permissionMode, "auto");
 assert.equal(autoDeny.agents.codex._autoPermissionRequests, true);
 // claude is gated to default (prompting) mode, not bypass.
@@ -1168,13 +1225,13 @@ const scopedDeny = applyHarnessSettings(config, {
 	permissions: { mode: "auto", rules: [{ agent: "codex", tool: "shell", action: "deny" }] },
 });
 assert.equal(scopedDeny.agents.claude._startupMode, "bypassPermissions"); // claude NOT gated
-assert.ok(scopedDeny.agents.codex.acp.args.join(" ").includes('approval_policy="on-request"')); // codex IS gated
+assert.equal(scopedDeny.agents.codex._startupMode, "agent"); // codex IS gated
 
 // A PERSISTED deny grant (no config rule) also forces gating at spawn.
 const autoGrant = applyHarnessSettings(config, { permissions: { mode: "auto" } }, [{ agent: "codex", tool: "shell", action: "deny" }]);
-assert.ok(autoGrant.agents.codex.acp.args.join(" ").includes('approval_policy="on-request"'), "persisted deny grant gates auto");
+assert.equal(autoGrant.agents.codex._startupMode, "agent", "persisted deny grant gates auto");
 // without the grant, pure auto still uses the full bypass.
-assert.ok(applyHarnessSettings(config, { permissions: { mode: "auto" } }).agents.codex.acp.args.join(" ").includes('approval_policy="never"'));
+assert.equal(applyHarnessSettings(config, { permissions: { mode: "auto" } }).agents.codex._startupMode, "agent-full-access");
 
 // Explicit unified "ask"/"deny" must NEUTRALIZE conflicting native auto/bypass on
 // the same agent, or cc (asking) and the backend (silently auto-running) disagree.
@@ -1192,10 +1249,9 @@ assert.equal(neutralized.agents.claude._startupMode, undefined);
 assert.deepEqual(neutralized.agents.claude._sessionMeta, {
 	claudeCode: { options: { settings: { permissions: { defaultMode: "default" }, model: "sonnet" } } },
 });
-// codex: approval_policy "never" flipped to "on-request" (prompting back on); auto cleared.
-const ncodex = neutralized.agents.codex.acp.args.join(" ");
-assert.ok(!ncodex.includes('approval_policy="never"'), "codex auto approval_policy neutralized");
-assert.ok(ncodex.includes('approval_policy="on-request"'), "codex now prompts");
+// codex: legacy bypass config removed and normal agent mode selected; auto cleared.
+assert.deepEqual(codexConfig(neutralized.agents.codex), {});
+assert.equal(neutralized.agents.codex._startupMode, "agent");
 assert.equal(neutralized.agents.codex._autoPermissionRequests, undefined);
 // cursor: --force removed (deny), unrelated args kept; cc decides deny-side.
 assert.ok(!neutralized.agents.cursor.acp.args.includes("--force"), "cursor force flag removed");
@@ -1214,6 +1270,7 @@ if (previousDefaultCcSettings === undefined) delete process.env.CC_SETTINGS;
 else process.env.CC_SETTINGS = previousDefaultCcSettings;
 assert.ok(defaultConfig.agents["terminus-2"]);
 assert.ok(defaultConfig.agents["mini-swe-agent"]);
+assert.equal(defaultConfig.agents.codex._requiredAgentName, "@agentclientprotocol/codex-acp");
 assert.match(defaultConfig.agents["terminus-2"].acp.args[0], /terminus_2\/bridge\.py$/);
 assert.match(defaultConfig.agents["mini-swe-agent"].acp.args[0], /mini_swe_agent\/bridge\.py$/);
 

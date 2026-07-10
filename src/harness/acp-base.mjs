@@ -147,7 +147,7 @@ export class BaseAcpAdapter {
 		const acpArgs = stringArray(settings.acpArgs);
 		if (acpArgs.length > 0) command.args = [...(command.args ?? []), ...acpArgs];
 
-		if (isPlainObject(settings.config)) command.args = this.translateConfig(command.args ?? [], settings.config);
+		if (isPlainObject(settings.config)) this.translateConfig(applied, settings.config);
 		if (isPlainObject(settings.settings)) this.translateNativeSettings(applied, settings.settings);
 		this.applyPermissionMode(applied, settings);
 		return applied;
@@ -193,11 +193,12 @@ export class BaseAcpAdapter {
 	applyGeneratedNativeConfig(applied, native) {
 		const command = applied.acp ?? applied;
 		if (native.settings) this.translateNativeSettings(applied, native.settings);
+		if (Array.isArray(native.removeConfig) && native.removeConfig.length > 0) this.removeConfig(applied, native.removeConfig);
 		if (native.config) {
-			// Drop any existing `-c key=...` the user set so the generated values
-			// win, then let the harness's own translateConfig append them.
+			// Drop any legacy `-c key=...` values before applying the harness's
+			// current config transport. Generated values must win.
 			command.args = stripConfigArgs(command.args ?? [], Object.keys(native.config));
-			command.args = this.translateConfig(command.args, native.config);
+			this.translateConfig(applied, native.config);
 		}
 		if (Array.isArray(native.removeArgs) && native.removeArgs.length > 0) {
 			command.args = stripFlags(command.args ?? [], native.removeArgs);
@@ -214,10 +215,11 @@ export class BaseAcpAdapter {
 		return [...baseArgs, ...nativeArgs];
 	}
 
-	/** Hook: translate a `config` block into spawn args. Base ignores it. */
-	translateConfig(baseArgs) {
-		return baseArgs;
-	}
+	/** Hook: translate a `config` block into the launch spec. Base ignores it. */
+	translateConfig() {}
+
+	/** Hook: remove native config keys superseded by unified settings. */
+	removeConfig() {}
 
 	/** Hook: fold a `settings` block into native session meta. Base ignores it. */
 	translateNativeSettings() {}

@@ -427,9 +427,12 @@ const PERMISSION_DIALECTS = {
 		},
 	},
 	codex: {
-		auto: { config: { approval_policy: "never", sandbox_mode: "danger-full-access" } },
-		gatedAuto: { config: { approval_policy: "on-request", sandbox_mode: "danger-full-access" } },
-		prompt: { config: { approval_policy: "on-request" } },
+		// @agentclientprotocol/codex-acp owns approval/sandbox policy through its
+		// ACP modes. The old @zed-industries adapter consumed `-c` arguments, but
+		// the successor ignores them and exposes these three modes instead.
+		auto: { startupMode: "agent-full-access", removeConfig: ["approval_policy", "sandbox_mode"] },
+		gatedAuto: { startupMode: "agent", removeConfig: ["approval_policy", "sandbox_mode"] },
+		prompt: { startupMode: "agent", removeConfig: ["approval_policy", "sandbox_mode"] },
 		infer(agentSettings) {
 			const config = agentSettings.config;
 			return config?.approval_policy === "never" && config?.sandbox_mode === "danger-full-access" ? "auto" : undefined;
@@ -466,7 +469,7 @@ export function getPermissionDialect(key) {
 /**
  * Map a unified mode to a harness's native settings — generic over the harness's
  * registered dialect. `autoApprove` tells cc to auto-accept; the spawn-config keys
- * (startupMode/settings/config/args/removeArgs) configure or neutralize the backend
+ * (startupMode/settings/config/removeConfig/args/removeArgs) configure or neutralize the backend
  * so cc and it never disagree. A harness with no dialect just gets `autoApprove`
  * for auto and {} for ask/deny (cc decides). `gated: true` (auto + deny rule) uses
  * the dialect's prompting variant so cc can still enforce the denial.

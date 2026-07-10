@@ -343,7 +343,8 @@ check("nativePermissionConfig generates per-harness native dialect for auto", ()
 	});
 	assert.deepEqual(nativePermissionConfig("codex", "auto"), {
 		autoApprove: true,
-		config: { approval_policy: "never", sandbox_mode: "danger-full-access" },
+		startupMode: "agent-full-access",
+		removeConfig: ["approval_policy", "sandbox_mode"],
 	});
 	assert.deepEqual(nativePermissionConfig("cursor", "auto"), { autoApprove: true, args: ["--force"] });
 	assert.deepEqual(nativePermissionConfig("opencode", "auto"), { autoApprove: true });
@@ -356,10 +357,11 @@ check("gated auto keeps the backend prompting (no full bypass) so deny rules fir
 		autoApprove: true,
 		settings: { permissions: { defaultMode: "default" } },
 	});
-	// codex: prompt (on-request) but keep full capability (danger sandbox).
+	// codex: use the maintained adapter's prompting agent mode.
 	assert.deepEqual(nativePermissionConfig("codex", "auto", { gated: true }), {
 		autoApprove: true,
-		config: { approval_policy: "on-request", sandbox_mode: "danger-full-access" },
+		startupMode: "agent",
+		removeConfig: ["approval_policy", "sandbox_mode"],
 	});
 	assert.deepEqual(nativePermissionConfig("cursor", "auto", { gated: true }), {
 		autoApprove: true,
@@ -381,7 +383,10 @@ check("policyNeedsGating is true iff a deny rule/grant is present", () => {
 check("nativePermissionConfig emits NEUTRALIZERS for ask/deny", () => {
 	// ask: flip the prompting switch back on, leaving orthogonal settings alone.
 	assert.deepEqual(nativePermissionConfig("claude", "ask"), { settings: { permissions: { defaultMode: "default" } } });
-	assert.deepEqual(nativePermissionConfig("codex", "ask"), { config: { approval_policy: "on-request" } });
+	assert.deepEqual(nativePermissionConfig("codex", "ask"), {
+		startupMode: "agent",
+		removeConfig: ["approval_policy", "sandbox_mode"],
+	});
 	assert.deepEqual(nativePermissionConfig("cursor", "ask"), { removeArgs: ["--force", "-f", "--yolo"] });
 	assert.deepEqual(nativePermissionConfig("opencode", "ask"), {});
 	// deny neutralizes identically to ask (the ask/deny difference is cc-side only).

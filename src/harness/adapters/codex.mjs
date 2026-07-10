@@ -1,40 +1,62 @@
 // Codex adapter — the most tightly coupled harness. Re-homes every codex-only
 // branch from pi-harness.mjs behind interface methods: copy-fork, prompt unsend,
-// the /review preset dialog, and `-c key=value` config translation. It reuses the
+// the /review preset dialog, and CODEX_CONFIG translation. It reuses the
 // exact exported production helpers so behavior is identical.
 
 import { copyCodexRolloutWithNewId, findCodexRolloutPath, readCodexThreadState } from "../../pi-harness.mjs";
 import { randomUUID } from "node:crypto";
 import { BaseAcpAdapter, REVIEW_PRESET } from "../acp-base.mjs";
-import { tomlValue } from "../util.mjs";
+
+const CODEX_ACP_AGENT_NAME = "@agentclientprotocol/codex-acp";
+
+function parseCodexConfig(value) {
+	try {
+		const parsed = JSON.parse(value ?? "{}");
+		return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+	} catch {
+		return {};
+	}
+}
 
 export class CodexAdapter extends BaseAcpAdapter {
 	declaredCapabilities() {
 		return { fork: "copy", retractPrompt: true, commandPresets: ["review"] };
 	}
 
-	// Unsend is only safe against the real codex-acp backend (matches isCodexAcpActive:
-	// agentInfo.name === "codex-acp"). Narrow only once connected to a live backend;
+	// Unsend is only safe against the maintained Codex ACP backend. Narrow only
+	// once connected to a live backend;
 	// pre-connect, keep the declared capability (the contract says pre-connect caps
 	// expose the declared subset). Pointing the codex key at another bridge then keeps
 	// unsend off rather than advertising a feature that backend can't honor.
 	refineCapabilities(caps) {
-		if (this.connection) caps.retractPrompt = this.connection.agentInfo?.name === "codex-acp";
+		if (this.connection) caps.retractPrompt = this.connection.agentInfo?.name === CODEX_ACP_AGENT_NAME;
 		return caps;
 	}
 
-	// `settings.config` -> repeated `-c name=<tomlValue>` spawn args.
-	translateConfig(baseArgs, config) {
-		const args = [...baseArgs];
-		for (const [name, value] of Object.entries(config)) {
-			args.push("-c", `${name}=${tomlValue(value)}`);
-		}
-		return args;
+	// The maintained adapter consumes Codex overrides as a JSON object. Preserve
+	// any config supplied directly through env, then let explicit cc settings win.
+	translateConfig(applied, config) {
+		const existing = {
+			...parseCodexConfig(process.env.CODEX_CONFIG),
+			...parseCodexConfig(applied.env?.CODEX_CONFIG),
+		};
+		applied.env = {
+			...(applied.env ?? {}),
+			CODEX_CONFIG: JSON.stringify({ ...existing, ...config }),
+		};
 	}
 
-	// Permissions (auto-accept from approval_policy=never + sandbox_mode=
-	// danger-full-access, and generation of those keys from the unified mode) are
-	// handled generically by BaseAcpAdapter via the unified engine.
+	removeConfig(applied, names) {
+		const parsed = {
+			...parseCodexConfig(process.env.CODEX_CONFIG),
+			...parseCodexConfig(applied.env?.CODEX_CONFIG),
+		};
+		for (const name of names) delete parsed[name];
+		applied.env = { ...(applied.env ?? {}), CODEX_CONFIG: JSON.stringify(parsed) };
+	}
+
+	// Permission intent maps to the successor adapter's ACP modes through the
+	// unified engine in BaseAcpAdapter.
 
 	// codex-acp exposes no session/fork. Copy the parent's rollout JSONL to a new
 	// id and session/load the copy: an isolated branch, parent untouched.

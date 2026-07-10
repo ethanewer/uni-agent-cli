@@ -125,7 +125,7 @@ function factoryFor(profile) {
 // Simulated wire capabilities per harness (mirrors the audit's findings).
 const PROFILES = {
 	codex: {
-		agentInfo: { name: "codex-acp" },
+		agentInfo: { name: "@agentclientprotocol/codex-acp" },
 		capabilities: { loadSession: true, sessionCapabilities: { list: {}, resume: {} }, promptCapabilities: { image: false } },
 		configOptions: [{ id: "model", category: "model" }, { id: "mode", category: "mode" }, { id: "thought_level", category: "thought_level" }],
 		modes: { currentModeId: "agent", availableModes: [{ id: "agent" }] },
@@ -184,9 +184,43 @@ const CONFIGS = {
 	"mini-swe-agent": { label: "mini-swe-agent", transport: "acp", acp: { command: "python3", args: ["bridge.py"] } },
 };
 
+function codexConfig(agent) {
+	return JSON.parse(agent.env?.CODEX_CONFIG ?? "{}");
+}
+
 const noopHost = () => ({ onEvent() {}, requestPermission: () => ({ outcome: "cancelled" }), requestInteraction: () => undefined });
 
 async function main() {
+	{
+		const original = process.env.CODEX_CONFIG;
+		process.env.CODEX_CONFIG = JSON.stringify({ model: "ambient-model", approval_policy: "never" });
+		try {
+			const codex = createAdapter("codex", CONFIGS.codex, noopHost(), {
+				settings: { config: { reasoning_effort: "high" }, permissions: { mode: "ask" } },
+				connectionFactory: factoryFor(PROFILES.codex),
+			});
+			assert.deepEqual(codexConfig(codex.launchSpec), { model: "ambient-model", reasoning_effort: "high" });
+		} finally {
+			if (original === undefined) delete process.env.CODEX_CONFIG;
+			else process.env.CODEX_CONFIG = original;
+		}
+		ok("codex-config:ambient-merge-and-permission-neutralization");
+	}
+	{
+		const safeDefault = applyHarnessSettings({
+			agents: { codex: { command: "codex", acp: { command: "codex-acp", args: [] } } },
+		}, {});
+		assert.equal(
+			Object.prototype.hasOwnProperty.call(safeDefault.agents.codex.env ?? {}, "CODEX_PATH"),
+			false,
+			"a PATH codex is never selected without an explicit override",
+		);
+		const explicit = applyHarnessSettings({
+			agents: { codex: { command: "codex", acp: { command: "codex-acp", args: [] } } },
+		}, { agents: { codex: { env: { CODEX_PATH: "/known-compatible/codex" } } } });
+		assert.equal(explicit.agents.codex.env.CODEX_PATH, "/known-compatible/codex");
+		ok("codex-path:bundled-default-explicit-override");
+	}
 	// =====================================================================
 	// (1) SINGLE INTERFACE — every adapter conforms to the one contract.
 	// =====================================================================
@@ -295,19 +329,15 @@ async function main() {
 	assert.deepEqual(settingsConfig.agents.cursor.acp.args, ["acp"]);
 	ok("settings-equivalence:no-mutation");
 
-	// Unified `mode: auto` overrides a conflicting/stale Codex native config on the
-	// adapter path too (parity with applyHarnessSettings).
+	// Unified `mode: auto` removes stale permission config and selects the new
+	// adapter's full-access mode (parity with applyHarnessSettings).
 	{
 		const codex = createAdapter("codex", CONFIGS.codex, noopHost(), {
 			settings: { permissions: { mode: "auto" }, config: { approval_policy: "on-request", model: "gpt-5" } },
 			connectionFactory: factoryFor(PROFILES.codex),
 		});
-		const args = codex.launchSpec.acp.args.join(" ");
-		assert.ok(!args.includes('approval_policy="on-request"'), "stale approval_policy removed (adapter)");
-		assert.ok(args.includes('approval_policy="never"'), "generated approval_policy wins (adapter)");
-		assert.ok(args.includes('sandbox_mode="danger-full-access"'), "generated sandbox_mode added (adapter)");
-		assert.ok(args.includes('model="gpt-5"'), "unrelated config preserved (adapter)");
-		assert.equal((args.match(/approval_policy=/g) || []).length, 1);
+		assert.deepEqual(codexConfig(codex.launchSpec), { model: "gpt-5" });
+		assert.equal(codex.launchSpec._startupMode, "agent-full-access");
 		assert.equal(codex.capabilities.autoApprove, true);
 		ok("settings-equivalence:unified-auto-overrides-codex");
 	}
@@ -319,9 +349,8 @@ async function main() {
 			settings: { permissions: { mode: "ask" }, config: { approval_policy: "never", sandbox_mode: "danger-full-access" } },
 			connectionFactory: factoryFor(PROFILES.codex),
 		});
-		const args = codex.launchSpec.acp.args.join(" ");
-		assert.ok(!args.includes('approval_policy="never"'), "codex auto neutralized (adapter)");
-		assert.ok(args.includes('approval_policy="on-request"'), "codex prompts again (adapter)");
+		assert.deepEqual(codexConfig(codex.launchSpec), {});
+		assert.equal(codex.launchSpec._startupMode, "agent");
 		assert.equal(codex.launchSpec._autoPermissionRequests, undefined);
 		assert.equal(codex.capabilities.autoApprove, false);
 
@@ -342,10 +371,7 @@ async function main() {
 			settings: { permissions: { mode: "auto", rules: [{ tool: "shell", action: "deny" }] } },
 			connectionFactory: factoryFor(PROFILES.codex),
 		});
-		const args = codex.launchSpec.acp.args.join(" ");
-		assert.ok(!args.includes('approval_policy="never"'), "codex not in no-prompt bypass when a deny rule exists (adapter)");
-		assert.ok(args.includes('approval_policy="on-request"'), "codex still prompts (adapter)");
-		assert.ok(args.includes('sandbox_mode="danger-full-access"'), "codex keeps full capability (adapter)");
+		assert.equal(codex.launchSpec._startupMode, "agent");
 		assert.equal(codex.capabilities.autoApprove, true);
 		ok("settings-equivalence:auto-with-deny-gates");
 	}
@@ -359,15 +385,13 @@ async function main() {
 			grants,
 			connectionFactory: factoryFor(PROFILES.codex),
 		});
-		const gargs = gated.launchSpec.acp.args.join(" ");
-		assert.ok(!gargs.includes('approval_policy="never"'), "persisted deny grant gates auto (adapter)");
-		assert.ok(gargs.includes('approval_policy="on-request"'), "codex prompts under a persisted deny grant (adapter)");
+		assert.equal(gated.launchSpec._startupMode, "agent", "persisted deny grant gates auto (adapter)");
 
 		const ungated = createAdapter("codex", CONFIGS.codex, noopHost(), {
 			settings: { permissions: { mode: "auto" } },
 			connectionFactory: factoryFor(PROFILES.codex),
 		});
-		assert.ok(ungated.launchSpec.acp.args.join(" ").includes('approval_policy="never"'), "no grant -> full bypass (adapter)");
+		assert.equal(ungated.launchSpec._startupMode, "agent-full-access", "no grant -> full bypass (adapter)");
 		ok("settings-equivalence:persisted-deny-grant-gates");
 	}
 
@@ -462,7 +486,7 @@ async function main() {
 			process.env.CODEX_HOME = dir;
 			const codex = createAdapter("codex", CONFIGS.codex, noopHost(), { connectionFactory: factoryFor(PROFILES.codex) });
 			await codex.connect();
-			// retractPrompt is gated on the live wire identity (agentInfo.name === "codex-acp").
+			// retractPrompt is gated on the maintained Codex ACP identity.
 			assert.equal(codex.capabilities.retractPrompt, true);
 			assert.equal(typeof codex.snapshotRetractionState, "function");
 			// armUnsend/canUnsend are cc's generic helpers; with no codex state db the

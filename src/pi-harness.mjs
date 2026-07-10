@@ -12,7 +12,7 @@ import { Text } from "@mariozechner/pi-tui/dist/components/text.js";
 import { isKeyRelease, matchesKey } from "@mariozechner/pi-tui/dist/keys.js";
 import { ProcessTerminal } from "@mariozechner/pi-tui/dist/terminal.js";
 import { Container, TUI } from "@mariozechner/pi-tui/dist/tui.js";
-import { normalizeTerminalOutput, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui/dist/utils.js";
+import { extractAnsiCode, normalizeTerminalOutput, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui/dist/utils.js";
 import {
 	cancelledOutcome,
 	classifyOption,
@@ -110,6 +110,7 @@ const DEFAULT_CONFIG = {
 			transport: "acp",
 			command: "codex",
 			args: [],
+			_requiredAgentName: "@agentclientprotocol/codex-acp",
 			acp: { command: "codex-acp", args: [] },
 		},
 		cursor: {
@@ -788,6 +789,14 @@ class VoiceEditor extends Editor {
 		if (this.state.cursorLine === 0) this.state.cursorCol += normalized.length;
 		this.onChange?.(this.getText());
 	}
+
+	refreshAutocompleteForCurrentInput() {
+		const line = this.state.lines[this.state.cursorLine] ?? "";
+		const beforeCursor = line.slice(0, this.state.cursorCol);
+		if (this.state.cursorLine !== 0 || !/^\/[A-Za-z0-9._-]*$/.test(beforeCursor)) return;
+		if (this.autocompleteState) this.updateAutocomplete();
+		else this.tryTriggerAutocomplete();
+	}
 }
 
 class AgentMenu {
@@ -837,7 +846,26 @@ class AgentMenu {
 	}
 }
 
-class SelectionPanel {
+export function singleLineMenuText(value) {
+	const source = String(value ?? "");
+	let plain = "";
+	for (let index = 0; index < source.length; ) {
+		const ansi = source.charCodeAt(index) === 0x1b ? extractAnsiCode(source, index) : null;
+		if (ansi) {
+			index += ansi.length;
+			continue;
+		}
+		plain += source[index];
+		index += 1;
+	}
+	return plain
+		.replace(/[\r\n\t\f\v]+/g, " ")
+		.replace(/[\u0000-\u001f\u007f-\u009f]/g, "")
+		.replace(/\s+/gu, " ")
+		.trim();
+}
+
+export class SelectionPanel {
 	constructor(title, entries, onSelect, options = {}) {
 		this.title = title;
 		this.entries = entries;
@@ -858,7 +886,7 @@ class SelectionPanel {
 		this.selected = entries.length > 0 ? Math.min(this.selected, entries.length - 1) : 0;
 		const start = Math.max(0, Math.min(this.selected - half, entries.length - maxVisible));
 		const visible = entries.slice(start, start + maxVisible);
-		const lines = [chalk.bold(this.title), ""];
+		const lines = [chalk.bold(singleLineMenuText(this.title)), ""];
 
 		for (let offset = 0; offset < rowCount; offset += 1) {
 			const entry = visible[offset];
@@ -869,8 +897,10 @@ class SelectionPanel {
 			const index = start + offset;
 			const cursor = index === this.selected ? "›" : " ";
 			const marker = entry.active ? "●" : " ";
-			const description = entry.description ? chalk.dim(`  ${entry.description}`) : "";
-			const label = `${cursor} ${marker} ${entry.label}${description}`;
+			const entryLabel = singleLineMenuText(entry.label);
+			const entryDescription = singleLineMenuText(entry.description);
+			const description = entryDescription ? chalk.dim(`  ${entryDescription}`) : "";
+			const label = `${cursor} ${marker} ${entryLabel}${description}`;
 			lines.push(index === this.selected ? chalk.blue(label) : chalk.text(label));
 		}
 
@@ -933,7 +963,7 @@ class SelectionPanel {
 		if (!this.query) return this.entries;
 		const query = this.query.toLowerCase();
 		return this.entries.filter((entry) =>
-			[entry.label, entry.description, entry.value].filter(Boolean).some((value) => String(value).toLowerCase().includes(query)),
+			[entry.label, entry.description, entry.value].filter(Boolean).some((value) => singleLineMenuText(value).toLowerCase().includes(query)),
 		);
 	}
 }
@@ -1590,6 +1620,14 @@ export class AcpClient {
 		this.capabilities = initialized?.agentCapabilities ?? {};
 		this.agentInfo = initialized?.agentInfo ?? {};
 		this.authMethods = initialized?.authMethods ?? [];
+		const requiredAgentName = this.agent._requiredAgentName;
+		if (requiredAgentName && this.agentInfo.name !== requiredAgentName) {
+			this.stop();
+			const actual = this.agentInfo.name || "unknown";
+			throw new Error(
+				`Unsupported Codex ACP adapter (${actual}). Install the maintained adapter with: npm install -g @agentclientprotocol/codex-acp`,
+			);
+		}
 		// createSession:false lets a caller (e.g. /btw) decide between newSession,
 		// forkSession, or loadSession after seeing the advertised capabilities.
 		if (options.createSession !== false) await this.newSession();
@@ -3200,7 +3238,7 @@ export class HarnessApp {
 
 	isCodexAcpActive() {
 		const info = this.client?.agentInfo ?? this.sessionStates.get(this.activeKey)?.agentInfo;
-		return this.transport === "acp" && info?.name === "codex-acp";
+		return this.transport === "acp" && info?.name === "@agentclientprotocol/codex-acp";
 	}
 
 	refreshCodexThreadStateSnapshot(sessionInfo = undefined) {
@@ -3824,13 +3862,15 @@ export class HarnessApp {
 			const sessions = await this.client.listSessions();
 			const forkIds = loadForkIds();
 			const entries = sessions.map((session) => {
-				const title = session.title || session.sessionId;
+				const title = singleLineMenuText(session.title) || singleLineMenuText(session.sessionId) || "unknown session";
 				return {
 					value: session.sessionId,
 					// /btw forks inherit the parent's title; mark them so a resume list
 					// of a parent + its fork(s) is distinguishable.
 					label: forkIds.has(session.sessionId) ? `(fork) ${title}` : title,
-					description: session.updatedAt ? `${compactDate(session.updatedAt)} · ${compactPath(session.cwd)}` : compactPath(session.cwd),
+					description: singleLineMenuText(
+						session.updatedAt ? `${compactDate(session.updatedAt)} · ${compactPath(session.cwd)}` : compactPath(session.cwd),
+					),
 					active: session.sessionId === this.client.sessionId,
 					session,
 				};
@@ -3853,10 +3893,11 @@ export class HarnessApp {
 
 	async resumeSelectedSession(session, options = {}) {
 		if (!this.client) return;
-		const displayText = options.displayText ?? slashPromptDisplay("/resume", session.title || session.sessionId);
+		const title = singleLineMenuText(session.title) || singleLineMenuText(session.sessionId) || "unknown session";
+		const displayText = options.displayText ?? slashPromptDisplay("/resume", title);
 		if (session.sessionId === this.client.sessionId) {
 			this.addCommandMessage(displayText);
-			this.addNotice(`Already using ${session.title || session.sessionId}`);
+			this.addNotice(`Already using ${title}`);
 			return;
 		}
 		this.statusState = "resuming";
@@ -4209,19 +4250,20 @@ export class HarnessApp {
 		this.forceFullRepaint({ immediate: options.immediateRender === true });
 	}
 
-	// Codex's ACP bridge (codex-acp) does not expose session/fork — session/load and
+	// Codex's ACP bridge does not expose session/fork — session/load and
 	// session/resume reuse the SAME thread id and append to the SAME rollout file,
 	// so resuming the live session in a second process would corrupt its rollout.
 	// To fork safely we copy the main session's rollout JSONL to a brand-new id and
 	// load the copy: an isolated branch with full history + tools, parent untouched.
 	//
-	// VERSION-SPECIFIC ASSUMPTIONS (verified against openai/codex + codex-acp as of
-	// 2026-06; if Codex changes its on-disk layout this is where to fix it):
+	// VERSION-SPECIFIC ASSUMPTIONS (verified against openai/codex 0.144 and
+	// @agentclientprotocol/codex-acp 1.1 as of 2026-07; if Codex changes its
+	// on-disk layout this is where to fix it):
 	//   • Rollouts live under $CODEX_HOME (default ~/.codex) at
 	//     sessions/YYYY/MM/DD/rollout-<timestamp>-<threadUuid>.jsonl (JSON Lines).
 	//   • The ACP session id returned by session/new equals <threadUuid>, which is
 	//     also embedded in the rollout (SessionMeta header + per-item thread_id).
-	//   • codex-acp resolves session/load by scanning rollout filenames for the id,
+	//   • codex-acp resolves session/load from a rollout filename containing the id,
 	//     so writing a copy named with the new uuid makes it loadable without the
 	//     state_5.sqlite index. Replacing every occurrence of the old uuid with the
 	//     new one keeps the header and all item records internally consistent.
@@ -4233,9 +4275,8 @@ export class HarnessApp {
 		if (rolloutPath.endsWith(".zst")) throw new Error("the Codex session rollout is compressed; cannot fork it (see forkCodexSession notes)");
 		const newId = randomUUID();
 		copyCodexRolloutWithNewId(rolloutPath, parentSessionId, newId);
-		// codex-acp only implements session/load (session/resume is "method not
-		// found"), and load replays the parent transcript. That replay arrives
-		// before the thread is marked ready, and BtwThread discards pre-ready
+		// Use session/load so the copied id is loaded directly. It replays the parent
+		// transcript before the thread is marked ready, and BtwThread discards pre-ready
 		// events, so the fork inherits context without dumping history into the
 		// pane (the parent conversation is already visible in the main thread).
 		await btwClient.loadSession(newId);
@@ -4682,13 +4723,17 @@ export class HarnessApp {
 			...localSlashCommands(this),
 			...(this.availableCommands.get(this.activeKey) ?? []),
 		]);
-		// Rebuilding the provider tears down any open autocomplete popup, so skip
-		// it when the effective command set is unchanged (a frequent no-op on
-		// every config/mode/session-info update while the user is mid-type).
+		// Skip frequent no-op config/mode/session updates while the user is mid-type.
 		const key = `${this.activeKey}\t${JSON.stringify(commands.map((command) => [command.name, command.description, command.argumentHint]))}`;
 		if (key === this.lastAutocompleteKey) return;
 		this.lastAutocompleteKey = key;
-		this.editor.setAutocompleteProvider(new LazyCombinedAutocompleteProvider(commands, process.cwd(), null));
+		const provider = this.editor.autocompleteProvider;
+		if (provider instanceof LazyCombinedAutocompleteProvider) provider.setCommands(commands);
+		else this.editor.setAutocompleteProvider(new LazyCombinedAutocompleteProvider(commands, process.cwd(), null));
+		// Backend commands commonly arrive after the user has already typed `/x`.
+		// Re-evaluate that unchanged input immediately; replacing a provider alone
+		// cancels Pi's popup and it otherwise stays closed until another keystroke.
+		this.editor.refreshAutocompleteForCurrentInput?.();
 	}
 
 	addUserMessage(text, options = {}) {
@@ -4985,6 +5030,11 @@ class LazyCombinedAutocompleteProvider {
 		this.basePath = basePath;
 		this.fdPath = fdPath;
 		this.delegate = undefined;
+	}
+
+	setCommands(commands) {
+		this.commands = commands;
+		if (this.delegate) this.delegate.commands = commands;
 	}
 
 	async getSuggestions(lines, cursorLine, cursorCol, options) {
@@ -6654,7 +6704,7 @@ function applyAgentSettings(key, agent, settings, globalPermissions, grants = []
 	const acpArgs = stringArray(settings.acpArgs);
 	if (acpArgs.length > 0) command.args = [...(command.args ?? []), ...acpArgs];
 
-	if (isPlainObject(settings.config)) command.args = applyConfigSettings(key, command.args ?? [], settings.config);
+	if (isPlainObject(settings.config)) applyConfigSettings(key, applied, settings.config);
 	if (isPlainObject(settings.settings)) applyNativeSettings(key, applied, settings.settings);
 	applyNativePermissionSetting(key, applied, settings, globalPermissions, grants);
 	return applied;
@@ -6665,13 +6715,35 @@ function applyNativeArgs(key, baseArgs, nativeArgs) {
 	return [...baseArgs, ...nativeArgs];
 }
 
-function applyConfigSettings(key, baseArgs, config) {
-	if (key !== "codex") return baseArgs;
-	const args = [...baseArgs];
-	for (const [name, value] of Object.entries(config)) {
-		args.push("-c", `${name}=${tomlValue(value)}`);
+function applyConfigSettings(key, agent, config) {
+	if (key !== "codex") return;
+	const existing = {
+		...parseCodexConfig(process.env.CODEX_CONFIG),
+		...parseCodexConfig(agent.env?.CODEX_CONFIG),
+	};
+	agent.env = {
+		...(agent.env ?? {}),
+		CODEX_CONFIG: JSON.stringify({ ...existing, ...config }),
+	};
+}
+
+function removeConfigSettings(key, agent, names) {
+	if (key !== "codex") return;
+	const parsed = {
+		...parseCodexConfig(process.env.CODEX_CONFIG),
+		...parseCodexConfig(agent.env?.CODEX_CONFIG),
+	};
+	for (const name of names) delete parsed[name];
+	agent.env = { ...(agent.env ?? {}), CODEX_CONFIG: JSON.stringify(parsed) };
+}
+
+function parseCodexConfig(value) {
+	try {
+		const parsed = JSON.parse(value ?? "{}");
+		return isPlainObject(parsed) ? parsed : {};
+	} catch {
+		return {};
 	}
-	return args;
 }
 
 function applyNativeSettings(key, agent, settings) {
@@ -6728,13 +6800,8 @@ function applyNativePermissionSetting(key, agent, settings, globalPermissions, g
 function applyGeneratedNativeConfig(key, agent, native) {
 	const command = agent.acp ?? agent;
 	if (native.settings) applyNativeSettings(key, agent, native.settings);
-	if (native.config) {
-		let args = command.args ?? [];
-		for (const [name, value] of Object.entries(native.config)) {
-			args = overrideConfigArg(args, name, value);
-		}
-		command.args = args;
-	}
+	if (Array.isArray(native.removeConfig) && native.removeConfig.length > 0) removeConfigSettings(key, agent, native.removeConfig);
+	if (native.config) applyConfigSettings(key, agent, native.config);
 	if (Array.isArray(native.removeArgs) && native.removeArgs.length > 0) {
 		command.args = stripFlags(command.args ?? [], native.removeArgs);
 	}
@@ -6745,41 +6812,10 @@ function applyGeneratedNativeConfig(key, agent, native) {
 	}
 }
 
-// Force a generated `-c name=value`: drop any existing `-c name=...` pair (so a
-// stale user value cannot win over an explicit unified auto), then append it.
-function overrideConfigArg(args, name, value) {
-	const next = [];
-	for (let index = 0; index < args.length; index++) {
-		if (args[index] === "-c" && typeof args[index + 1] === "string" && args[index + 1].startsWith(`${name}=`)) {
-			index++;
-			continue;
-		}
-		next.push(args[index]);
-	}
-	next.push("-c", `${name}=${tomlValue(value)}`);
-	return next;
-}
-
 function insertArgsBefore(baseArgs, marker, inserted) {
 	const index = baseArgs.indexOf(marker);
 	if (index === -1) return [...baseArgs, ...inserted];
 	return [...baseArgs.slice(0, index), ...inserted, ...baseArgs.slice(index)];
-}
-
-function tomlValue(value) {
-	if (typeof value === "string") return JSON.stringify(value);
-	if (typeof value === "number" || typeof value === "boolean") return String(value);
-	if (Array.isArray(value)) return `[${value.map(tomlValue).join(", ")}]`;
-	if (value === null) return "null";
-	if (isPlainObject(value)) {
-		const entries = Object.entries(value).map(([key, entry]) => `${tomlKey(key)} = ${tomlValue(entry)}`);
-		return `{ ${entries.join(", ")} }`;
-	}
-	return JSON.stringify(value);
-}
-
-function tomlKey(key) {
-	return /^[A-Za-z0-9_-]+$/.test(key) ? key : JSON.stringify(key);
 }
 
 function stringArray(value) {
