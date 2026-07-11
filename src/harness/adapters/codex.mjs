@@ -3,21 +3,11 @@
 // the /review preset dialog, and CODEX_CONFIG translation. It reuses the
 // exact exported production helpers so behavior is identical.
 
-import {
-	acquireForkOperationLock,
-	codexHome,
-	copyCodexRolloutWithNewId,
-	findCodexRolloutPath,
-	forgetForkIds,
-	mergeEnvironments,
-	readCodexThreadState,
-	recordForkId,
-	stopClientsForReplacement,
-} from "../../pi-harness.mjs";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { BaseAcpAdapter, REVIEW_PRESET } from "../acp-base.mjs";
+import { mergeEnvironments } from "../acp-runtime.mjs";
 
 const CODEX_ACP_AGENT_NAME = "@agentclientprotocol/codex-acp";
 
@@ -31,6 +21,13 @@ function parseCodexConfig(value) {
 }
 
 export class CodexAdapter extends BaseAcpAdapter {
+	codexService(name, options = {}) {
+		const service = this.services?.codex?.[name] ?? this.services?.[name];
+		if (typeof service === "function") return service;
+		if (options.optional === true) return undefined;
+		throw new Error(`Codex adapter requires the host service ${name}()`);
+	}
+
 	declaredCapabilities() {
 		return { fork: "copy", retractPrompt: true, commandPresets: ["review"] };
 	}
@@ -76,7 +73,13 @@ export class CodexAdapter extends BaseAcpAdapter {
 
 	// codex-acp exposes no session/fork. Copy the parent's rollout JSONL to a new
 	// id and session/load the copy: an isolated branch, parent untouched.
-	async fork(parentSessionId) {
+	async fork(parentSessionId, options = {}) {
+		const acquireForkOperationLock = this.codexService("acquireForkOperationLock");
+		const codexHome = this.codexService("codexHome");
+		const findCodexRolloutPath = this.codexService("findCodexRolloutPath");
+		const copyCodexRolloutWithNewId = this.codexService("copyCodexRolloutWithNewId");
+		const recordForkId = this.codexService("recordForkId");
+		const forgetForkIds = this.codexService("forgetForkIds");
 		const releaseForkOperation = await acquireForkOperationLock({ operation: `fork ${parentSessionId}` });
 		try {
 			const environment = this.codexEnvironment();
@@ -96,9 +99,9 @@ export class CodexAdapter extends BaseAcpAdapter {
 				throw error;
 			}
 			try {
-				await this.loadSession(newId);
+				await this.loadSession(newId, options);
 			} catch (error) {
-				await stopClientsForReplacement([this.connection]);
+				await this.stopConnections([this.connection]);
 				fs.rmSync(copiedRolloutPath, { force: true });
 				forgetForkIds(newId, { required: true });
 				throw error;
@@ -111,6 +114,9 @@ export class CodexAdapter extends BaseAcpAdapter {
 	// Unsend: snapshot the on-disk thread state, then check it is unchanged before
 	// retracting the just-sent prompt.
 	snapshotRetractionState() {
+		const readCodexThreadState = this.codexService("readCodexThreadState", { optional: true });
+		const codexHome = this.codexService("codexHome", { optional: true });
+		if (!readCodexThreadState || !codexHome) return undefined;
 		return readCodexThreadState(
 			this.sessionId,
 			path.join(codexHome(this.codexEnvironment()), "state_5.sqlite"),
@@ -119,6 +125,9 @@ export class CodexAdapter extends BaseAcpAdapter {
 
 	canRetract(snapshot) {
 		if (!snapshot) return false;
+		const readCodexThreadState = this.codexService("readCodexThreadState", { optional: true });
+		const codexHome = this.codexService("codexHome", { optional: true });
+		if (!readCodexThreadState || !codexHome) return false;
 		const current = readCodexThreadState(
 			snapshot.sessionId,
 			path.join(codexHome(this.codexEnvironment()), "state_5.sqlite"),

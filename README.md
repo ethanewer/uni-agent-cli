@@ -6,13 +6,13 @@ A fast, low-latency `cc` CLI for driving **Claude Code**, **Codex**, and **Curso
 
 ## Install
 
-One command (requires Node 20+ and `git`):
+One command (requires Node 22+ and `git`):
 
 ```sh
 npm install -g github:ethanewer/uni-agent-cli
 ```
 
-The post-install step installs the ACP adapters for Claude and Codex (`@agentclientprotocol/claude-agent-acp` and `@agentclientprotocol/codex-acp`) if compatible versions aren't already on your `PATH`. Codex requires `@agentclientprotocol/codex-acp` 1.1.2 or newer. The installer also replaces the deprecated `@zed-industries/codex-acp`, which `cc` no longer supports. Failed installs restore the prior package non-destructively and report how to finish the upgrade. To skip adapter installation, set `CC_SKIP_ADAPTER_INSTALL=1`.
+`cc` carries its ACP adapters as exact runtime dependencies: `@agentclientprotocol/claude-agent-acp` 0.58.1 and `@agentclientprotocol/codex-acp` 1.1.2. The built-in Claude and Codex harnesses launch those package-local copies, so an unrelated global adapter on `PATH` cannot silently change the protocol. A custom `agents.<name>.acp.command` remains an explicit override and must identify itself as the expected adapter at startup. Post-install only verifies those local dependencies; it never installs, removes, or migrates global adapter packages.
 
 Then run:
 
@@ -38,6 +38,50 @@ npm install
 npm link
 ```
 
+### Stable `cc` and beta `cc2` channels
+
+For side-by-side testing, install commit snapshots instead of using `npm link`:
+
+```sh
+npm run install:channels
+```
+
+This resolves `cc` from the local `main` ref and `cc2` from the local
+`ux-0711` ref. Rerun the command after either local ref moves. (`git fetch`
+alone updates `origin/main`, not the local `main` ref.) A specific commit,
+remote-tracking ref, or branch can be selected for one channel with, for
+example:
+
+```sh
+node scripts/install-channel.mjs beta --ref HEAD
+node scripts/install-channel.mjs stable --ref origin/main
+```
+
+The installer archives the selected commit, so uncommitted working-tree changes
+are never included. It builds and smoke-tests the complete release before an
+atomic channel switch. Releases and their private `node_modules`/ACP adapters
+live under `~/.local/share/cc/channels/<channel>/releases/<commit>`; the launchers
+are `~/.local/bin/cc` and `~/.local/bin/cc2`. Add `~/.local/bin` to `PATH` if it
+is not already there. On Windows the launchers use the corresponding `cc.cmd`
+and `cc2.cmd` names. The installer never runs `npm link` or changes npm's
+global prefix.
+
+Stable `cc` continues to use the normal `~/.config/cc` state. Beta `cc2` keeps
+its config, settings, permission grants, fork registry, and autocomplete cache
+under `~/.local/share/cc/channels/beta/state`, so beta experiments cannot alter
+stable wrapper state. Backend-owned Claude and Codex session stores remain
+shared.
+
+Each successful update records the old release as `previous`. Roll back without
+reinstalling dependencies:
+
+```sh
+node scripts/install-channel.mjs beta --rollback
+```
+
+Use `--root` and `--bin-dir` (or `CC_INSTALL_ROOT` and `CC_BIN_DIR`) to override
+the default locations.
+
 ## Sending messages while the agent is working
 
 `cc` mirrors Codex's steering model so you never have to wait for a turn to finish:
@@ -58,6 +102,71 @@ including the CSI-u and modifyOtherKeys encodings used by modern terminals and t
 
 Queued messages are shown above the input box (`after tool: …` / `queued: …`). If the backend crashes while messages are queued, they are preserved and re-sent against a fresh connection on your next submit — never silently dropped.
 
+## Custom keybindings
+
+Run `/keybindings` to create and open `~/.config/cc/keybindings.json`. The file
+uses Claude Code's `bindings` array, context names, keystroke aliases, and
+`key -> action` layout. cc watches the file and applies valid changes without a
+restart; `/keybindings reload` reloads it explicitly and `/keybindings show`
+lists the active custom bindings and validation warnings. Set `CC_KEYBINDINGS`
+to move the file. When `CC_SETTINGS` points at an isolated settings directory
+(as it does for `cc2`), keybindings live beside that settings file automatically.
+
+```json
+{
+  "$schema": "https://www.schemastore.org/claude-code-keybindings.json",
+  "$docs": "https://code.claude.com/docs/en/keybindings",
+  "bindings": [
+    {
+      "context": "Chat",
+      "bindings": {
+        "enter": "chat:newline",
+        "ctrl+enter": "chat:submit"
+      }
+    }
+  ]
+}
+```
+
+The harness-neutral input layer supports Claude-compatible `Global` actions for
+interrupt, exit, redraw, and `app:toggleTodos`; `Chat` actions for cancel and input-preserving redraw,
+stopping running agents, cycling advertised modes, opening the model picker,
+submit, newline, undo, image paste, fast-mode toggle, and voice push-to-talk;
+all `Autocomplete` and generic `Select` actions;
+`Confirmation` yes/no/previous/next/toggle; and `Task` backgrounding. Two-key
+chords such as `ctrl+x ctrl+k` are supported and keep their prefix reserved while
+cc waits for the second key. A mismatched or timed-out chord never leaks its
+prefix into the editor.
+
+cc does not pretend to support a Claude action when the shared TUI has no
+equivalent surface. For example, Claude's transcript toggles, external
+editor and prompt stash, clear-screen/double-clear behavior, permission-explanation controls, and fullscreen-only
+panels produce a clear validation warning. Ctrl+C, Ctrl+D, and Ctrl+M remain
+reserved. Ctrl+B, Ctrl+A, and Ctrl+Z bindings report their tmux, GNU screen, or
+terminal conflict without preventing startup. The built-in defaults include
+Shift+Enter and Option/Alt+Enter for newlines, Claude's safe Ctrl+X task chords,
+Ctrl+T checklist toggle, and Ctrl+B task backgrounding outside tmux. Default plain Space starts voice
+only in cc's empty voice composer; it remains a normal space while typing.
+Shift+Tab cycles advertised modes unless a `/btw` pane is open, where it keeps
+cc's existing pane-focus behavior.
+
+## Local shell mode
+
+Start a composer entry with `!` to run it in your local shell, for example
+`!git status`. cc captures bounded stdout/stderr, strips terminal-control
+sequences, records the result in the transcript, and asks the active agent to
+respond to it. File and directory arguments complete live while you type; when
+there is no matching path, autocomplete offers recent prefix-matching commands
+from a bounded, read-only view of your shell history and the current cc run.
+cc never writes, persists, or forwards that command history to a harness. The
+process runs in cc's current working directory and is stopped with the rest of
+cc during shutdown.
+
+Set `"respondToBashCommands": false` in cc's `settings.json` to retain the
+command result as context without starting a model turn. Context-only insertion
+is capability-gated; a harness that cannot append context reports that clearly
+instead of silently dropping the result.
+
 ## Switching agents
 
 ```text
@@ -74,7 +183,7 @@ The harness you pick with `/harness` is remembered (written to `settings.json` a
 
 Agent-advertised ACP commands appear in autocomplete and are forwarded to that backend (a backend command always takes precedence over a same-named local command, except the reserved UI commands below). This keeps Codex commands such as `/review`, `/compact`, and `/skills` available without `cc` needing to duplicate them. Bare `/mcp` and `/mcp verbose` likewise stay on the live ACP session; only the explicit management subcommands documented below are handled locally. `cc` also provides these commands:
 
-Autocomplete does not wait for the ACP process on every launch. `cc` seeds the fixed commands of the version-checked Codex adapter and privately caches each harness's last advertised command list for the current working directory. Cached entries are display hints only: live ACP advertisements replace them, including with an empty list, and command routing never treats a cached name as local or authoritative. Dynamic project, plugin, account, and skill commands become immediate after their first discovery in that directory. The bounded cache is stored in the platform cache directory (`~/Library/Caches/cc/commands.json` on macOS), expires after 30 days, and can be disabled with `CC_DISABLE_COMMAND_CACHE=1` or relocated with `CC_COMMAND_CACHE`.
+Autocomplete does not wait for the ACP process on every launch. `cc` seeds an identity-and-version-gated snapshot of first-party commands from its pinned Claude and Codex adapters, then privately caches each harness's last advertised command list for the current working directory. Cached entries are display hints only: live ACP advertisements replace them, including with an empty list, and command routing never treats a cached name as local or authoritative. Dynamic project, plugin, account, and skill commands become immediate after their first discovery in that directory. The bounded cache is stored in the platform cache directory (`~/Library/Caches/cc/commands.json` on macOS), expires after 30 days, and can be disabled with `CC_DISABLE_COMMAND_CACHE=1` or relocated with `CC_COMMAND_CACHE`.
 
 - `/new`, `/clear` — start a fresh ACP session and clear the visible thread.
 - `/resume` — open the session picker (when the backend supports `session/list`).
@@ -84,12 +193,19 @@ Autocomplete does not wait for the ACP process on every launch. `cc` seeds the f
 - `/plan [prompt]` — switch to an advertised Plan mode, then optionally submit the inline request. The current Codex ACP adapter does not expose native collaboration mode, so `cc` clearly labels and uses a read-only, prompt-based planning fallback instead.
 - `/permissions [read-only|auto|full-access|show|clear]` — select Codex's advertised sandbox/approval preset while keeping `cc`'s host-side permission gate synchronized, or inspect/clear remembered grants.
 - `/status` — use the backend's richer status command when it advertises one; otherwise show the local session summary.
-- `/cc-status` — always show the `cc`/ACP summary (agent, model, mode, reasoning, fast mode, context usage, theme, and session id when available).
+- `/cc-status` — always show the `cc`/ACP summary (agent, model, backend mode, cc's resolved `ask`/`auto`/`deny` permission policy, reasoning, fast mode, Remote Control state, context usage, theme, and session id when available). The same resolved permission policy is always visible in the footer, with `⏸` marking manual `ask` mode; an active, disconnected, or failed Remote Control state is shown there without putting its URL in the persistent line.
 - `/delete [session-id|name]` — permanently delete the current or supplied session after confirmation. Names are resolved for Codex and ACP backends that advertise `session/list`; other backends require a session id. Codex deletion also removes descendant sessions, and duplicate Codex names must be disambiguated with a UUID.
 - `/login [method]`, `/logout` — run the active backend's advertised ACP authentication flow without leaving `cc`. Choosing Codex's ChatGPT method may let `codex-acp` open the sign-in page directly; URL confirmation prompts in `cc` are used for MCP authorization requests.
 - `/btw <question>` (also `/side`) — ask an **ephemeral side question** in a transient overlay (see below).
 - `/diff` — show tracked and untracked working-tree changes; pass explicit git arguments such as `/diff --staged` when needed.
-- `/copy` — copy the last response to the clipboard.
+- `/copy [N|picker]` — copy the focused thread's Nth-latest assistant response. Plain responses copy immediately; responses with fenced code open a picker with the full response first and each code block after it. Press **Enter** to copy, or **w** with an empty filter to choose a file; existing files are replaced only after confirmation. Choosing **Always copy full response** stores a cc-only preference and skips future pickers; `/copy picker` disables that preference.
+- `/color [red|blue|green|yellow|purple|orange|pink|cyan|default]` — recolor the editor border for this `cc` session. With no argument, `/color` chooses a random palette color. This remains host-local: the pinned Claude Agent SDK 0.3.205 declares an internal `set_color` control message but exposes no supported `Query.setColor()` mutation, so cc does not call the SDK's private request API to imitate Remote Control accent synchronization.
+- `/cd <path>` — move a capable live session and cc itself to another working directory without rebuilding context; trust and permission rules remain backend-enforced.
+- `/branch [name]` — fork the active main conversation and continue on the new branch while leaving the source resumable. A name is applied only when the harness advertises named forks; close `/btw` first.
+- `/tasks [stop <task-id>|background [tool-use-id]]` — list a capable harness's live foreground/background tasks, stop one by id, or move blocking work into the background. Claude task lifecycle events are normalized and bounded by its per-harness bridge; raw SDK frames never enter the shared TUI.
+- `/todos` — open the focused main or `/btw` session's live checklist. Standard ACP plan updates, Claude TodoWrite/Task snapshots, and Cursor todo snapshots are normalized into the same bounded state. Press **Ctrl+T** to toggle this surface without adding a transcript message. This is separate from `/tasks`, which controls running background work.
+- `/rewind` (also `/checkpoint` and `/undo`) — choose an earlier user message, then restore **code and conversation**, **conversation only**, or **code only** when the harness advertises checkpoints. Immediately after `/clear`, the picker also offers `/resume <id> (previous session)` until another resume commits or cc exits. All three names are reserved locally and report unsupported capability instead of being forwarded with backend-specific semantics. The built-in Claude bridge enables Agent SDK file checkpointing; conversation rewind creates and atomically loads a new branch, leaving the original session resumable. Claude Code's **Summarize from here** and **Summarize up to here** choices are not shown because the pinned public Agent SDK has no safe summarization-at-checkpoint control; `cc` does not imitate them with a prompt.
+- `/remote-control [name|off]` (also `/rc`) — make the existing main session available at a validated `claude.ai/code` URL through the built-in Claude bridge, optionally give it a name, or disconnect it with `off`. This calls the pinned public Agent SDK's existing-session control; it does not start Claude's separate server mode and accepts no server flags. The normalized state belongs to the exact adapter connection and session: switching sessions updates the indicator, and switching harnesses cannot retain or expose the previous harness's URL. The local `cc` process must remain running. Availability still depends on Claude's account, organization, region, and authentication requirements; [Claude's Remote Control documentation](https://code.claude.com/docs/en/remote-control) says API-key authentication is unsupported.
 - `/voice` — return the empty input box to voice mode.
 - `/theme` — pick a color theme (persisted).
 - `/init` — ask the agent to create or improve the repository's `AGENTS.md` guidance.
@@ -118,9 +234,15 @@ The following commands expose Codex CLI features that are not carried by ACP its
 
 These integrations are exposed only while Codex is active. The Codex form of `/delete` and CLI/app-server operations above use `CODEX_PATH` when explicitly configured, then the compatible Codex bundled with `codex-acp`, then a `codex` executable on `PATH`. This keeps an older standalone CLI from breaking newer adapter-backed features. They report an error instead of changing state when no CLI can be found. Persistent forking, import, memory management, config diagnostics, app discovery, hook inspection, feedback, rename, usage, and goal inspection use initialized app-server connections; none runs a competing model turn. `/fork` waits for the native process tree to finish and then loads the confirmed child through ACP. `/memories` goes further for task metadata: it first proves the ACP owner has stopped, performs the cold mutation, and resumes the same thread. MCP management launches the compatible CLI directly with literal argument arrays and no shell. `/app` is the exception: it hands a validated thread deep link directly to the installed desktop application and does not launch the Codex CLI.
 
-### Skills, files, and other Codex input
+### Skills, files, and agent mentions
 
-Backend-advertised skills autocomplete with their native `$skill-name` syntax anywhere in a prompt. File mentions autocomplete after `@`, including when `fd` is not installed. If the backend advertises ACP embedded-context support, `@path` and `@"path with spaces"` are sent as structured file resources rather than plain text. Text files up to 512 KiB are embedded; larger or binary files are sent as resource links. Image and file parts keep their original prompt order.
+Backend-advertised skills autocomplete with their native `$skill-name` syntax anywhere in a prompt. File mentions autocomplete after `@`, including when `fd` is not installed. A harness that advertises an `agent` session config option also contributes its custom agents to the same `@` menu; Claude's custom-agent descriptions therefore appear without the TUI reading Claude files or SDK internals. If the backend advertises ACP embedded-context support, `@path` and `@"path with spaces"` are sent as structured file resources rather than plain text. Text files up to 512 KiB are embedded; larger or binary files are sent as resource links. Image and file parts keep their original prompt order.
+
+### Claude Code parity and SDK boundaries
+
+The built-in Claude adapter exposes the current maintained ACP surface for models, effort, fast mode, custom agents, skills, plugins, hooks, MCP, memory, subagents, and backend commands. Generic cc extensions cover recent interactive-CLI additions that need host UI: shell history and path completion, `/cd`, `/branch`, `/tasks`, `/todos`, `/rewind`, Remote Control, Claude-compatible keybindings, Option/Alt+Return newlines, persistent permission/Remote Control status, and merged `@agent`/`@file` completion.
+
+The remaining Claude CLI features depend on its private fullscreen application loop or on SDK operations that are not public. cc therefore does not imitate whole-session background/daemon attach, `claude agents`, `/fork <directive>` background-subagent launch, the `/workflows` management dashboard, `/tui`/`/focus` and transcript/Vim visual modes, checkpoint summarization, native plugin/skill management panels, or Remote Control server-mode flags. Backend-executed workflows and subagents still run and render normally when the adapter advertises or invokes them.
 
 ### Codex parity and ACP boundaries
 
@@ -159,7 +281,7 @@ Codex's main-pane `/fork` is separate from `/btw`: it uses native `thread/fork`,
 
 ### Cursor
 
-`cc` natively handles Cursor's ACP extensions: `cursor/ask_question` and `cursor/create_plan` are surfaced as TUI prompts (accept/answer/reject), and `update_todos` / `task` / `generate_image` are rendered inline. Cursor's `agent` / `plan` / `ask` modes map onto `/mode`.
+`cc` natively handles Cursor's ACP extensions: `cursor/ask_question` and `cursor/create_plan` are surfaced as TUI prompts (accept/answer/reject), `update_todos` feeds the generic `/todos` checklist, and `task` / `generate_image` are rendered inline. Cursor's `agent` / `plan` / `ask` modes map onto `/mode`.
 
 ## Voice input
 
@@ -239,6 +361,7 @@ Create `~/.config/cc/settings.json` (or point `CC_SETTINGS` at another file) to 
 ```json
 {
   "theme": "tokyonight",
+  "copyAlwaysFullResponse": false,
   "agents": {
     "claude": { "settings": { "permissions": { "defaultMode": "bypassPermissions" }, "model": "sonnet" } },
     "codex": {
@@ -253,6 +376,8 @@ Create `~/.config/cc/settings.json` (or point `CC_SETTINGS` at another file) to 
   }
 }
 ```
+
+`copyAlwaysFullResponse` is host-only UI state: choosing **Always copy full response** in `/copy` sets it to `true`, and `/copy picker` resets it to `false`. It is never sent to a harness.
 
 These mirror each backend as closely as the ACP wrapper allows: Claude uses its `settings.permissions.defaultMode`, Codex passes config through `CODEX_CONFIG` and selects the matching ACP mode, and Cursor uses command-line args before the `acp` subcommand. The Codex adapter uses its bundled compatible Codex by default, avoiding app-server protocol mismatches with an unrelated CLI on `PATH`. Set `env.CODEX_PATH` explicitly only when you want to supply a known-compatible Codex executable. When these imply bypass/force mode, `cc` also auto-accepts ACP permission requests the backend still emits. `args` are appended to the backend command (Cursor args are inserted before the `acp` subcommand).
 

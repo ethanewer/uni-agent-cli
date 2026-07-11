@@ -1,18 +1,15 @@
 // BaseAcpAdapter — implements the entire HarnessAdapter interface over an
-// AcpConnection (the generic ACP transport). In production the connection is the
-// real AcpClient from pi-harness.mjs; tests inject a fake. Most harnesses are a
+// AcpConnection (the generic ACP transport). The embedding host injects the
+// connection factory; tests inject a fake. Most harnesses are a
 // ~10-line subclass that overrides only the hooks for their niceties.
 
 import {
-	AcpClient,
 	autoCursorOutcome,
-	collectEnvironmentAuthenticationVariables,
 	cursorActionName,
 	cursorCancelResult,
 	mergeEnvironments,
-	runTerminalAuthentication,
-	stopClientsForReplacement,
-} from "../pi-harness.mjs";
+	stopConnectionsForReplacement,
+} from "./acp-runtime.mjs";
 import { capabilitiesFromWire, emptyCapabilities } from "./interface.mjs";
 import {
 	cancelledOutcome,
@@ -27,9 +24,9 @@ import {
 } from "./permissions.mjs";
 import { clonePlain, isPlainObject, stringArray } from "./util.mjs";
 
-/** The transport contract the base adapter depends on (satisfied by AcpClient). */
-export function defaultConnectionFactory(agent, onEvent, options) {
-	return new AcpClient(agent, onEvent, options);
+/** Fail clearly when an embedding host forgets to supply its ACP transport. */
+export function defaultConnectionFactory() {
+	throw new Error("Harness adapter requires an ACP connectionFactory");
 }
 
 /** Remove every `-c name=...` pair whose name is in `names` (codex `-c` form). */
@@ -83,7 +80,10 @@ export class BaseAcpAdapter {
 		// decisions (permissionPolicy), so a remembered deny gates an auto launch.
 		// Default [] keeps the adapter deterministic — no implicit fs reads.
 		this.permissionGrants = Array.isArray(options.grants) ? options.grants : [];
-		this.connectionFactory = options.connectionFactory ?? defaultConnectionFactory;
+		this.services = options.services ?? {};
+		this.connectionFactory = options.connectionFactory ?? this.services.connectionFactory ?? defaultConnectionFactory;
+		this.stopConnections = options.stopConnections ?? this.services.stopConnections ?? stopConnectionsForReplacement;
+		this.runtimePermissionMode = undefined;
 		this.connection = undefined;
 		this.connectOptions = {};
 		this.replacementProcessFence = undefined;
@@ -95,7 +95,9 @@ export class BaseAcpAdapter {
 		// The fully-resolved spawn spec, with native settings translated. This is
 		// what cc would spawn and what carries _sessionMeta / _startupMode /
 		// _autoPermissionRequests into AcpClient.
-		this.launchSpec = this.buildLaunchSpec(this.settings);
+		this.launchSpec = options.launchSpec
+			? clonePlain(options.launchSpec)
+			: this.buildLaunchSpec(this.settings);
 		this.autoApprove = Boolean(this.launchSpec?._autoPermissionRequests);
 
 		// Capabilities are valid after connect(); pre-connect they hold the declared
@@ -348,7 +350,7 @@ export class BaseAcpAdapter {
 			// Production AcpClient instances need their complete process tree reaped,
 			// not merely signalled. The helper retains the synchronous stop fallback for
 			// lightweight injected connections used by other adapters and tests.
-			connectionShutdown = stopClientsForReplacement([connection]);
+			connectionShutdown = this.stopConnections([connection]);
 		} catch (error) {
 			connectionShutdown = Promise.reject(error);
 		}
@@ -374,14 +376,53 @@ export class BaseAcpAdapter {
 		return this.connection?.sessionId;
 	}
 
+	get exited() {
+		return this.lifecycleState !== "open" || this.connection?.exited === true;
+	}
+
+	get stopping() {
+		return this.lifecycleState !== "open" || this.connection?.stopping === true;
+	}
+
+	get agentInfo() {
+		return this.getSessionInfo().agentInfo ?? {};
+	}
+
+	get authMethods() {
+		return this.getSessionInfo().authMethods ?? [];
+	}
+
+	get configOptions() {
+		return this.getSessionInfo().configOptions ?? [];
+	}
+
+	get models() {
+		return this.getSessionInfo().models;
+	}
+
+	get modes() {
+		return this.getSessionInfo().modes;
+	}
+
+	// The host's process-tree fence uses this name to distinguish production
+	// clients from lightweight synchronous test doubles.
+	stopAndWait() {
+		return this.stop();
+	}
+
+	// Settle a backend that acknowledged cancel but omitted the prompt response.
+	forceResolvePrompt() {
+		return this.connection?.forceResolvePrompt?.() ?? false;
+	}
+
 	// ---- sessions (capability-gated) ------------------------------------------
 
 	async listSessions() {
 		return this.connection.listSessions();
 	}
 
-	async loadSession(sessionId) {
-		return this.connection.loadSession(sessionId);
+	async loadSession(sessionId, options = {}) {
+		return this.connection.loadSession(sessionId, options);
 	}
 
 	async deleteSession(sessionId) {
@@ -404,6 +445,76 @@ export class BaseAcpAdapter {
 		return this.connection.setMode(modeId);
 	}
 
+	// ---- working directory (capability-gated) ---------------------------------
+
+	supportsChangeWorkingDirectory() {
+		return this.capabilities.changeWorkingDirectory === true;
+	}
+
+	async changeWorkingDirectory(targetPath, options = {}) {
+		if (!this.capabilities.changeWorkingDirectory) {
+			throw new Error("this harness does not advertise live working-directory changes");
+		}
+		return this.connection.changeWorkingDirectory(targetPath, options);
+	}
+
+	// ---- transcript context (capability-gated) --------------------------------
+
+	async appendContext(text) {
+		if (!this.capabilities.appendContext) {
+			throw new Error("this harness does not advertise context-only transcript input");
+		}
+		return this.connection.appendContext(text);
+	}
+
+	// ---- background tasks (capability-gated) ---------------------------------
+
+	async listBackgroundTasks(options = {}) {
+		if (!this.capabilities.backgroundTasks) {
+			throw new Error("this harness does not advertise background-task lifecycle support");
+		}
+		return this.connection.listBackgroundTasks(options);
+	}
+
+	async stopBackgroundTask(taskId) {
+		if (!this.capabilities.backgroundTasks) {
+			throw new Error("this harness does not advertise background-task lifecycle support");
+		}
+		return this.connection.stopBackgroundTask(taskId);
+	}
+
+	async backgroundTasks(toolUseId = undefined) {
+		if (!this.capabilities.backgroundTasks) {
+			throw new Error("this harness does not advertise background-task lifecycle support");
+		}
+		return this.connection.backgroundTasks(toolUseId);
+	}
+
+	// ---- checkpoints / rewind (capability-gated) -----------------------------
+
+	async listCheckpoints(options = {}) {
+		if (!this.capabilities.checkpoints) {
+			throw new Error("this harness does not advertise checkpoint support");
+		}
+		return this.connection.listCheckpoints(options);
+	}
+
+	async rewindCheckpoint(checkpointId, mode, options = {}) {
+		if (!this.capabilities.checkpoints) {
+			throw new Error("this harness does not advertise checkpoint support");
+		}
+		return this.connection.rewindCheckpoint(checkpointId, mode, options);
+	}
+
+	// ---- Remote Control (capability-gated) ------------------------------------
+
+	async setRemoteControl(options = {}) {
+		if (!this.capabilities.remoteControl) {
+			throw new Error("this harness does not advertise Remote Control support");
+		}
+		return this.connection.setRemoteControl(options);
+	}
+
 	// ---- authentication (capability-gated) ------------------------------------
 
 	async authenticate(methodId, meta = undefined) {
@@ -412,11 +523,11 @@ export class BaseAcpAdapter {
 		if (method?.type === "terminal") {
 			await this.#runClientAuthentication(async ({ signal, processTracker }) => {
 				const context = { adapter: this, meta, signal, processTracker };
-				if (typeof this.host.runTerminalAuthentication === "function") {
-					await this.host.runTerminalAuthentication(this.launchSpec, method, context);
-				} else {
-					await runTerminalAuthentication(this.launchSpec, method, context);
+				const runner = this.host.runTerminalAuthentication ?? this.services.runTerminalAuthentication;
+				if (typeof runner !== "function") {
+					throw new Error("This ACP authentication method requires a terminal-authentication host callback");
 				}
+				await runner(this.launchSpec, method, context);
 			});
 			this.#assertLifecycleOpen();
 			delete this.launchSpec._signedOutAuthEnvNames;
@@ -427,9 +538,11 @@ export class BaseAcpAdapter {
 			const configuredEnvironment = mergeEnvironments([process.env, this.launchSpec?.env, command?.env]);
 			const credentials = await this.#runClientAuthentication(async ({ signal }) => {
 				const context = { adapter: this, meta, signal };
-				return typeof this.host.collectEnvironmentVariables === "function"
-					? await this.host.collectEnvironmentVariables(method, configuredEnvironment, context)
-					: await collectEnvironmentAuthenticationVariables(method, configuredEnvironment, context);
+				const collect = this.host.collectEnvironmentVariables ?? this.services.collectEnvironmentVariables;
+				if (typeof collect !== "function") {
+					throw new Error("This ACP authentication method requires an environment-credential host callback");
+				}
+				return await collect(method, configuredEnvironment, context);
 			});
 			this.#assertLifecycleOpen();
 			const authenticationEnvironment = this.#validatedAuthenticationEnvironment(method, credentials);
@@ -591,7 +704,7 @@ export class BaseAcpAdapter {
 				// replacement until every old connection has either exited gracefully or
 				// been force-killed with its complete process tree confirmed gone.
 				try {
-					await stopClientsForReplacement([connectionToRetire, currentConnection]);
+					await this.stopConnections([connectionToRetire, currentConnection]);
 				} catch (error) {
 					if (error?.code === "PROCESS_TREE_TERMINATION_FAILED") {
 						this.replacementProcessFence ??= error;
@@ -710,7 +823,7 @@ export class BaseAcpAdapter {
 		if (decision.action === "deny") return cursorCancelResult(method);
 		if (decision.action === "allow") return autoCursorOutcome(method, params);
 		if (typeof this.host.requestInteraction === "function") {
-			return this.host.requestInteraction(method, params);
+			return this.host.requestInteraction(method, params, { adapter: this });
 		}
 		return undefined;
 	}
@@ -729,7 +842,7 @@ export class BaseAcpAdapter {
 			agents: { [this.key]: { permissions: this.settings?.permissions } },
 		};
 		const policy = resolvePermissionPolicy(settings, this.key, this.permissionGrants);
-		policy.mode = this.launchSpec?._permissionMode ?? policy.mode;
+		policy.mode = this.runtimePermissionMode ?? this.launchSpec?._permissionMode ?? policy.mode;
 		return policy;
 	}
 
@@ -742,6 +855,14 @@ export class BaseAcpAdapter {
 		this.permissionGrants = Array.isArray(grants) ? grants : [];
 	}
 
+	/** Host-owned, in-memory /yolo override for this exact adapter. */
+	setRuntimePermissionMode(mode = undefined) {
+		if (mode !== undefined && !["ask", "auto", "deny"].includes(mode)) {
+			throw new Error(`Unsupported runtime permission mode: ${mode}`);
+		}
+		this.runtimePermissionMode = mode;
+	}
+
 	// Decide allow/deny/ask uniformly via the shared engine; only "ask" reaches the
 	// host. This mirrors pi-harness HarnessApp.resolvePermissionOutcome exactly, so
 	// moving cc onto adapters keeps identical behavior.
@@ -750,7 +871,12 @@ export class BaseAcpAdapter {
 		const decision = decidePermission(policy, params, { agentKey: this.key });
 		if (decision.action !== "ask") return outcomeForDecision(decision);
 		if (typeof this.host.requestPermission === "function") {
-			return this.host.requestPermission(params, { agentKey: this.key, policy });
+			return this.host.requestPermission(params, {
+				agentKey: this.key,
+				adapter: this,
+				sourceClient: this,
+				policy,
+			});
 		}
 		return cancelledOutcome();
 	}

@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 
 const nodeMajorVersion = Number.parseInt(process.versions.node.split(".")[0], 10);
-if (!Number.isFinite(nodeMajorVersion) || nodeMajorVersion < 20) {
+if (!Number.isFinite(nodeMajorVersion) || nodeMajorVersion < 22) {
 	if (process.env.CC_PREPAINTED === "1") {
 		// The shell launcher has already drawn a placeholder and hidden the cursor.
 		// Tear it down before exiting so an unsupported Node version cannot leave
@@ -12,7 +12,7 @@ if (!Number.isFinite(nodeMajorVersion) || nodeMajorVersion < 20) {
 		process.stdout.write("\x1b8\x1b[J\x1b[?25h");
 	}
 	console.error(
-		`cc requires Node.js 20 or newer (found ${process.versions.node}). Upgrade Node.js, then reinstall cc.`,
+		`cc requires Node.js 22 or newer (found ${process.versions.node}). Upgrade Node.js, then reinstall cc.`,
 	);
 	process.exit(1);
 }

@@ -3,6 +3,8 @@ import fs from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { BUNDLED_ACP_ADAPTERS } from "./bundled-adapters.mjs";
 
 const CACHE_VERSION = 2;
 const MAX_CACHE_BYTES = 1024 * 1024;
@@ -35,6 +37,7 @@ const DISCOVERY_ENVIRONMENT_NAMES = [
 const SECRET_ENVIRONMENT_NAME = /(?:^|_)(?:access_?key(?:_id)?|api_?key|auth|authorization|cookie|credential(?:s)?|key|oauth|passphrase|passwd|password|pin|secret|token)(?:$|_)/iu;
 const SCRIPT_LAUNCHER_NAMES = new Set(["bash", "bun", "dash", "deno", "ksh", "node", "nodejs", "python", "python3", "ruby", "sh", "zsh"]);
 const PACKAGE_LAUNCHER_NAMES = new Set(["bunx", "npx", "npm", "pnpm", "yarn"]);
+const PACKAGE_ROOT = path.dirname(fileURLToPath(new URL("../../package.json", import.meta.url)));
 
 const hint = (name, description = undefined, argumentHint = undefined) => ({
 	name,
@@ -42,13 +45,55 @@ const hint = (name, description = undefined, argumentHint = undefined) => ({
 	...(argumentHint ? { argumentHint } : {}),
 });
 
-// These are deliberately non-authoritative startup hints. Keep this list to
-// commands whose adapter identity/version cc verifies before use. Claude,
-// Cursor, OpenCode, Pi, and Codex skills mix account-, plugin-, and
-// workspace-specific entries, so their exact lists belong in the last-seen
-// cache rather than in a snapshot copied from one machine. A live advertisement
-// always replaces these hints.
+// These are deliberately non-authoritative startup hints, gated to adapter
+// identities/versions cc verifies before use. Claude's entries snapshot the
+// pinned release's first-party commands and bundled skills so its large SDK
+// scan cannot make autocomplete look empty on a first launch. User/project
+// skills, plugins, MCP commands, and workspace commands remain last-seen cache
+// entries. A live advertisement always replaces every hint, including with an
+// empty or account-restricted list.
 const BUILTIN_COMMAND_HINTS = {
+	claude: [
+		hint("deep-research", "Run cited multi-agent web research"),
+		hint("design-sync", "Push a React design system to Claude Design", "[project]"),
+		hint("dataviz", "Create accessible, consistent data visualizations"),
+		hint("update-config", "Configure Claude Code settings, hooks, and permissions"),
+		hint("verify", "Exercise a change end-to-end and observe its behavior"),
+		hint("debug", "Enable debug logging and diagnose an issue", "[issue]"),
+		hint("code-review", "Review changes for bugs and cleanups", "[effort] [--fix] [--comment] [target]"),
+		hint("simplify", "Review and apply code-quality cleanups", "[target]"),
+		hint("batch", "Plan and execute a large change across worktree agents", "<instruction>"),
+		hint("fewer-permission-prompts", "Create a safe allowlist from common read-only calls"),
+		hint("doctor", "Diagnose and repair the Claude Code setup"),
+		hint("loop", "Run a prompt or command on a recurring interval", "[interval] [prompt]"),
+		hint("claude-api", "Load current Claude API and Agent SDK guidance", "[migrate|managed-agents-onboard]"),
+		hint("run", "Launch and drive the project to verify behavior"),
+		hint("run-skill-generator", "Create or improve the project's run skill"),
+		hint("agents", "Create or manage Claude subagents"),
+		hint("color", "Set the prompt-bar color", "[color|default]"),
+		hint("compact", "Compact the conversation context"),
+		hint("config", "Set a Claude Code setting", "key=value"),
+		hint("context", "Show current context usage"),
+		hint("effort", "Set model effort", "<low|medium|high|xhigh|max|ultracode|auto>"),
+		hint("fast", "Toggle Claude fast mode", "[on|off]"),
+		hint("heapdump", "Write a JavaScript heap snapshot"),
+		hint("init", "Initialize CLAUDE.md project guidance"),
+		hint("mcp", "Inspect or manage MCP servers", "[reconnect|enable|disable [server|all]]"),
+		hint("model", "Change the Claude model", "<model>"),
+		hint("reload-skills", "Reload skills changed on disk"),
+		hint("rename", "Rename the current conversation", "[name]"),
+		hint("review", "Review a GitHub pull request", "[pr]"),
+		hint("security-review", "Review pending changes for security issues"),
+		hint("status", "Show Claude Code status"),
+		hint("usage", "Show cost, plan usage, and attribution"),
+		hint("insights", "Analyze Claude Code session history"),
+		hint("recap", "Generate a one-line session recap"),
+		hint("goal", "Keep working until a condition is met", "[condition|clear]"),
+		hint("design", "Manage Claude Design access", "[consent|revoke]"),
+		hint("design-consent", "Grant Claude Design access"),
+		hint("design-revoke", "Revoke Claude Design access"),
+		hint("team-onboarding", "Generate a team onboarding guide from usage"),
+	],
 	codex: [
 		hint("skills", "List available skills"),
 		hint("review", "Review uncommitted changes or follow custom instructions", "[instructions]"),
@@ -58,6 +103,18 @@ const BUILTIN_COMMAND_HINTS = {
 		hint("goal", "Set, pause, resume, clear, or inspect a task goal", "[<objective>|view|edit|clear|pause|resume]"),
 	],
 };
+
+function declaredMinimumAtLeast(agent, expected) {
+	const actual = String(agent._minimumAgentVersion ?? "").split(".").map((part) => Number.parseInt(part, 10));
+	const minimum = String(expected).split(".").map((part) => Number.parseInt(part, 10));
+	if (actual.length === 0 || actual.some((part) => !Number.isFinite(part))) return false;
+	for (let index = 0; index < Math.max(actual.length, minimum.length); index += 1) {
+		const left = actual[index] ?? 0;
+		const right = minimum[index] ?? 0;
+		if (left !== right) return left > right;
+	}
+	return true;
+}
 
 function boundedText(value, maxChars) {
 	if (typeof value !== "string") return undefined;
@@ -93,13 +150,16 @@ export function normalizeBackendCommands(commands) {
 }
 
 function commandKind(agent = {}) {
+	if (agent._commandHintProfile === "claude") return "claude";
 	if (agent._commandHintProfile === "codex") return "codex";
-	const minimum = String(agent._minimumAgentVersion ?? "").split(".").map((part) => Number.parseInt(part, 10));
-	const supportsCurrentCommands =
-		minimum.every((part) => Number.isFinite(part)) &&
-		(minimum[0] > 1 ||
-			(minimum[0] === 1 && ((minimum[1] ?? 0) > 1 || ((minimum[1] ?? 0) === 1 && (minimum[2] ?? 0) >= 2))));
-	if (agent._requiredAgentName === "@agentclientprotocol/codex-acp" && supportsCurrentCommands) return "codex";
+	if (
+		agent._requiredAgentName === BUNDLED_ACP_ADAPTERS.claude.packageName &&
+		declaredMinimumAtLeast(agent, BUNDLED_ACP_ADAPTERS.claude.minimumVersion)
+	) return "claude";
+	if (
+		agent._requiredAgentName === BUNDLED_ACP_ADAPTERS.codex.packageName &&
+		declaredMinimumAtLeast(agent, BUNDLED_ACP_ADAPTERS.codex.minimumVersion)
+	) return "codex";
 	return undefined;
 }
 
@@ -303,20 +363,43 @@ function resolveLaunchTargetIdentities(command, args, cwd) {
 	return identities;
 }
 
+function packageLocalLaunchIdentities(agent, launch) {
+	const contract = Object.values(BUNDLED_ACP_ADAPTERS).find((entry) =>
+		agent?._requiredAgentName === entry.packageName &&
+		agent?._packageLocalAcpCommand === entry.bin &&
+		launch?.command === entry.bin,
+	);
+	if (!contract) return [];
+	const packageRoot = path.join(PACKAGE_ROOT, "node_modules", ...contract.packageName.split("/"));
+	const packageJson = path.join(packageRoot, "package.json");
+	try {
+		const metadata = JSON.parse(fs.readFileSync(packageJson, "utf8"));
+		if (metadata?.name !== contract.packageName || metadata.version !== contract.version) {
+			return [];
+		}
+		const relative = typeof metadata.bin === "string" ? metadata.bin : metadata.bin?.[contract.bin];
+		if (typeof relative !== "string" || !relative) return [];
+		return [dataFileIdentity(packageJson), dataFileIdentity(path.resolve(packageRoot, relative))].filter(Boolean);
+	} catch {
+		return [];
+	}
+}
+
 function cacheKey(key, agent, cwd, environment) {
 	const launch = agent?.acp ?? agent ?? {};
 	const configuredEnvironment = configuredLaunchEnvironment(agent);
 	const discoveryEnvironment = effectiveDiscoveryEnvironment(agent, environment, configuredEnvironment);
 	const sessionNames = new Set(Object.keys(agent?._sessionAuthEnv ?? {}).map(canonicalEnvironmentName));
 	const executableEnvironment = { ...environment, ...configuredEnvironment };
-	const executable = resolveExecutableIdentity(launch.command, cwd, executableEnvironment);
+	const packageLocalIdentities = packageLocalLaunchIdentities(agent, launch);
+	const executable = packageLocalIdentities.at(-1) ?? resolveExecutableIdentity(launch.command, cwd, executableEnvironment);
 	const canonicalCwd = canonicalPath(cwd);
 	const identity = JSON.stringify({
 		key,
 		command: String(launch.command ?? ""),
 		args: Array.isArray(launch.args) ? launch.args.map(String) : [],
 		executable,
-		launchTargets: resolveLaunchTargetIdentities(launch.command, launch.args, canonicalCwd),
+		launchTargets: [...packageLocalIdentities, ...resolveLaunchTargetIdentities(launch.command, launch.args, canonicalCwd)],
 		...(!executable ? { pathFallback: environmentFingerprint("PATH", environmentValue(executableEnvironment, "PATH"), sessionNames) } : {}),
 		discoveryEnvironment: Object.entries(discoveryEnvironment)
 			.sort(([left], [right]) => left.localeCompare(right))
@@ -495,6 +578,13 @@ export class BackendCommandCatalog {
 		this.environment = options.environment ?? process.env;
 		this.cachePath = options.cachePath;
 		this.cache = readCache(this.cachePath);
+	}
+
+	setCwd(cwd) {
+		const next = path.resolve(cwd);
+		if (next === this.cwd) return false;
+		this.cwd = next;
+		return true;
 	}
 
 	scopeFor(key) {

@@ -1,46 +1,48 @@
 # The `HarnessAdapter` interface
 
 > A single, unified boundary between `cc` and every agent harness.
-> Prototype lives under `src/harness/`. Verified by `tests/harness_adapter.test.mjs`.
+> Implemented under `src/harness/` and enforced by
+> `tests/adapter_boundary.test.mjs` plus `tests/harness_adapter.test.mjs`.
 
-## The problem
+## Purpose
 
-Today `cc` mostly talks to backends through one generic `AcpClient`, but a
-handful of harness-specific behaviours are sprinkled through `pi-harness.mjs`
-as `this.activeKey === "codex"` / Codex ACP wire-identity branches and
-name-keyed `switch` statements:
+Every live main or `/btw` session crosses the same `HarnessAdapter` boundary.
+The TUI consumes normalized capabilities, methods, and events; it never reaches
+through an adapter to a harness's wire protocol or raw SDK messages.
 
-| Coupling | Where (today) |
-| --- | --- |
-| Codex copy-fork (`~/.codex` rollout) | `runBtw` ladder + `forkCodexSession` |
-| Codex prompt **unsend** | `isCodexAcpActive` + `readCodexThreadState` + `tryUnsendPendingPrompt` |
-| Codex `/review` preset dialog | `shouldOpenCodexReviewDialog` / `openCodexReviewDialog` |
-| Codex storage/account commands (`/rename`, `/usage`, goal view) | short-lived `runCodexAppServerRequests` calls; no competing live-thread turn |
-| Codex Cloud workflows | resolved compatible native CLI invocation |
-| Codex `CODEX_CONFIG` JSON | `applyConfigSettings` (key === "codex") |
-| Claude `_meta` settings | `applyNativeSettings` (key === "claude") |
-| Cursor arg-insert-before-`acp` | `applyNativeArgs` (key === "cursor") |
-| Cursor `/btw` refusal | `runBtw` (key === "cursor") |
-| Permission auto-accept inference | ~~`applyNativePermissionSetting` (per-name)~~ → now the unified engine (`permissions.mjs`) |
+Harness-specific behavior belongs in one of two places:
 
-Adding a harness that needs *any* of these means editing those switches.
+- a per-harness adapter, for launch settings, capabilities, live-session
+  operations, and storage semantics such as Codex copy-forking; or
+- a per-harness bridge behind that adapter, when a real harness SDK operation
+  has no ACP v1 equivalent. The built-in Claude bridge uses this path for cwd,
+  context append, tasks, checkpoints, branch names, and Remote Control.
 
-> **Permissions are no longer per-name.** A single harness-agnostic engine
-> (`src/harness/permissions.mjs`) owns the policy: it *generates* each backend's
-> native auto-approve dialect from one unified `permissions.mode`, persists "allow
-> always" grants cc-side, and decides allow/deny/ask uniformly. The engine logic
-> names no harness — the only per-harness knowledge is a **data** dialect table
-> (`auto`/`gatedAuto`/`prompt`/`infer`), extensible at runtime via
-> `registerPermissionDialect(key, dialect)` (parity with `registerAdapter`), so a
-> new harness's native dialect needs no engine edit. `BaseAcpAdapter` calls the
-> engine (`applyPermissionMode` / `#onPermission` / `handleExtensionRequest`), so
-> adapters carry zero permission code. See `docs/permissions-audit.md`.
+Host-only rendering, input, and process orchestration stay in the TUI. The TUI
+may retain normalized presentation state returned by the interface, but scopes
+it to the owning adapter connection and session. For example, Remote Control's
+`{enabled,url,error?}` display state is never read from Claude internals and a
+harness/session transition cannot reuse another session's URL. ACP plan,
+Claude Task/TodoWrite, and Cursor todo snapshots likewise become one bounded
+`checklist` event/state consumed by `/todos`; `/tasks` remains the separate
+background-process lifecycle surface. The persistent
+permission indicator likewise reads the unified adapter/host permission policy,
+not a harness-specific mode ID. Cold management operations that do not
+participate in a live model turn may use
+adapter-injected services, but cannot create a competing live-session path.
+
+A single harness-agnostic permissions engine (`src/harness/permissions.mjs`)
+owns the policy: it generates each backend's native auto-approve dialect from
+one unified `permissions.mode`, persists "allow always" grants cc-side, and
+decides allow/deny/ask uniformly. Harness knowledge is data in a dialect table
+(`auto`/`gatedAuto`/`prompt`/`infer`) extensible through
+`registerPermissionDialect()`. `BaseAcpAdapter` invokes the engine, so adapter
+subclasses carry no permission decision code. See `docs/permissions-audit.md`.
 
 ## The abstraction
 
-`cc` should talk to **one interface** — `HarnessAdapter` — and never name a
-harness. Each harness ships an adapter that adapts it to the interface. The
-interface is the **single target** every future harness adapts to.
+`cc` talks to **one live-session interface** — `HarnessAdapter`. Each harness
+adapts to that interface, which is the single target for future harnesses.
 
 ```
         ┌─────────────────────────────────────────────┐
@@ -91,6 +93,12 @@ degrades gracefully. Flags are either **declared** by the adapter (static) or
 | `embeddedContext` | bool | wire (`promptCapabilities.embeddedContext`) | structured `@file` prompt resources |
 | `auth` | bool | wire (`authMethods`) | ACP authentication-method selection |
 | `logout` | bool | wire (`agentCapabilities.auth.logout`) | ACP logout flow |
+| `changeWorkingDirectory` | bool | negotiated cc extension | local `/cd <path>` |
+| `appendContext` | bool | negotiated cc extension | context-only shell results |
+| `backgroundTasks` | bool | negotiated cc extension | `/tasks` lifecycle list/stop/background |
+| `checkpoints` | bool | negotiated cc extension | `/rewind`, `/checkpoint`, `/undo` list/restore |
+| `remoteControl` | bool | negotiated cc extension | `/remote-control [name\|off]`, `/rc` |
+| `namedFork` | bool | negotiated cc extension | optional branch name in `/branch [name]` |
 
 ## The contract
 
@@ -105,7 +113,10 @@ async connect(options?)              // spawn + initialize (+ first session unle
 async newSession(options?)
 async prompt(parts): {stopReason}
 cancel()
-stop()
+stop(): Promise                         // terminal close; signals synchronously
+stopAndWait(): Promise                  // complete process-tree teardown
+forceResolvePrompt(): boolean           // settle a cancelled prompt if needed
+setRuntimePermissionMode(mode?)         // host-owned in-memory policy override
 getSessionInfo(): SessionInfo        // sessionId, capabilities, configOptions, models, modes, agentInfo
 ```
 
@@ -120,6 +131,14 @@ async setConfigOption(id, value, type?)         // all advertised config options
 async setMode(id)                               // modes
 async authenticate(methodId, meta?)             // auth; agent RPC or client-run terminal/env flow
 async logout()                                  // logout
+async changeWorkingDirectory(path, options?)    // changeWorkingDirectory
+async appendContext(text)                       // appendContext
+async listBackgroundTasks(options?)             // backgroundTasks
+async stopBackgroundTask(taskId)                // backgroundTasks
+async backgroundTasks(toolUseId?)               // backgroundTasks
+async listCheckpoints(options?)                  // checkpoints
+async rewindCheckpoint(id, mode, options?)       // checkpoints; conversation/both atomically loads the returned branch
+async setRemoteControl({ enabled, name? })       // remoteControl; toggles only the existing local session
 snapshotRetractionState(): token | undefined    // retractPrompt
 canRetract(token): boolean                      // retractPrompt
 interceptCommand(name, arg, backendNames): PresetDialog | null   // commandPresets
@@ -151,22 +170,22 @@ would necessarily cancel.
 ### Normalized events (identical to today's `AcpClient.onEvent` shape)
 
 `text` · `user_text` · `commands` · `tool` · `tool_update` · `line` ·
-`session_info` · `backend_activity` · `backend_exit` · `error` · `cursor_todos`.
-`cc`'s renderer is unchanged — adapters speak the event vocabulary it already
-consumes.
+`session_info` · `background_tasks` · `checklist` · `backend_activity` ·
+`backend_exit` · `error` · `cursor_todos` (legacy compatibility).
+Adapters speak this generic event vocabulary; raw plan/task SDK frames never
+reach the TUI.
 
-## How each coupling collapses
+## Where harness differences live
 
-| Old coupling | New home (no harness name in cc) |
+| Difference | Adapter-side home |
 | --- | --- |
-| `runBtw` fork ladder | `if (adapter.capabilities.fork) await adapter.fork(parentId)` |
-| `forkCodexSession` | `CodexAdapter.fork()` (`fork: "copy"`) |
-| unsend `isCodexAcpActive`/state | `adapter.snapshotRetractionState()` / `adapter.canRetract()` |
-| `/review` dialog | `adapter.interceptCommand("review", …)` → `PresetDialog` |
-| config env / `_meta` / arg-insert | `adapter.buildLaunchSpec(settings)` |
-| auto-accept inference + auto/ask/deny + "allow always" | unified `permissions.mjs` engine (mode → native config + cc-side decision + persisted grants) → `capabilities.autoApprove` |
-| cursor/* extensions | already wire-method-gated in transport; surfaced via `handleExtensionRequest` |
-| cursor `/btw` refusal | falls out of `capabilities.fork === false` (no special case) |
+| Fork semantics | `adapter.capabilities.fork` + `adapter.fork()`; Codex implements copy-fork |
+| Prompt retraction | `snapshotRetractionState()` / `canRetract()` |
+| Command preset UI | `interceptCommand()` returns a normalized preset dialog |
+| Native config/env/args/meta | `buildLaunchSpec()` and adapter translation hooks |
+| Permissions | shared `permissions.mjs` policy and dialect data |
+| Cursor interactive extensions | `handleExtensionRequest()` |
+| Claude SDK-only operations | pinned bridge negotiates generic cc extension capabilities |
 
 ## Adding a harness
 
@@ -192,29 +211,16 @@ behavior that reads adapter outputs:
   the "is the last prompt still retractable?" judgment is the adapter's
   (`snapshotRetractionState()` / `canRetract()`).
 
-See `host-example.mjs` for the exact generic helpers (`openSideThread`,
-`dispatchSlashCommand`, `armUnsend`/`canUnsend`) — these are the name-free
-replacements for the per-harness branches, and they are exercised by the tests.
+## Boundary enforcement
 
-## Wiring it into cc (the remaining integration step)
-
-This prototype is verified standalone (and via `host-example.mjs`), but `cc`
-(`pi-harness.mjs`) does not yet consume it. Integration is mechanical:
-
-1. In `HarnessApp`, replace `new AcpClient(agent, …)` with
-   `createAdapter(activeKey, agent, host, { settings, globalPermissions, grants: loadGrants() })`;
-   route all calls through the adapter; drop `applyAgentSettings` in favor of
-   `adapter.buildLaunchSpec`. Pass `grants` so a persisted deny gates the launch
-   spec (an auto backend stays prompting), matching the live path; refresh runtime
-   grants with `adapter.setPermissionGrants(...)` after recording a new one.
-2. `runBtw`: replace the cursor refusal + `supportsFork()`/`forkCodexSession`
-   ladder with `openSideThread(forkAdapter, parentId)`.
-3. `handleSlashCommand`: replace `shouldOpenCodexReviewDialog`/`isKnownCodexReviewCommand`
-   with `dispatchSlashCommand(adapter, …)`.
-4. Unsend: replace `isCodexAcpActive()` + `readCodexThreadState()` with
-   `armUnsend`/`canUnsend`.
-5. Permissions/cursor: pass `requestPermission`/`requestInteraction` into the
-   host; delete the `agent._autoPermissionRequests ? …` branches (the adapter
-   now owns auto-accept for both permissions and interactive prompts).
-6. Delete the name-keyed `applyConfigSettings`/`applyNativeSettings`/
-   `applyNativePermissionSetting`/`applyNativeArgs` switches.
+- `HarnessApp.createRuntimeAdapter()` is the only production constructor for
+  main and `/btw` adapters.
+- `createAcpConnection()` is the sole production `new AcpClient(...)` site. It
+  is injected below the adapter boundary and is not exposed to TUI call sites.
+- A built-in bridge is selected only for cc's exact pinned Claude adapter.
+  Explicit custom ACP commands receive only capabilities they negotiate.
+- Bridge messages are parsed, bounded, and normalized before they cross the
+  adapter. Raw Claude SDK frames never enter the shared renderer.
+- `tests/adapter_boundary.test.mjs` checks construction and wire-capability
+  boundaries structurally; feature tests exercise every negotiated extension
+  through transport, base adapter, and TUI layers.

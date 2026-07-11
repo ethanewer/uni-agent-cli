@@ -8,6 +8,7 @@ import * as zlib from "node:zlib";
 import {
 	AcpClient,
 	acquireForkOperationLock,
+	agentMentionsFromConfigOptions,
 	agentSupportsLogout,
 	applyHarnessSettings,
 	autoPermissionOutcome,
@@ -43,6 +44,7 @@ import {
 	resolveAcpExecutable,
 	resolveAgentAcpExecutable,
 	resolveCodexInvocation,
+	resolvePackageLocalAcpExecutable,
 	resolveThemeName,
 	rewriteFullScreenClear,
 	runCodexCommand,
@@ -63,6 +65,18 @@ import {
 assert.equal(singleLineMenuText("first\nsecond\tthird"), "first second third");
 assert.equal(singleLineMenuText("safe\x1b[2J\x1b]0;owned\x07 title"), "safe title");
 assert.equal(singleLineMenuText("\x1b[31msession\nidentifier\x1b[0m"), "session identifier");
+{
+	let nestedOptionReads = 0;
+	const emptyGroups = Array.from({ length: 10_000 }, () => Object.defineProperty({}, "options", {
+		get() {
+			nestedOptionReads += 1;
+			return [];
+		},
+	}));
+	emptyGroups.push({ value: "unbounded-tail" });
+	assert.deepEqual(agentMentionsFromConfigOptions([{ id: "agent", options: emptyGroups }]), []);
+	assert.equal(nestedOptionReads, 256, "empty grouped-option accessors are inspected through a bounded prefix");
+}
 {
 	const keybindings = configureCcKeybindings();
 	for (const sequence of [
@@ -306,7 +320,10 @@ function unsendHarness({ initialState, currentState = initialState } = {}) {
 	app.client = {
 		sessionId: "codex-session",
 		agentInfo: { name: "@agentclientprotocol/codex-acp" },
+		capabilities: { retractPrompt: true },
 		exited: false,
+		snapshotRetractionState: () => initialState,
+		canRetract: (snapshot) => Boolean(snapshot && JSON.stringify(snapshot) === JSON.stringify(currentState)),
 		prompt(prompt) {
 			prompts.push(prompt);
 			return new Promise((resolve) => {
@@ -449,7 +466,7 @@ await (async () => {
 	let stopped = false;
 	let sessionCreated = false;
 	const client = Object.create(AcpClient.prototype);
-	client.agent = { _requiredAgentName: "@agentclientprotocol/codex-acp" };
+	client.agent = { label: "Codex", _requiredAgentName: "@agentclientprotocol/codex-acp" };
 	client.start = () => {};
 	client.stop = () => (stopped = true);
 	client.newSession = async () => (sessionCreated = true);
@@ -460,7 +477,7 @@ await (async () => {
 	});
 	await assert.rejects(
 		client.initialize(),
-		/Unsupported Codex ACP adapter.*npm install -g @agentclientprotocol\/codex-acp/,
+		/Unsupported Codex ACP adapter.*expected @agentclientprotocol\/codex-acp.*Reinstall cc/,
 	);
 	assert.equal(stopped, true);
 	assert.equal(sessionCreated, false, "legacy identity is rejected before session/new or session/set_mode");
@@ -475,6 +492,7 @@ await (async () => {
 	let sessionCreated = false;
 	const client = Object.create(AcpClient.prototype);
 	client.agent = {
+		label: "Codex",
 		_requiredAgentName: "@agentclientprotocol/codex-acp",
 		_minimumAgentVersion: "1.1.2",
 	};
@@ -486,9 +504,32 @@ await (async () => {
 		agentCapabilities: {},
 		authMethods: [],
 	});
-	await assert.rejects(client.initialize(), /adapter 1\.1\.1 is too old.*1\.1\.2.*@latest/);
+	await assert.rejects(client.initialize(), /Codex ACP adapter 1\.1\.1 is too old.*1\.1\.2.*Reinstall cc/);
 	assert.equal(stopped, true);
 	assert.equal(sessionCreated, false);
+})();
+
+await (async () => {
+	let stopped = false;
+	const client = Object.create(AcpClient.prototype);
+	client.agent = {
+		label: "Claude Code",
+		_requiredAgentName: "@agentclientprotocol/claude-agent-acp",
+		_minimumAgentVersion: "0.58.1",
+	};
+	client.start = () => {};
+	client.stop = () => (stopped = true);
+	client.newSession = async () => assert.fail("identity must be checked before session/new");
+	client.request = async () => ({
+		agentInfo: { name: "claude-agent-acp", version: "0.58.1" },
+		agentCapabilities: {},
+		authMethods: [],
+	});
+	await assert.rejects(
+		client.initialize(),
+		/Unsupported Claude Code ACP adapter.*@agentclientprotocol\/claude-agent-acp/,
+	);
+	assert.equal(stopped, true);
 })();
 
 // Native session mutation can wait for the ACP process to release its files.
@@ -1294,6 +1335,15 @@ await (async () => {
 	app.availableCommands = new Map([["codex", []]]);
 	app.commandsLoaded = new Set(["codex"]);
 	const sideThread = {
+		client: {
+			exited: false,
+			capabilities: { commandPresets: ["review"] },
+			interceptCommand(name, argument, backendNames) {
+				return name === "review" && !argument && backendNames.has("review-branch") && backendNames.has("review-commit")
+					? { kind: "preset-dialog" }
+					: null;
+			},
+		},
 		availableCommands: [{ name: "review" }, { name: "review-branch" }, { name: "review-commit" }],
 		commandsLoaded: true,
 		submit(text) {
@@ -1422,6 +1472,49 @@ await (async () => {
 	assert.deepEqual(submitted, ["/archive", "/unarchive named"]);
 	assert.deepEqual(localRan, []);
 })();
+
+// Live non-Codex commands win over cc's same-named fallbacks. Keep bare
+// /config as the unified ACP option picker, but forward Claude's native
+// key=value form. Codex retains its existing local integrations.
+{
+	const advertisedNames = ["config", "fast", "init", "doctor", "feedback", "usage"];
+	const routeApp = (activeKey, isCodex) => {
+		const app = Object.create(HarnessApp.prototype);
+		Object.assign(app, {
+			activeKey,
+			client: { capabilities: {} },
+			config,
+			sessionStates: new Map([[activeKey, {}]]),
+			themeName: "system",
+			availableCommands: new Map([[activeKey, advertisedNames.map((name) => ({ name }))]]),
+			commandsLoaded: new Set([activeKey]),
+			sessionSwitchInProgress: false,
+			isCodexBackendActive: () => isCodex,
+		});
+		return app;
+	};
+
+	const claude = routeApp("claude", false);
+	assert.equal(claude.slashCommandRoute("init"), "backend");
+	assert.equal(claude.slashCommandRoute("fast"), "backend");
+	assert.equal(claude.slashCommandRoute("config", "theme=dark"), "backend");
+	assert.equal(claude.slashCommandRoute("config", "--help"), "backend");
+	assert.equal(claude.slashCommandRoute("config"), "local");
+	assert.equal(claude.slashCommandRoute("config", "mode plan"), "local");
+	assert.equal(claude.slashCommandRoute("doctor"), "backend");
+	assert.equal(claude.slashCommandRoute("feedback"), "backend");
+	assert.equal(claude.slashCommandRoute("usage"), "backend");
+
+	claude.availableCommands.set("claude", []);
+	assert.equal(claude.slashCommandRoute("init"), "local");
+	assert.equal(claude.slashCommandRoute("fast"), "local");
+	assert.equal(claude.slashCommandRoute("config", "theme=dark"), "local");
+
+	const codex = routeApp("codex", true);
+	assert.equal(codex.slashCommandRoute("init"), "local");
+	assert.equal(codex.slashCommandRoute("fast"), "local");
+	assert.equal(codex.slashCommandRoute("config", "theme=dark"), "local");
+}
 
 // A local command (/model, /effort, …) deferred while a /resume load is in
 // flight must be flushed when the switch completes, not left stuck in the queue.
@@ -1622,6 +1715,7 @@ await (async () => {
 	const client = {
 		sessionId: "current",
 		agentInfo: { name: "fake" },
+		capabilities: { sessionList: true },
 		listSessions: () => new Promise((resolve) => { release = resolve; }),
 	};
 	const agent = {};
@@ -1678,6 +1772,41 @@ await (async () => {
 		["command", "/harness claude"],
 		["notice", "Harness switching is unavailable while a session transition is in progress"],
 	]);
+})();
+
+// User-requested exits cannot tear down cc while a session mutation still owns
+// the transition gate (notably while code-only rewind is changing the worktree).
+await (async () => {
+	const calls = [];
+	const app = Object.create(HarnessApp.prototype);
+	app.sessionSwitchInProgress = true;
+	app.config = { agents: { codex: {} } };
+	app.stop = () => assert.fail("exit must not stop cc during a session transition");
+	app.addCommandMessage = (message) => calls.push(["command", message]);
+	app.addNotice = (message) => calls.push(["notice", message]);
+	app.ui = { requestRender() {} };
+	await app.runLocalSlashCommand("exit", "");
+	await app.handleHarnessCommand("/harness exit");
+	assert.deepEqual(calls, [
+		["command", "/exit"],
+		["notice", "Exit is unavailable while a session transition is in progress"],
+		["command", "/harness exit"],
+		["notice", "Exit is unavailable while a session transition is in progress"],
+	]);
+})();
+
+// Selecting the already-active harness is an explicit replacement, not an
+// internal reconnect, and must therefore get a fresh lifecycle generation.
+await (async () => {
+	let selected;
+	const app = Object.create(HarnessApp.prototype);
+	app.sessionSwitchInProgress = false;
+	app.config = { agents: { codex: { label: "Codex" } } };
+	app.switchAgent = async (key, transport, options) => { selected = { key, transport, options }; };
+	await app.handleHarnessCommand("/harness codex");
+	assert.equal(selected.key, "codex");
+	assert.equal(selected.transport, "acp");
+	assert.equal(selected.options.explicitReplacement, true);
 })();
 
 // A failed resume is non-destructive: the old transcript/session remain live,
@@ -1755,6 +1884,7 @@ await (async () => {
 	const app = Object.create(HarnessApp.prototype);
 	Object.assign(app, {
 		client,
+		previousClearedSession: { key: "fake", sessionId: "before-clear" },
 		ready: true,
 		busy: false,
 		btwThread: undefined,
@@ -1786,6 +1916,7 @@ await (async () => {
 	});
 	await app.resumeSelectedSession({ sessionId: "target-session", title: "Target" });
 	assert.equal(app.ready, false);
+	assert.equal(app.previousClearedSession, undefined, "a committed explicit resume expires the pre-clear shortcut");
 	assert.equal(app.sessionSwitchInProgress, false);
 	assert.equal(app.editor.getText(), "/model gpt-next\n/effort high");
 	assert.deepEqual(app.deferredLocalSlashCommands, []);
@@ -2193,6 +2324,7 @@ await (async () => {
 // the live client can complete an advertised authentication flow in place.
 await (async () => {
 	const originalInitialize = AcpClient.prototype.initialize;
+	const originalStopAndWait = AcpClient.prototype.stopAndWait;
 	const makeApp = () => {
 		const app = Object.create(HarnessApp.prototype);
 		app.startupConnectTimer = undefined;
@@ -2256,6 +2388,28 @@ await (async () => {
 		await noAuthPath.switchAgent("fake");
 		assert.equal(noAuthPath.client.exited, true, "an auth-looking error is not recoverable without an advertised method");
 
+		// Failed startup must not release the serialized harness-switch lifecycle
+		// until the failed adapter's complete process tree has been reaped.
+		let releaseFailedStartupStop;
+		let markFailedStartupStopStarted;
+		const failedStartupStopStarted = new Promise((resolve) => { markFailedStartupStopStarted = resolve; });
+		const failedStartupStopGate = new Promise((resolve) => { releaseFailedStartupStop = resolve; });
+		AcpClient.prototype.stopAndWait = async function delayedFailedStartupStop() {
+			markFailedStartupStopStarted();
+			await failedStartupStopGate;
+			this.exited = true;
+		};
+		const failedStartup = makeApp();
+		let failedStartupSettled = false;
+		const failedStartupSwitch = failedStartup.switchAgent("fake").then(() => { failedStartupSettled = true; });
+		await failedStartupStopStarted;
+		await Promise.resolve();
+		assert.equal(failedStartupSettled, false, "failed startup waits for process-tree teardown");
+		releaseFailedStartupStop();
+		await failedStartupSwitch;
+		assert.equal(failedStartup.client.exited, true);
+		AcpClient.prototype.stopAndWait = originalStopAndWait;
+
 		AcpClient.prototype.initialize = async function initializeNeedingAuth() {
 			this.authMethods = [{ id: "chat-gpt", name: "ChatGPT" }];
 			throw new Error("authentication required");
@@ -2299,13 +2453,33 @@ await (async () => {
 				this.exited = true;
 			},
 		};
+		const reconnectContext = replacing.captureActiveAgentContext();
 		const replacement = replacing.switchAgent("fake", "acp", { continueSessionSwitch: true });
 		await stopStarted;
 		assert.equal(replacementInitializations, 0, "replacement must wait for old process-tree reaping");
 		releaseStop();
 		await replacement;
 		assert.equal(replacementInitializations, 1);
+		assert.equal(
+			replacing.isActiveAgentContext(reconnectContext),
+			true,
+			"an intentional internal same-harness reconnect retains async context ownership",
+		);
 		replacing.client.stop();
+
+		const explicitRestart = makeApp();
+		await explicitRestart.switchAgent("fake");
+		const staleContext = explicitRestart.captureActiveAgentContext();
+		const generationBeforeRestart = explicitRestart.activeAgentGeneration ?? 0;
+		await explicitRestart.switchAgent("fake", "acp", { explicitReplacement: true });
+		assert.equal(explicitRestart.activeAgentGeneration, generationBeforeRestart + 1);
+		assert.equal(
+			explicitRestart.isActiveAgentContext(staleContext),
+			false,
+			"an explicit same-key harness replacement invalidates async work from its predecessor",
+		);
+		explicitRestart.client.stop();
+		const replacementInitializationsBeforeFatal = replacementInitializations;
 
 		const fatal = makeApp();
 		const fatalErrors = [];
@@ -2319,14 +2493,14 @@ await (async () => {
 		};
 		fatal.addError = (message) => fatalErrors.push(message);
 		await fatal.switchAgent("fake");
-		assert.equal(replacementInitializations, 1, "unconfirmed shutdown must not start a replacement");
+		assert.equal(replacementInitializations, replacementInitializationsBeforeFatal, "unconfirmed shutdown must not start a replacement");
 		assert.ok(fatalErrors.some((message) => message.includes("old process tree is still live")));
 		await fatal.switchAgent("fake");
-		assert.equal(replacementInitializations, 1, "manual retry stays fenced after unconfirmed shutdown");
+		assert.equal(replacementInitializations, replacementInitializationsBeforeFatal, "manual retry stays fenced after unconfirmed shutdown");
 		await fatal.submitBackendPrompt("must remain queued behind the fatal fence");
 		const fencedPromptSwitch = fatal.agentSwitchTail;
 		if (fencedPromptSwitch) await fencedPromptSwitch;
-		assert.equal(replacementInitializations, 1, "queued prompts cannot bypass the fatal replacement fence");
+		assert.equal(replacementInitializations, replacementInitializationsBeforeFatal, "queued prompts cannot bypass the fatal replacement fence");
 		assert.equal(fatal.promptQueue.at(-1).text, "must remain queued behind the fatal fence");
 		assert.ok(fatalErrors.some((message) => message.includes("restart cc")));
 
@@ -2364,10 +2538,11 @@ await (async () => {
 		await Promise.all([firstSwitch, secondSwitch]);
 		assert.equal(initializedClients.length, 2);
 		assert.equal(initializedClients[0].exited, true);
-		assert.equal(concurrent.client, initializedClients[1]);
+		assert.equal(concurrent.client.connection, initializedClients[1]);
 		concurrent.client.stop();
 	} finally {
 		AcpClient.prototype.initialize = originalInitialize;
+		AcpClient.prototype.stopAndWait = originalStopAndWait;
 	}
 })();
 
@@ -2418,6 +2593,7 @@ await (async () => {
 	const calls = [];
 	const app = Object.create(HarnessApp.prototype);
 	app.ready = true;
+	app.activeKey = "fake";
 	app.busy = false;
 	app.sessionSwitchInProgress = false;
 	app.btwThread = undefined;
@@ -2426,8 +2602,10 @@ await (async () => {
 	app.deferredLocalSlashCommands = [];
 	app.statusState = "";
 	app.client = {
+		sessionId: "before-clear",
 		async newSession(options) {
 			calls.push("session/new");
+			this.sessionId = "after-clear";
 			await options.beforeReplay();
 		},
 	};
@@ -2441,6 +2619,7 @@ await (async () => {
 	assert.deepEqual(calls, ["session/new", "reset-view", "/clear (New session)"]);
 	assert.deepEqual(app.promptQueue, []);
 	assert.equal(app.sessionSwitchInProgress, false);
+	assert.deepEqual(app.previousClearedSession, { key: "fake", sessionId: "before-clear" });
 })();
 
 {
@@ -2851,6 +3030,7 @@ await (async () => {
 	const { app, cancelCount } = unsendHarness({ initialState: unchanged });
 	app.activeKey = "claude";
 	app.client.agentInfo = { name: "claude-agent-acp" };
+	app.client.capabilities.retractPrompt = false;
 	app.sessionStates = new Map([["claude", { agentInfo: { name: "claude-agent-acp" } }]]);
 	void app.submitBackendPrompt("not codex");
 	assert.equal(app.pendingUnsendPrompt, undefined);
@@ -3292,8 +3472,19 @@ if (previousDefaultCcSettings === undefined) delete process.env.CC_SETTINGS;
 else process.env.CC_SETTINGS = previousDefaultCcSettings;
 assert.ok(defaultConfig.agents["terminus-2"]);
 assert.ok(defaultConfig.agents["mini-swe-agent"]);
+assert.equal(defaultConfig.agents.claude._requiredAgentName, "@agentclientprotocol/claude-agent-acp");
+assert.equal(defaultConfig.agents.claude._minimumAgentVersion, "0.58.1");
+assert.equal(defaultConfig.agents.claude._packageLocalAcpVersion, "0.58.1");
+assert.match(defaultConfig.agents.claude._packageLocalAcpBridge, /harness[/\\]claude-acp-bridge\.mjs$/u);
 assert.equal(defaultConfig.agents.codex._requiredAgentName, "@agentclientprotocol/codex-acp");
 assert.equal(defaultConfig.agents.codex._minimumAgentVersion, "1.1.2");
+assert.equal(defaultConfig.agents.codex._packageLocalAcpVersion, "1.1.2");
+for (const key of ["claude", "codex"]) {
+	const launch = resolveAgentAcpExecutable(defaultConfig.agents[key], process.cwd(), { PATH: "" });
+	assert.equal(launch.executable, process.execPath, `${key} must use cc's Node runtime for its package-local adapter`);
+	if (key === "claude") assert.match(launch.prefixArgs[0], /harness[/\\]claude-acp-bridge\.mjs$/u);
+	else assert.match(launch.prefixArgs[0], /node_modules[/\\]@agentclientprotocol[/\\]codex-acp[/\\]dist[/\\]index\.js$/u);
+}
 assert.match(defaultConfig.agents["terminus-2"].acp.args[0], /terminus_2\/bridge\.py$/);
 assert.match(defaultConfig.agents["mini-swe-agent"].acp.args[0], /mini_swe_agent\/bridge\.py$/);
 
@@ -4133,6 +4324,19 @@ assert.deepEqual(newSessionOrder, ["before replay", "fresh welcome"]);
 // Native Codex resolution stays shell-free on Windows: npm's .cmd shims are
 // traced back to their package-owned JavaScript entrypoints and run with Node.
 {
+	const bundled = resolveCodexInvocation({
+		_requiredAgentName: "@agentclientprotocol/codex-acp",
+		_minimumAgentVersion: "1.1.2",
+		_packageLocalAcpCommand: "codex-acp",
+		_packageLocalAcpVersion: "1.1.2",
+		acp: { command: "codex-acp", args: [] },
+		env: { PATH: "" },
+	});
+	assert.equal(bundled?.command, process.execPath);
+	assert.match(bundled?.args?.[0] ?? "", /node_modules[/\\]@openai[/\\]codex/u);
+}
+
+{
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "cc-codex-invocation-"));
 	const writePackage = (packageRoot, name, bin = undefined) => {
 		fs.mkdirSync(packageRoot, { recursive: true });
@@ -4282,6 +4486,45 @@ assert.deepEqual(newSessionOrder, ["before replay", "fresh welcome"]);
 // A stale adapter in an older global prefix must not shadow a compatible
 // maintained adapter later on PATH. Explicit path commands remain untouched;
 // this search applies only to a bare package command.
+{
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "cc-package-local-acp-"));
+	try {
+		const packageRoot = path.join(root, "node_modules", "@agentclientprotocol", "claude-agent-acp");
+		const entrypoint = path.join(packageRoot, "dist", "index.js");
+		fs.mkdirSync(path.dirname(entrypoint), { recursive: true });
+		fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({
+			name: "@agentclientprotocol/claude-agent-acp",
+			version: "0.58.1",
+			bin: { "claude-agent-acp": "dist/index.js" },
+		}));
+		fs.writeFileSync(entrypoint, "// package-local adapter\n");
+		const agent = {
+			_requiredAgentName: "@agentclientprotocol/claude-agent-acp",
+			_minimumAgentVersion: "0.58.1",
+			_packageLocalAcpCommand: "claude-agent-acp",
+			_packageLocalAcpVersion: "0.58.1",
+			acp: { command: "claude-agent-acp", args: [] },
+		};
+		assert.deepEqual(resolvePackageLocalAcpExecutable(agent, root), {
+			executable: process.execPath,
+			prefixArgs: [entrypoint],
+		});
+		assert.equal(
+			resolvePackageLocalAcpExecutable({ ...agent, acp: { command: "/custom/claude-acp", args: [] } }, root),
+			undefined,
+			"a custom acp.command remains an explicit adapter override",
+		);
+		fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({
+			name: "@agentclientprotocol/claude-agent-acp",
+			version: "0.58.0",
+			bin: { "claude-agent-acp": "dist/index.js" },
+		}));
+		assert.equal(resolvePackageLocalAcpExecutable(agent, root), undefined, "an old local adapter is never selected");
+	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+}
+
 if (process.platform !== "win32") {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "cc-acp-prefix-shadow-"));
 	try {
@@ -4595,7 +4838,7 @@ await (async () => {
 	app.switchAgent = async () => {
 		app.activeKey = "second";
 		app.activeAgentGeneration += 1;
-		app.client = { sessionId: "second-session", capabilities: { sessionCapabilities: { delete: {} } } };
+		app.client = { sessionId: "second-session", capabilities: { delete: true } };
 	};
 	app.openSelection = () => { pickerOpened = true; };
 	await app.openDeleteDialog();
@@ -4611,7 +4854,7 @@ await (async () => {
 	app.activeKey = "fake";
 	app.client = {
 		sessionId: "current-id",
-		capabilities: { sessionCapabilities: { delete: {}, list: {} } },
+		capabilities: { delete: true, sessionList: true },
 		listSessions: async () => [
 			{ sessionId: "current-id", title: "Current" },
 			{ sessionId: "target-id", title: "Named session" },
@@ -4637,7 +4880,7 @@ await (async () => {
 	const errors = [];
 	const oldClient = {
 		sessionId: "current-id",
-		capabilities: { loadSession: true, sessionCapabilities: { delete: {} } },
+		capabilities: { delete: true, resume: true },
 		deleteSession: async () => {
 			oldClient.tornDown = true;
 			throw new Error("persistent delete failed");
@@ -4689,7 +4932,7 @@ await (async () => {
 	let resets = 0;
 	const oldClient = {
 		sessionId: "delete-only-session",
-		capabilities: { sessionCapabilities: { delete: {} } },
+		capabilities: { delete: true, resume: false },
 		deleteSession: async () => { throw new Error("delete failed after teardown"); },
 	};
 	const app = Object.create(HarnessApp.prototype);
@@ -4830,6 +5073,7 @@ await (async () => {
 	await client.initialize();
 	assert.equal(requests[0].params.clientCapabilities.auth.terminal, true);
 	assert.deepEqual(requests[0].params.clientCapabilities.session.configOptions.boolean, {});
+	assert.deepEqual(requests[0].params.clientCapabilities.plan, {});
 	assert.deepEqual(requests[0].params.clientCapabilities.elicitation.url, {});
 
 	const unsupportedRequests = [];
@@ -5062,6 +5306,7 @@ await (async () => {
 	const spaced = path.join(root, "file with spaces.md");
 	fs.writeFileSync(first, "alpha");
 	fs.writeFileSync(spaced, "beta");
+	fs.writeFileSync(path.join(root, "reviewer"), "agent collision");
 	const built = buildEmbeddedFilePromptParts("email@example.test read @first.txt and @\"file with spaces.md\"", root);
 	assert.equal(built.embeddedCount, 2);
 	assert.equal(built.parts.filter((part) => part.type === "resource").length, 2);
@@ -5113,9 +5358,19 @@ await (async () => {
 	app.activeKey = "fake";
 	app.config = { agents: { fake: { label: "Fake" } } };
 	app.sessionStates = new Map([
-		["fake", { capabilities: { promptCapabilities: { image: true, embeddedContext: true } } }],
+		["fake", {
+			capabilities: { promptCapabilities: { image: true, embeddedContext: true } },
+			configOptions: [{
+				id: "agent",
+				type: "select",
+				options: [{ value: "reviewer", name: "File-name agent" }],
+			}],
+		}],
 	]);
-	app.client = { capabilities: { promptCapabilities: { image: true, embeddedContext: true } } };
+	app.client = {
+		capabilities: { promptCapabilities: { image: true, embeddedContext: true } },
+		configOptions: app.sessionStates.get("fake").configOptions,
+	};
 	app.addNotice = () => {};
 	app.clipboardImageCounter = 0;
 	app.clipboardImages = [];
@@ -5131,6 +5386,10 @@ await (async () => {
 	const previousCwd = process.cwd();
 	process.chdir(root);
 	try {
+		const agentCollision = app.promptForActiveCapabilities("ask @reviewer");
+		assert.equal(agentCollision, "ask @reviewer", "advertised @agents remain literal even when a same-named file exists");
+		const explicitCollisionFile = app.promptForActiveCapabilities('read @"reviewer"');
+		assert.equal(explicitCollisionFile.find((part) => part.type === "resource").resource.text, "agent collision");
 		const collisionText = `Discuss the literal [Image 1], inspect @first.txt, then use ${collisionFreeLabel}.`;
 		const collisionParts = app.consumeImagePromptParts(collisionText);
 		const collisionPayload = app.promptForActiveCapabilities(collisionText, collisionParts);
@@ -5712,6 +5971,29 @@ await (async () => {
 	assert.deepEqual(app.deferredLocalSlashCommands.map(({ name, argument }) => ({ name, argument })), [
 		{ name: "login", argument: "chat-gpt" },
 	]);
+})();
+
+// A same-harness reconnect replaces the adapter's cloned launch spec. Context
+// ownership follows the stable configured definition, so cold local commands
+// do not report failure after successfully reconnecting.
+await (async () => {
+	const definition = { label: "Fake", acp: { command: "fake", args: [] } };
+	const app = Object.create(HarnessApp.prototype);
+	Object.assign(app, {
+		activeKey: "fake",
+		transport: "acp",
+		activeAgentGeneration: 0,
+		config: { agents: { fake: definition } },
+		client: { exited: true, launchSpec: structuredClone(definition) },
+		ready: false,
+		async switchAgent() {
+			this.client = { exited: false, launchSpec: structuredClone(definition) };
+			this.ready = true;
+		},
+	});
+	assert.equal(await app.ensureConnected(), true);
+	assert.notEqual(app.client.launchSpec, definition);
+	assert.equal(app.isActiveAgentContext(app.captureActiveAgentContext({ includeClient: true })), true);
 })();
 
 // Terminal auth can only add args/env to the configured agent executable. It

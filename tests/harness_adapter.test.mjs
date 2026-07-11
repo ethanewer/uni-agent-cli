@@ -18,7 +18,19 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { applyHarnessSettings, collectEnvironmentAuthenticationVariables, loadForkParents } from "../src/pi-harness.mjs";
+import {
+	AcpClient,
+	acquireForkOperationLock,
+	applyHarnessSettings,
+	codexHome,
+	collectEnvironmentAuthenticationVariables,
+	copyCodexRolloutWithNewId,
+	findCodexRolloutPath,
+	forgetForkIds,
+	loadForkParents,
+	readCodexThreadState,
+	recordForkId,
+} from "../src/pi-harness.mjs";
 import { BaseAcpAdapter } from "../src/harness/acp-base.mjs";
 import {
 	assertAdapterConformance,
@@ -83,8 +95,9 @@ class FakeConnection {
 		this.calls.push(["listSessions"]);
 		return this.profile.sessions ?? [];
 	}
-	async loadSession(id) {
+	async loadSession(id, options = {}) {
 		this.calls.push(["loadSession", id]);
+		this.lastLoadOptions = options;
 		this.sessionId = id;
 		this.onEvent?.({ type: "session_info", sessionInfo: this.getSessionInfo() });
 		return {};
@@ -212,6 +225,16 @@ function codexConfig(agent) {
 
 const noopHost = () => ({ onEvent() {}, requestPermission: () => ({ outcome: "cancelled" }), requestInteraction: () => undefined });
 
+const codexServices = {
+	acquireForkOperationLock,
+	codexHome,
+	copyCodexRolloutWithNewId,
+	findCodexRolloutPath,
+	forgetForkIds,
+	readCodexThreadState,
+	recordForkId,
+};
+
 async function main() {
 	{
 		const original = process.env.CODEX_CONFIG;
@@ -288,6 +311,38 @@ async function main() {
 		assert.equal(checkAdapterConformance(complete).ok, true);
 		ok("conformance:delete-method-required");
 	}
+	// Config-option and legacy-mode capabilities use distinct adapter methods.
+	// The TUI calls setConfigOption() for model/reasoning selectors and setMode()
+	// for the legacy ACP modes surface, so one method cannot stand in for both.
+	{
+		const required = {};
+		for (const method of REQUIRED_METHODS) required[method] = () => {};
+		const configOnly = {
+			key: "config-only",
+			label: "Config only",
+			capabilities: { ...emptyCapabilities(), models: true, reasoningEffort: true },
+			setConfigOption: () => {},
+			...required,
+		};
+		assert.equal(checkAdapterConformance(configOnly).ok, true);
+		const missingConfig = { ...configOnly, setConfigOption: undefined };
+		assert.ok(
+			checkAdapterConformance(missingConfig).problems.some((problem) => problem.includes("setConfigOption")),
+		);
+
+		const modeWithWrongMethod = {
+			key: "mode-with-wrong-method",
+			label: "Mode with wrong method",
+			capabilities: { ...emptyCapabilities(), modes: true },
+			setConfigOption: () => {},
+			...required,
+		};
+		const modeReport = checkAdapterConformance(modeWithWrongMethod);
+		assert.equal(modeReport.ok, false);
+		assert.ok(modeReport.problems.some((problem) => problem.includes("setMode")));
+		assert.equal(checkAdapterConformance({ ...modeWithWrongMethod, setMode: () => {} }).ok, true);
+		ok("conformance:config-and-mode-methods-required-separately");
+	}
 	// Authentication methods and logout are independently capability-gated.
 	{
 		const required = {};
@@ -299,6 +354,45 @@ async function main() {
 		assert.equal(checkAdapterConformance({ ...authMissing, authenticate: () => {} }).ok, true);
 		assert.equal(checkAdapterConformance({ ...logoutMissing, logout: () => {} }).ok, true);
 		ok("conformance:authentication-methods-required");
+	}
+	// The runtime-facing lifecycle/state surface remains adapter-owned. Session
+	// transition callbacks must cross the adapter rather than leaking AcpClient.
+	{
+		const profile = {
+			...PROFILES.claude,
+			authMethods: [{ id: "browser", name: "Browser" }],
+		};
+		const adapter = createAdapter("claude", CONFIGS.claude, noopHost(), {
+			settings: { permissions: { mode: "ask" } },
+			connectionFactory: factoryFor(profile),
+		});
+		await adapter.connect();
+		assert.equal(adapter.exited, false);
+		assert.equal(adapter.stopping, false);
+		assert.deepEqual(adapter.agentInfo, profile.agentInfo);
+		assert.deepEqual(adapter.authMethods, profile.authMethods);
+		assert.deepEqual(adapter.configOptions, profile.configOptions);
+		assert.deepEqual(adapter.models, profile.models);
+		assert.deepEqual(adapter.modes, profile.modes);
+		const beforeReplay = () => {};
+		await adapter.loadSession("resumed", { beforeReplay });
+		assert.equal(adapter.connection.lastLoadOptions.beforeReplay, beforeReplay);
+		adapter.connection.forceResolvePrompt = () => "settled";
+		assert.equal(adapter.forceResolvePrompt(), "settled");
+		adapter.setRuntimePermissionMode("deny");
+		assert.equal(adapter.permissionPolicy().mode, "deny");
+		adapter.setRuntimePermissionMode();
+		assert.equal(adapter.permissionPolicy().mode, "ask");
+		await adapter.stopAndWait();
+		assert.equal(adapter.exited, true);
+		assert.equal(adapter.stopping, true);
+		ok("adapter-runtime:lifecycle-state-and-session-options");
+	}
+	{
+		const adapter = createAdapter("claude", CONFIGS.claude, noopHost());
+		await assert.rejects(() => adapter.connect(), /requires an ACP connectionFactory/u);
+		await adapter.stopAndWait();
+		ok("adapter-runtime:transport-injection-required");
 	}
 
 	// =====================================================================
@@ -1415,7 +1509,10 @@ async function main() {
 				...CONFIGS.codex,
 				env: { ...(CONFIGS.codex.env ?? {}), CODEX_HOME: dir },
 			};
-			const codex = createAdapter("codex", codexConfig, noopHost(), { connectionFactory: factoryFor(PROFILES.codex) });
+			const codex = createAdapter("codex", codexConfig, noopHost(), {
+				connectionFactory: factoryFor(PROFILES.codex),
+				services: { codex: codexServices },
+			});
 			assert.equal(codex.codexEnvironment().CODEX_HOME, dir, "adapter storage helpers honor configured CODEX_HOME");
 			await codex.connect({ createSession: false });
 			assert.equal(codex.capabilities.fork, "copy");
@@ -1486,7 +1583,10 @@ async function main() {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-codex-empty-"));
 		try {
 			process.env.CODEX_HOME = dir;
-			const codex = createAdapter("codex", CONFIGS.codex, noopHost(), { connectionFactory: factoryFor(PROFILES.codex) });
+			const codex = createAdapter("codex", CONFIGS.codex, noopHost(), {
+				connectionFactory: factoryFor(PROFILES.codex),
+				services: { codex: codexServices },
+			});
 			await codex.connect();
 			// retractPrompt is gated on the maintained Codex ACP identity.
 			assert.equal(codex.capabilities.retractPrompt, true);
@@ -1626,6 +1726,15 @@ async function main() {
 	// (3) ADDABILITY — opencode + pi + a brand-new harness, no core changes.
 	// =====================================================================
 	{
+		// Claude declares the adapter protocol identity/version at its adapter
+		// boundary as well as in the production registry defaults.
+		const claude = createAdapter("claude", undefined, noopHost(), { connectionFactory: factoryFor(PROFILES.claude) });
+		assert.equal(claude.launchSpec._requiredAgentName, "@agentclientprotocol/claude-agent-acp");
+		assert.equal(claude.launchSpec._minimumAgentVersion, "0.58.1");
+		assert.equal(claude.launchSpec._packageLocalAcpCommand, "claude-agent-acp");
+		assert.equal(claude.launchSpec._packageLocalAcpVersion, "0.58.1");
+		ok("adapter-default:claude-identity-version");
+
 		// opencode/pi resolve from their own defaultAgentConfig (no DEFAULT_CONFIG edit).
 		const oc = createAdapter("opencode", undefined, noopHost(), { connectionFactory: factoryFor(PROFILES.opencode) });
 		assertAdapterConformance(oc);
@@ -1669,7 +1778,8 @@ async function main() {
 		const fakeConfig = { label: "Fake", transport: "acp", acp: { command: "python3", args: ["tests/fake_acp.py"] } };
 		const events = [];
 		const host = { onEvent: (e) => events.push(e), requestPermission: () => ({ outcome: "selected", optionId: "allow" }), requestInteraction: () => undefined };
-		const adapter = createAdapter("__fake__", fakeConfig, host); // default factory = real AcpClient
+		const connectionFactory = (agent, onEvent, options) => new AcpClient(agent, onEvent, options);
+		const adapter = createAdapter("__fake__", fakeConfig, host, { connectionFactory });
 		try {
 			await adapter.connect();
 			assert.equal(adapter.capabilities.fork, "native", "fake advertises fork");
@@ -1690,7 +1800,7 @@ async function main() {
 			ok("real-transport:base-adapter");
 
 			// native fork over the real transport on a fresh, sessionless adapter.
-			const fork = createAdapter("__fake__", fakeConfig, host);
+			const fork = createAdapter("__fake__", fakeConfig, host, { connectionFactory });
 			await fork.connect({ createSession: false });
 			assert.equal(fork.capabilities.fork, "native");
 			await fork.fork("fake-session");

@@ -669,11 +669,11 @@ await (async () => {
 		const events = [];
 		const mainClient = harness.app.client;
 		mainClient.sessionId = mainId;
-		mainClient.capabilities = { sessionCapabilities: { delete: {}, list: {} } };
+		mainClient.capabilities = { delete: true, sessionList: true };
 		const sideClient = {
 			sessionId: sideId,
 			exited: false,
-			capabilities: { sessionCapabilities: { delete: {}, list: {} } },
+			capabilities: { delete: true, sessionList: true },
 		};
 		const sessions = [
 			{ sessionId: mainId, title: "Main session" },
@@ -2241,7 +2241,7 @@ rl.on("line", (line) => {
 			await sideScoped.app.handleSubmit("/rename Side session");
 			let sideRequests = fs.readFileSync(log, "utf8").trim().split("\n").map(JSON.parse);
 			assert.equal(sideRequests.findLast((message) => message.method === "thread/name/set")?.params?.threadId, sideClient.sessionId);
-			assert.equal(sideClient.sessionInfo.title, "Side session");
+			assert.equal(sideClient.sessionInfo, undefined, "side rename does not mutate adapter-owned session metadata");
 			assert.equal(sideScoped.app.sessionStates.get("codex").sessionInfo, undefined, "side rename cannot rewrite main session state");
 			assert.match(sideOutput.commands.at(-1), /^\/rename Side session/);
 			assert.match(sideOutput.notices.at(-1), /Renamed this \/btw session to Side session/);
@@ -2440,6 +2440,7 @@ await (async () => {
 	let newSideInitializations = 0;
 	try {
 		const { app } = appHarness();
+		app.client.capabilities = { fork: "native" };
 		app.focusedThread = "btw";
 		app.mainView = {};
 		app.closeMenu = () => {};

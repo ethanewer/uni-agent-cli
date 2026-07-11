@@ -67,6 +67,78 @@ import {
 	validateElicitationFieldValue,
 } from "./harness/elicitation.mjs";
 import { BackendCommandCatalog, backendCommandCachePath, normalizeBackendCommands } from "./harness/command-catalog.mjs";
+import { BUNDLED_ACP_ADAPTERS } from "./harness/bundled-adapters.mjs";
+import { capabilitiesFromWire } from "./harness/interface.mjs";
+import { createAdapter } from "./harness/registry.mjs";
+import {
+	CC_UNBOUND_ACTION,
+	CcKeybindingDispatcher,
+	DEFAULT_CC_KEYBINDINGS,
+	ccKeybindingsPath,
+	ensureCcKeybindingsFile,
+	formatCcKeybindingsStatus,
+	loadCcKeybindings,
+	watchCcKeybindings,
+} from "./harness/keybindings.mjs";
+import {
+	formatShellContext,
+	formatShellFollowup,
+	formatShellTranscript,
+	normalizeShellResult,
+	parseShellInput,
+	SHELL_INPUT_MAX_STDERR_BYTES,
+	SHELL_INPUT_MAX_STDOUT_BYTES,
+	SHELL_INPUT_TIMEOUT_MS,
+	shellInvocation,
+} from "./harness/shell-input.mjs";
+import { ShellCommandHistory } from "./harness/shell-history.mjs";
+import {
+	CHANGE_WORKING_DIRECTORY_METHOD,
+	directoryCompletionMatches,
+	normalizeChangeWorkingDirectoryResponse,
+	parseChangeWorkingDirectoryParams,
+	resolveWorkingDirectoryTarget,
+} from "./harness/working-directory.mjs";
+import {
+	APPEND_CONTEXT_METHOD,
+	normalizeAppendContextResponse,
+	parseAppendContextParams,
+} from "./harness/append-context.mjs";
+import {
+	BACKGROUND_TASKS_BACKGROUND_METHOD,
+	BACKGROUND_TASKS_CHANGED_NOTIFICATION,
+	BACKGROUND_TASKS_LIST_METHOD,
+	BACKGROUND_TASKS_STOP_METHOD,
+	formatBackgroundTaskList,
+	normalizeBackgroundTaskActionResponse,
+	normalizeBackgroundTaskListResponse,
+	parseBackgroundTaskListParams,
+	parseBackgroundTasksBackgroundParams,
+	parseBackgroundTasksCommand,
+	parseBackgroundTaskStopParams,
+} from "./harness/background-tasks.mjs";
+import {
+	CHECKPOINTS_LIST_METHOD,
+	CHECKPOINT_REWIND_METHOD,
+	formatCheckpointRewindResult,
+	normalizeCheckpointListResponse,
+	normalizeCheckpointRewindResponse,
+	parseCheckpointListParams,
+	parseCheckpointRewindParams,
+} from "./harness/checkpoints.mjs";
+import {
+	REMOTE_CONTROL_METHOD,
+	formatRemoteControlResult,
+	normalizeRemoteControlResponse,
+	parseRemoteControlCommand,
+	parseRemoteControlParams,
+} from "./harness/remote-control.mjs";
+import { copyResponseChoices, resolveCopyWritePath, writeCopySelection } from "./harness/copy-response.mjs";
+import { PROMPT_COLOR_NAMES, resolvePromptColor } from "./harness/prompt-color.mjs";
+import {
+	ChecklistStore,
+	emptyChecklistSnapshot,
+} from "./harness/checklists.mjs";
 
 const HARNESS = "/harness";
 // Commands the shared UI owns when localSlashCommands exposes them, even if a
@@ -81,8 +153,10 @@ const RESERVED_LOCAL_COMMANDS = new Set([
 	"btw",
 	"side",
 	"fork",
+	"branch",
 	"diff",
 	"copy",
+	"color",
 	"config",
 	"fast",
 	"delete",
@@ -109,8 +183,19 @@ const RESERVED_LOCAL_COMMANDS = new Set([
 	"yolo",
 	"auto",
 	"permissions",
+	"keybindings",
+	"cd",
+	"tasks",
+	"todos",
+	"rewind",
+	"checkpoint",
+	"undo",
+	"remote-control",
+	"rc",
 ]);
 const SOURCE_DIR = path.dirname(fileURLToPath(import.meta.url));
+const PACKAGE_ROOT = path.dirname(SOURCE_DIR);
+const CLAUDE_ACP_BRIDGE = path.join(SOURCE_DIR, "harness", "claude-acp-bridge.mjs");
 const HARNESS_ROOT = path.join(SOURCE_DIR, "harnesses");
 const HARNESS_PYTHON = resolveHarnessPython();
 const OSC133_ZONE_START = "\x1b]133;A\x07";
@@ -238,16 +323,23 @@ const DEFAULT_CONFIG = {
 			transport: "acp",
 			command: "claude",
 			args: [],
-			acp: { command: "claude-agent-acp", args: [] },
+			_requiredAgentName: BUNDLED_ACP_ADAPTERS.claude.packageName,
+			_minimumAgentVersion: BUNDLED_ACP_ADAPTERS.claude.minimumVersion,
+			_packageLocalAcpCommand: BUNDLED_ACP_ADAPTERS.claude.bin,
+			_packageLocalAcpVersion: BUNDLED_ACP_ADAPTERS.claude.version,
+			_packageLocalAcpBridge: CLAUDE_ACP_BRIDGE,
+			acp: { command: BUNDLED_ACP_ADAPTERS.claude.bin, args: [] },
 		},
 		codex: {
 			label: "Codex",
 			transport: "acp",
 			command: "codex",
 			args: [],
-			_requiredAgentName: "@agentclientprotocol/codex-acp",
-			_minimumAgentVersion: "1.1.2",
-			acp: { command: "codex-acp", args: [] },
+			_requiredAgentName: BUNDLED_ACP_ADAPTERS.codex.packageName,
+			_minimumAgentVersion: BUNDLED_ACP_ADAPTERS.codex.minimumVersion,
+			_packageLocalAcpCommand: BUNDLED_ACP_ADAPTERS.codex.bin,
+			_packageLocalAcpVersion: BUNDLED_ACP_ADAPTERS.codex.version,
+			acp: { command: BUNDLED_ACP_ADAPTERS.codex.bin, args: [] },
 		},
 		cursor: {
 			label: "Cursor Agent",
@@ -278,12 +370,10 @@ const DEFAULT_SETTINGS = {
 	theme: "system",
 };
 
-export function configureCcKeybindings() {
+export function configureCcKeybindings(userBindings = {}) {
 	const keybindings = new KeybindingsManager(TUI_KEYBINDINGS, {
-		// macOS terminals report Option as Alt. Keep Pi's Shift+Return default
-		// while accepting the protocol-aware CSI-u/modifyOtherKeys forms of
-		// Option+Return as the same multiline-editor action.
-		"tui.input.newLine": ["shift+enter", "alt+enter"],
+		...DEFAULT_CC_KEYBINDINGS,
+		...userBindings,
 	});
 	setKeybindings(keybindings);
 	return keybindings;
@@ -882,6 +972,17 @@ const BUILTIN_THEMES = {
 
 let activeThemeName = "system";
 
+export function statusLineText(status = {}, cwd = process.cwd()) {
+	const state = status.state ? `${status.spinner ? `${status.spinner} ` : ""}${status.state} · ` : "";
+	const parts = [
+		`${status.agent ?? "?"} ${status.transport ?? "acp"}`,
+		status.permissionMode ? `${status.permissionMode === "ask" ? "⏸ " : ""}permissions ${status.permissionMode}` : undefined,
+		status.remoteControl?.error ? "remote error" : status.remoteControl?.enabled ? "remote on" : status.remoteControl ? "remote off" : undefined,
+		compactCwd(cwd),
+	].filter(Boolean);
+	return `${state}${parts.join(" · ")}`;
+}
+
 class StatusLine extends Text {
 	constructor(getStatus) {
 		super("", 0, 0);
@@ -890,8 +991,7 @@ class StatusLine extends Text {
 
 	render(width) {
 		const status = this.getStatus();
-		const state = status.state ? `${status.spinner ? `${status.spinner} ` : ""}${status.state} · ` : "";
-		const line = `${state}${status.agent} ${status.transport} · ${compactCwd(process.cwd())}`;
+		const line = statusLineText(status);
 		return [chalk.dim(truncateVisual(line, width))];
 	}
 }
@@ -976,11 +1076,47 @@ class VoiceEditor extends Editor {
 		if (this.autocompleteState) this.updateAutocomplete();
 		else this.tryTriggerAutocomplete();
 	}
+
+	performAutocompleteAction(action) {
+		const list = this.autocompleteList;
+		if (!this.autocompleteState || !list) return false;
+		if (action === "dismiss") {
+			this.cancelAutocomplete();
+			return true;
+		}
+		if (action === "previous" || action === "next") {
+			const count = list.filteredItems?.length ?? 0;
+			if (count === 0) return true;
+			const delta = action === "previous" ? -1 : 1;
+			list.setSelectedIndex((list.selectedIndex + delta + count) % count);
+			list.notifySelectionChange?.();
+			return true;
+		}
+		if (action !== "accept") return false;
+		const selected = list.getSelectedItem();
+		if (!selected || !this.autocompleteProvider) return true;
+		this.pushUndoSnapshot();
+		this.lastAction = null;
+		const result = this.autocompleteProvider.applyCompletion(
+			this.state.lines,
+			this.state.cursorLine,
+			this.state.cursorCol,
+			selected,
+			this.autocompletePrefix,
+		);
+		this.state.lines = result.lines;
+		this.state.cursorLine = result.cursorLine;
+		this.setCursorCol(result.cursorCol);
+		this.cancelAutocomplete();
+		this.onChange?.(this.getText());
+		return true;
+	}
 }
 
 class AgentMenu {
 	constructor(app) {
 		this.app = app;
+		this.keybindingContext = "Select";
 		this.selected = Math.max(0, Object.keys(app.config.agents).indexOf(app.activeKey));
 	}
 
@@ -1015,12 +1151,20 @@ class AgentMenu {
 		}
 		if (data >= "1" && data <= "9") {
 			const key = keys[Number(data) - 1];
-			if (key) void this.app.switchAgent(key, "acp", { persist: true, displayText: slashPromptDisplay("/harness", this.app.config.agents[key]?.label ?? key) });
+			if (key) void this.app.switchAgent(key, "acp", {
+				explicitReplacement: true,
+				persist: true,
+				displayText: slashPromptDisplay("/harness", this.app.config.agents[key]?.label ?? key),
+			});
 			return;
 		}
 		if (matchesKey(data, "enter") || data === "\r" || data === "\n") {
 			const key = keys[this.selected];
-			if (key) void this.app.switchAgent(key, "acp", { persist: true, displayText: slashPromptDisplay("/harness", this.app.config.agents[key]?.label ?? key) });
+			if (key) void this.app.switchAgent(key, "acp", {
+				explicitReplacement: true,
+				persist: true,
+				displayText: slashPromptDisplay("/harness", this.app.config.agents[key]?.label ?? key),
+			});
 		}
 	}
 }
@@ -1052,12 +1196,18 @@ export class SelectionPanel {
 		this.selected = Math.max(0, options.selected ?? 0);
 		this.emptyText = options.emptyText ?? "No items";
 		this.onQueryChange = options.onQueryChange ?? (() => {});
+		this.onWrite = typeof options.onWrite === "function" ? options.onWrite : undefined;
+		this.writeHint = options.writeHint ?? "w write to file";
+		this.verbatimTitle = options.verbatimTitle === true;
+		this.wrapTitle = options.wrapTitle === true;
+		this.keybindingContext = options.keybindingContext ?? "Select";
 		this.query = "";
 	}
 
 	invalidate() {}
 
 	render(width) {
+		const safeWidth = Math.max(1, width - 1);
 		const entries = this.filteredEntries();
 		const maxVisible = 12;
 		const rowCount = Math.min(maxVisible, Math.max(this.entries.length, 1));
@@ -1065,7 +1215,11 @@ export class SelectionPanel {
 		this.selected = entries.length > 0 ? Math.min(this.selected, entries.length - 1) : 0;
 		const start = Math.max(0, Math.min(this.selected - half, entries.length - maxVisible));
 		const visible = entries.slice(start, start + maxVisible);
-		const lines = [chalk.bold(singleLineMenuText(this.title)), ""];
+		const title = this.verbatimTitle ? String(this.title) : singleLineMenuText(this.title);
+		const titleLines = this.wrapTitle
+			? wrapTextWithAnsi(chalk.bold(title), safeWidth)
+			: [chalk.bold(title)];
+		const lines = [...titleLines, ""];
 
 		for (let offset = 0; offset < rowCount; offset += 1) {
 			const entry = visible[offset];
@@ -1084,11 +1238,13 @@ export class SelectionPanel {
 		}
 
 		const position = entries.length > 0 ? `${this.selected + 1}/${entries.length}` : "0/0";
-		lines.push("", chalk.dim(position), chalk.dim("type to filter · enter select · esc cancel"));
+		const controls = ["type to filter", "enter select"];
+		if (this.onWrite) controls.push(this.writeHint);
+		controls.push("esc cancel");
+		lines.push("", chalk.dim(position), chalk.dim(controls.join(" · ")));
 		// Keep the final terminal cell empty. A very long session title rendered into
 		// that cell can trigger an implicit terminal wrap, leaving the tail of one
 		// picker row underneath the next row on incremental repaints.
-		const safeWidth = Math.max(1, width - 1);
 		return lines.map((line) => truncateVisual(line, safeWidth));
 	}
 
@@ -1119,6 +1275,10 @@ export class SelectionPanel {
 			return;
 		}
 		const entries = this.filteredEntries();
+		if (data === "w" && !this.query && this.onWrite && entries[this.selected]) {
+			this.onWrite(entries[this.selected]);
+			return;
+		}
 		if ((matchesKey(data, "enter") || data === "\r" || data === "\n") && entries[this.selected]) {
 			this.onSelect(entries[this.selected]);
 			return;
@@ -1155,6 +1315,74 @@ export class SelectionPanel {
 		return this.entries.filter((entry) =>
 			[entry.label, entry.description, entry.value].filter(Boolean).some((value) => singleLineMenuText(value).toLowerCase().includes(query)),
 		);
+	}
+}
+
+// Read-only, live checklist surface. The panel consumes only the generic
+// snapshot retained by HarnessApp/BtwThread; it has no knowledge of which
+// harness produced the ACP plan or task events.
+export class ChecklistPanel {
+	constructor(app, target) {
+		this.app = app;
+		this.target = target;
+		this.keybindingContext = "Select";
+		this.offset = 0;
+	}
+
+	invalidate() {}
+
+	render(width) {
+		const safeWidth = Math.max(1, width - 1);
+		const snapshot = this.app.checklistSnapshotForTarget(this.target);
+		const entries = Array.isArray(snapshot?.entries) ? snapshot.entries : [];
+		const maxVisible = 12;
+		const maxOffset = Math.max(0, entries.length - maxVisible);
+		this.offset = Math.min(Math.max(0, this.offset), maxOffset);
+		const completed = Number.isSafeInteger(snapshot?.completed)
+			? snapshot.completed
+			: entries.filter((entry) => entry?.status === "completed").length;
+		const scope = this.target?.targetThread ? " · /btw" : "";
+		const lines = [chalk.bold(`Checklist${scope}`), chalk.dim(`${completed}/${entries.length} complete`), ""];
+		if (entries.length === 0) {
+			lines.push(chalk.dim("No checklist is available for this session yet."));
+		} else {
+			for (const entry of entries.slice(this.offset, this.offset + maxVisible)) {
+				const glyph = entry.status === "completed" ? chalk.blue("[x]")
+					: entry.status === "in_progress" ? chalk.blue("[>]")
+						: chalk.dim("[ ]");
+				const content = singleLineMenuText(entry.content);
+				lines.push(`${glyph} ${entry.status === "completed" ? chalk.dim(content) : chalk.text(content)}`);
+			}
+		}
+		const position = entries.length > maxVisible
+			? `${this.offset + 1}-${Math.min(entries.length, this.offset + maxVisible)}/${entries.length} · `
+			: "";
+		lines.push("", chalk.dim(`${position}up/down scroll · ctrl+t or esc close`));
+		return lines.map((line) => truncateVisual(line, safeWidth));
+	}
+
+	handleInput(data) {
+		const snapshot = this.app.checklistSnapshotForTarget(this.target);
+		const entries = Array.isArray(snapshot?.entries) ? snapshot.entries : [];
+		const maxOffset = Math.max(0, entries.length - 12);
+		if (matchesKey(data, "escape") || data === "q" || data === "\x03") {
+			this.cancel();
+			return;
+		}
+		if (matchesKey(data, "up")) this.offset = Math.max(0, this.offset - 1);
+		else if (matchesKey(data, "down")) this.offset = Math.min(maxOffset, this.offset + 1);
+		else if (matchesKey(data, "pageup")) this.offset = Math.max(0, this.offset - 12);
+		else if (matchesKey(data, "pagedown")) this.offset = Math.min(maxOffset, this.offset + 12);
+		else if (matchesKey(data, "home")) this.offset = 0;
+		else if (matchesKey(data, "end")) this.offset = maxOffset;
+	}
+
+	clearInput() {
+		return false;
+	}
+
+	cancel() {
+		if (this.app.menuHandle === this) this.app.closeMenu();
 	}
 }
 
@@ -1212,10 +1440,18 @@ export class ElicitationFormPanel {
 		this.multiSelected = new Set();
 		this.error = "";
 		this.settled = false;
+		this.keybindingContext = "Confirmation";
 		this.prepareField();
 	}
 
 	invalidate() {}
+
+	activeKeybindingContexts() {
+		if (this.stage === "review") return ["Confirmation"];
+		const field = this.activeField();
+		const freeText = field && ((field.type === "string" && !field.options) || field.type === "number" || field.type === "integer");
+		return freeText ? [] : ["Confirmation"];
+	}
 
 	activeField() {
 		return this.form.fields[this.fieldIndex];
@@ -1480,6 +1716,13 @@ class ThemePanel {
 
 	invalidate() {}
 
+	// Claude gives the theme picker its own context. cc intentionally warns that
+	// ThemePicker actions are unsupported, so generic Select bindings must not
+	// bleed into this panel.
+	activeKeybindingContexts() {
+		return [];
+	}
+
 	render(width) {
 		const entries = this.filteredEntries();
 		const maxVisible = 8;
@@ -1617,6 +1860,7 @@ export class BtwThread {
 		this.queuedInputOrder = 0;
 		this.availableCommands = [];
 		this.commandsLoaded = false;
+		this.checklist = emptyChecklistSnapshot();
 		this.ready = false;
 		this.readyWaiters = [];
 		this.cancelGraceTimer = undefined;
@@ -1648,8 +1892,21 @@ export class BtwThread {
 			this.app.onThreadActivity();
 			return;
 		}
+		if (event.type === "background_tasks") {
+			this.backgroundTasks = event.snapshot;
+			this.app.onThreadActivity();
+			return;
+		}
+		if (event.type === "checklist") {
+			this.checklist = event.snapshot;
+			this.app.onThreadActivity();
+			return;
+		}
 		if (event.type === "session_info") {
 			this.app.syncRuntimePermissionModeForSideClient?.(this.client, event.sessionInfo, { onlyIfChanged: true });
+			if (this.app.btwThread === this && this.app.focusedThread === "btw") {
+				this.app.updateAutocomplete();
+			}
 			return;
 		}
 		if (event.type === "backend_exit") {
@@ -1721,13 +1978,14 @@ export class BtwThread {
 			this.queue.push({
 				text: trimmed,
 				promptParts,
+				...(options.displayText ? { displayText: options.displayText } : {}),
 				queuedInputOrder: options.queuedInputOrder ?? this.nextQueuedInputOrder(),
 			});
 			this.queue.sort((left, right) => left.queuedInputOrder - right.queuedInputOrder);
 			this.app.onThreadActivity();
 			return;
 		}
-		this.addUserMessage(trimmed);
+		this.addUserMessage(options.displayText ?? trimmed);
 		await this.sendPrompt(trimmed, promptParts);
 	}
 
@@ -1806,7 +2064,7 @@ export class BtwThread {
 			return;
 		}
 		this.queue.shift();
-		this.addUserMessage(prompt.text);
+		this.addUserMessage(prompt.displayText ?? prompt.text);
 		void this.sendPrompt(prompt.text, prompt.promptParts);
 	}
 
@@ -1851,6 +2109,7 @@ export class BtwThread {
 		}
 		const payload = this.app.promptForActiveCapabilities(backendText, backendParts, {
 			capabilities: this.client.capabilities,
+			configOptions: this.client.getSessionInfo?.().configOptions ?? this.client.configOptions,
 			onNotice: (message) => this.addNotice(message),
 		});
 		try {
@@ -1971,7 +2230,7 @@ export class BtwThread {
 		this.currentToolSummary = undefined;
 		if (!this.currentAssistantText) {
 			this.addHistorySpacer("assistant");
-			this.currentAssistantText = new MutableMarkdown("");
+			this.currentAssistantText = new AssistantMessage("");
 			this.chat.addChild(this.currentAssistantText);
 		}
 		this.currentAssistantText.append(text);
@@ -2195,6 +2454,9 @@ export class AcpClient {
 		this.configOptions = [];
 		this.models = undefined;
 		this.modes = undefined;
+		this.backgroundTasksSnapshot = { revision: 0, tasks: [], total: 0 };
+		this.checklistStore = new ChecklistStore();
+		this.checklistSnapshot = this.checklistStore.list();
 		this.bufferingSessionUpdates = false;
 		this.bufferedSessionUpdates = [];
 		this.terminals = new Map();
@@ -2332,6 +2594,9 @@ export class AcpClient {
 			clientCapabilities: {
 				auth: { terminal: true },
 				fs: { readTextFile: false, writeTextFile: false },
+				// Opt into ACP's bounded multi-plan updates. Stable `plan` snapshots
+				// remain supported regardless of this experimental capability.
+				plan: {},
 				terminal: true,
 				session: { configOptions: { boolean: {} } },
 				// A client must not negotiate an elicitation mode unless it can surface
@@ -2347,16 +2612,18 @@ export class AcpClient {
 		if (requiredAgentName && this.agentInfo.name !== requiredAgentName) {
 			this.stop();
 			const actual = this.agentInfo.name || "unknown";
+			const label = this.agent.label || requiredAgentName;
 			throw new Error(
-				`Unsupported Codex ACP adapter (${actual}). Install the maintained adapter with: npm install -g @agentclientprotocol/codex-acp`,
+				`Unsupported ${label} ACP adapter (${actual}); expected ${requiredAgentName}. Reinstall cc to restore its pinned adapter, or set a compatible custom acp.command.`,
 			);
 		}
 		const minimumAgentVersion = this.agent._minimumAgentVersion;
 		if (minimumAgentVersion && !versionAtLeast(this.agentInfo.version, minimumAgentVersion)) {
 			this.stop();
 			const actual = this.agentInfo.version || "unknown";
+			const label = this.agent.label || requiredAgentName || "ACP";
 			throw new Error(
-				`Codex ACP adapter ${actual} is too old; version ${minimumAgentVersion} or newer is required. Update it with: npm install -g @agentclientprotocol/codex-acp@latest`,
+				`${label} ACP adapter ${actual} is too old; version ${minimumAgentVersion} or newer is required. Reinstall cc to restore its pinned adapter, or set a compatible custom acp.command.`,
 			);
 		}
 		// createSession:false lets a caller (e.g. /btw) decide between newSession,
@@ -2384,11 +2651,167 @@ export class AcpClient {
 		return Boolean(this.capabilities?.sessionCapabilities?.fork);
 	}
 
+	supportsChangeWorkingDirectory() {
+		return capabilitiesFromWire(this.getSessionInfo()).changeWorkingDirectory;
+	}
+
+	async changeWorkingDirectory(targetPath, options = {}) {
+		if (!this.sessionId) throw new Error("ACP session is not ready");
+		if (!this.supportsChangeWorkingDirectory()) {
+			throw new Error("This agent does not advertise live working-directory changes");
+		}
+		const params = parseChangeWorkingDirectoryParams({
+			sessionId: this.sessionId,
+			path: targetPath,
+			...(options.trustAccepted !== undefined ? { trustAccepted: options.trustAccepted } : {}),
+			...(options.trustedDirectory ? { trustedDirectory: options.trustedDirectory } : {}),
+		});
+		return normalizeChangeWorkingDirectoryResponse(
+			await this.request(CHANGE_WORKING_DIRECTORY_METHOD, params),
+		);
+	}
+
+	async appendContext(text) {
+		if (!this.sessionId) throw new Error("ACP session is not ready");
+		if (!capabilitiesFromWire(this.getSessionInfo()).appendContext) {
+			throw new Error("This agent does not advertise context-only transcript input");
+		}
+		const params = parseAppendContextParams({ sessionId: this.sessionId, text });
+		return normalizeAppendContextResponse(await this.request(APPEND_CONTEXT_METHOD, params));
+	}
+
+	supportsBackgroundTasks() {
+		return capabilitiesFromWire(this.getSessionInfo()).backgroundTasks;
+	}
+
+	async listBackgroundTasks(options = {}) {
+		if (!this.sessionId) throw new Error("ACP session is not ready");
+		if (!this.supportsBackgroundTasks()) {
+			throw new Error("This agent does not advertise background-task lifecycle support");
+		}
+		const params = parseBackgroundTaskListParams({
+			sessionId: this.sessionId,
+			...(options.limit !== undefined ? { limit: options.limit } : {}),
+		});
+		const snapshot = normalizeBackgroundTaskListResponse(await this.request(BACKGROUND_TASKS_LIST_METHOD, params));
+		return this.applyBackgroundTaskSnapshot(this.sessionId, snapshot)
+			? snapshot
+			: this.backgroundTasksSnapshot;
+	}
+
+	async stopBackgroundTask(taskId) {
+		if (!this.sessionId) throw new Error("ACP session is not ready");
+		if (!this.supportsBackgroundTasks()) {
+			throw new Error("This agent does not advertise background-task lifecycle support");
+		}
+		const params = parseBackgroundTaskStopParams({ sessionId: this.sessionId, taskId });
+		return normalizeBackgroundTaskActionResponse(
+			await this.request(BACKGROUND_TASKS_STOP_METHOD, params),
+			"stop",
+		);
+	}
+
+	async backgroundTasks(toolUseId = undefined) {
+		if (!this.sessionId) throw new Error("ACP session is not ready");
+		if (!this.supportsBackgroundTasks()) {
+			throw new Error("This agent does not advertise background-task lifecycle support");
+		}
+		const params = parseBackgroundTasksBackgroundParams({
+			sessionId: this.sessionId,
+			...(toolUseId ? { toolUseId } : {}),
+		});
+		return normalizeBackgroundTaskActionResponse(
+			await this.request(BACKGROUND_TASKS_BACKGROUND_METHOD, params),
+			"background",
+		);
+	}
+
+	supportsCheckpoints() {
+		return capabilitiesFromWire(this.getSessionInfo()).checkpoints;
+	}
+
+	async listCheckpoints(options = {}) {
+		if (!this.sessionId) throw new Error("ACP session is not ready");
+		if (!this.supportsCheckpoints()) {
+			throw new Error("This agent does not advertise checkpoint support");
+		}
+		const params = parseCheckpointListParams({
+			sessionId: this.sessionId,
+			...(options.limit !== undefined ? { limit: options.limit } : {}),
+		});
+		return normalizeCheckpointListResponse(await this.request(CHECKPOINTS_LIST_METHOD, params));
+	}
+
+	async rewindCheckpoint(checkpointId, mode, options = {}) {
+		if (!this.sessionId) throw new Error("ACP session is not ready");
+		if (!this.supportsCheckpoints()) {
+			throw new Error("This agent does not advertise checkpoint support");
+		}
+		const sourceSessionId = this.sessionId;
+		const params = parseCheckpointRewindParams({ sessionId: sourceSessionId, checkpointId, mode });
+		const response = normalizeCheckpointRewindResponse(
+			await this.request(CHECKPOINT_REWIND_METHOD, params),
+		);
+		if (mode === "code") return response;
+		if (response.sessionId === sourceSessionId) {
+			throw new Error("checkpoint rewind did not create a distinct conversation fork");
+		}
+
+		try {
+			// switchSession buffers replay events and commits the session id before the
+			// host's beforeReplay callback, so the transcript view changes as one unit.
+			await this.loadSession(response.sessionId, options);
+			return response;
+		} catch (cause) {
+			const error = cause instanceof Error ? cause : new Error(String(cause));
+			error.checkpointRewind = response;
+			// If switchSession never committed the fork, it is an implementation detail
+			// rather than a user branch. Remove it best-effort. A committed load must be
+			// retained because its replay callback may be the only thing that failed.
+			if (this.sessionId === sourceSessionId) {
+				try {
+					await this.deleteSession(response.sessionId);
+				} catch (cleanupError) {
+					error.checkpointForkCleanupError = cleanupError;
+				}
+			}
+			throw error;
+		}
+	}
+
+	supportsRemoteControl() {
+		return capabilitiesFromWire(this.getSessionInfo()).remoteControl;
+	}
+
+	async setRemoteControl(options = {}) {
+		if (!this.sessionId) throw new Error("ACP session is not ready");
+		if (!this.supportsRemoteControl()) {
+			throw new Error("This agent does not advertise Remote Control support");
+		}
+		const params = parseRemoteControlParams({
+			sessionId: this.sessionId,
+			enabled: options.enabled !== false,
+			...(options.name !== undefined ? { name: options.name } : {}),
+		});
+		return normalizeRemoteControlResponse(await this.request(REMOTE_CONTROL_METHOD, params));
+	}
+
 	// Create a new session branched from an existing one's full history (ACP
 	// unstable session/fork). The new session gets a fresh id; the parent is
 	// untouched and the default tool preset is preserved.
 	async forkSession(parentSessionId, options = {}) {
-		return await this.switchSession("session/fork", this.sessionRequestParams({ sessionId: parentSessionId }), undefined, options);
+		const params = this.sessionRequestParams({ sessionId: parentSessionId });
+		if (options.name !== undefined) {
+			const name = String(options.name).trim();
+			if (!name || name.length > 1_000 || /[\u0000-\u001f\u007f]/u.test(name)) {
+				throw new Error("branch name must be 1-1000 characters without control characters");
+			}
+			params._meta = {
+				...(params._meta ?? {}),
+				cc: { ...(params._meta?.cc ?? {}), branchName: name },
+			};
+		}
+		return await this.switchSession("session/fork", params, undefined, options);
 	}
 
 	async prompt(prompt) {
@@ -2472,6 +2895,8 @@ export class AcpClient {
 		this.configOptions = [];
 		this.models = undefined;
 		this.modes = undefined;
+		this.backgroundTasksSnapshot = { revision: 0, tasks: [], total: 0 };
+		this.checklistSnapshot = this.getChecklistStore().reset();
 		this.sessionInfo = {};
 		this.applySessionState(result);
 		// Keep buffering across beforeReplay so a live update arriving during its
@@ -2583,8 +3008,31 @@ export class AcpClient {
 			configOptions: this.configOptions,
 			models: this.models,
 			modes: this.modes,
+			backgroundTasks: this.backgroundTasksSnapshot,
+			checklist: this.checklistSnapshot ?? this.getChecklistStore().list(),
 			sessionInfo: this.sessionInfo,
 		};
+	}
+
+	applyBackgroundTaskSnapshot(sessionId, snapshot) {
+		if (sessionId && this.sessionId && sessionId !== this.sessionId) return false;
+		if (snapshot.revision < (this.backgroundTasksSnapshot?.revision ?? 0)) return false;
+		this.backgroundTasksSnapshot = snapshot;
+		this.onEvent({ type: "background_tasks", snapshot });
+		return true;
+	}
+
+	applyChecklistSnapshot(snapshot) {
+		if (!snapshot || snapshot.revision <= (this.checklistSnapshot?.revision ?? -1)) return false;
+		this.checklistSnapshot = snapshot;
+		this.onEvent({ type: "checklist", snapshot });
+		return true;
+	}
+
+	getChecklistStore() {
+		this.checklistStore ??= new ChecklistStore();
+		this.checklistSnapshot ??= this.checklistStore.list();
+		return this.checklistStore;
 	}
 
 	cancel() {
@@ -2817,6 +3265,17 @@ export class AcpClient {
 			this.handleSessionUpdate(message.params);
 			return;
 		}
+		if (message.method === BACKGROUND_TASKS_CHANGED_NOTIFICATION) {
+			if (!this.sessionUpdateTargetsCurrentSession(message.params)) return;
+			try {
+				const snapshot = normalizeBackgroundTaskListResponse(message.params);
+				this.onEvent({ type: "backend_activity" });
+				this.applyBackgroundTaskSnapshot(message.params?.sessionId, snapshot);
+			} catch (error) {
+				this.onEvent({ type: "error", message: `Invalid background-task update: ${error.message ?? error}` });
+			}
+			return;
+		}
 		if (message.id !== undefined && message.method?.startsWith("terminal/")) {
 			this.onEvent({ type: "backend_activity" });
 			void this.handleTerminalRequest(message);
@@ -2887,7 +3346,7 @@ export class AcpClient {
 		const method = message.method;
 		const params = message.params ?? {};
 		if (method === "cursor/update_todos") {
-			this.onEvent({ type: "cursor_todos", todos: Array.isArray(params.todos) ? params.todos : [] });
+			this.applyChecklistSnapshot(this.getChecklistStore().replace(params.todos, { planId: "cursor" }));
 			this.writeSafe({ jsonrpc: "2.0", id: message.id, result: {} });
 			return;
 		}
@@ -3024,10 +3483,20 @@ export class AcpClient {
 			return;
 		}
 		if (kind === "plan" && Array.isArray(update.entries)) {
-			this.onEvent({
-				type: "line",
-				text: ["• plan", ...update.entries.map((entry) => `  - [${entry.status ?? "pending"}] ${entry.content}`)].join("\n"),
-			});
+			this.applyChecklistSnapshot(this.getChecklistStore().replace(update.entries));
+			return;
+		}
+		if (kind === "plan_update") {
+			const plan = update.plan;
+			if (!plan || typeof plan !== "object" || typeof plan.planId !== "string") return;
+			const snapshot = plan.type === "items" && Array.isArray(plan.entries)
+				? this.getChecklistStore().replacePlan(plan.planId, plan.entries)
+				: this.getChecklistStore().removePlan(plan.planId);
+			this.applyChecklistSnapshot(snapshot);
+			return;
+		}
+		if (kind === "plan_removed" && typeof update.planId === "string") {
+			this.applyChecklistSnapshot(this.getChecklistStore().removePlan(update.planId));
 		}
 	}
 
@@ -3035,6 +3504,27 @@ export class AcpClient {
 		const sessionId = params?.sessionId ?? params?.session?.sessionId ?? params?.session?.id;
 		return !(sessionId && this.sessionId && sessionId !== this.sessionId);
 	}
+}
+
+// The TUI injects its transport into the harness layer. This is the only
+// production construction point for a raw ACP connection; HarnessApp itself
+// owns and talks exclusively to HarnessAdapter instances.
+export function createAcpConnection(agent, onEvent, options) {
+	return new AcpClient(agent, onEvent, options);
+}
+
+function harnessAdapterServices() {
+	return {
+		codex: {
+			acquireForkOperationLock,
+			codexHome,
+			copyCodexRolloutWithNewId,
+			findCodexRolloutPath,
+			forgetForkIds,
+			readCodexThreadState,
+			recordForkId,
+		},
+	};
 }
 
 class VoiceController {
@@ -3207,9 +3697,19 @@ class VoiceController {
 export class HarnessApp {
 	constructor(config, initialAgent, initialTransport, options = {}) {
 		this.config = config;
-		this.inputKeybindings = configureCcKeybindings();
+		// Shell history belongs to the shared composer, not to any harness. Keep one
+		// bounded, read-only view for this app so switching harnesses neither resets
+		// nor forwards it.
+		this.shellCommandHistory = options.shellCommandHistory ?? new ShellCommandHistory();
+		this.activeShellInputCount = 0;
+		this.keybindingsOptions = options.keybindingsOptions ?? {};
+		this.keybindingsResult = loadCcKeybindings(this.keybindingsOptions);
+		this.inputKeybindings = configureCcKeybindings(this.keybindingsResult.userBindings);
+		this.keybindingDispatcher = new CcKeybindingDispatcher(this.keybindingsResult);
+		this.stopKeybindingsWatcher = undefined;
 		this.backendCommandCatalog = options.backendCommandCatalog ?? new BackendCommandCatalog(config.agents);
 		this.themeName = resolveThemeName(config.theme ?? config.settings?.theme) ?? "system";
+		this.promptColorName = "default";
 		this.previewThemeName = undefined;
 		setActiveTheme(this.themeName);
 		this.activeKey = initialAgent;
@@ -3220,6 +3720,7 @@ export class HarnessApp {
 		this.client = undefined;
 		this.connectionAttempt = undefined;
 		this.agentSwitchTail = undefined;
+		this.workingDirectoryShutdownTail = undefined;
 		this.replacementProcessFence = undefined;
 		this.menuHandle = undefined;
 		this.menuEditorText = undefined;
@@ -3245,6 +3746,9 @@ export class HarnessApp {
 		this.flushingPromptQueue = false;
 		this.promptQueueDrainScheduled = false;
 		this.pendingNewSessionCommandName = undefined;
+		// `/clear` starts a fresh backend session, but Claude exposes one same-process
+		// escape hatch in `/rewind` back to the session that preceded it.
+		this.previousClearedSession = undefined;
 		this.sessionSwitchInProgress = false;
 		this.deferredLocalSlashCommands = [];
 		this.flushingDeferredLocalSlashCommands = false;
@@ -3258,6 +3762,11 @@ export class HarnessApp {
 		this.runtimePermissionMode = new Map();
 		this.runtimePermissionModeByClient = new WeakMap();
 		this.runtimePermissionBackendContextByClient = new WeakMap();
+		// Remote Control is owned by the exact adapter connection + ACP session.
+		// A WeakMap prevents a stopped harness from retaining pairing URLs, while
+		// the nested map lets a still-live multi-session adapter restore the state
+		// when the user resumes that same session.
+		this.remoteControlStatesByClient = new WeakMap();
 		this.cancelRequested = false;
 		this.afterToolCancelPending = false;
 		this.cancelGraceTimer = undefined;
@@ -3320,6 +3829,8 @@ export class HarnessApp {
 				state,
 				spinner: state ? AGENT_WORK_FRAMES[this.spinnerIndex % AGENT_WORK_FRAMES.length] : "",
 				transport: this.transport,
+				permissionMode: this.permissionModeForStatus(),
+				remoteControl: this.remoteControlStateForActiveSession(),
 			};
 		});
 		this.queueSummary = new PromptQueueSummary(
@@ -3376,8 +3887,42 @@ export class HarnessApp {
 		return true;
 	}
 
+	reloadKeybindings(options = {}) {
+		const result = loadCcKeybindings(this.keybindingsOptions);
+		const userBindings = { ...DEFAULT_CC_KEYBINDINGS, ...result.userBindings };
+		if (this.inputKeybindings) this.inputKeybindings.setUserBindings(userBindings);
+		else this.inputKeybindings = configureCcKeybindings(userBindings);
+		setKeybindings(this.inputKeybindings);
+		if (this.keybindingDispatcher) this.keybindingDispatcher.update(result);
+		else this.keybindingDispatcher = new CcKeybindingDispatcher(result);
+		this.keybindingsResult = result;
+		if (options.announce) {
+			const warningCount = result.warnings.length;
+			this.addNotice(
+				warningCount > 0
+					? `Reloaded keybindings with ${warningCount} warning${warningCount === 1 ? "" : "s"}. Run /keybindings show for details.`
+					: `Reloaded keybindings from ${result.file}`,
+			);
+			this.ui?.requestRender?.();
+		}
+		return result;
+	}
+
+	startKeybindingsWatcher() {
+		this.stopKeybindingsWatcher?.();
+		const file = this.keybindingsResult?.file ?? ccKeybindingsPath(this.keybindingsOptions);
+		this.stopKeybindingsWatcher = watchCcKeybindings(file, () => {
+			if (!this.stopping) this.reloadKeybindings({ announce: true });
+		}, this.keybindingsOptions);
+	}
+
 	async start() {
 		this.ui.start();
+		this.startKeybindingsWatcher();
+		if (this.keybindingsResult?.exists && this.keybindingsResult.warnings.length > 0) {
+			this.addNotice(`Keybindings loaded with warnings. Run /keybindings show for details.`);
+			this.ui.requestRender();
+		}
 		if (MARKDOWN_PRELOAD_DELAY_MS >= 0) {
 			this.markdownPreloadTimer = setTimeout(() => {
 				this.markdownPreloadTimer = undefined;
@@ -3511,6 +4056,57 @@ export class HarnessApp {
 		this.ui.requestRender();
 	}
 
+	createRuntimeAdapter(key, agentConfig, callbacks = {}) {
+		let adapter;
+		const isCurrent = () => callbacks.isCurrent?.(adapter) !== false;
+		const host = {
+			onEvent: (event) => {
+				if (isCurrent()) callbacks.onEvent?.(event, adapter);
+			},
+			requestPermission: (params, context = {}) => {
+				if (!isCurrent()) return cancelledOutcome();
+				return this.requestPermission(params, {
+					...context,
+					agentKey: key,
+					adapter,
+					sourceClient: adapter,
+				});
+			},
+			requestInteraction: (method, params, context = {}) => {
+				if (!isCurrent()) return cursorCancelResult(method);
+				return this.requestCursorInteraction(method, params, {
+					...context,
+					agentKey: key,
+					adapter,
+					sourceClient: adapter,
+				});
+			},
+			onElicitationRequest: (params) => {
+				if (!isCurrent()) return { action: "cancel" };
+				return this.requestElicitation(params, {
+					agentKey: key,
+					adapter,
+					sourceClient: adapter,
+				});
+			},
+			elicitationCapabilities: { url: true, form: true },
+			runTerminalAuthentication: (agent, method, context) =>
+				this.runAdapterTerminalAuthentication(agent, method, context),
+			collectEnvironmentVariables: (method, environment, context) =>
+				this.collectAdapterEnvironmentVariables(method, environment, context),
+		};
+		adapter = createAdapter(key, agentConfig, host, {
+			settings: this.config.settings?.agents?.[key] ?? {},
+			globalPermissions: this.config.settings?.permissions,
+			grants: this.permissionGrants,
+			connectionFactory: createAcpConnection,
+			services: harnessAdapterServices(),
+		});
+		const runtimeMode = this.runtimePermissionMode?.get(key);
+		if (runtimeMode) adapter.setRuntimePermissionMode(runtimeMode);
+		return adapter;
+	}
+
 	async retireSupersededClient(client) {
 		try {
 			await stopClientsForReplacement([client]);
@@ -3535,6 +4131,8 @@ export class HarnessApp {
 			// Shutdown may have started while this replacement was queued behind an
 			// earlier lifecycle turn. Never let a queued turn launch after the TUI has
 			// begun returning control to the shell.
+			if (this.stopping) return;
+			if (this.workingDirectoryShutdownTail) await this.workingDirectoryShutdownTail;
 			if (this.stopping) return;
 			if (this.replacementProcessFence) {
 				this.reportReplacementProcessFence();
@@ -3563,6 +4161,18 @@ export class HarnessApp {
 		if (!agent) {
 			this.addNotice(`unknown agent: ${key}`);
 			return;
+		}
+		// A user-selected /harness replacement starts a new lifecycle even when it
+		// selects the same configured key. Invalidate outstanding context owners
+		// before waiting for the old process tree, while internal crash/auth/session
+		// reconnects deliberately retain their generation.
+		if (
+			options.explicitReplacement === true ||
+			this.activeKey !== key ||
+			this.transport !== transport
+		) {
+			this.activeAgentGeneration = (this.activeAgentGeneration ?? 0) + 1;
+			this.previousClearedSession = undefined;
 		}
 		const previousClient = this.client;
 		const previousBtwClient = this.btwThread?.client;
@@ -3604,9 +4214,6 @@ export class HarnessApp {
 				this.statusState = "";
 				return;
 			}
-		}
-		if (this.activeKey !== key || this.transport !== transport) {
-			this.activeAgentGeneration = (this.activeAgentGeneration ?? 0) + 1;
 		}
 		this.activeKey = key;
 		this.transport = transport;
@@ -3663,22 +4270,9 @@ export class HarnessApp {
 			this.transport = "acp";
 		}
 		let client;
-		client = new AcpClient(agent, (event) => {
-			if (this.client === client) this.handleBackendEvent(event);
-		}, {
-				onPermissionRequest: (params) => {
-					if (this.client !== client) return cancelledOutcome();
-					return this.resolvePermissionOutcome(key, agent, params, { sourceClient: client });
-				},
-				onCursorRequest: (method, params) => {
-					if (this.client !== client) return cursorCancelResult(method);
-					return this.resolveCursorOutcome(key, agent, method, params, { sourceClient: client });
-				},
-				onElicitationRequest: (params) => {
-					if (this.client !== client) return { action: "cancel" };
-					return this.requestElicitation(params, { sourceClient: client });
-				},
-				elicitationCapabilities: { url: true, form: true },
+		client = this.createRuntimeAdapter(key, agent, {
+			isCurrent: (candidate) => this.client === candidate,
+			onEvent: (event) => this.handleBackendEvent(event),
 		});
 		this.client = client;
 		let settleConnectionAttempt;
@@ -3689,7 +4283,7 @@ export class HarnessApp {
 		this.connectionAttempt = connectionAttempt;
 		try {
 			const sessionIdToLoad = options.loadSessionId;
-			await client.initialize({ createSession: !sessionIdToLoad });
+			await client.connect({ createSession: !sessionIdToLoad });
 			if (sessionIdToLoad) {
 				await client.loadSession(sessionIdToLoad, {
 					beforeReplay: options.beforeSessionReplay,
@@ -3716,7 +4310,12 @@ export class HarnessApp {
 				return;
 			}
 			const authenticationPending = client.authMethods.length > 0 && isAuthenticationRequiredError(error);
-			if (!authenticationPending) client.stop();
+			// A failed initialize can still leave the ACP process (and descendants) alive.
+			// Confirm that complete tree has retired before this lifecycle turn can release
+			// and a later harness switch can start its replacement. BaseAcpAdapter.stop()
+			// is intentionally asynchronous, so a fire-and-forget call here would also turn
+			// teardown failures into unhandled promise rejections.
+			if (!authenticationPending) await this.retireSupersededClient(client);
 			this.ready = false;
 			this.statusState = "";
 			this.updateSpinner();
@@ -3731,6 +4330,213 @@ export class HarnessApp {
 		}
 	}
 
+	activeCcKeybindingContexts() {
+		if (this.menuHandle) {
+			const menuContexts = this.menuHandle.activeKeybindingContexts?.() ?? [this.menuHandle.keybindingContext ?? "Select"];
+			return [...menuContexts, "Global"];
+		}
+		const contexts = [];
+		if (this.editor?.autocompleteState) contexts.push("Autocomplete");
+		const sideFocused = this.focusedThread === "btw" && this.btwThread;
+		const focusedClient = sideFocused ? this.btwThread.client : this.client;
+		const focusedBusy = sideFocused ? this.btwThread.busy : this.busy;
+		if (focusedBusy && focusedClient?.capabilities?.backgroundTasks === true) contexts.push("Task");
+		contexts.push("Chat", "Global");
+		return contexts;
+	}
+
+	handleCcKeybindingInput(data) {
+		const result = this.keybindingDispatcher?.handle(data, this.activeCcKeybindingContexts());
+		if (!result?.consume) return false;
+		if (result.pending || result.action === CC_UNBOUND_ACTION) return true;
+		return this.executeCcKeybindingAction(result.action, result) !== false;
+	}
+
+	executeCcKeybindingAction(action, resolution = {}) {
+		if (action === "cc.app.exit") {
+			this.requestUserExit();
+			return true;
+		}
+		if (action === "cc.app.interrupt" || action === "cc.chat.cancel") return this.cancelFromCcKeybinding();
+		if (action === "cc.app.redraw") {
+			this.forceFullRepaint({ immediate: true });
+			return true;
+		}
+		if (action === "cc.app.toggleTodos") {
+			this.toggleTodosPanel();
+			return true;
+		}
+		if (action === "cc.chat.killAgents") {
+			void this.killRunningTasksFromKeybinding();
+			return true;
+		}
+		if (action === "cc.chat.cycleMode") {
+			// /btw already uses Shift+Tab as its documented pane-focus key. Keep
+			// that behavior for Claude's default binding; an explicit custom key
+			// still cycles modes while a side thread is open.
+			if (resolution.binding?.default === true && this.btwThread) return false;
+			void this.cycleModeFromKeybinding();
+			return true;
+		}
+		if (action === "cc.chat.modelPicker") {
+			const targetThread = this.focusedThread === "btw" ? this.btwThread : undefined;
+			void this.runLocalSlashCommand("model", "", { targetThread });
+			return true;
+		}
+		if (action === "cc.chat.fastMode") {
+			const targetThread = this.focusedThread === "btw" ? this.btwThread : undefined;
+			void this.openFastModeDialog("", "fast", { targetThread });
+			return true;
+		}
+		if (action === "cc.chat.imagePaste") {
+			void this.handleClipboardPaste();
+			return true;
+		}
+		if (action === "cc.voice.pushToTalk") {
+			const defaultPlainSpace = resolution.chord === "space" && resolution.binding?.default === true;
+			if (defaultPlainSpace && (!this.voiceModeEnabled || this.editor.getText() || this.lastKnownEditorText)) {
+				if (this.editor.getText() || this.lastKnownEditorText) this.exitVoiceMode();
+				return false;
+			}
+			if (resolution.chord !== "space") this.enterVoiceMode();
+			return this.handleVoiceKey(resolution.chord, {
+				isSpace: true,
+				isModifiedSpace: false,
+				isCtrlSpace: false,
+				isSubmit: false,
+				isTab: false,
+				isCancel: false,
+			});
+		}
+		if (action === "tui.input.submit") {
+			this.editor.submitValue();
+			return true;
+		}
+		if (action === "tui.input.newLine") {
+			this.editor.addNewLine();
+			return true;
+		}
+		if (action === "tui.editor.undo") {
+			this.editor.undo();
+			return true;
+		}
+		if (action === "tui.select.confirm") return this.editor.performAutocompleteAction("accept");
+		if (action === "tui.select.cancel") return this.editor.performAutocompleteAction("dismiss");
+		if (action === "tui.select.up") return this.editor.performAutocompleteAction("previous");
+		if (action === "tui.select.down") return this.editor.performAutocompleteAction("next");
+		if (action === "cc.select.accept" || action === "cc.confirm.yes") return this.sendMenuKeyFromBinding("\r");
+		if (action === "cc.select.cancel" || action === "cc.confirm.no") return this.sendMenuKeyFromBinding("\x1b");
+		if (action === "cc.select.previous" || action === "cc.confirm.previous") return this.sendMenuKeyFromBinding("\x1b[A");
+		if (action === "cc.select.next" || action === "cc.confirm.next") return this.sendMenuKeyFromBinding("\x1b[B");
+		if (action === "cc.confirm.toggle") {
+			if (this.menuHandle instanceof ElicitationFormPanel) return this.sendMenuKeyFromBinding(" ");
+			return true;
+		}
+		if (action === "cc.task.background") {
+			void this.backgroundTaskFromKeybinding();
+			return true;
+		}
+		return false;
+	}
+
+	sendMenuKeyFromBinding(data) {
+		if (!this.menuHandle?.handleInput) return false;
+		this.menuHandle.handleInput(data);
+		this.ui.requestRender();
+		return true;
+	}
+
+	cancelFromCcKeybinding() {
+		if (this.voiceController?.isRecording() || this.voiceController?.isTranscribing()) {
+			this.voiceController.cancel();
+			this.exitVoiceMode();
+			return true;
+		}
+		if (this.focusedThread === "btw" && this.btwThread?.busy) {
+			if (this.btwThread.cancelRequested) this.btwThread.client?.forceResolvePrompt?.();
+			else this.btwThread.interrupt();
+			return true;
+		}
+		if (this.focusedThread === "main" && this.busy) {
+			if (!this.tryUnsendPendingPrompt()) this.interruptViaEscape();
+			return true;
+		}
+		this.handleInterrupt("keybinding");
+		return true;
+	}
+
+	async cycleModeFromKeybinding() {
+		const targetThread = this.focusedThread === "btw" ? this.btwThread : undefined;
+		const target = this.captureSessionCommandTarget(targetThread);
+		if (!this.isSessionCommandTargetActive(target)) return;
+		const state = this.sessionStateForCommandTarget(target);
+		const option = findConfigOption(state, "mode");
+		const values = option
+			? flattenConfigOptions(option)
+			: flattenModes(state).map((mode) => ({ value: mode.id, name: mode.name ?? mode.id }));
+		if (values.length < 2) {
+			this.addSessionTargetNotice(target, values.length === 0 ? "This harness does not advertise modes" : "Only one mode is available");
+			this.ui.requestRender();
+			return;
+		}
+		const current = option?.currentValue ?? state?.modes?.currentModeId;
+		const currentIndex = values.findIndex((entry) => entry.value === current);
+		const next = values[currentIndex < 0 ? 0 : (currentIndex + 1) % values.length];
+		const options = { displayText: slashPromptDisplay("/mode", next.name), commandName: "mode" };
+		if (option) await this.setConfigValueForCommandTarget(target, option, next.value, next.name, options);
+		else await this.setModeValueForCommandTarget(target, next.value, next.name, options);
+	}
+
+	async backgroundTaskFromKeybinding() {
+		const targetThread = this.focusedThread === "btw" ? this.btwThread : undefined;
+		const target = this.captureSessionCommandTarget(targetThread);
+		if (!this.isSessionCommandTargetActive(target)) return;
+		if (target.client?.capabilities?.backgroundTasks !== true) {
+			this.addSessionTargetNotice(target, "This harness does not advertise background-task control");
+			this.ui.requestRender();
+			return;
+		}
+		try {
+			const response = await target.client.backgroundTasks();
+			if (!this.isSessionCommandTargetActive(target)) return;
+			this.addSessionTargetNotice(
+				target,
+				response.backgrounded ? "Foreground task work is now running in the background" : "No foreground task was available to background",
+			);
+		} catch (error) {
+			if (this.isSessionCommandTargetActive(target)) this.addSessionTargetError(target, error.message ?? String(error));
+		}
+		this.ui.requestRender();
+	}
+
+	async killRunningTasksFromKeybinding() {
+		const targetThread = this.focusedThread === "btw" ? this.btwThread : undefined;
+		const target = this.captureSessionCommandTarget(targetThread);
+		if (!this.isSessionCommandTargetActive(target)) return;
+		if (target.client?.capabilities?.backgroundTasks !== true) {
+			this.addSessionTargetNotice(target, "This harness does not advertise background-task control");
+			this.ui.requestRender();
+			return;
+		}
+		try {
+			const snapshot = await target.client.listBackgroundTasks();
+			if (!this.isSessionCommandTargetActive(target)) return;
+			const active = snapshot.tasks.filter((task) => ["pending", "running", "paused"].includes(task.status));
+			if (active.length === 0) {
+				this.addSessionTargetNotice(target, "No running background agents to stop");
+			} else {
+				const outcomes = await Promise.allSettled(active.map((task) => target.client.stopBackgroundTask(task.id)));
+				if (!this.isSessionCommandTargetActive(target)) return;
+				const stopped = outcomes.filter((outcome) => outcome.status === "fulfilled").length;
+				const failed = outcomes.length - stopped;
+				this.addSessionTargetNotice(target, `Stop requested for ${stopped} running agent${stopped === 1 ? "" : "s"}${failed ? `; ${failed} failed` : ""}`);
+			}
+		} catch (error) {
+			if (this.isSessionCommandTargetActive(target)) this.addSessionTargetError(target, error.message ?? String(error));
+		}
+		this.ui.requestRender();
+	}
+
 	handleGlobalInput(data) {
 		if (isTerminalResponse(data)) return undefined;
 		if (isMouseInput(data)) return { consume: true };
@@ -3740,9 +4546,16 @@ export class HarnessApp {
 			this.applyInputPrefix(control.prefix);
 			data = control.key;
 		}
+		// Preserve input ordering while an asynchronous clipboard read is active;
+		// keybinding actions must not jump ahead of the buffered editor input.
+		if (this.clipboardPasteInProgress) {
+			this.bufferClipboardPasteInput(data);
+			return { consume: true };
+		}
+		if (this.handleCcKeybindingInput(data)) return { consume: true };
 		if (this.menuHandle) {
 			if (isCtrlD(data)) {
-				this.stop();
+				this.requestUserExit();
 				return { consume: true };
 			}
 			if (isCtrlC(data)) {
@@ -3751,15 +4564,6 @@ export class HarnessApp {
 			}
 			this.menuHandle.handleInput(data);
 			this.ui.requestRender();
-			return { consume: true };
-		}
-		// While a clipboard paste is resolving (an async image read kicked off by
-		// Ctrl+V), buffer every subsequent keystroke and replay it in order once the
-		// read settles. This must precede all interactive interpretation below —
-		// otherwise busy-steering would consume a buffered Tab/Esc and act on stale
-		// editor text (the not-yet-applied buffered input), scrambling the result.
-		if (this.clipboardPasteInProgress) {
-			this.bufferClipboardPasteInput(data);
 			return { consume: true };
 		}
 		// Shift+Tab toggles focus between the main thread and the /btw fork.
@@ -3816,7 +4620,7 @@ export class HarnessApp {
 			return { consume: true };
 		}
 		if (isCtrlD(data)) {
-			this.stop();
+			this.requestUserExit();
 			return { consume: true };
 		}
 		if (isCtrlC(data)) {
@@ -4038,14 +4842,15 @@ export class HarnessApp {
 
 	imagePromptCapability(capabilitiesOverride = undefined) {
 		const state = this.sessionStates.get(this.activeKey);
-		const capabilities = capabilitiesOverride ?? state?.capabilities ?? this.client?.capabilities;
+		const capabilities = capabilitiesOverride ?? this.client?.capabilities ?? state?.capabilities;
 		return imagePromptCapability(capabilities);
 	}
 
 	embeddedContextCapability(capabilitiesOverride = undefined) {
 		const state = this.sessionStates.get(this.activeKey);
-		const capabilities = capabilitiesOverride ?? state?.capabilities ?? this.client?.capabilities;
+		const capabilities = capabilitiesOverride ?? this.client?.capabilities ?? state?.capabilities;
 		if (!capabilities || Object.keys(capabilities).length === 0) return undefined;
+		if (typeof capabilities.embeddedContext === "boolean") return capabilities.embeddedContext;
 		return capabilities.promptCapabilities?.embeddedContext === true;
 	}
 
@@ -4063,12 +4868,29 @@ export class HarnessApp {
 			const expanded = [];
 			let embedded = 0;
 			const expansionState = { seenPaths: new Set(), embeddedCount: 0, embeddedBytes: 0 };
+			let configOptions = options.configOptions;
+			if (!Array.isArray(configOptions)) {
+				try {
+					configOptions = this.sessionStates?.get?.(this.activeKey)?.configOptions
+						?? this.client?.getSessionInfo?.().configOptions
+						?? this.client?.configOptions
+						?? [];
+				} catch {
+					configOptions = this.client?.configOptions ?? [];
+				}
+			}
+			const reservedMentions = new Set(
+				agentMentionsFromConfigOptions(configOptions).map((mention) => mention.value),
+			);
 			for (const part of parts) {
 				if (part?.type !== "text") {
 					expanded.push(part);
 					continue;
 				}
-				const result = buildEmbeddedFilePromptParts(part.text, process.cwd(), { state: expansionState });
+				const result = buildEmbeddedFilePromptParts(part.text, process.cwd(), {
+					state: expansionState,
+					reservedMentions,
+				});
 				expanded.push(...result.parts);
 				embedded += result.embeddedCount;
 			}
@@ -4297,6 +5119,12 @@ export class HarnessApp {
 		if (inputSideThread) {
 			const targetThread = inputSideThread;
 			this.editor.addToHistory(text);
+			const shellCommand = parseShellInput(text);
+			if (shellCommand !== undefined) {
+				this.shellCommandHistory?.remember(shellCommand);
+				await this.runShellInput(shellCommand, { targetThread });
+				return;
+			}
 			if (isHarnessCommandText(text)) {
 				await this.handleHarnessCommand(text);
 				return;
@@ -4348,6 +5176,12 @@ export class HarnessApp {
 			this.editor.onSubmit = (next) => void this.handleSubmit(next);
 		});
 
+		const shellCommand = parseShellInput(text);
+		if (shellCommand !== undefined) {
+			this.shellCommandHistory?.remember(shellCommand);
+			await this.runShellInput(shellCommand);
+			return;
+		}
 		if (isHarnessCommandText(text)) {
 			await this.handleHarnessCommand(text);
 			return;
@@ -4362,6 +5196,143 @@ export class HarnessApp {
 		// locally-handled command must not silently swallow a pending attachment.
 		const promptParts = this.consumeImagePromptParts(text);
 		await this.submitBackendPrompt(text, { displayText, compactCommand, promptParts, queueTiming: opts.queueTiming });
+	}
+
+	shellModelResponseEnabled(key = this.activeKey) {
+		const harnessSettings = this.config?.settings?.agents?.[key] ?? {};
+		const harnessSetting =
+			harnessSettings.respondToBashCommands ??
+			harnessSettings.settings?.respondToBashCommands ??
+			harnessSettings.shellModelResponse;
+		const globalSetting = this.config?.settings?.respondToBashCommands ?? this.config?.settings?.shellModelResponse;
+		return (harnessSetting ?? globalSetting) !== false;
+	}
+
+	setShellInputStatus(targetThread, running) {
+		const owner = targetThread ?? this;
+		this.activeShellInputCount = Math.max(0, (this.activeShellInputCount ?? 0) + (running ? 1 : -1));
+		owner.shellInputsRunning = Math.max(0, (owner.shellInputsRunning ?? 0) + (running ? 1 : -1));
+		if (running && owner.shellInputsRunning === 1 && !owner.statusState) {
+			owner.statusState = "running shell command";
+			owner.shellInputOwnsStatus = true;
+		}
+		if (!running && owner.shellInputsRunning === 0 && owner.shellInputOwnsStatus) {
+			if (owner.statusState === "running shell command") owner.statusState = "";
+			owner.shellInputOwnsStatus = false;
+		}
+		if (targetThread) this.onThreadActivity();
+		else {
+			this.updateSpinner();
+			this.ui.requestRender();
+		}
+	}
+
+	async runShellInput(command, options = {}) {
+		const targetThread = options.targetThread;
+		if (!command) {
+			if (targetThread) {
+				targetThread.addNotice("usage: !<command>");
+				this.onThreadActivity();
+			} else {
+				this.addNotice("usage: !<command>");
+				this.ui.requestRender();
+			}
+			return;
+		}
+		if (this.sessionSwitchInProgress || this.workingDirectoryCommandTransition) {
+			const displayText = `!${command}`;
+			const message = this.sessionSwitchInProgress
+				? "Shell commands are unavailable while a session transition is in progress"
+				: "Shell commands are unavailable while the working directory is changing";
+			if (targetThread && this.btwThread === targetThread) {
+				targetThread.addCommandMessage(displayText);
+				targetThread.addNotice(message);
+				this.onThreadActivity();
+			} else {
+				this.addCommandMessage(displayText);
+				this.addNotice(message);
+				this.ui.requestRender();
+			}
+			return;
+		}
+		// A shell command can outlive a harness/session transition. Bind both its
+		// delivery target and response policy at launch so output from session A can
+		// never be appended or submitted to a replacement session B.
+		const target = this.captureSessionCommandTarget(targetThread);
+		const modelResponseEnabled = this.shellModelResponseEnabled(target.agentContext.key);
+
+		this.setShellInputStatus(targetThread, true);
+		try {
+			const invocation = shellInvocation(command);
+			const captured = await runCapture(invocation.command, invocation.args, this.trackedNativeProcessOptions({
+				cwd: process.cwd(),
+				maxStdoutBytes: SHELL_INPUT_MAX_STDOUT_BYTES,
+				maxStderrBytes: SHELL_INPUT_MAX_STDERR_BYTES,
+				rejectOnExit: false,
+				timeoutMs: SHELL_INPUT_TIMEOUT_MS,
+			}));
+			const result = normalizeShellResult(command, captured);
+			const displayText = formatShellTranscript(result);
+			if (!this.isSessionCommandTargetActive(target)) {
+				const owner = targetThread ? "its /btw thread closed" : "its original session changed";
+				this.addNotice(
+					`Shell command finished after ${owner}; its output was not sent to the replacement session ` +
+					`(${result.signal ?? result.code ?? "unknown"})`,
+				);
+				this.ui.requestRender();
+				return;
+			}
+			if (modelResponseEnabled) {
+				const prompt = formatShellFollowup(result);
+				if (targetThread) await targetThread.submit(prompt, undefined, { displayText });
+				else await this.submitBackendPrompt(prompt, { displayText });
+			} else {
+				const client = target.client;
+				if (targetThread) {
+					targetThread.addUserMessage(displayText);
+					this.onThreadActivity();
+				} else {
+					this.addUserMessage(displayText);
+					this.ui.requestRender();
+				}
+				if (client?.capabilities?.appendContext === true) {
+					try {
+						await client.appendContext(formatShellContext(result));
+					} catch (error) {
+						if (!this.isSessionCommandTargetActive(target)) {
+							this.addNotice("Shell context injection finished after its original session changed; its error was not attached to the replacement session");
+							this.ui.requestRender();
+							return;
+						}
+						const message = `Shell output was displayed, but could not be added to model context: ${error.message ?? error}`;
+						if (targetThread) targetThread.addError(message);
+						else this.addError(message);
+					}
+				} else {
+					const message = "Shell output was displayed, but this harness does not support context-only injection; the model will not see it.";
+					if (targetThread) targetThread.addNotice(message);
+					else this.addNotice(message);
+				}
+				if (targetThread) this.onThreadActivity();
+				else this.ui.requestRender();
+			}
+		} catch (error) {
+			const message = error?.message ?? String(error);
+			if (!this.isSessionCommandTargetActive(target)) {
+				this.addNotice("Shell command failed after its original session changed; its error was not attached to the replacement session");
+				this.ui.requestRender();
+				return;
+			}
+			if (targetThread && this.btwThread === targetThread) {
+				targetThread.addError(message);
+				this.onThreadActivity();
+			} else {
+				this.addError(message);
+				this.ui.requestRender();
+			}
+		} finally {
+			this.setShellInputStatus(targetThread, false);
+		}
 	}
 
 	async submitBackendPrompt(text, options = {}) {
@@ -4412,9 +5383,12 @@ export class HarnessApp {
 	}
 
 	armPendingUnsendPrompt(entry) {
-		const sessionId = this.client?.sessionId;
-		const stateSnapshot = this.codexThreadStateSnapshot;
-		if (!entry.transcriptEntry?.message || !this.isCodexAcpActive() || !sessionId || stateSnapshot?.sessionId !== sessionId) {
+		const client = this.client;
+		const sessionId = client?.sessionId;
+		const stateSnapshot = client?.capabilities?.retractPrompt
+			? client.snapshotRetractionState?.()
+			: undefined;
+		if (!entry.transcriptEntry?.message || !sessionId || !stateSnapshot) {
 			this.pendingUnsendPrompt = undefined;
 			return;
 		}
@@ -4437,14 +5411,12 @@ export class HarnessApp {
 		const pending = this.pendingUnsendPrompt;
 		if (!pending || pending.client !== this.client || !this.busy || this.cancelRequested) return false;
 		if (this.promptQueue.some((entry) => entry.timing === "afterTool")) return false;
-		if (!this.isCodexAcpActive()) {
+		if (!pending.client.capabilities?.retractPrompt) {
 			this.pendingUnsendPrompt = undefined;
 			return false;
 		}
-		const currentState = this.readCodexThreadState(pending.sessionId);
-		if (!codexThreadStatesEqual(currentState, pending.stateSnapshot)) {
+		if (!pending.client.canRetract?.(pending.stateSnapshot)) {
 			this.pendingUnsendPrompt = undefined;
-			this.codexThreadStateSnapshot = currentState;
 			return false;
 		}
 
@@ -4642,11 +5614,30 @@ export class HarnessApp {
 		const key = this.activeKey;
 		return {
 			key,
-			agent: this.config.agents[key],
+			// Stable identity for lifecycle checks. `agent` below is the current
+			// runtime launch spec and is intentionally cloned by every adapter, so
+			// comparing it across a same-harness reconnect always fails.
+			agentDefinition: this.config?.agents?.[key],
+			agent: this.activeAgentLaunchSpec(key),
 			transport: this.transport,
 			generation: this.activeAgentGeneration ?? 0,
 			...(options.includeClient ? { client: this.client } : {}),
 		};
+	}
+
+	activeAgentLaunchSpec(key = this.activeKey) {
+		if (key === this.activeKey && this.client?.launchSpec) return this.client.launchSpec;
+		return this.config.agents[key];
+	}
+
+	syncAgentAuthenticationState(key, adapter = this.client) {
+		const definition = this.config?.agents?.[key];
+		const launchSpec = adapter?.launchSpec;
+		if (!definition || !launchSpec) return;
+		for (const property of ["_sessionAuthEnv", "_signedOutAuthEnvNames"]) {
+			if (Object.hasOwn(launchSpec, property)) definition[property] = clonePlain(launchSpec[property]);
+			else delete definition[property];
+		}
 	}
 
 	captureSessionCommandTarget(targetThread = undefined) {
@@ -4747,7 +5738,10 @@ export class HarnessApp {
 
 	isSessionCommandTargetActive(target) {
 		if (!target || !this.isActiveAgentContext(target.agentContext)) return false;
-		if (!target.targetThread) return this.client === target.client;
+		if (!target.targetThread) {
+			if (this.client !== target.client || target.client?.exited) return false;
+			return target.sessionId === undefined || sameSessionId(target.client?.sessionId, target.sessionId);
+		}
 		if (this.btwThread !== target.targetThread || target.targetThread.client !== target.client) return false;
 		const liveSessionId = target.targetThread.sessionId ?? target.client?.sessionId;
 		return !target.client?.exited && (
@@ -4778,10 +5772,15 @@ export class HarnessApp {
 	}
 
 	isActiveAgentContext(context) {
+		const agentIdentityMatches = Object.hasOwn(context ?? {}, "agentDefinition")
+			? this.config?.agents?.[context.key] === context.agentDefinition
+			// Backward-compatible fallback for injected/test contexts created before
+			// the stable-definition field existed.
+			: this.activeAgentLaunchSpec(context?.key) === context?.agent;
 		return Boolean(
 			context &&
 				this.activeKey === context.key &&
-				this.config.agents[context.key] === context.agent &&
+				agentIdentityMatches &&
 				this.transport === context.transport &&
 				(this.activeAgentGeneration ?? 0) === (context.generation ?? 0) &&
 			(!Object.hasOwn(context, "client") || this.client === context.client),
@@ -4796,7 +5795,7 @@ export class HarnessApp {
 	}
 
 	readCodexThreadState(sessionId) {
-		const env = mergedAgentEnvironment(this.config.agents[this.activeKey]);
+		const env = mergedAgentEnvironment(this.activeAgentLaunchSpec());
 		return readCodexThreadState(sessionId, codexStateDbPath(env));
 	}
 
@@ -5088,7 +6087,7 @@ export class HarnessApp {
 	async handleHarnessCommand(command) {
 		const parts = command.split(/\s+/).filter(Boolean);
 		if (parts.includes("exit") || parts.includes("quit")) {
-			this.stop();
+			this.requestUserExit(command);
 			return;
 		}
 		if (this.sessionSwitchInProgress) {
@@ -5106,7 +6105,11 @@ export class HarnessApp {
 			this.addNotice(`usage: /harness [${Object.keys(this.config.agents).join("|")}]`);
 			return;
 		}
-		await this.switchAgent(agentKey, "acp", { persist: true, displayText: slashPromptDisplay("/harness", this.config.agents[agentKey]?.label ?? agentKey) });
+		await this.switchAgent(agentKey, "acp", {
+			explicitReplacement: true,
+			persist: true,
+			displayText: slashPromptDisplay("/harness", this.config.agents[agentKey]?.label ?? agentKey),
+		});
 	}
 
 	async handleSlashCommand(text) {
@@ -5149,6 +6152,31 @@ export class HarnessApp {
 		if (name === "goal" && this.isCodexBackendActive() && ["", "view", "edit"].includes(argument.trim().toLowerCase())) {
 			return "local";
 		}
+		// These aliases own potentially destructive host/session orchestration. They
+		// are always local, including on a harness that cannot perform the operation;
+		// never forward a same-named command with different semantics.
+		if (["rewind", "checkpoint", "undo", "remote-control", "rc"].includes(name)) return "local";
+		// A cwd is process-global in cc, so never let a side session consume its
+		// backend's same-named command and silently diverge from the main TUI.
+		if (name === "cd" && this.focusedThread === "btw") return "local";
+		// /branch replaces the main session in place. A side pane must reject it
+		// locally instead of forking an independently focused backend session.
+		if (name === "branch" && this.focusedThread === "btw") return "local";
+		// Some shared cc fallbacks now overlap commands exposed by newer ACP
+		// backends. Let a live non-Codex advertisement own the native command while
+		// retaining the fallback when the backend omits it. Bare `/config` remains
+		// cc's unified ACP option picker; Claude's native form is `key=value`.
+		if (
+			!this.isCodexBackendActive() &&
+			backendNames.has(name) &&
+			(
+				name === "init" ||
+				name === "fast" ||
+				(name === "config" && (argument.includes("=") || argument.trim().startsWith("--")))
+			)
+		) {
+			return "backend";
+		}
 		// Persistent Codex forking is owned by cc's guarded main-session
 		// transition. Keep it local even while /btw is focused, where the command
 		// is deliberately hidden and rejected instead of leaking to the backend.
@@ -5174,12 +6202,15 @@ export class HarnessApp {
 
 	shouldOpenCodexReviewDialog(name, argument, backendNames) {
 		if (name !== "review" || argument || this.sessionSwitchInProgress) return false;
-		if (this.activeKey === "codex") return true;
-		return backendNames.has("review") && backendNames.has("review-branch") && backendNames.has("review-commit");
+		const adapter = this.focusedThread === "btw" && this.btwThread
+			? this.btwThread.client
+			: this.client;
+		return adapter?.interceptCommand?.(name, argument, backendNames)?.kind === "preset-dialog";
 	}
 
 	isKnownCodexReviewCommand(name) {
-		return this.activeKey === "codex" && (name === "review" || name === "review-branch" || name === "review-commit");
+		return this.client?.capabilities?.commandPresets?.includes("review") === true &&
+			(name === "review" || name === "review-branch" || name === "review-commit");
 	}
 
 	openCodexReviewDialog(options = {}) {
@@ -5286,7 +6317,7 @@ export class HarnessApp {
 			return;
 		}
 		if (name === "exit" || name === "quit") {
-			this.stop();
+			this.requestUserExit(slashCommandText(name, argument));
 			return;
 		}
 		if (name === "voice") {
@@ -5313,11 +6344,39 @@ export class HarnessApp {
 			return;
 		}
 		if (name === "copy") {
-			await this.runCopy();
+			await this.runCopy(argument);
+			return;
+		}
+		if (name === "color") {
+			this.runPromptColor(argument);
 			return;
 		}
 		if (name === "theme") {
 			await this.openThemeDialog(argument, name);
+			return;
+		}
+		if (name === "keybindings") {
+			await this.runKeybindingsCommand(argument, name);
+			return;
+		}
+		if (name === "cd") {
+			await this.runChangeWorkingDirectory(argument, name, { targetThread: options.targetThread });
+			return;
+		}
+		if (name === "tasks") {
+			await this.runBackgroundTasksCommand(argument, name, { targetThread: options.targetThread });
+			return;
+		}
+		if (name === "todos") {
+			this.runTodosCommand(argument, name, { targetThread: options.targetThread });
+			return;
+		}
+		if (name === "rewind" || name === "checkpoint" || name === "undo") {
+			await this.openCheckpointRewind(argument, name, { targetThread: options.targetThread });
+			return;
+		}
+		if (name === "remote-control" || name === "rc") {
+			await this.runRemoteControlCommand(argument, name, { targetThread: options.targetThread });
 			return;
 		}
 		if (name === "config") {
@@ -5420,6 +6479,10 @@ export class HarnessApp {
 			await this.startNewSession(name);
 			return;
 		}
+		if (name === "branch") {
+			await this.branchCurrentSession(argument, { targetThread: options.targetThread });
+			return;
+		}
 		if (name === "model") {
 			await this.openConfigDialog("model", "Model", argument, name, { targetThread: options.targetThread });
 			return;
@@ -5449,12 +6512,712 @@ export class HarnessApp {
 		}
 	}
 
+	async runBackgroundTasksCommand(argument, commandName = "tasks", options = {}) {
+		const target = await this.prepareSessionConfigCommandTarget(commandName, argument, options.targetThread);
+		if (!target) return;
+		this.addSessionTargetCommand(target, slashCommandText(commandName, argument));
+		let command;
+		try {
+			command = parseBackgroundTasksCommand(argument);
+		} catch (error) {
+			this.addSessionTargetNotice(target, error.message ?? String(error));
+			this.ui.requestRender();
+			return;
+		}
+		if (target.client?.capabilities?.backgroundTasks !== true) {
+			this.addSessionTargetNotice(target, "This agent does not advertise background-task lifecycle support");
+			this.ui.requestRender();
+			return;
+		}
+		try {
+			if (command.action === "list") {
+				const snapshot = await target.client.listBackgroundTasks();
+				if (this.isSessionCommandTargetActive(target)) {
+					this.addSessionTargetNotice(target, formatBackgroundTaskList(snapshot));
+				}
+			} else if (command.action === "stop") {
+				await target.client.stopBackgroundTask(command.taskId);
+				if (this.isSessionCommandTargetActive(target)) {
+					this.addSessionTargetNotice(target, `Stop requested for task ${command.taskId}`);
+				}
+			} else {
+				const response = await target.client.backgroundTasks(command.toolUseId);
+				if (this.isSessionCommandTargetActive(target)) {
+					this.addSessionTargetNotice(
+						target,
+						response.backgrounded
+							? "Foreground task work is now running in the background"
+							: "No matching foreground task was available to background",
+					);
+				}
+			}
+		} catch (error) {
+			if (this.isSessionCommandTargetActive(target)) {
+				this.addSessionTargetError(target, error.message ?? String(error));
+			}
+		}
+		this.ui.requestRender();
+	}
+
+	runTodosCommand(argument = "", commandName = "todos", options = {}) {
+		const target = this.captureSessionCommandTarget(options.targetThread);
+		if (options.targetThread && !this.isSessionCommandTargetActive(target)) {
+			this.reportClosedSessionCommandTarget(commandName, argument);
+			return false;
+		}
+		this.addSessionTargetCommand(target, slashCommandText(commandName, argument));
+		if (argument.trim()) {
+			this.addSessionTargetNotice(target, `usage: /${commandName}`);
+			this.ui.requestRender();
+			return false;
+		}
+		return this.toggleTodosPanel({ targetThread: options.targetThread });
+	}
+
+	async openCheckpointRewind(argument = "", commandName = "rewind", options = {}) {
+		const displayText = slashCommandText(commandName, argument);
+		const targetThread = options.targetThread ?? (
+			this.focusedThread === "btw" && this.btwThread ? this.btwThread : undefined
+		);
+		if (targetThread) {
+			const target = this.captureSessionCommandTarget(targetThread);
+			if (this.isSessionCommandTargetActive(target)) {
+				this.addSessionTargetCommand(target, displayText);
+				this.addSessionTargetNotice(target, `/${commandName} is available only from the main session`);
+			} else {
+				this.reportClosedSessionCommandTarget(commandName, argument);
+			}
+			this.ui.requestRender();
+			return false;
+		}
+		this.addCommandMessage(displayText);
+		if (argument.trim()) {
+			this.addNotice(`usage: /${commandName}`);
+			return false;
+		}
+		if (this.btwThread) {
+			this.addNotice("Close the /btw side thread before rewinding the main session");
+			return false;
+		}
+		if (
+			this.busy ||
+			this.sessionSwitchInProgress ||
+			this.selectionActionInProgress ||
+			(this.asyncPickerLoadCount ?? 0) > 0 ||
+			(this.configUpdateCount ?? 0) > 0
+		) {
+			this.addNotice(this.busy ? "A session cannot be rewound while a turn is running" : "Another session operation is active");
+			return false;
+		}
+		if (!this.client || !this.ready || this.client.exited) {
+			const connected = await this.ensureConnected();
+			if (!connected) return false;
+		}
+		const context = this.captureActiveAgentContext({ includeClient: true });
+		const sourceSessionId = context.client?.sessionId;
+		if (!sourceSessionId || context.client?.capabilities?.checkpoints !== true) {
+			this.addNotice("This agent does not advertise checkpoint support");
+			return false;
+		}
+
+		const pickerLoad = this.beginAsyncPickerLoad();
+		this.statusState = "loading checkpoints";
+		this.updateSpinner();
+		this.ui.requestRender();
+		try {
+			const result = await context.client.listCheckpoints();
+			if (!this.isCheckpointContextActive(context, sourceSessionId)) return false;
+			const previousSession = this.previousClearedSession?.key === context.key &&
+				!sameSessionId(this.previousClearedSession.sessionId, sourceSessionId)
+				? this.previousClearedSession
+				: undefined;
+			if (result.checkpoints.length === 0 && !previousSession) {
+				this.addNotice("No user-message checkpoints are available in this session");
+				return false;
+			}
+			if (!this.canOpenAsyncPicker()) {
+				this.addNotice("Checkpoints loaded, but another interaction is active. Run /rewind again.");
+				return false;
+			}
+			const entries = [...result.checkpoints].reverse().map((checkpoint, index) => ({
+				value: checkpoint,
+				label: checkpoint.summary,
+				description: index === 0 ? "Latest user checkpoint" : "Earlier user checkpoint",
+			}));
+			if (previousSession) {
+				entries.unshift({
+					value: undefined,
+					previousSession,
+					label: `/resume ${previousSession.sessionId} (previous session)`,
+					description: "Conversation active before /clear",
+				});
+			}
+			this.openSelection("Rewind to checkpoint", entries, async (entry) => {
+				this.closeMenu();
+				if (!entry || !this.isCheckpointContextActive(context, sourceSessionId)) return;
+				if (this.busy || this.sessionSwitchInProgress || this.btwThread) {
+					this.addNotice("The session changed while the checkpoint picker was open; run /rewind again");
+					return;
+				}
+				if (entry.previousSession) {
+					await this.resumeSelectedSession({
+						sessionId: entry.previousSession.sessionId,
+						title: "Previous session",
+					}, { displayText: entry.label });
+					return;
+				}
+				this.openCheckpointModeSelection(context, sourceSessionId, entry.value, displayText);
+			});
+			return true;
+		} catch (error) {
+			if (this.isActiveAgentContext(context)) this.addError(`Could not load checkpoints: ${error.message ?? error}`);
+			return false;
+		} finally {
+			if (this.isActiveAgentContext(context) && !this.busy && !this.sessionSwitchInProgress) {
+				this.statusState = "";
+				this.updateSpinner();
+				this.ui.requestRender();
+			}
+			this.endAsyncPickerLoad(pickerLoad);
+		}
+	}
+
+	openCheckpointModeSelection(context, sourceSessionId, checkpoint, displayText = "/rewind") {
+		if (!this.isCheckpointContextActive(context, sourceSessionId)) return false;
+		const entries = [
+			{
+				value: "both",
+				label: "Code and conversation",
+				description: "Restore files and continue from this point on a new branch",
+			},
+			{
+				value: "conversation",
+				label: "Conversation only",
+				description: "Keep files as-is and continue from this point on a new branch",
+			},
+			{
+				value: "code",
+				label: "Code only",
+				description: "Restore files while keeping the full conversation",
+			},
+		];
+		this.openSelection("What should be rewound?", entries, async (entry) => {
+			this.closeMenu();
+			if (!entry || !this.isCheckpointContextActive(context, sourceSessionId)) return;
+			await this.applyCheckpointRewind(context, sourceSessionId, checkpoint, entry.value, displayText);
+		});
+		return true;
+	}
+
+	async applyCheckpointRewind(context, sourceSessionId, checkpoint, mode, displayText = "/rewind") {
+		if (!this.isCheckpointContextActive(context, sourceSessionId)) return false;
+		if (this.busy || this.sessionSwitchInProgress || this.btwThread) {
+			this.addNotice("The session changed while the rewind choice was open; run /rewind again");
+			return false;
+		}
+		const client = context.client;
+		if (mode === "code") {
+			// File restoration mutates the shared working tree even though the ACP
+			// session id does not change. Own the same transition gate as conversation
+			// rewind so /clear, /branch, /harness, and new prompts cannot race it.
+			this.clearConfigUpdates();
+			this.sessionSwitchInProgress = true;
+			this.statusState = "rewinding files";
+			this.updateSpinner();
+			this.ui.requestRender();
+			try {
+				const result = await client.rewindCheckpoint(checkpoint.id, mode);
+				if (!this.isCheckpointContextActive(context, sourceSessionId)) return false;
+				this.addNotice(formatCheckpointRewindResult(result));
+				return true;
+			} catch (error) {
+				if (this.isActiveAgentContext(context)) this.addError(`Could not rewind files: ${error.message ?? error}`);
+				return false;
+			} finally {
+				if (this.isActiveAgentContext(context)) {
+					this.sessionSwitchInProgress = false;
+					this.statusState = "";
+					this.updateSpinner();
+					this.ui.requestRender();
+					if (!this.selectionActionInProgress) {
+						await this.flushDeferredLocalSlashCommands();
+						this.schedulePromptQueueDrain();
+					}
+				}
+			}
+		}
+
+		this.clearConfigUpdates();
+		this.sessionSwitchInProgress = true;
+		this.statusState = mode === "both" ? "rewinding code and conversation" : "rewinding conversation";
+		this.updateSpinner();
+		this.ui.requestRender();
+		let switched = false;
+		let restored = false;
+		const commitView = () => {
+			if (switched || !this.isActiveAgentContext(context)) return;
+			switched = true;
+			this.clearLiveBackendCommands(context.key);
+			this.resetConversationView();
+			this.addCommandMessage(slashPromptDisplay(displayText, checkpoint.summary));
+			this.updateAutocomplete();
+		};
+		try {
+			const result = await client.rewindCheckpoint(checkpoint.id, mode, { beforeReplay: commitView });
+			if (!this.isActiveAgentContext(context)) return false;
+			if (!client.sessionId || sameSessionId(client.sessionId, sourceSessionId)) {
+				throw new Error("the harness did not switch to a distinct checkpoint branch");
+			}
+			commitView();
+			try {
+				recordForkId(client.sessionId, sourceSessionId);
+			} catch (error) {
+				this.addNotice(`The rewind succeeded, but cc could not record its parent session: ${error.message ?? error}`);
+			}
+			this.addNotice(formatCheckpointRewindResult(result));
+			return true;
+		} catch (error) {
+			if (!this.isActiveAgentContext(context)) return false;
+			if (client.exited) this.ready = false;
+			if (!switched || !this.ready || client.exited) {
+				this.restoreFailedSessionSwitchInput();
+				restored = true;
+			}
+			const prefix = mode === "both" && error?.checkpointRewind
+				? "Files were rewound, but the conversation branch could not be loaded"
+				: "Could not rewind the conversation";
+			this.addError(`${prefix}: ${error.message ?? error}`);
+			if (error?.checkpointForkCleanupError) {
+				this.addNotice(`The unused checkpoint branch could not be removed: ${error.checkpointForkCleanupError.message ?? error.checkpointForkCleanupError}`);
+			}
+			return false;
+		} finally {
+			if (this.client !== client) return;
+			if (client.exited) this.ready = false;
+			const transitionUsable = switched && this.ready && !client.exited;
+			if (!transitionUsable && !restored) this.restoreFailedSessionSwitchInput();
+			this.sessionSwitchInProgress = false;
+			this.statusState = "";
+			this.updateSpinner();
+			this.ui.requestRender();
+			if (transitionUsable && !this.selectionActionInProgress) {
+				await this.flushDeferredLocalSlashCommands();
+				this.schedulePromptQueueDrain();
+			}
+		}
+	}
+
+	isCheckpointContextActive(context, sessionId) {
+		return Boolean(
+			this.isActiveAgentContext(context) &&
+			this.ready &&
+			!context.client?.exited &&
+			sameSessionId(context.client?.sessionId, sessionId),
+		);
+	}
+
+	permissionModeForStatus() {
+		const sideThread = this.focusedThread === "btw" ? this.btwThread : undefined;
+		const sourceClient = sideThread?.client ?? this.client;
+		const agent = sourceClient?.launchSpec ?? this.config?.agents?.[this.activeKey];
+		return this.permissionPolicyFor(this.activeKey, agent, { sourceClient }).mode;
+	}
+
+	remoteControlStateForSession(client = this.client, sessionId = client?.sessionId) {
+		if (!client || sessionId === undefined || sessionId === null) return undefined;
+		const states = this.remoteControlStatesByClient?.get(client);
+		if (!states) return undefined;
+		for (const [storedSessionId, state] of states) {
+			if (sameSessionId(storedSessionId, sessionId)) return { ...state };
+		}
+		return undefined;
+	}
+
+	remoteControlStateForActiveSession() {
+		// Remote Control is intentionally main-session only. A focused /btw pane
+		// must not display the main session's pairing state under the side label.
+		if (this.focusedThread === "btw") return undefined;
+		if (this.client?.exited) {
+			this.remoteControlStatesByClient?.delete(this.client);
+			return undefined;
+		}
+		return this.remoteControlStateForSession(this.client, this.client?.sessionId);
+	}
+
+	recordRemoteControlState(target, state) {
+		if (!this.isSessionCommandTargetActive(target) || target.targetThread || !target.sessionId) return false;
+		const normalized = state?.enabled === true
+			? { enabled: true, url: state.url, ...(state.error ? { error: state.error } : {}) }
+			: { enabled: false, ...(state?.error ? { error: state.error } : {}) };
+		this.remoteControlStatesByClient ??= new WeakMap();
+		let states = this.remoteControlStatesByClient.get(target.client);
+		if (!states) {
+			states = new Map();
+			this.remoteControlStatesByClient.set(target.client, states);
+		}
+		for (const storedSessionId of states.keys()) {
+			if (sameSessionId(storedSessionId, target.sessionId)) states.delete(storedSessionId);
+		}
+		states.set(String(target.sessionId), normalized);
+		// The adapter itself owns live sessions. Keep only a small UI cache so a
+		// long-running cc process cannot retain an unbounded set of pairing URLs.
+		while (states.size > 64) states.delete(states.keys().next().value);
+		return true;
+	}
+
+	async runRemoteControlCommand(argument = "", commandName = "remote-control", options = {}) {
+		const displayText = slashCommandText(commandName, argument);
+		const targetThread = options.targetThread ?? (
+			this.focusedThread === "btw" && this.btwThread ? this.btwThread : undefined
+		);
+		if (targetThread) {
+			const target = this.captureSessionCommandTarget(targetThread);
+			if (this.isSessionCommandTargetActive(target)) {
+				this.addSessionTargetCommand(target, displayText);
+				this.addSessionTargetNotice(target, `/${commandName} controls only the main session`);
+			} else {
+				this.reportClosedSessionCommandTarget(commandName, argument);
+			}
+			this.ui.requestRender();
+			return false;
+		}
+
+		this.addCommandMessage(displayText);
+		let command;
+		try {
+			command = parseRemoteControlCommand(argument);
+		} catch (error) {
+			this.addNotice(error.message ?? String(error));
+			this.ui.requestRender();
+			return false;
+		}
+		if (this.btwThread) {
+			this.addNotice("Close the /btw side thread before changing Remote Control for the main session");
+			return false;
+		}
+		if (
+			this.busy ||
+			this.sessionSwitchInProgress ||
+			this.selectionActionInProgress ||
+			(this.asyncPickerLoadCount ?? 0) > 0 ||
+			(this.configUpdateCount ?? 0) > 0
+		) {
+			this.addNotice(this.busy
+				? "Remote Control can change only while the session is idle"
+				: "Another session operation is active");
+			return false;
+		}
+		if (!this.client || !this.ready || this.client.exited) {
+			const connected = await this.ensureConnected();
+			if (!connected) return false;
+		}
+		// Connection setup is asynchronous. Re-check every main-session gate before
+		// capturing the session id that owns the eventual URL.
+		if (
+			this.busy ||
+			this.btwThread ||
+			this.sessionSwitchInProgress ||
+			this.selectionActionInProgress ||
+			(this.asyncPickerLoadCount ?? 0) > 0 ||
+			(this.configUpdateCount ?? 0) > 0
+		) {
+			this.addNotice("The session changed while Remote Control was starting; run the command again");
+			return false;
+		}
+		const target = this.captureSessionCommandTarget();
+		if (!this.isSessionCommandTargetActive(target) || !target.sessionId) {
+			this.addNotice("The active session is not ready for Remote Control");
+			return false;
+		}
+		if (target.client?.capabilities?.remoteControl !== true) {
+			this.addNotice("This agent does not advertise Remote Control support");
+			return false;
+		}
+
+		const updateToken = this.beginConfigUpdate();
+		const operationStatus = command.enabled ? "enabling Remote Control" : "disconnecting Remote Control";
+		this.statusState = operationStatus;
+		this.updateSpinner();
+		this.ui.requestRender();
+		try {
+			const result = await target.client.setRemoteControl(command);
+			if (!this.isSessionCommandTargetActive(target)) return false;
+			const normalized = normalizeRemoteControlResponse(result);
+			this.recordRemoteControlState(target, normalized.enabled
+				? { enabled: true, url: normalized.url }
+				: { enabled: false });
+			this.addSessionTargetNotice(target, formatRemoteControlResult(normalized));
+			return true;
+		} catch (error) {
+			if (this.isSessionCommandTargetActive(target)) {
+				const message = oneLine(error?.message ?? error).slice(0, 1_000) || "Remote Control failed";
+				const previous = this.remoteControlStateForSession(target.client, target.sessionId) ?? { enabled: false };
+				this.recordRemoteControlState(target, { ...previous, error: message });
+				this.addSessionTargetError(target, `Could not change Remote Control: ${message}`);
+			}
+			return false;
+		} finally {
+			if (this.statusState === operationStatus) {
+				this.statusState = "";
+				this.updateSpinner();
+			}
+			this.endConfigUpdate(updateToken);
+			this.ui.requestRender();
+		}
+	}
+
+	async runChangeWorkingDirectory(argument, commandName = "cd", options = {}) {
+		this.addCommandMessage(slashCommandText(commandName, argument));
+		// cwd is process-global in cc. A live side session would retain its old
+		// backend cwd and make the footer and path completion ambiguous.
+		if (options.targetThread || this.focusedThread === "btw" || this.btwThread) {
+			this.addNotice("Close the /btw side thread before changing directories");
+			return;
+		}
+		if (
+			this.busy ||
+			(this.activeShellInputCount ?? 0) > 0 ||
+			(this.shellInputsRunning ?? 0) > 0 ||
+			(this.btwThread?.shellInputsRunning ?? 0) > 0 ||
+			this.sessionSwitchInProgress ||
+			this.selectionActionInProgress ||
+			(this.configUpdateCount ?? 0) > 0 ||
+			(this.asyncPickerLoadCount ?? 0) > 0
+		) {
+			this.addNotice("The working directory can change only while the session is idle");
+			return;
+		}
+		const client = this.client;
+		if (!this.ready || !client || client.exited) {
+			this.addNotice("The active session is not ready to change directories");
+			return;
+		}
+		if (client.capabilities?.changeWorkingDirectory !== true) {
+			this.addNotice("This agent does not advertise live working-directory changes");
+			return;
+		}
+		let targetPath;
+		try {
+			targetPath = resolveWorkingDirectoryTarget(argument, process.cwd());
+		} catch (error) {
+			this.addNotice(error.message ?? String(error));
+			return;
+		}
+		const context = this.captureActiveAgentContext({ includeClient: true });
+		const updateToken = this.beginConfigUpdate();
+		try {
+			const response = await this.requestWorkingDirectoryChange(context, targetPath);
+			if (!response || !this.isActiveAgentContext(context)) {
+				this.finishWorkingDirectoryCommandTransition(context, { apply: false });
+				return;
+			}
+			if (response.status === "ok") {
+				this.commitWorkingDirectoryChange(response, context);
+				return;
+			}
+			if (response.status === "rejected") {
+				this.addNotice(response.message);
+				return;
+			}
+			const trustedDirectory = response.directory;
+			this.openSelection(`Move this session to ${trustedDirectory}?`, [
+				{ value: "cancel", label: "No, stay put" },
+				{
+					value: "trust",
+					label: "Yes, move here",
+					description: "Claude will be able to read, edit, and execute files in this directory",
+				},
+			], async (entry) => {
+				this.closeMenu();
+				if (entry?.value !== "trust") return;
+				if (
+					!this.isActiveAgentContext(context) ||
+					this.busy ||
+					this.sessionSwitchInProgress ||
+					this.btwThread
+				) {
+					this.addNotice("The session changed while directory trust was open; run /cd again");
+					return;
+				}
+				const acceptedUpdateToken = this.beginConfigUpdate();
+				try {
+					const accepted = await this.requestWorkingDirectoryChange(context, targetPath, {
+						trustAccepted: true,
+						trustedDirectory,
+					});
+					if (!accepted || !this.isActiveAgentContext(context)) {
+						this.finishWorkingDirectoryCommandTransition(context, { apply: false });
+						return;
+					}
+					if (accepted.status === "ok") this.commitWorkingDirectoryChange(accepted, context);
+					else if (accepted.status === "rejected") this.addNotice(accepted.message);
+					else this.addNotice("The directory changed while trust was being confirmed; run /cd again");
+				} finally {
+					this.endConfigUpdate(acceptedUpdateToken);
+				}
+			}, { verbatimTitle: true, wrapTitle: true });
+		} finally {
+			this.endConfigUpdate(updateToken);
+		}
+	}
+
+	async requestWorkingDirectoryChange(context, targetPath, options = {}) {
+		if (!this.isActiveAgentContext(context)) return undefined;
+		const transition = { context, commands: undefined };
+		this.workingDirectoryCommandTransition = transition;
+		this.statusState = "changing directory";
+		this.updateSpinner();
+		this.ui.requestRender();
+		try {
+			const response = await context.client.changeWorkingDirectory(targetPath, options);
+			if (response?.status !== "ok") this.finishWorkingDirectoryCommandTransition(context, { apply: true });
+			return response;
+		} catch (error) {
+			this.finishWorkingDirectoryCommandTransition(context, { apply: false });
+			if (this.isActiveAgentContext(context)) this.addError(`Could not change directories: ${error.message ?? error}`);
+			return undefined;
+		} finally {
+			if (!this.isActiveAgentContext(context)) this.finishWorkingDirectoryCommandTransition(context, { apply: false });
+			if (this.isActiveAgentContext(context)) {
+				this.statusState = "";
+				this.updateSpinner();
+			}
+			this.ui.requestRender();
+		}
+	}
+
+	finishWorkingDirectoryCommandTransition(context, options = {}) {
+		const transition = this.workingDirectoryCommandTransition;
+		if (!transition || transition.context?.client !== context?.client || transition.context?.key !== context?.key) {
+			return undefined;
+		}
+		this.workingDirectoryCommandTransition = undefined;
+		if (options.apply === true && Array.isArray(transition.commands)) {
+			this.applyBackendCommandUpdate(transition.commands);
+		}
+		return transition.commands;
+	}
+
+	stageWorkingDirectoryCommandUpdate(commands) {
+		const transition = this.workingDirectoryCommandTransition;
+		if (
+			!transition ||
+			transition.context?.client !== this.client ||
+			transition.context?.key !== this.activeKey ||
+			!this.isActiveAgentContext(transition.context)
+		) return false;
+		transition.commands = Array.isArray(commands) ? commands : [];
+		return true;
+	}
+
+	applyBackendCommandUpdate(commands) {
+		this.availableCommands.set(this.activeKey, Array.isArray(commands) ? commands : []);
+		this.commandsLoaded.add(this.activeKey);
+		this.updateAutocomplete();
+		if (this.backendCommandCatalog?.remember?.(this.activeKey, commands, {
+			agentInfo: this.client?.agentInfo,
+			persist: false,
+		})) this.scheduleBackendCommandCatalogPersist(this.activeKey);
+	}
+
+	disconnectDivergedWorkingDirectorySession(context) {
+		if (!context?.client || !this.isActiveAgentContext(context)) return false;
+		const client = context.client;
+		this.ready = false;
+		this.sessionSwitchInProgress = true;
+		this.statusState = "disconnecting mismatched session";
+		this.cancelPermissionPrompts();
+		this.clearCancelGraceTimer();
+		this.updateSpinner();
+		this.ui.requestRender();
+
+		// Signal the exact session synchronously. While its bounded teardown is in
+		// flight, the transition gate prevents prompts and local shell output from
+		// reaching a backend whose cwd no longer matches cc. A later reconnect waits
+		// for this promise in switchAgent(), so it cannot overlap the unsafe process.
+		let trackedShutdown;
+		trackedShutdown = stopClientsForReplacement([client])
+			.catch((error) => {
+				if (this.recordReplacementProcessFence(error)) this.reportReplacementProcessFence();
+				else {
+					this.addError(`Could not disconnect the mismatched backend: ${error.message ?? error}`);
+					this.ui.requestRender();
+				}
+			})
+			.finally(() => {
+				if (this.workingDirectoryShutdownTail === trackedShutdown) {
+					this.workingDirectoryShutdownTail = undefined;
+				}
+				// A user or shutdown path may already have installed another client.
+				// Never detach or alter lifecycle state owned by that replacement.
+				if (!this.isActiveAgentContext(context) || this.client !== client) return;
+				this.client = undefined;
+				this.ready = false;
+				this.sessionSwitchInProgress = false;
+				if (this.statusState === "disconnecting mismatched session") this.statusState = "";
+				this.updateSpinner();
+				this.ui.requestRender();
+				// Input entered while teardown was in flight remains queued. Reconnect
+				// only when there is work to deliver; otherwise the next prompt uses the
+				// normal lazy reconnect path.
+				if (
+					(this.promptQueue?.length ?? 0) > 0 &&
+					!this.agentSwitchTail &&
+					!this.replacementProcessFence &&
+					!this.stopping
+				) {
+					void this.switchAgent(context.key, context.transport, { quiet: true });
+				}
+			});
+		this.workingDirectoryShutdownTail = trackedShutdown;
+		return true;
+	}
+
+	commitWorkingDirectoryChange(response, context = this.captureActiveAgentContext({ includeClient: true })) {
+		const previous = process.cwd();
+		try {
+			process.chdir(response.cwd);
+		} catch (error) {
+			this.finishWorkingDirectoryCommandTransition(context, { apply: false });
+			this.clearLiveBackendCommands(this.activeKey);
+			this.disconnectDivergedWorkingDirectorySession(context);
+			this.addError(
+				`Claude moved the session to ${response.cwd}, but cc could not follow: ${error.message ?? error}. ` +
+				"The mismatched session was disconnected; restart cc in that directory to continue there.",
+			);
+			return false;
+		}
+		const cwd = process.cwd();
+		const destinationCommands = this.finishWorkingDirectoryCommandTransition(context, { apply: false });
+		process.env.PWD = cwd;
+		if (cwd !== previous) {
+			const pendingPersist = this.backendCommandCacheTimers?.get(this.activeKey);
+			if (pendingPersist) {
+				clearTimeout(pendingPersist);
+				this.backendCommandCacheTimers.delete(this.activeKey);
+			}
+			this.backendCommandCatalog?.persist?.(this.activeKey);
+			this.backendCommandCatalog?.setCwd?.(cwd);
+			this.clearLiveBackendCommands(this.activeKey);
+			this.editor?.autocompleteProvider?.setBasePath?.(cwd);
+			this.lastAutocompleteKey = undefined;
+			if (Array.isArray(destinationCommands)) this.applyBackendCommandUpdate(destinationCommands);
+			else this.updateAutocomplete();
+		} else if (Array.isArray(destinationCommands)) this.applyBackendCommandUpdate(destinationCommands);
+		this.addNotice(response.changed ? `Working directory: ${cwd}` : `Already using ${cwd}`);
+		if (response.transcript_relocated === false) {
+			this.addNotice("The session moved, but Claude could not relocate its transcript; cwd-based resume may not find it");
+		}
+		this.ui.requestRender();
+		return true;
+	}
+
 	// Flip the active harness's permission mode at runtime, harness-agnostically.
 	// `/yolo` toggles auto<->ask; `/yolo ask|auto|deny` sets it explicitly.
-	toggleAutoApprove(name, argument) {
+		toggleAutoApprove(name, argument) {
 		this.addCommandMessage(slashCommandText(name, argument));
 		const agentKey = this.activeKey;
-		const agent = this.config.agents[agentKey];
+		const agent = this.client?.launchSpec ?? this.config.agents[agentKey];
 		const current = this.permissionPolicyFor(agentKey, agent).mode;
 		let next;
 		if (argument) {
@@ -5467,6 +7230,8 @@ export class HarnessApp {
 			next = current === "auto" ? "ask" : "auto";
 		}
 		this.runtimePermissionMode.set(agentKey, next);
+		this.client?.setRuntimePermissionMode?.(next);
+		this.btwThread?.client?.setRuntimePermissionMode?.(next);
 		this.runtimePermissionModeSource ??= new Map();
 		this.runtimePermissionModeSource.set(agentKey, "host");
 		const label = next === "auto" ? "auto-approve ON" : next === "deny" ? "auto-deny ON" : "ask on every request";
@@ -5513,6 +7278,8 @@ export class HarnessApp {
 			this.addSessionTargetCommand(target, slashCommandText(name, argument));
 			try {
 				this.permissionGrants = forgetGrants(() => true);
+				this.client?.setPermissionGrants?.(this.permissionGrants);
+				this.btwThread?.client?.setPermissionGrants?.(this.permissionGrants);
 				this.addSessionTargetNotice(target, "Cleared all remembered permission grants.");
 			} catch (error) {
 				this.addSessionTargetNotice(target, `Could not clear permission grants: ${error.message ?? error}`);
@@ -5839,9 +7606,33 @@ export class HarnessApp {
 	}
 
 	displayCommandCatalog() {
+		const backend = this.backendCommandsForDisplay();
+		const commandsLoaded = this.focusedThread === "btw"
+			? this.btwThread?.commandsLoaded === true
+			: this.commandsLoaded?.has(this.activeKey) === true;
+		// Cached/version-pinned entries are display hints, never routing authority.
+		// Until the focused session publishes its list, same-named local commands
+		// must keep the metadata for what Enter will actually execute.
+		if (!commandsLoaded) {
+			return dedupeCommands([
+				...localSlashCommands(this),
+				...backend,
+			]);
+		}
+		const backendPreferred = [];
+		const localPreferred = [];
+		for (const command of backend) {
+			const route = this.slashCommandRoute(command.name, "", {
+				availableCommands: backend,
+				commandsLoaded,
+			});
+			if (route === "backend" || route === "review-dialog") backendPreferred.push(command);
+			else localPreferred.push(command);
+		}
 		return dedupeCommands([
+			...backendPreferred,
 			...localSlashCommands(this),
-			...this.backendCommandsForDisplay(),
+			...localPreferred,
 		]);
 	}
 
@@ -5849,6 +7640,8 @@ export class HarnessApp {
 		const state = this.sessionStates.get(this.activeKey) ?? {};
 		const model = currentConfigLabel(findConfigOption(state, "model")) ?? state.models?.currentModelId;
 		const mode = currentConfigLabel(findConfigOption(state, "mode")) ?? state.modes?.currentModeId;
+		const permissionMode = this.permissionModeForStatus();
+		const remoteControl = this.remoteControlStateForActiveSession();
 		const effort = currentConfigLabel(findConfigOption(state, "thought_level"));
 		const fast = currentConfigLabel(findFastModeOption(state));
 		const usage = state.sessionInfo?.usage;
@@ -5856,8 +7649,12 @@ export class HarnessApp {
 			`${this.config.agents[this.activeKey]?.label ?? this.activeKey}`,
 			model ? `model ${model}` : undefined,
 			mode ? `mode ${mode}` : undefined,
+			`permissions ${permissionMode}`,
 			effort ? `reasoning ${effort}` : undefined,
 			fast ? `fast ${fast}` : undefined,
+			remoteControl?.enabled
+				? `remote ${remoteControl.url}${remoteControl.error ? ` (last change failed: ${remoteControl.error})` : ""}`
+				: remoteControl?.error ? `remote error: ${remoteControl.error}` : remoteControl ? "remote off" : undefined,
 			formatUsageSummary(usage),
 			`theme ${themeLabel(this.themeName)}`,
 			state.sessionId ? `session ${state.sessionId}` : undefined,
@@ -5910,6 +7707,55 @@ export class HarnessApp {
 		this.updateAutocomplete();
 		this.ui.requestRender(true);
 		return true;
+	}
+
+	async runKeybindingsCommand(argument = "", commandName = "keybindings") {
+		const action = argument.trim().toLowerCase();
+		this.addCommandMessage(slashCommandText(commandName, argument));
+		if (action === "show") {
+			this.addNotice(formatCcKeybindingsStatus(this.reloadKeybindings()));
+			this.ui.requestRender();
+			return;
+		}
+		if (action === "reload") {
+			const result = this.reloadKeybindings();
+			this.addNotice(formatCcKeybindingsStatus(result));
+			this.ui.requestRender();
+			return;
+		}
+		if (action === "path") {
+			this.addNotice(this.keybindingsResult?.file ?? ccKeybindingsPath(this.keybindingsOptions));
+			this.ui.requestRender();
+			return;
+		}
+		if (action && action !== "edit" && action !== "open") {
+			this.addNotice("usage: /keybindings [edit|show|reload|path]");
+			this.ui.requestRender();
+			return;
+		}
+
+		let ensured;
+		try {
+			ensured = ensureCcKeybindingsFile({ ...this.keybindingsOptions, file: this.keybindingsResult?.file });
+			this.reloadKeybindings();
+			await this.openKeybindingsFile(ensured.file);
+			this.addNotice(`${ensured.created ? "Created and opened" : "Opened"} ${ensured.file}`);
+		} catch (error) {
+			const file = ensured?.file ?? this.keybindingsResult?.file ?? ccKeybindingsPath(this.keybindingsOptions);
+			this.addError(`Could not open ${file}: ${error.message ?? error}`);
+			this.addNotice("Edit the file directly, then run /keybindings reload.");
+		}
+		this.ui.requestRender();
+	}
+
+	async openKeybindingsFile(file) {
+		const platform = this.platform ?? process.platform;
+		let command;
+		if (platform === "darwin") command = "/usr/bin/open";
+		else if (platform === "win32") command = windowsExplorerPath();
+		else if (platform === "linux") command = linuxExternalUrlLauncherPath();
+		else throw new Error(`opening local files is unsupported on ${platform}`);
+		await this.runTrackedCapture(command, [file], { timeoutMs: 5_000 });
 	}
 
 	async openGenericConfigDialog(argument = "", commandName = "config", commandOptions = {}) {
@@ -6072,7 +7918,7 @@ export class HarnessApp {
 			return;
 		}
 		const isCodex = this.isCodexAcpActive() || this.activeKey === "codex";
-		const supportsDelete = Boolean(requestedTarget.client?.capabilities?.sessionCapabilities?.delete);
+		const supportsDelete = requestedTarget.client?.capabilities?.delete === true;
 		if (!isCodex && !supportsDelete) {
 			this.addCommandMessage(slashCommandText(commandName, argument));
 			this.addNotice("This agent does not advertise session deletion");
@@ -6210,7 +8056,7 @@ export class HarnessApp {
 				// exact, unambiguous title through session/list when it is available.
 				if (
 					targetId !== targetClient?.sessionId &&
-					targetClient?.capabilities?.sessionCapabilities?.list &&
+					targetClient?.capabilities?.sessionList === true &&
 					typeof targetClient.listSessions === "function"
 				) {
 					const sessions = await targetClient.listSessions();
@@ -6301,10 +8147,7 @@ export class HarnessApp {
 				// reconnect it to a usable fresh session instead of sending an unsupported
 				// session/resume request.
 				this.ready = false;
-				const canReload = Boolean(
-					operationClient?.capabilities?.loadSession ||
-					operationClient?.capabilities?.sessionCapabilities?.resume,
-				);
+				const canReload = operationClient?.capabilities?.resume === true;
 				if (canReload) {
 					await this.reloadSessionAfterMutationFailure(operationClient?.sessionId ?? sessionId, displayText);
 				} else {
@@ -6377,7 +8220,7 @@ export class HarnessApp {
 		const operationTransport = this.transport;
 		const operationClient = this.client;
 		const targetClient = requestedTarget.client ?? operationClient;
-		const agent = this.config.agents[operationKey];
+		const agent = this.activeAgentLaunchSpec(operationKey);
 		const invocation = resolveCodexInvocation(agent);
 		if (!invocation) {
 			this.addError("A compatible Codex CLI is required for archive operations");
@@ -6548,6 +8391,43 @@ export class HarnessApp {
 		});
 	}
 
+	async runAdapterTerminalAuthentication(agent, method, context = {}) {
+		let suspended = false;
+		try {
+			this.statusState = "";
+			this.updateSpinner();
+			suspended = true;
+			this.ui.stop();
+			await runTerminalAuthentication(agent, method, {
+				processTracker: context.processTracker,
+				terminationGraceMs: context.terminationGraceMs,
+			});
+		} finally {
+			if (suspended && !this.stopping) {
+				this.ui.start();
+				this.ui.requestRender(true);
+			}
+		}
+	}
+
+	async collectAdapterEnvironmentVariables(method, environment, context = {}) {
+		let suspended = false;
+		try {
+			this.statusState = "";
+			this.updateSpinner();
+			suspended = true;
+			this.ui.stop();
+			return await collectEnvironmentAuthenticationVariables(method, environment, {
+				signal: context.signal,
+			});
+		} finally {
+			if (suspended && !this.stopping) {
+				this.ui.start();
+				this.ui.requestRender(true);
+			}
+		}
+	}
+
 	async authenticateWithMethod(method, commandName = "login", options = {}) {
 		const methodLabel = method?.name ?? method?.id ?? "authentication";
 		if (this.busy) {
@@ -6565,7 +8445,7 @@ export class HarnessApp {
 			method?.type !== "env_var" &&
 			method.id === "api-key" &&
 			this.isCodexBackendActive() &&
-			!hasConfiguredCodexApiKey(this.config?.agents?.[this.activeKey])
+			!hasConfiguredCodexApiKey(this.activeAgentLaunchSpec())
 		) {
 			this.addCommandMessage(`/${commandName}`);
 			this.addNotice("Set CODEX_API_KEY or OPENAI_API_KEY, then run /login api-key again");
@@ -6576,14 +8456,16 @@ export class HarnessApp {
 		const commandsBeforeAuthentication = this.availableCommands?.get(transitionKey);
 		this.sessionSwitchInProgress = true;
 		try {
-			if (method?.type === "terminal") {
+			// Retain the explicit helper injection seam used by embedders/tests. Normal
+			// runtime clients are HarnessAdapters and own both auth variants uniformly.
+			if (method?.type === "terminal" && typeof options.runTerminalAuthentication === "function") {
 				await this.authenticateWithTerminalMethod(method, commandName, {
 					...options,
 					continueSessionSwitch: true,
 				});
 				return;
 			}
-			if (method?.type === "env_var") {
+			if (method?.type === "env_var" && typeof options.collectEnvironmentVariables === "function") {
 				await this.authenticateWithEnvironmentMethod(method, commandName, {
 					...options,
 					continueSessionSwitch: true,
@@ -6596,14 +8478,11 @@ export class HarnessApp {
 			this.ui.requestRender();
 			const authenticationMeta =
 				method.id === "api-key" && this.isCodexAcpActive()
-					? codexApiKeyAuthenticationMeta(this.config.agents[transitionKey])
+					? codexApiKeyAuthenticationMeta(this.activeAgentLaunchSpec(transitionKey))
 					: undefined;
 			await client.authenticate(method.id, authenticationMeta);
 			if (this.client !== client || this.activeKey !== transitionKey) return;
-			// A successful, explicit /login authorizes configured credentials again.
-			// /logout masks those values for future child processes so an ambient key
-			// cannot silently sign the user straight back in; do not lift that mask for
-			// a failed or stale authentication attempt.
+			this.syncAgentAuthenticationState(transitionKey, client);
 			clearSignedOutAuthenticationEnvironment(this.config?.agents?.[transitionKey]);
 			const authenticatedCommands = this.availableCommands?.get(transitionKey);
 			const learnedCommandsDuringAuthentication =
@@ -6812,7 +8691,7 @@ export class HarnessApp {
 		}
 		const client = this.client;
 		const transitionKey = this.activeKey;
-		const agent = this.config.agents[transitionKey];
+		const agent = this.activeAgentLaunchSpec(transitionKey);
 		const authenticationEnvironmentNames = signedOutAuthenticationEnvironmentNames(
 			client.authMethods,
 			agent,
@@ -6834,6 +8713,7 @@ export class HarnessApp {
 			const btwClient = this.btwThread?.client;
 			if (this.btwThread) this.closeBtw({ stop: false });
 			delete agent._sessionAuthEnv;
+			this.syncAgentAuthenticationState(transitionKey, client);
 			this.ready = false;
 			await stopClientsForReplacement([client, btwClient]);
 			this.invalidateBackendCommandHints(transitionKey);
@@ -8339,7 +10219,6 @@ export class HarnessApp {
 		try {
 			await this.runFencedCodexAppServerRequests(invocation, [{ method: "thread/name/set", params: { threadId: sessionId, name } }], context.agent);
 			if (!this.isSessionCommandTargetActive(target)) return;
-			target.client.sessionInfo = { ...(target.client.sessionInfo ?? {}), title: name };
 			if (!target.targetThread) {
 				const previous = this.sessionStates.get(this.activeKey) ?? {};
 				this.sessionStates.set(this.activeKey, {
@@ -8800,7 +10679,7 @@ export class HarnessApp {
 			this.addNotice(this.busy ? "A session cannot be resumed while a turn is running" : "Another session operation is active");
 			return;
 		}
-		if (!supportsSessionList(this.sessionStates.get(this.activeKey))) {
+		if (this.client?.capabilities?.sessionList !== true) {
 			this.addCommandMessage(`/${commandName}`);
 			this.addNotice("This agent does not advertise session listing");
 			return;
@@ -8901,6 +10780,9 @@ export class HarnessApp {
 					// after load commits so a failed resume remains nondestructive.
 					if (this.btwThread) this.closeBtw();
 					switched = true;
+					// Claude's pre-/clear escape hatch expires after any explicit resume
+					// commits, including resuming that previous session itself.
+					this.previousClearedSession = undefined;
 					this.clearLiveBackendCommands(this.activeKey);
 					this.resetConversationView();
 					this.addCommandMessage(displayText);
@@ -8931,8 +10813,129 @@ export class HarnessApp {
 		}
 	}
 
+	async branchCurrentSession(argument = "", options = {}) {
+		const commandName = "branch";
+		const name = oneLine(argument).trim();
+		const displayText = slashCommandText(commandName, argument);
+		if (options.targetThread || this.focusedThread === "btw") {
+			this.addCommandMessage(displayText);
+			this.addNotice("/branch is available only from the main session");
+			return false;
+		}
+		if (name && this.client?.capabilities?.namedFork !== true) {
+			this.addCommandMessage(displayText);
+			this.addNotice("This harness does not advertise named branches. Run /branch without a name.");
+			return false;
+		}
+		if (this.btwThread) {
+			this.addCommandMessage(displayText);
+			this.addNotice("Close the /btw side thread before branching the main session");
+			return false;
+		}
+		if (this.busy) {
+			this.addCommandMessage(displayText);
+			this.addNotice("A session cannot be branched while a turn is running");
+			return false;
+		}
+		if (this.sessionSwitchInProgress) {
+			this.addCommandMessage(displayText);
+			this.addNotice("A session transition is already in progress");
+			return false;
+		}
+		const client = this.client;
+		const parentSessionId = client?.sessionId;
+		if (!this.ready || !client || client.exited || !parentSessionId) {
+			this.addCommandMessage(displayText);
+			this.addNotice("The active session is not ready to branch");
+			return false;
+		}
+		if (!client.capabilities?.fork || typeof client.fork !== "function") {
+			this.addCommandMessage(displayText);
+			this.addNotice("This harness does not advertise session forking");
+			return false;
+		}
+
+		this.statusState = "branching session";
+		this.clearConfigUpdates();
+		this.sessionSwitchInProgress = true;
+		this.updateSpinner();
+		this.ui.requestRender();
+		let switched = false;
+		let commandShown = false;
+		let restored = false;
+		const commitView = () => {
+			if (switched || this.client !== client) return;
+			switched = true;
+			this.clearLiveBackendCommands(this.activeKey);
+			this.resetConversationView();
+			this.addCommandMessage(displayText);
+			commandShown = true;
+			this.updateAutocomplete();
+		};
+		try {
+			const forkResult = await client.fork(parentSessionId, {
+				beforeReplay: commitView,
+				...(name ? { name } : {}),
+			});
+			if (this.client !== client) return false;
+			if (!client.sessionId || sameSessionId(client.sessionId, parentSessionId)) {
+				throw new Error("the harness did not return a distinct forked session");
+			}
+			// Some adapters have no replay callback. Commit the UI only after their
+			// fork RPC has returned a distinct live session.
+			commitView();
+			recordForkId(client.sessionId, parentSessionId);
+			if (name && forkResult?._meta?.cc?.branchNameApplied !== true) {
+				this.addNotice(
+					`Created the branch, but could not name it ${name}: ` +
+						(forkResult?._meta?.cc?.branchNameError ?? "the harness did not confirm the rename"),
+				);
+			}
+			return true;
+		} catch (error) {
+			if (this.client !== client) return false;
+			if (client.exited) this.ready = false;
+			if (!commandShown) this.addCommandMessage(displayText);
+			if (!switched || !this.ready || client.exited) {
+				this.restoreFailedSessionSwitchInput();
+				restored = true;
+			}
+			this.addError(`Could not branch session: ${error.message ?? error}`);
+			return false;
+		} finally {
+			if (this.client !== client) return;
+			if (client.exited) this.ready = false;
+			const transitionUsable = switched && this.ready && !client.exited;
+			if (!transitionUsable && !restored) this.restoreFailedSessionSwitchInput();
+			this.sessionSwitchInProgress = false;
+			this.statusState = "";
+			this.updateSpinner();
+			this.ui.requestRender();
+			if (transitionUsable) {
+				await this.flushDeferredLocalSlashCommands();
+				this.schedulePromptQueueDrain();
+			}
+		}
+	}
+
+	rememberSessionBeforeClear(source, currentSessionId = this.client?.sessionId) {
+		if (
+			!source ||
+			source.key !== this.activeKey ||
+			typeof source.sessionId !== "string" ||
+			!source.sessionId ||
+			!currentSessionId ||
+			sameSessionId(source.sessionId, currentSessionId)
+		) return false;
+		this.previousClearedSession = source;
+		return true;
+	}
+
 	async startNewSession(commandName = "new", options = {}) {
 		const displayText = slashPromptDisplay(`/${commandName}`, "New session");
+		const clearedSource = commandName === "clear" && this.client?.sessionId
+			? { key: this.activeKey, sessionId: this.client.sessionId }
+			: undefined;
 		if (this.sessionSwitchInProgress && !options.afterTurn) {
 			this.addNotice("Already starting a new session");
 			this.ui.requestRender();
@@ -8969,6 +10972,7 @@ export class HarnessApp {
 				this.ui.requestRender();
 				return;
 			}
+			this.rememberSessionBeforeClear(clearedSource);
 			this.resetConversationView();
 			this.addCommandMessage(displayText);
 			this.updateAutocomplete();
@@ -9011,6 +11015,7 @@ export class HarnessApp {
 				},
 			});
 			if (this.client !== client) return;
+			this.rememberSessionBeforeClear(clearedSource, client.sessionId);
 		} catch (error) {
 			if (this.client !== client) return;
 			if (client.exited) this.ready = false;
@@ -9259,8 +11264,10 @@ export class HarnessApp {
 			// explicitly chose a host-only /yolo override.
 			if (!sameSession || source === "host") return;
 		}
+		const hostMode = mode === "agent-full-access" ? "auto" : "ask";
 		this.runtimePermissionMode ??= new Map();
-		this.runtimePermissionMode.set(this.activeKey, mode === "agent-full-access" ? "auto" : "ask");
+		this.runtimePermissionMode.set(this.activeKey, hostMode);
+		this.client?.setRuntimePermissionMode?.(hostMode);
 		this.runtimePermissionModeSource.set(this.activeKey, "backend");
 		// Any explicit backend mode selection exits the prompt-based plan fallback.
 		this.planPromptFallback = undefined;
@@ -9296,10 +11303,12 @@ export class HarnessApp {
 			return;
 		}
 		this.runtimePermissionModeByClient ??= new WeakMap();
+		const hostMode = permissionMode === "agent-full-access" ? "auto" : "ask";
 		this.runtimePermissionModeByClient.set(client, {
 			sessionId: context.sessionId,
-			mode: permissionMode === "agent-full-access" ? "auto" : "ask",
+			mode: hostMode,
 		});
+		client.setRuntimePermissionMode?.(hostMode);
 	}
 
 	async setSideThreadConfigValue(target, option, value, options = {}) {
@@ -9527,14 +11536,14 @@ export class HarnessApp {
 			this.ui.requestRender();
 			return;
 		}
-		if (this.activeKey === "cursor") {
-			this.addNotice("/btw is not supported for Cursor (it does not support session forking).");
+		if (!this.ready || !this.client?.sessionId) {
+			this.addNotice("/btw needs an active session — try again once connected.");
 			restorePromptAttachments();
 			this.ui.requestRender();
 			return;
 		}
-		if (!this.ready || !this.client?.sessionId) {
-			this.addNotice("/btw needs an active session — try again once connected.");
+		if (!this.client.capabilities.fork) {
+			this.addNotice("/btw is not supported by this harness (it does not advertise session forking).");
 			restorePromptAttachments();
 			this.ui.requestRender();
 			return;
@@ -9543,27 +11552,10 @@ export class HarnessApp {
 		this.closeMenu();
 		const parentSessionId = this.client.sessionId;
 		let thread;
-		const btwClient = new AcpClient(
-			agent,
-			(event) => {
-				if (this.btwThread === thread) thread.handleEvent(event);
-			},
-			{
-					onPermissionRequest: (params) => {
-						if (this.btwThread !== thread) return cancelledOutcome();
-						return this.resolvePermissionOutcome(this.activeKey, agent, params, { sourceClient: btwClient });
-					},
-					onCursorRequest: (method, params) => {
-						if (this.btwThread !== thread) return cursorCancelResult(method);
-						return this.resolveCursorOutcome(this.activeKey, agent, method, params, { sourceClient: btwClient });
-					},
-					onElicitationRequest: (params) => {
-						if (this.btwThread !== thread) return { action: "cancel" };
-						return this.requestElicitation(params, { sourceClient: btwClient });
-					},
-					elicitationCapabilities: { url: true, form: true },
-			},
-		);
+		const btwClient = this.createRuntimeAdapter(this.activeKey, agent, {
+			isCurrent: () => this.btwThread === thread,
+			onEvent: (event) => thread?.handleEvent(event),
+		});
 		thread = new BtwThread(this, btwClient, trimmed);
 		this.btwThread = thread;
 		this.focusedThread = "btw";
@@ -9578,19 +11570,16 @@ export class HarnessApp {
 		if (trimmed) thread.submit(trimmed, promptParts);
 
 		try {
-			await btwClient.initialize({ createSession: false });
+			await btwClient.connect({ createSession: false });
 			if (this.btwThread !== thread) {
 				await this.trackBtwShutdown(btwClient);
 				return;
 			}
-			if (btwClient.supportsFork()) {
-				await btwClient.forkSession(parentSessionId);
-				recordForkId(btwClient.sessionId);
-			} else if (this.activeKey === "codex") {
-				await this.forkCodexSession(btwClient, parentSessionId);
-			} else {
+			if (!btwClient.capabilities.fork) {
 				throw new Error("this agent does not support session forking");
 			}
+			await btwClient.fork(parentSessionId);
+			recordForkId(btwClient.sessionId, parentSessionId);
 			thread.sessionId = btwClient.sessionId;
 			this.syncRuntimePermissionModeForSideClient(btwClient, btwClient.getSessionInfo(), { onlyIfChanged: true });
 			thread.markReady();
@@ -9646,6 +11635,9 @@ export class HarnessApp {
 
 	closeBtw(options = {}) {
 		const thread = this.btwThread;
+		if (this.menuHandle instanceof ChecklistPanel && this.menuHandle.target?.targetThread === thread) {
+			this.closeMenu();
+		}
 		this.clearEditorSideThreadBinding(thread);
 		this.btwThread = undefined;
 		this.focusedThread = "main";
@@ -9693,7 +11685,7 @@ export class HarnessApp {
 	async forkCodexSession(btwClient, parentSessionId) {
 		const releaseForkOperation = await acquireForkOperationLock({ operation: `fork ${parentSessionId}` });
 		try {
-			const env = mergedAgentEnvironment(this.config.agents[this.activeKey]);
+			const env = mergedAgentEnvironment(this.activeAgentLaunchSpec());
 			const rolloutPath = findCodexRolloutPath(parentSessionId, path.join(codexHome(env), "sessions"));
 			if (!rolloutPath) throw new Error("could not locate the Codex session rollout to fork (see forkCodexSession notes)");
 			if (rolloutPath.endsWith(".zst")) throw new Error("the Codex session rollout is compressed; cannot fork it (see forkCodexSession notes)");
@@ -9930,25 +11922,156 @@ export class HarnessApp {
 		}
 	}
 
-	async runCopy() {
-		this.addCommandMessage("/copy");
-		// Copy the focused thread's last response (the fork, when it is focused).
-		const text =
-			this.focusedThread === "btw" && this.btwThread
-				? this.btwThread.lastAssistantText?.trim()
-				: (this.currentAssistantText?.text?.trim() ? this.currentAssistantText.text : this.lastAssistantText)?.trim();
-		if (!text) {
-			this.addNotice("Nothing to copy yet.");
+	async runCopy(argument = "") {
+		const requested = argument.trim();
+		this.addCommandMessage(slashCommandText("copy", requested));
+		if (["picker", "reset"].includes(requested.toLowerCase())) {
+			if (this.setCopyAlwaysFullResponse(false)) {
+				this.addNotice("The response picker will be shown again for responses with fenced code.");
+			}
 			this.ui.requestRender();
 			return;
 		}
+		const index = requested ? Number(requested) : 1;
+		if (!Number.isSafeInteger(index) || index < 1) {
+			this.addNotice("usage: /copy [positive-response-index|picker]");
+			this.ui.requestRender();
+			return;
+		}
+		// Copy the focused thread's Nth-latest complete assistant response. Assistant
+		// text separated by tool calls remains one response; host-rendered markdown
+		// such as /diff is deliberately not included.
+		const targetChat = this.focusedThread === "btw" && this.btwThread ? this.btwThread.chat : this.chat;
+		const responses = assistantResponseTexts(targetChat);
+		const text = responses.at(-index)?.trim();
+		if (!text) {
+			this.addNotice(index === 1 ? "Nothing to copy yet." : `There are only ${responses.length} assistant responses to copy.`);
+			this.ui.requestRender();
+			return;
+		}
+		const choices = copyResponseChoices(text);
+		if (choices.length <= 1 || this.copyAlwaysFullResponse()) {
+			await this.copyResponseChoice(choices[0], index);
+			return;
+		}
+		const alwaysFullChoice = {
+			kind: "always-full",
+			label: "Always copy full response",
+			description: "Copy the full response now and skip this picker in the future",
+			text: choices[0].text,
+		};
+		const entries = [...choices, alwaysFullChoice].map((choice) => ({
+			value: choice,
+			label: choice.label,
+			description: choice.description,
+		}));
+		this.openSelection("Copy response", entries, async (entry) => {
+			this.closeMenu();
+			if (!entry) return;
+			if (entry.value.kind === "always-full") this.setCopyAlwaysFullResponse(true);
+			await this.copyResponseChoice(entry.value.kind === "always-full" ? choices[0] : entry.value, index);
+		}, {
+			onWrite: (entry) => {
+				this.closeMenu();
+				if (entry) this.openCopyWriteForm(entry.value.kind === "always-full" ? choices[0] : entry.value, index);
+			},
+			writeHint: "w write selection",
+		});
+	}
+
+	copyAlwaysFullResponse() {
+		return this.config?.settings?.copyAlwaysFullResponse === true;
+	}
+
+	setCopyAlwaysFullResponse(enabled) {
+		const value = enabled === true;
 		try {
-			await writeClipboardText(text);
-			this.addNotice("Copied the last response to the clipboard.");
+			saveSettingsPatch({
+				copyAlwaysFullResponse: value,
+				theme: this.config?.settings?.theme ?? this.config?.theme ?? DEFAULT_SETTINGS.theme,
+			});
+		} catch (error) {
+			this.addError(`Could not save copy preference: ${error.message ?? error}`);
+			return false;
+		}
+		this.config.settings = { ...(this.config.settings ?? {}), copyAlwaysFullResponse: value };
+		return true;
+	}
+
+	async copyResponseChoice(choice, responseIndex = 1) {
+		if (!choice?.text) return;
+		try {
+			await writeClipboardText(choice.text);
+			const responseLabel = responseIndex === 1 ? "the last response" : `response ${responseIndex}`;
+			this.addNotice(choice.kind === "full"
+				? `Copied ${responseLabel} to the clipboard.`
+				: `Copied ${choice.label.toLowerCase()} from ${responseLabel} to the clipboard.`);
 		} catch (error) {
 			this.addError(`Could not copy: ${error.message ?? error}`);
 		}
 		this.ui.requestRender();
+	}
+
+	openCopyWriteForm(choice, responseIndex = 1) {
+		if (!choice?.text) return;
+		this.openElicitationForm({
+			title: `Write ${choice.label.toLowerCase()} to a file`,
+			message: "Enter a destination path. Parent directories will be created.",
+			fields: [{
+				key: "path",
+				title: "Destination path",
+				description: "Relative paths are resolved from the current working directory; ~ expands to your home directory.",
+				type: "string",
+				required: true,
+				minLength: 1,
+				maxLength: 4_096,
+			}],
+		}, (result) => {
+			this.closeMenu();
+			if (result?.action !== "accept") return;
+			this.writeCopyChoice(result.content?.path, choice, responseIndex);
+		});
+	}
+
+	writeCopyChoice(requestedPath, choice, responseIndex = 1, options = {}) {
+		let destination;
+		try {
+			destination = resolveCopyWritePath(requestedPath, { cwd: process.cwd() });
+			writeCopySelection(destination, choice.text, { overwrite: options.overwrite === true });
+		} catch (error) {
+			if (error?.code === "EEXIST" && options.overwrite !== true && destination) {
+				this.openSelection(`Overwrite ${singleLineMenuText(destination)}?`, [
+					{ value: "overwrite", label: "Overwrite file", description: "Replace the existing file with this selection" },
+					{ value: "cancel", label: "Cancel" },
+				], (entry) => {
+					this.closeMenu();
+					if (entry?.value === "overwrite") this.writeCopyChoice(destination, choice, responseIndex, { overwrite: true });
+				}, { wrapTitle: true });
+				return;
+			}
+			this.addError(`Could not write selection: ${error.message ?? error}`);
+			this.ui.requestRender();
+			return;
+		}
+		const responseLabel = responseIndex === 1 ? "last response" : `response ${responseIndex}`;
+		this.addNotice(`Wrote ${choice.kind === "full" ? responseLabel : choice.label.toLowerCase()} to ${destination}.`);
+		this.ui.requestRender();
+	}
+
+	runPromptColor(argument = "") {
+		this.addCommandMessage(slashCommandText("color", argument));
+		let color;
+		try {
+			color = resolvePromptColor(argument);
+		} catch (error) {
+			this.addNotice(error.message ?? String(error));
+			this.ui.requestRender();
+			return;
+		}
+		this.promptColorName = color.name;
+		this.editor.borderColor = color.hex ? truecolorStyle(color.hex, "fg") : EDITOR_THEME.borderColor;
+		this.addNotice(color.name === "default" ? "Reset the editor border color." : `Editor border color: ${color.name}.`);
+		this.ui.requestRender(true);
 	}
 
 	async copyTextToClipboard(text) {
@@ -9982,13 +12105,13 @@ export class HarnessApp {
 		this.closeMenu({ cancelSelection: true });
 		this.menuEditorText = this.editor.getText();
 		this.updateFilterEditor("");
-		const guardedOnSelect = async (entry) => {
+		const guardSelectionAction = (action) => async (entry) => {
 			this.selectionActions ??= new Set();
 			const actionToken = Symbol("selection-action");
 			this.selectionActions.add(actionToken);
 			this.selectionActionInProgress = true;
 			try {
-				await onSelect(entry);
+				await action(entry);
 			} catch (error) {
 				this.addError(error.message ?? String(error));
 			} finally {
@@ -10002,13 +12125,53 @@ export class HarnessApp {
 				this.ui.requestRender();
 			}
 		};
+		const guardedOnSelect = guardSelectionAction(onSelect);
+		const guardedOnWrite = typeof options.onWrite === "function"
+			? guardSelectionAction(options.onWrite)
+			: undefined;
 		this.menuHandle = new SelectionPanel(title, entries, guardedOnSelect, {
 			...options,
+			keybindingContext: options.keybindingContext ?? (this.permissionPromptActive ? "Confirmation" : "Select"),
+			onWrite: guardedOnWrite,
 			onQueryChange: (query) => this.updateFilterEditor(query),
 		});
 		this.commandPanel.addChild(this.menuHandle);
 		this.ui.setFocus(this.editor);
 		this.ui.requestRender();
+	}
+
+	checklistSnapshotForTarget(target) {
+		if (target?.targetThread) {
+			if (this.btwThread !== target.targetThread || target.targetThread.client !== target.client) {
+				return emptyChecklistSnapshot();
+			}
+			return target.targetThread.checklist ?? target.client?.getSessionInfo?.().checklist ?? emptyChecklistSnapshot();
+		}
+		if (target?.client && this.client !== target.client) return emptyChecklistSnapshot();
+		return this.sessionStates.get(this.activeKey)?.checklist
+			?? target?.client?.getSessionInfo?.().checklist
+			?? emptyChecklistSnapshot();
+	}
+
+	toggleTodosPanel(options = {}) {
+		if (this.menuHandle instanceof ChecklistPanel) {
+			this.closeMenu();
+			return false;
+		}
+		// Never replace a permission, elicitation, or selection interaction.
+		if (this.menuHandle) return false;
+		const targetThread = options.targetThread ?? (
+			this.focusedThread === "btw" && this.btwThread ? this.btwThread : undefined
+		);
+		const target = this.captureSessionCommandTarget(targetThread);
+		if (targetThread && !this.isSessionCommandTargetActive(target)) return false;
+		this.menuEditorText = this.editor.getText();
+		this.updateFilterEditor("");
+		this.menuHandle = new ChecklistPanel(this, target);
+		this.commandPanel.addChild(this.menuHandle);
+		this.ui.setFocus(this.editor);
+		this.ui.requestRender();
+		return true;
 	}
 
 	openElicitationForm(form, onFinish) {
@@ -10081,6 +12244,11 @@ export class HarnessApp {
 	// (agent._permissionMode, already = explicit settings ?? native-inferred) >
 	// "ask". Rules come from settings + persisted grants.
 	permissionPolicyFor(agentKey, agent, requestContext = {}) {
+		const sourceAdapter = requestContext.adapter ?? requestContext.sourceClient;
+		if (typeof sourceAdapter?.permissionPolicy === "function") {
+			sourceAdapter.setPermissionGrants?.(this.permissionGrants);
+			return sourceAdapter.permissionPolicy();
+		}
 		const policy = resolvePermissionPolicy(this.config.settings ?? {}, agentKey, this.permissionGrants);
 		const globalRuntime = this.runtimePermissionMode.get(agentKey);
 		const globalSource = this.runtimePermissionModeSource?.get(agentKey);
@@ -10109,6 +12277,8 @@ export class HarnessApp {
 		const action = classifyOption(option) === "deny" ? "deny" : "allow";
 		try {
 			this.permissionGrants = recordGrant({ agent: agentKey, tool, action });
+			this.client?.setPermissionGrants?.(this.permissionGrants);
+			this.btwThread?.client?.setPermissionGrants?.(this.permissionGrants);
 			this.addNotice(`Remembered: ${action === "deny" ? "deny" : "allow"} "${oneLine(tool)}" for ${agentKey} (see /permissions)`);
 		} catch (error) {
 			this.addNotice(`Could not save permission grant: ${error.message ?? error}`);
@@ -10449,19 +12619,21 @@ export class HarnessApp {
 			this.disarmPendingUnsendPrompt();
 			this.addNotice(cursorTodosText(event.todos));
 		} else if (event.type === "commands") {
-			this.availableCommands.set(this.activeKey, event.commands);
-			this.commandsLoaded.add(this.activeKey);
-			this.updateAutocomplete();
-			if (this.backendCommandCatalog?.remember?.(this.activeKey, event.commands, {
-				agentInfo: this.client?.agentInfo,
-				persist: false,
-			})) this.scheduleBackendCommandCatalogPersist(this.activeKey);
+			if (!this.stageWorkingDirectoryCommandUpdate(event.commands)) {
+				this.applyBackendCommandUpdate(event.commands);
+			}
 		} else if (event.type === "session_info") {
 			this.sessionStates.set(this.activeKey, event.sessionInfo);
 			this.syncRuntimePermissionModeFromSessionInfo(event.sessionInfo);
 			this.refreshCodexThreadStateSnapshot(event.sessionInfo);
 			this.backendCommandCatalog?.validateIdentity?.(this.activeKey, event.sessionInfo?.agentInfo);
 			this.updateAutocomplete();
+		} else if (event.type === "background_tasks") {
+			const previous = this.sessionStates.get(this.activeKey) ?? {};
+			this.sessionStates.set(this.activeKey, { ...previous, backgroundTasks: event.snapshot });
+		} else if (event.type === "checklist") {
+			const previous = this.sessionStates.get(this.activeKey) ?? {};
+			this.sessionStates.set(this.activeKey, { ...previous, checklist: event.snapshot });
 		}
 		this.ui.requestRender();
 	}
@@ -10540,17 +12712,50 @@ export class HarnessApp {
 
 	updateAutocomplete() {
 		const commands = this.displayCommandCatalog();
+		const mentions = agentMentionsFromConfigOptions(this.focusedConfigOptionsForAutocomplete());
 		// Skip frequent no-op config/mode/session updates while the user is mid-type.
-		const key = `${this.activeKey}\t${JSON.stringify(commands.map((command) => [command.name, command.description, command.argumentHint]))}`;
+		const key = `${this.activeKey}\t${this.focusedThread}\t${JSON.stringify([
+			commands.map((command) => [command.name, command.description, command.argumentHint]),
+			mentions.map((mention) => [mention.value, mention.description]),
+		])}`;
 		if (key === this.lastAutocompleteKey) return;
 		this.lastAutocompleteKey = key;
 		const provider = this.editor.autocompleteProvider;
-		if (provider instanceof LazyCombinedAutocompleteProvider) provider.setCommands(commands);
-		else this.editor.setAutocompleteProvider(new LazyCombinedAutocompleteProvider(commands, process.cwd(), whichPath("fd")));
+		if (provider instanceof LazyCombinedAutocompleteProvider) {
+			provider.setCommands(commands);
+			provider.setMentions(mentions);
+		}
+		else this.editor.setAutocompleteProvider(new LazyCombinedAutocompleteProvider(
+			commands,
+			process.cwd(),
+			whichPath("fd"),
+			this.shellCommandHistory,
+			mentions,
+		));
 		// Backend commands commonly arrive after the user has already typed `/x`.
 		// Re-evaluate that unchanged input immediately; replacing a provider alone
 		// cancels Pi's popup and it otherwise stays closed until another keystroke.
 		this.editor.refreshAutocompleteForCurrentInput?.();
+	}
+
+	focusedConfigOptionsForAutocomplete() {
+		if (this.focusedThread === "btw" && this.btwThread?.client) {
+			try {
+				return this.btwThread.client.getSessionInfo?.().configOptions
+					?? this.btwThread.client.configOptions
+					?? [];
+			} catch {
+				return this.btwThread.client.configOptions ?? [];
+			}
+		}
+		try {
+			return this.sessionStates?.get?.(this.activeKey)?.configOptions
+				?? this.client?.getSessionInfo?.().configOptions
+				?? this.client?.configOptions
+				?? [];
+		} catch {
+			return this.client?.configOptions ?? [];
+		}
 	}
 
 	addUserMessage(text, options = {}) {
@@ -10582,7 +12787,7 @@ export class HarnessApp {
 		this.currentToolSummary = undefined;
 		if (!this.currentAssistantText) {
 			this.addHistorySpacer("assistant");
-			this.currentAssistantText = new MutableMarkdown("");
+			this.currentAssistantText = new AssistantMessage("");
 			this.chat.addChild(this.currentAssistantText);
 		}
 		this.currentAssistantText.append(text);
@@ -10633,6 +12838,17 @@ export class HarnessApp {
 		this.chat.addChild(new CtrlCExitHint());
 	}
 
+	requestUserExit(displayText = undefined) {
+		if (this.sessionSwitchInProgress) {
+			if (displayText) this.addCommandMessage(displayText);
+			this.addNotice("Exit is unavailable while a session transition is in progress");
+			this.ui.requestRender();
+			return false;
+		}
+		this.stop();
+		return true;
+	}
+
 	addError(text) {
 		this.closeCurrentAssistantText();
 		this.currentUserText = undefined;
@@ -10667,6 +12883,9 @@ export class HarnessApp {
 
 	async stopAndExit(options = {}) {
 		this.stopping = true;
+		this.stopKeybindingsWatcher?.();
+		this.stopKeybindingsWatcher = undefined;
+		this.keybindingDispatcher?.dispose();
 		for (const [key, timer] of this.backendCommandCacheTimers ?? []) {
 			clearTimeout(timer);
 			this.backendCommandCatalog?.persist(key);
@@ -10737,6 +12956,27 @@ class MutableMarkdown {
 		this.cache = { width, text, lines, renderer };
 		return lines.slice();
 	}
+}
+
+class AssistantMessage extends MutableMarkdown {}
+
+export function assistantResponseTexts(container) {
+	const responses = [];
+	let parts = [];
+	const commit = () => {
+		const text = parts.join("\n").trim();
+		if (text) responses.push(text);
+		parts = [];
+	};
+	for (const child of container?.children ?? []) {
+		if (child instanceof AssistantMessage) {
+			if (child.text?.trim()) parts.push(child.text.trim());
+			continue;
+		}
+		if (child instanceof UserMessage || child instanceof CommandMessage) commit();
+	}
+	commit();
+	return responses;
 }
 
 class MutableUserMessage {
@@ -10870,11 +13110,13 @@ class PromptQueueSummary {
 }
 
 export class LazyCombinedAutocompleteProvider {
-	constructor(commands, basePath, fdPath = null) {
+	constructor(commands, basePath, fdPath = null, shellCommandHistory = undefined, mentions = []) {
 		this.commands = commands;
 		this.slashCommands = commands.filter((command) => !String(command?.name ?? command?.value ?? "").startsWith("$"));
 		this.basePath = basePath;
 		this.fdPath = fdPath;
+		this.shellCommandHistory = shellCommandHistory;
+		this.mentions = mentions;
 		this.delegate = undefined;
 	}
 
@@ -10882,6 +13124,15 @@ export class LazyCombinedAutocompleteProvider {
 		this.commands = commands;
 		this.slashCommands = commands.filter((command) => !String(command?.name ?? command?.value ?? "").startsWith("$"));
 		if (this.delegate) this.delegate.commands = this.slashCommands;
+	}
+
+	setBasePath(basePath) {
+		this.basePath = basePath;
+		if (this.delegate) this.delegate.basePath = basePath;
+	}
+
+	setMentions(mentions) {
+		this.mentions = Array.isArray(mentions) ? mentions : [];
 	}
 
 	async getSuggestions(lines, cursorLine, cursorCol, options) {
@@ -10902,17 +13153,96 @@ export class LazyCombinedAutocompleteProvider {
 		}
 		const Provider = await loadAutocompleteProvider();
 		this.delegate ??= new Provider(this.slashCommands, this.basePath, this.fdPath);
+		// Claude Code 2.1.193 added live path completion in leading-! shell
+		// mode. Pi's generic provider normally waits for a slash/dot or an explicit
+		// Tab; inside a shell command, keep completing the current argument as it is
+		// typed. The provider retains all quoting, home-directory, and directory
+		// continuation behavior, so this stays a host feature for every harness.
+		if (beforeCursor.startsWith("!") && /\s/u.test(beforeCursor.slice(1))) {
+			const prefix = this.delegate.extractPathPrefix?.(beforeCursor, true);
+			if (prefix !== null && prefix !== undefined) {
+				const items = this.delegate.getFileSuggestions?.(prefix) ?? [];
+				if (items.length > 0) return { items, prefix };
+			}
+		}
+		if (beforeCursor.startsWith("!") && this.shellCommandHistory) {
+			const commands = this.shellCommandHistory.suggestions(beforeCursor.slice(1));
+			if (commands.length > 0) {
+				return {
+					items: commands.map((command) => ({
+						value: `!${command}`,
+						label: `!${command}`,
+						description: "shell history",
+						ccShellHistory: true,
+					})),
+					prefix: beforeCursor,
+				};
+			}
+		}
 		const atMatch = beforeCursor.match(/(?:^|[\s])(@(?:"[^"]*|[^\s]*))$/);
-		if (atMatch && !this.fdPath && typeof this.delegate.getFileSuggestions === "function") {
+		if (atMatch) {
 			const prefix = atMatch[1];
-			const items = this.delegate.getFileSuggestions(prefix);
-			return items.length > 0 ? { items, prefix } : null;
+			const mentionQuery = /^@[A-Za-z0-9._-]*$/u.test(prefix) ? prefix.slice(1).toLowerCase() : undefined;
+			const mentionItems = mentionQuery === undefined ? [] : this.mentions
+				.filter((mention) => mention.value.toLowerCase().startsWith(mentionQuery))
+				.map((mention) => ({
+					value: `@${mention.value}`,
+					label: `@${mention.value}`,
+					description: mention.description ?? "custom agent",
+					ccAgentMention: true,
+				}));
+			let delegated;
+			if (!this.fdPath && typeof this.delegate.getFileSuggestions === "function") {
+				const items = this.delegate.getFileSuggestions(prefix);
+				delegated = items.length > 0 ? { items, prefix } : null;
+			} else {
+				delegated = await this.delegate.getSuggestions(lines, cursorLine, cursorCol, options);
+			}
+			const items = [...mentionItems];
+			const values = new Set(items.map((item) => item.value));
+			for (const item of delegated?.items ?? []) {
+				if (!values.has(item.value)) {
+					items.push(item);
+					values.add(item.value);
+					continue;
+				}
+				// An advertised custom agent and a local file may share the same
+				// unquoted @token. Keep both choices: the agent owns `@name`, while a
+				// quoted completion explicitly selects the file and remains embeddable.
+				if (typeof item.value === "string" && /^@[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(item.value)) {
+					const quotedValue = `@"${item.value.slice(1)}"`;
+					if (!values.has(quotedValue)) {
+						items.push({
+							...item,
+							value: quotedValue,
+							label: `${item.label} (file)`,
+							description: [item.description, "local file"].filter(Boolean).join(" · "),
+						});
+						values.add(quotedValue);
+					}
+				}
+			}
+			return items.length > 0 ? { items, prefix: delegated?.prefix ?? prefix } : null;
 		}
 		return this.delegate.getSuggestions(lines, cursorLine, cursorCol, options);
 	}
 
 	applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
+		if (item?.ccShellHistory === true) {
+			const next = [...lines];
+			next[cursorLine] = item.value;
+			return { lines: next, cursorLine, cursorCol: item.value.length };
+		}
 		if (prefix?.startsWith("$")) {
+			const currentLine = lines[cursorLine] ?? "";
+			const beforePrefix = currentLine.slice(0, cursorCol - prefix.length);
+			const afterCursor = currentLine.slice(cursorCol);
+			const suffix = afterCursor.startsWith(" ") ? "" : " ";
+			const next = [...lines];
+			next[cursorLine] = `${beforePrefix}${item.value}${suffix}${afterCursor}`;
+			return { lines: next, cursorLine, cursorCol: beforePrefix.length + item.value.length + suffix.length };
+		}
+		if (item?.ccAgentMention === true && prefix?.startsWith("@")) {
 			const currentLine = lines[cursorLine] ?? "";
 			const beforePrefix = currentLine.slice(0, cursorCol - prefix.length);
 			const afterCursor = currentLine.slice(cursorCol);
@@ -10923,6 +13253,64 @@ export class LazyCombinedAutocompleteProvider {
 		}
 		return this.delegate?.applyCompletion(lines, cursorLine, cursorCol, item, prefix);
 	}
+}
+
+// ACP config options are the unified discovery surface for custom agents. The
+// TUI deliberately does not inspect Claude SDK state or harness-specific files;
+// any adapter can opt into @mention completion by advertising the same select.
+export function agentMentionsFromConfigOptions(configOptions, options = {}) {
+	const requestedLimit = Number.isSafeInteger(options.limit) ? options.limit : 64;
+	const limit = Math.min(128, Math.max(0, requestedLimit));
+	let agentOption;
+	if (Array.isArray(configOptions)) {
+		for (let index = 0; index < Math.min(configOptions.length, 128); index += 1) {
+			const candidate = configOptions[index];
+			if (candidate?.id !== "agent") continue;
+			const candidateOptions = candidate.options;
+			if (Array.isArray(candidateOptions)) {
+				agentOption = { options: candidateOptions };
+				break;
+			}
+		}
+	}
+	if (!agentOption) return [];
+	const mentions = [];
+	const seen = new Set();
+	const flattened = [];
+	let inspected = 0;
+	// Bound both array levels independently. Counting only leaf entries allowed an
+	// arbitrarily large prefix of empty groups (or indexed accessors) to block the
+	// autocomplete path before a single candidate was inspected.
+	const agentEntries = agentOption.options;
+	const outerLimit = Math.min(agentEntries.length, 256);
+	for (let outerIndex = 0; outerIndex < outerLimit; outerIndex += 1) {
+		if (inspected >= 256) break;
+		const entry = agentEntries[outerIndex];
+		const nestedOptions = entry?.options;
+		const groupEntries = Array.isArray(nestedOptions) ? nestedOptions : [entry];
+		const groupName = Array.isArray(nestedOptions) && typeof entry.name === "string"
+			? entry.name.slice(0, 960)
+			: "";
+		for (let childIndex = 0; childIndex < Math.min(groupEntries.length, 256 - inspected); childIndex += 1) {
+			if (inspected++ >= 256) break;
+			const child = groupEntries[childIndex];
+			flattened.push({ entry: child, groupName });
+		}
+	}
+	for (const { entry, groupName } of flattened) {
+		if (mentions.length >= limit) break;
+		const value = typeof entry?.value === "string" ? entry.value.slice(0, 512).trim() : "";
+		if (value === "default" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(value)) continue;
+		const key = value.toLowerCase();
+		if (seen.has(key)) continue;
+		seen.add(key);
+		const rawDescription = [groupName, typeof entry.description === "string" ? entry.description.slice(0, 960) : ""]
+			.filter(Boolean)
+			.join(" · ");
+		const description = rawDescription ? singleLineMenuText(rawDescription).slice(0, 240) : undefined;
+		mentions.push({ value, description: description || undefined });
+	}
+	return mentions;
 }
 
 function toolGlyph(status) {
@@ -11814,7 +14202,23 @@ export function localSlashCommands(app) {
 		{ name: "btw", description: "Fork this conversation into a side thread (full context + tools)", argumentHint: "<question>" },
 		{ name: "side", description: "Alias for /btw", argumentHint: "<question>" },
 		{ name: "diff", description: "Show the working-tree git diff" },
-		{ name: "copy", description: "Copy the last response to the clipboard" },
+		{ name: "todos", description: "Show the active session checklist" },
+		{
+			name: "copy",
+			description: "Copy the Nth-latest assistant response",
+			argumentHint: "[N|picker]",
+			getArgumentCompletions: (prefix) => "picker".startsWith(prefix.toLowerCase())
+				? [{ value: "picker", label: "picker", description: "Show the response/code-block picker again" }]
+				: [],
+		},
+		{
+			name: "color",
+			description: "Change the editor border color for this cc session",
+			argumentHint: `[${[...PROMPT_COLOR_NAMES, "default"].join("|")}]`,
+			getArgumentCompletions: (prefix) => [...PROMPT_COLOR_NAMES, "default"]
+				.filter((name) => name.startsWith(prefix.toLowerCase()))
+				.map((name) => ({ value: name, label: name })),
+		},
 		{ name: "config", description: "Change any configuration option advertised by the agent" },
 		{ name: "fast", description: "Toggle the agent's advertised fast mode", argumentHint: "[on|off]" },
 		{ name: "delete", description: "Permanently delete a saved session", argumentHint: "[session-id|name]" },
@@ -11823,6 +14227,17 @@ export function localSlashCommands(app) {
 		{ name: "exit", description: "Exit cc" },
 		{ name: "quit", description: "Exit cc" },
 		themeSlashCommand(app),
+		{
+			name: "keybindings",
+			description: "Open or reload cc keyboard shortcuts",
+			argumentHint: "[edit|show|reload|path]",
+			getArgumentCompletions: (prefix) => [
+				{ value: "edit", label: "edit", description: "Open the keybindings file" },
+				{ value: "show", label: "show", description: "Show active custom bindings and warnings" },
+				{ value: "reload", label: "reload", description: "Reload the keybindings file" },
+				{ value: "path", label: "path", description: "Show the keybindings file path" },
+			].filter((entry) => entry.value.startsWith(prefix.toLowerCase())),
+		},
 	];
 	if (app.isCodexBackendActive()) {
 		commands.push(
@@ -11858,9 +14273,62 @@ export function localSlashCommands(app) {
 	};
 	const capabilities = focusedClient?.capabilities ?? state?.capabilities;
 	if (agentSupportsLogout(capabilities)) addIfMissing({ name: "logout", description: "Sign out of the active ACP agent" });
+	const supportsWorkingDirectoryChange = capabilities?.changeWorkingDirectory === true;
+	if (supportsWorkingDirectoryChange) {
+		addIfMissing({
+			name: "cd",
+			description: "Move this session to another working directory",
+			argumentHint: "<path>",
+			getArgumentCompletions: (prefix) => directoryCompletionMatches(prefix, process.cwd()),
+		});
+	}
+	if (capabilities?.backgroundTasks === true) {
+		addIfMissing({
+			name: "tasks",
+			description: "List, stop, or background harness tasks",
+			argumentHint: "[stop <task-id>|background [tool-use-id]]",
+			getArgumentCompletions: (prefix) => [
+				{ value: "stop ", label: "stop", description: "Stop a task by task id" },
+				{ value: "background", label: "background", description: "Background all foreground tasks" },
+			].filter((entry) => entry.value.startsWith(prefix.toLowerCase())),
+		});
+	}
+	const rewindDescription = focusedSideThread
+		? "Rewinding is available only from the main session"
+		: capabilities?.checkpoints === true
+			? "Restore code, conversation, or both to an earlier user message"
+			: "Restore an earlier checkpoint when the harness supports it";
+	addIfMissing({ name: "rewind", description: rewindDescription });
+	addIfMissing({ name: "checkpoint", description: focusedSideThread ? rewindDescription : "Alias for /rewind" });
+	addIfMissing({ name: "undo", description: focusedSideThread ? rewindDescription : "Alias for /rewind" });
+	const remoteControlDescription = focusedSideThread
+		? "Remote Control is available only from the main session"
+		: capabilities?.remoteControl === true
+			? "Open or disconnect this local session on claude.ai/code"
+			: "Control this session remotely when the harness supports it";
+	const remoteControlArguments = (prefix) => "off".startsWith(prefix.toLowerCase())
+		? [{ value: "off", label: "off", description: "Disconnect Remote Control for this session" }]
+		: [];
+	addIfMissing({
+		name: "remote-control",
+		description: remoteControlDescription,
+		argumentHint: "[name|off]",
+		getArgumentCompletions: remoteControlArguments,
+	});
+	addIfMissing({
+		name: "rc",
+		description: focusedSideThread ? remoteControlDescription : "Alias for /remote-control",
+		argumentHint: "[name|off]",
+		getArgumentCompletions: remoteControlArguments,
+	});
 
 	addIfMissing({ name: "resume", description: "Resume a previous ACP session" });
 	addIfMissing({ name: "new", description: "Start a new ACP session" });
+	if (focusedSideThread) {
+		addIfMissing({ name: "branch", description: "Branching is available only from the main session", argumentHint: "[name]" });
+	} else if (focusedClient?.capabilities?.fork) {
+		addIfMissing({ name: "branch", description: "Fork this session and continue on the new branch", argumentHint: "[name]" });
+	}
 	addIfMissing({ name: "model", description: "Change model" });
 	addIfMissing({ name: "mode", description: "Change agent mode" });
 	addIfMissing({ name: "effort", description: "Change reasoning effort" });
@@ -11871,7 +14339,7 @@ export function localSlashCommands(app) {
 	addIfMissing({ name: "auto", description: "Toggle auto-approve for this harness", argumentHint: "[ask|auto|deny]" });
 	addIfMissing({ name: "permissions", description: "Select Codex permissions or manage remembered grants", argumentHint: "[read-only|auto|full-access|show|clear]" });
 
-	if (supportsSessionList(state)) {
+	if (focusedClient?.capabilities?.sessionList === true || supportsSessionList(state)) {
 		addIfMissing({ name: "resume", description: "Resume a previous ACP session" });
 	}
 
@@ -11954,7 +14422,7 @@ function codexFeedbackSlashCommand() {
 }
 
 function shouldDeferLocalSlashCommand(name) {
-	return ["resume", "fork", "model", "mode", "effort", "reasoning", "thinking", "plan", "config", "fast", "permissions", "delete", "archive", "unarchive", "login", "logout", "btw", "side", "theme", "plugins", "hooks", "app", "apps", "feedback", "import", "memories", "debug-config", "mcp", "doctor", "experimental", "rename", "usage", "cloud", "goal"].includes(name);
+	return ["resume", "fork", "model", "mode", "effort", "reasoning", "thinking", "plan", "config", "fast", "permissions", "delete", "archive", "unarchive", "login", "logout", "btw", "side", "theme", "plugins", "hooks", "app", "apps", "feedback", "import", "memories", "debug-config", "mcp", "doctor", "experimental", "rename", "usage", "cloud", "goal", "tasks", "rewind", "checkpoint", "undo", "remote-control", "rc"].includes(name);
 }
 
 function shouldDeferBusyConfigCommand(name) {
@@ -12371,8 +14839,68 @@ function compatibleNodePackageExecutableOnPath(bin, packageName, minimumVersion,
 	return undefined;
 }
 
+function packageNameSegments(packageName) {
+	if (typeof packageName !== "string") return undefined;
+	const segments = packageName.split("/");
+	const validSegment = (segment) => /^[A-Za-z0-9._-]+$/u.test(segment) && segment !== "." && segment !== "..";
+	if (segments.length === 1 && validSegment(segments[0])) return segments;
+	if (segments.length === 2 && /^@[A-Za-z0-9._-]+$/u.test(segments[0]) && validSegment(segments[1])) return segments;
+	return undefined;
+}
+
+/**
+ * Resolve a direct adapter dependency installed with cc itself. The marker is
+ * deliberately tied to the built-in command string: changing `acp.command` in
+ * settings remains an explicit override and bypasses package-local selection.
+ */
+export function resolvePackageLocalAcpExecutable(agent, packageRoot = PACKAGE_ROOT) {
+	const packageDir = packageLocalAcpPackageRoot(agent, packageRoot);
+	if (!packageDir) return undefined;
+	const defaultCommand = agent?._packageLocalAcpCommand;
+	const packageJson = path.join(packageDir, "package.json");
+	// A built-in per-harness bridge may wrap the pinned adapter with negotiated
+	// extensions. Select it only after proving that the package-local dependency
+	// above is present and compatible. The marker must resolve to a real script
+	// inside this cc installation, so config cannot redirect it to arbitrary code.
+	if (typeof agent?._packageLocalAcpBridge === "string") {
+		try {
+			const root = fs.realpathSync(packageRoot);
+			const bridge = fs.realpathSync(agent._packageLocalAcpBridge);
+			const relative = path.relative(root, bridge);
+			const inside = relative && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+			if (inside && [".js", ".mjs", ".cjs"].includes(path.extname(bridge).toLowerCase())) {
+				return { executable: process.execPath, prefixArgs: [bridge] };
+			}
+		} catch {}
+	}
+	const entrypoint = nodePackageBin(packageJson, path.basename(defaultCommand));
+	if (!entrypoint) return undefined;
+	const extension = path.extname(entrypoint).toLowerCase();
+	if ([".js", ".mjs", ".cjs"].includes(extension)) {
+		return { executable: process.execPath, prefixArgs: [entrypoint] };
+	}
+	return { executable: entrypoint, prefixArgs: [] };
+}
+
+function packageLocalAcpPackageRoot(agent, packageRoot = PACKAGE_ROOT) {
+	const command = agent?.acp ?? agent;
+	const defaultCommand = agent?._packageLocalAcpCommand;
+	if (!defaultCommand || command?.command !== defaultCommand) return undefined;
+	const packageName = agent?._requiredAgentName;
+	const segments = packageNameSegments(packageName);
+	if (!segments) return undefined;
+	const packageDir = path.join(packageRoot, "node_modules", ...segments);
+	const pkg = readNodePackage(packageDir);
+	if (!pkg || pkg.metadata.name !== packageName) return undefined;
+	if (agent?._packageLocalAcpVersion && pkg.metadata.version !== agent._packageLocalAcpVersion) return undefined;
+	if (agent?._minimumAgentVersion && !versionAtLeast(pkg.metadata.version, agent._minimumAgentVersion)) return undefined;
+	return packageDir;
+}
+
 export function resolveAgentAcpExecutable(agent, cwd = process.cwd(), env = mergedAgentEnvironment(agent), platform = process.platform) {
 	const command = agent?.acp ?? agent;
+	const packageLocal = resolvePackageLocalAcpExecutable(agent);
+	if (packageLocal) return packageLocal;
 	let executable = command?.command;
 	if (agent?._requiredAgentName) {
 		const compatible = compatibleNodePackageExecutableOnPath(
@@ -12447,6 +14975,17 @@ export function resolveCodexInvocation(agent = {}) {
 	const explicitPath = explicit && whichPath(explicit, environmentValue(env, "PATH"));
 	const explicitInvocation = codexInvocationFromExecutable(explicitPath);
 	if (explicitInvocation) return explicitInvocation;
+	// Normal cc installs carry codex-acp (and its compatible Codex CLI) as a
+	// direct package-local dependency. Native management helpers must find that
+	// copy even though launching a global npm bin does not add its private .bin to
+	// the user's PATH. An explicit custom ACP command intentionally bypasses this.
+	const localAdapterRoot = packageLocalAcpPackageRoot(agent);
+	if (localAdapterRoot && agent?._requiredAgentName === BUNDLED_ACP_ADAPTERS.codex.packageName) {
+		const packageJson = resolveDependencyPackageJson(localAdapterRoot, "@openai/codex");
+		const bundled = packageJson && nodePackageBin(packageJson, "codex");
+		const bundledInvocation = codexInvocationFromExecutable(bundled);
+		if (bundledInvocation) return bundledInvocation;
+	}
 	const acpCommand = agent?.acp?.command ?? "codex-acp";
 	const acpPath = compatibleNodePackageExecutableOnPath(
 		acpCommand,
@@ -12479,6 +15018,7 @@ function mergedAgentEnvironment(agent = {}) {
 }
 
 export function agentSupportsLogout(capabilities) {
+	if (typeof capabilities?.logout === "boolean") return capabilities.logout;
 	return Boolean(capabilities?.auth?.logout);
 }
 
@@ -13755,6 +16295,7 @@ function runCapture(command, args = [], options = {}) {
 			stdio: ["ignore", "pipe", "pipe"],
 			detached: process.platform !== "win32",
 			shell: false,
+			...(options.cwd ? { cwd: options.cwd } : {}),
 			...(options.env ? { env: mergeEnvironments([options.env]) } : {}),
 		});
 		const stdout = [];
@@ -13766,6 +16307,7 @@ function runCapture(command, args = [], options = {}) {
 		let settled = false;
 		let terminating = false;
 		let terminationPromise;
+		let terminationReason;
 		let directChildClosed = false;
 		let timer;
 		let unregister = () => {};
@@ -13780,7 +16322,16 @@ function runCapture(command, args = [], options = {}) {
 		};
 		const terminateProcessTree = (reason) => {
 			if (settled) return Promise.resolve();
-			if (terminationPromise) return terminationPromise;
+			if (terminationPromise) {
+				// A naturally-exited root may already be sweeping its surviving POSIX
+				// group. Preserve that one ownership lease instead of starting a later
+				// signal attempt against a numeric PGID that could have disappeared and
+				// been recycled in the meantime.
+				terminationReason ??= reason;
+				terminating = true;
+				return terminationPromise;
+			}
+			terminationReason = reason;
 			terminating = true;
 			terminationPromise = (async () => {
 				// A Windows SIGTERM is already an unconditional direct-process kill, so use
@@ -13865,12 +16416,56 @@ function runCapture(command, args = [], options = {}) {
 				...(stderrTruncated ? { stderrTruncated: true } : {}),
 			};
 			if (terminating || settled) return;
-			if (rejectOnExit && code !== 0) {
-				const details = result.stderr.toString("utf8").trim();
-				finish(new Error(`${command} exited ${signal ?? code}${details ? `: ${oneLine(details)}` : ""}`));
-				return;
+			const settleResult = () => {
+				if (rejectOnExit && code !== 0) {
+					const details = result.stderr.toString("utf8").trim();
+					finish(new Error(`${command} exited ${signal ?? code}${details ? `: ${oneLine(details)}` : ""}`));
+					return;
+				}
+				finish(undefined, result);
+			};
+
+			if (process.platform !== "win32") {
+				const pid = Number(child.pid);
+				if (Number.isInteger(pid) && pid > 0 && posixProcessGroupExists(pid)) {
+					// A shell wrapper can exit after launching a redirected background job,
+					// which closes all of Node's handles while its detached process group is
+					// still alive. Sweep that group synchronously with the close observation:
+					// this is the last point at which the PGID is known to belong to this
+					// child. Never retain the numeric id for a delayed retry after absence.
+					const cleanup = terminateChild(child, "SIGKILL", { includeExitedGroup: true });
+					if (!cleanup.treeSignalled) {
+						// The group can disappear between the existence probe and signal. Once
+						// absence is observed, retire the id without signalling it again.
+						if (!posixProcessGroupExists(pid)) settleResult();
+						else finish(processTreeTerminationError(`${command} exited, but its detached process group could not be stopped`));
+						return;
+					}
+					terminationPromise = (async () => {
+						const treeExited = await waitForProcessTreeExit(
+							child,
+							() => directChildClosed,
+							PROCESS_FORCE_KILL_WAIT_MS,
+							cleanup,
+						);
+						if (!treeExited) {
+							finish(processTreeTerminationError(`${command} exited, but its detached process group did not stop after SIGKILL`));
+							return;
+						}
+						if (terminationReason === "timeout") {
+							finish(new Error(`${command} timed out after ${timeoutMs}ms; its process tree was force-killed`));
+							return;
+						}
+						if (terminationReason === "shutdown") {
+							finish(nativeProcessShutdownError(command));
+							return;
+						}
+						settleResult();
+					})();
+					return;
+				}
 			}
-			finish(undefined, result);
+			settleResult();
 		});
 	});
 }
@@ -14775,6 +17370,7 @@ function hasImagePromptPart(promptParts) {
 
 function imagePromptCapability(capabilities) {
 	if (!capabilities || Object.keys(capabilities).length === 0) return undefined;
+	if (typeof capabilities.image === "boolean") return capabilities.image;
 	return capabilities.promptCapabilities?.image === true;
 }
 
@@ -14791,6 +17387,15 @@ export function buildEmbeddedFilePromptParts(text, basePath = process.cwd(), opt
 		? Math.max(0, Math.trunc(options.maxTotalBytes))
 		: EMBEDDED_FILE_MAX_TOTAL_BYTES;
 	const platform = options.platform ?? process.platform;
+	const reservedMentions = new Set();
+	if (options.reservedMentions && typeof options.reservedMentions[Symbol.iterator] === "function") {
+		for (const value of options.reservedMentions) {
+			if (reservedMentions.size >= 128) break;
+			if (typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/u.test(value)) {
+				reservedMentions.add(value);
+			}
+		}
+	}
 	// Keep ':' excluded for ordinary mentions (so sentence punctuation remains
 	// text), but admit it as part of an unquoted Windows drive-letter path.
 	const pattern = /(^|[\s(])@(?:"([^"\r\n]+)"|([A-Za-z]:[\\/][^\s,;!?()[\]{}<>]+|[^\s,;:!?()[\]{}<>]+))/g;
@@ -14806,6 +17411,8 @@ export function buildEmbeddedFilePromptParts(text, basePath = process.cwd(), opt
 		const mentionStart = match.index + prefix.length;
 		let mentionEnd = match.index + match[0].length;
 		let rawPath = match[2] ?? match[3];
+		const unquotedMention = match[2] === undefined;
+		if (unquotedMention && reservedMentions.has(rawPath)) continue;
 		const resolvePath = (candidate) => {
 			const expanded = candidate === "~"
 				? os.homedir()
@@ -14823,6 +17430,7 @@ export function buildEmbeddedFilePromptParts(text, basePath = process.cwd(), opt
 			// Prefer the full candidate; only peel terminal periods when that exact
 			// path is absent and the trimmed path actually exists.
 			const trimmed = match[2] === undefined ? rawPath.replace(/\.+$/, "") : rawPath;
+			if (unquotedMention && reservedMentions.has(trimmed)) continue;
 			if (trimmed === rawPath || !trimmed) continue;
 			const trimmedAbsolute = resolvePath(trimmed);
 			try {
@@ -15267,9 +17875,12 @@ export function loadConfig() {
 	const user = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : {};
 	const config = deepMerge(DEFAULT_CONFIG, user);
 	const settings = normalizeSettings(deepMerge(config.settings ?? {}, loadSettings()), config.theme);
-	// Persisted grants participate in spawn-time gating: a remembered deny means an
-	// auto-mode backend must keep prompting so cc can enforce it.
-	return applyHarnessSettings(config, settings, loadGrants());
+	const defaultAgent = typeof settings.defaultAgent === "string" && config.agents?.[settings.defaultAgent]
+		? settings.defaultAgent
+		: config.defaultAgent;
+	// Harness definitions remain raw here. The selected adapter is the sole owner
+	// of native args/config/session metadata and permission launch-mode generation.
+	return { ...config, defaultAgent, settings, theme: settings.theme };
 }
 
 function configPath() {

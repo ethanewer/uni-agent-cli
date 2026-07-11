@@ -28,6 +28,12 @@ export const CAPABILITY_KEYS = [
 	"embeddedContext", // bool — @file embedded context
 	"auth", // bool — one or more ACP authentication methods advertised
 	"logout", // bool — agentCapabilities.auth.logout advertised
+	"changeWorkingDirectory", // bool — negotiated cc/session/change_cwd extension
+	"appendContext", // bool — append user context without starting a model turn
+	"backgroundTasks", // bool — negotiated lifecycle list/stop/background extension
+	"checkpoints", // bool — negotiated checkpoint list/rewind extension
+	"remoteControl", // bool — negotiated existing-session remote-control toggle
+	"namedFork", // bool — fork accepts a branch name and reports whether it was applied
 ];
 
 /** A fresh, all-off capability descriptor. */
@@ -51,6 +57,12 @@ export function emptyCapabilities() {
 		embeddedContext: false,
 		auth: false,
 		logout: false,
+		changeWorkingDirectory: false,
+		appendContext: false,
+		backgroundTasks: false,
+		checkpoints: false,
+		remoteControl: false,
+		namedFork: false,
 	};
 }
 
@@ -62,7 +74,10 @@ export const REQUIRED_METHODS = [
 	"prompt",
 	"cancel",
 	"stop",
+	"stopAndWait",
+	"forceResolvePrompt",
 	"getSessionInfo",
+	"setRuntimePermissionMode",
 ];
 
 /** Methods an adapter implements only if it advertises the matching capability. */
@@ -71,7 +86,7 @@ export const OPTIONAL_METHODS = [
 	"loadSession", // resume
 	"deleteSession", // delete
 	"fork", // fork
-	"setConfigOption", // models / modes / reasoningEffort
+	"setConfigOption", // models / reasoningEffort (and generic config options)
 	"setMode", // modes
 	"snapshotRetractionState", // retractPrompt
 	"canRetract", // retractPrompt
@@ -79,6 +94,14 @@ export const OPTIONAL_METHODS = [
 	"handleExtensionRequest", // interactiveRequests
 	"authenticate", // auth
 	"logout", // logout
+	"changeWorkingDirectory", // changeWorkingDirectory
+	"appendContext", // appendContext
+	"listBackgroundTasks", // backgroundTasks
+	"stopBackgroundTask", // backgroundTasks
+	"backgroundTasks", // backgroundTasks
+	"listCheckpoints", // checkpoints
+	"rewindCheckpoint", // checkpoints
+	"setRemoteControl", // remoteControl
 ];
 
 /** The set of normalized UI event types an adapter may emit to host.onEvent. */
@@ -93,7 +116,9 @@ export const EVENT_TYPES = [
 	"backend_activity",
 	"backend_exit",
 	"error",
-	"cursor_todos",
+	"cursor_todos", // legacy extension event retained for third-party adapters
+	"checklist",
+	"background_tasks",
 ];
 
 /**
@@ -131,8 +156,11 @@ export function checkAdapterConformance(adapter) {
 		if (caps.resume && typeof adapter.loadSession !== "function") problems.push("capability resume set but loadSession() missing");
 		if (caps.sessionList && typeof adapter.listSessions !== "function") problems.push("capability sessionList set but listSessions() missing");
 		if (caps.delete && typeof adapter.deleteSession !== "function") problems.push("capability delete set but deleteSession() missing");
-		if ((caps.models || caps.modes || caps.reasoningEffort) && typeof adapter.setConfigOption !== "function") {
-			problems.push("config capability set but setConfigOption() missing");
+		if ((caps.models || caps.reasoningEffort) && typeof adapter.setConfigOption !== "function") {
+			problems.push("model/reasoning config capability set but setConfigOption() missing");
+		}
+		if (caps.modes && typeof adapter.setMode !== "function") {
+			problems.push("capability modes set but setMode() missing");
 		}
 		if (caps.retractPrompt && (typeof adapter.snapshotRetractionState !== "function" || typeof adapter.canRetract !== "function")) {
 			problems.push("capability retractPrompt set but snapshot/canRetract missing");
@@ -148,6 +176,31 @@ export function checkAdapterConformance(adapter) {
 		}
 		if (caps.logout && typeof adapter.logout !== "function") {
 			problems.push("capability logout set but logout() missing");
+		}
+		if (caps.changeWorkingDirectory && typeof adapter.changeWorkingDirectory !== "function") {
+			problems.push("capability changeWorkingDirectory set but changeWorkingDirectory() missing");
+		}
+		if (caps.appendContext && typeof adapter.appendContext !== "function") {
+			problems.push("capability appendContext set but appendContext() missing");
+		}
+		if (
+			caps.backgroundTasks &&
+			(
+				typeof adapter.listBackgroundTasks !== "function" ||
+				typeof adapter.stopBackgroundTask !== "function" ||
+				typeof adapter.backgroundTasks !== "function"
+			)
+		) {
+			problems.push("capability backgroundTasks set but list/stop/background methods are missing");
+		}
+		if (
+			caps.checkpoints &&
+			(typeof adapter.listCheckpoints !== "function" || typeof adapter.rewindCheckpoint !== "function")
+		) {
+			problems.push("capability checkpoints set but list/rewind methods are missing");
+		}
+		if (caps.remoteControl && typeof adapter.setRemoteControl !== "function") {
+			problems.push("capability remoteControl set but setRemoteControl() missing");
 		}
 	}
 
@@ -193,5 +246,11 @@ export function capabilitiesFromWire(sessionInfo = {}) {
 		embeddedContext: acp.promptCapabilities?.embeddedContext === true,
 		auth: Array.isArray(sessionInfo.authMethods) && sessionInfo.authMethods.length > 0,
 		logout: Boolean(acp.auth?.logout),
+		changeWorkingDirectory: acp._meta?.cc?.changeWorkingDirectory === true,
+		appendContext: acp._meta?.cc?.appendContext === true,
+		backgroundTasks: acp._meta?.cc?.backgroundTasks === true,
+		checkpoints: acp._meta?.cc?.checkpoints === true,
+		remoteControl: acp._meta?.cc?.remoteControl === true,
+		namedFork: acp._meta?.cc?.namedFork === true,
 	};
 }

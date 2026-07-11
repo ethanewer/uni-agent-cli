@@ -21,15 +21,40 @@ const codexAgent = {
 const claudeAgent = {
 	label: "Claude",
 	transport: "acp",
+	_requiredAgentName: "@agentclientprotocol/claude-agent-acp",
+	_minimumAgentVersion: "0.58.1",
+	_packageLocalAcpCommand: "claude-agent-acp",
+	_packageLocalAcpVersion: "0.58.1",
 	acp: { command: "claude-agent-acp", args: [] },
 };
+const uncataloguedClaudeAgent = {
+	label: "Claude",
+	transport: "acp",
+	acp: { command: "claude-agent-acp", args: [] },
+};
+const claudeBuiltinHintNames = [
+	"deep-research", "design-sync", "dataviz", "update-config", "verify", "debug", "code-review", "simplify", "batch",
+	"fewer-permission-prompts", "doctor", "loop", "claude-api", "run", "run-skill-generator", "agents", "color", "compact",
+	"config", "context", "effort", "fast", "heapdump", "init", "mcp", "model", "reload-skills", "rename", "review",
+	"security-review", "status", "usage", "insights", "recap", "goal", "design", "design-consent", "design-revoke",
+	"team-onboarding",
+];
 
 assert.deepEqual(
 	startupCommandHints("codex", codexAgent).map((command) => command.name),
 	["skills", "review", "review-branch", "review-commit", "compact", "goal"],
 	"only identity-gated Codex built-ins are safe first-run hints",
 );
-assert.deepEqual(startupCommandHints("claude", claudeAgent), [], "dynamic harness commands are learned from ACP, not hard-coded");
+assert.deepEqual(
+	startupCommandHints("claude", claudeAgent).map((command) => command.name),
+	claudeBuiltinHintNames,
+	"the pinned adapter's first-party commands are available on the first autocomplete pass",
+);
+assert.deepEqual(
+	startupCommandHints("claude", { ...claudeAgent, _minimumAgentVersion: "0.58.0" }),
+	[],
+	"Claude hints are gated by the adapter version whose command contract they describe",
+);
 assert.deepEqual(
 	startupCommandHints("codex", { ...codexAgent, _minimumAgentVersion: "1.1.1" }),
 	[],
@@ -74,8 +99,23 @@ try {
 	fs.mkdirSync(cwdB);
 	const agents = {
 		codex: codexAgent,
-		claude: { ...claudeAgent, env: { PRIVATE_DISCOVERY_PROFILE: "profile-secret" } },
+		claude: { ...uncataloguedClaudeAgent, env: { PRIVATE_DISCOVERY_PROFILE: "profile-secret" } },
 	};
+	const localAdapterCache = path.join(root, "package-local.json");
+	new BackendCommandCatalog({ claude: claudeAgent }, {
+		cwd: cwdA,
+		cachePath: localAdapterCache,
+		environment: { ...process.env, PATH: path.join(root, "old-global-prefix") },
+	}).remember("claude", ["project-command"]);
+	assert.deepEqual(
+		new BackendCommandCatalog({ claude: claudeAgent }, {
+			cwd: cwdA,
+			cachePath: localAdapterCache,
+			environment: { ...process.env, PATH: path.join(root, "new-global-prefix") },
+		}).commandsFor("claude").map((command) => command.name),
+		["project-command", ...claudeBuiltinHintNames],
+		"package-local adapter caches are keyed by the bundled package, not an unrelated global PATH",
+	);
 
 	const first = new BackendCommandCatalog(agents, { cwd: cwdA, cachePath: cacheFile });
 	assert.deepEqual(first.commandsFor("claude"), []);
@@ -462,6 +502,34 @@ assert.equal(
 	assert.deepEqual(app.backendCommandsForDisplay(), [{ name: "main-live" }]);
 	app.btwThread.commandsLoaded = true;
 	assert.deepEqual(app.backendCommandsForDisplay(), [], "a side thread's empty live list is authoritative too");
+	app.voiceController.dispose();
+}
+
+// When a live backend owns an overlapping command, autocomplete must describe
+// the command that Enter will actually execute. Reserved local forms such as
+// bare /config keep cc's unified description.
+{
+	const config = { defaultAgent: "claude", agents: { claude: claudeAgent }, theme: "system" };
+	const app = new HarnessApp(config, "claude", "acp", {
+		backendCommandCatalog: new BackendCommandCatalog(config.agents, { cwd: process.cwd() }),
+	});
+	app.ui.requestRender = () => {};
+	const cold = new Map(app.displayCommandCatalog().map((command) => [command.name, command]));
+	assert.equal(cold.get("status").description, "Show current session status");
+	assert.equal(cold.get("init").description, "Generate repository guidance in AGENTS.md");
+	assert.equal(app.slashCommandRoute("init"), "local", "startup hints never become routing authority");
+	app.availableCommands.set("claude", [
+		{ name: "init", description: "Initialize native Claude project memory" },
+		{ name: "fast", description: "Toggle native Claude fast mode" },
+		{ name: "status", description: "Show native Claude status" },
+		{ name: "config", description: "Configure Claude with key=value" },
+	]);
+	app.commandsLoaded.add("claude");
+	const displayed = new Map(app.displayCommandCatalog().map((command) => [command.name, command]));
+	assert.equal(displayed.get("init").description, "Initialize native Claude project memory");
+	assert.equal(displayed.get("fast").description, "Toggle native Claude fast mode");
+	assert.equal(displayed.get("status").description, "Show native Claude status");
+	assert.equal(displayed.get("config").description, "Change any configuration option advertised by the agent");
 	app.voiceController.dispose();
 }
 
