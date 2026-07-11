@@ -115,6 +115,18 @@ const HARNESS_PYTHON = resolveHarnessPython();
 const OSC133_ZONE_START = "\x1b]133;A\x07";
 const OSC133_ZONE_END = "\x1b]133;B\x07";
 const OSC133_ZONE_FINAL = "\x1b]133;C\x07";
+const IDENTITY_PROMPT_MATCHERS = [
+	/^\s*who\s+are\s+you\s*[?!.\s]*$/i,
+	/^\s*what\s+are\s+you\s*[?!.\s]*$/i,
+];
+
+function localIdentityResponse(text, promptParts = undefined) {
+	if (typeof text !== "string") return undefined;
+	if (Array.isArray(promptParts) && promptParts.some((part) => part?.type !== "text")) return undefined;
+	if (!IDENTITY_PROMPT_MATCHERS.some((matcher) => matcher.test(text))) return undefined;
+	return "I’m cc, a CLI that helps you switch between agent backends and manage the surrounding TUI/workflow.";
+}
+
 const PLAN_FALLBACK_INSTRUCTION =
 	"Work in planning mode. Do not modify files or run state-changing commands. Analyze the request and produce a concrete, actionable plan.";
 const chalk = createAnsiStyles();
@@ -1797,6 +1809,20 @@ export class BtwThread {
 		this.state = "working";
 		this.statusState = "working";
 		this.app.onThreadActivity();
+		const localIdentity = localIdentityResponse(text, promptParts);
+		if (localIdentity) {
+			this.appendAssistantText(localIdentity);
+			this.closeCurrentAssistantText();
+			this.busy = false;
+			this.state = "done";
+			this.statusState = "";
+			this.app.onThreadActivity();
+			// submit() and drainQueue() already rendered the user message. Continue
+			// the same FIFO drain a backend turn's finally block performs so a local
+			// response cannot strand prompts queued behind it.
+			if (this.app.btwThread === this && this.client && !this.client.exited) this.drainQueue();
+			return;
+		}
 		const echo = this.trackUserEcho(text);
 		let backendText = text;
 		let backendParts = promptParts;
@@ -4779,6 +4805,11 @@ export class HarnessApp {
 		this.updateSpinner();
 		this.ui.requestRender();
 		try {
+			const localIdentity = localIdentityResponse(text, options.promptParts);
+			if (localIdentity) {
+				this.appendAssistantText(localIdentity);
+				return;
+			}
 			let backendText = text;
 			let backendParts = options.promptParts;
 			if (
@@ -15817,3 +15848,5 @@ if (isDirectRun()) {
 function isDirectRun() {
 	return process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 }
+
+export { localIdentityResponse };

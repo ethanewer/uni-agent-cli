@@ -222,6 +222,35 @@ await (async () => {
 	await Promise.resolve();
 	assert.deepEqual(missingClient.prompts, ["missing first"]);
 	assert.deepEqual(missingClient.thread.queue.map((entry) => entry.text), ["missing second"]);
+
+	const identityQueued = makeThread();
+	const identityFirstTurn = identityQueued.thread.submit("identity first");
+	await Promise.resolve();
+	await identityQueued.thread.submit("who are you?");
+	await identityQueued.thread.submit("after identity");
+	identityQueued.releaseFirst({ stopReason: "end_turn" });
+	await identityFirstTurn;
+	for (let tick = 0; tick < 4; tick += 1) await Promise.resolve();
+	assert.deepEqual(
+		identityQueued.prompts,
+		["identity first", "after identity"],
+		"the local identity response does not reach the backend and drains the next queued prompt",
+	);
+	assert.deepEqual(identityQueued.thread.queue, []);
+	assert.deepEqual(identityQueued.thread.pendingUserEchoes, []);
+	const identityTranscript = identityQueued.thread.chat.render(200).join("\n");
+	assert.equal(identityTranscript.match(/who are you\?/giu)?.length, 1, "the queued identity question is rendered once");
+	assert.equal(identityTranscript.match(/I’m cc/gu)?.length, 1, "the local identity response is rendered once");
+
+	const structuredIdentity = makeThread();
+	const structuredParts = [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }];
+	structuredIdentity.app.promptForActiveCapabilities = (_text, parts) => parts;
+	structuredIdentity.client.prompt = async (prompt) => {
+		structuredIdentity.prompts.push(prompt);
+		return { stopReason: "end_turn" };
+	};
+	await structuredIdentity.thread.submit("who are you?", structuredParts);
+	assert.deepEqual(structuredIdentity.prompts, [structuredParts], "a structured side identity prompt reaches the backend intact");
 })();
 
 // A dead side backend no longer owns autocomplete. Keeping its last advertised
@@ -2614,6 +2643,36 @@ await (async () => {
 	settleOldSend();
 	await pending;
 	assert.equal(flushes, 0);
+})();
+
+// Identity questions use the same local response in the primary conversation
+// and preserve the normal transcript/echo/queue lifecycle.
+await (async () => {
+	const { app, prompts } = unsendHarness();
+	app.client.prompt = async (prompt) => {
+		prompts.push(prompt);
+		return { stopReason: "end_turn" };
+	};
+	app.promptQueue.push({ text: "after identity", timing: "afterTurn" });
+	await app.submitBackendPrompt("who are you?");
+	assert.deepEqual(prompts, ["after identity"], "the identity question stays local and the following prompt reaches the backend");
+	assert.equal(app.busy, false);
+	assert.deepEqual(app.pendingUserEchoes, []);
+	assert.equal(app.pendingUnsendPrompt, undefined);
+	assert.equal(app.lastAssistantText, "I’m cc, a CLI that helps you switch between agent backends and manage the surrounding TUI/workflow.");
+	const transcript = app.chat.children.flatMap((child) => child.render?.(200) ?? []).join("\n");
+	assert.equal(transcript.match(/who are you\?/giu)?.length, 1, "the main identity question is rendered once");
+	assert.equal(transcript.match(/I’m cc/gu)?.length, 1, "the main identity response is rendered once");
+
+	const structured = unsendHarness();
+	const structuredParts = [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }];
+	structured.app.promptForActiveCapabilities = (_text, parts) => parts;
+	structured.app.client.prompt = async (prompt) => {
+		structured.prompts.push(prompt);
+		return { stopReason: "end_turn" };
+	};
+	await structured.app.submitBackendPrompt("who are you?", { promptParts: structuredParts });
+	assert.deepEqual(structured.prompts, [structuredParts], "a structured main identity prompt reaches the backend intact");
 })();
 
 {

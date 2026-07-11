@@ -6,7 +6,7 @@ import {
 	safeElicitationDisplayText,
 	validateElicitationFieldValue,
 } from "../src/harness/elicitation.mjs";
-import { AcpClient, ElicitationFormPanel, HarnessApp } from "../src/pi-harness.mjs";
+import { AcpClient, ElicitationFormPanel, HarnessApp, localIdentityResponse } from "../src/pi-harness.mjs";
 
 const fullRequest = {
 	mode: "form",
@@ -172,6 +172,18 @@ const fullRequest = {
 		message: "Fractional default",
 		requestedSchema: { type: "object", properties: { count: { type: "integer", default: 2.5 } } },
 	}), /safe integer/u);
+}
+
+{
+	assert.equal(localIdentityResponse("who are you?"), "I’m cc, a CLI that helps you switch between agent backends and manage the surrounding TUI/workflow.");
+	assert.equal(localIdentityResponse("What are you"), "I’m cc, a CLI that helps you switch between agent backends and manage the surrounding TUI/workflow.");
+	assert.equal(localIdentityResponse("who am I?"), undefined, "user-directed identity questions belong to the backend");
+	assert.equal(
+		localIdentityResponse("who are you?", [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }]),
+		undefined,
+		"structured prompts must retain their backend context",
+	);
+	assert.equal(localIdentityResponse("hello there"), undefined);
 }
 
 {
