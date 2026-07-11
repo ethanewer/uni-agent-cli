@@ -10191,6 +10191,14 @@ export class HarnessApp {
 		return true;
 	}
 
+	async copyAuthenticationUrl(url) {
+		await writeSecretClipboardText(url);
+	}
+
+	async openAuthenticationUrl(url) {
+		await openExternalUrl(url, this.trackedNativeProcessOptions());
+	}
+
 	openCursorInteraction(request) {
 		const { method, params, resolve } = request;
 		const finish = (result) => {
@@ -10289,10 +10297,11 @@ export class HarnessApp {
 			}
 			if (entry?.value === "copy") {
 				try {
-					await writeSecretClipboardText(params.url);
+					await this.copyAuthenticationUrl(params.url);
 					this.addNotice("Copied the authentication URL. Treat it as a secret until sign-in completes.");
 				} catch {
-					this.addNotice(`Open this authentication URL manually (it may contain a secret): ${singleLineMenuText(params.url)}`);
+					this.addError("Could not copy the authentication URL. Choose another option, retry, or press Esc to cancel.");
+					return;
 				}
 				finish({ action: "accept" });
 				return;
@@ -10303,13 +10312,12 @@ export class HarnessApp {
 			}
 			opening = true;
 			try {
-				await openExternalUrl(params.url, this.trackedNativeProcessOptions());
+				await this.openAuthenticationUrl(params.url);
 				finish({ action: "accept" });
-			} catch (error) {
-				if (!settled) this.addError(`Could not open authentication page: ${error.message ?? error}`);
+			} catch {
 				if (!settled) {
-					this.addNotice(`Open this authentication URL manually (it may contain a secret): ${singleLineMenuText(params.url)}`);
-					finish({ action: "accept" });
+					opening = false;
+					this.addError("Could not open the authentication page. Choose the copy option, retry, or press Esc to cancel.");
 				}
 			}
 		});

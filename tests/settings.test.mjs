@@ -5468,6 +5468,95 @@ await (async () => {
 	assert.equal(app.permissionPromptActive, false);
 })();
 
+// Failed authentication URL delivery never prints or acknowledges the secret.
+// The same picker stays live so the user can retry or cancel explicitly.
+await (async () => {
+	const secretUrl = "https://example.test/auth?token=one-time-copy-secret";
+	let select;
+	let pickerEntries;
+	let copyAttempts = 0;
+	let copyShouldFail = true;
+	let closed = 0;
+	let drained = 0;
+	const results = [];
+	const messages = [];
+	const app = Object.create(HarnessApp.prototype);
+	app.permissionPromptActive = true;
+	app.closeMenu = () => { closed += 1; };
+	app.drainPermissionQueue = () => { drained += 1; };
+	app.addError = (message) => messages.push(message);
+	app.addNotice = (message) => messages.push(message);
+	app.copyAuthenticationUrl = async (url) => {
+		assert.equal(url, secretUrl);
+		copyAttempts += 1;
+		if (copyShouldFail) throw new Error(`clipboard rejected ${secretUrl}`);
+	};
+	app.openSelection = (_title, entries, callback) => {
+		pickerEntries = entries;
+		select = callback;
+	};
+	app.openElicitationRequest({
+		params: { mode: "url", message: "Sign in", url: secretUrl },
+		resolve: (result) => results.push(result),
+	});
+	assert.doesNotMatch(JSON.stringify(pickerEntries), /one-time-copy-secret/u);
+	await select({ value: "copy" });
+	assert.equal(copyAttempts, 1);
+	assert.deepEqual(results, [], "a failed clipboard write is not acknowledged");
+	assert.equal(closed, 0, "the picker remains open after a failed clipboard write");
+	assert.equal(drained, 0);
+	assert.equal(app.permissionPromptActive, true);
+	assert.doesNotMatch(messages.join("\n"), /one-time-copy-secret|https:\/\//u);
+	copyShouldFail = false;
+	await select({ value: "copy" });
+	assert.equal(copyAttempts, 2);
+	assert.deepEqual(results, [{ action: "accept" }]);
+	assert.equal(closed, 1);
+	assert.equal(drained, 1);
+	assert.equal(app.permissionPromptActive, false);
+})();
+
+await (async () => {
+	const secretUrl = "https://example.test/auth?token=one-time-browser-secret";
+	let select;
+	let openAttempts = 0;
+	let openShouldFail = true;
+	let closed = 0;
+	let drained = 0;
+	const results = [];
+	const messages = [];
+	const app = Object.create(HarnessApp.prototype);
+	app.permissionPromptActive = true;
+	app.closeMenu = () => { closed += 1; };
+	app.drainPermissionQueue = () => { drained += 1; };
+	app.addError = (message) => messages.push(message);
+	app.addNotice = (message) => messages.push(message);
+	app.openAuthenticationUrl = async (url) => {
+		assert.equal(url, secretUrl);
+		openAttempts += 1;
+		if (openShouldFail) throw new Error(`browser rejected ${secretUrl}`);
+	};
+	app.openSelection = (_title, _entries, callback) => { select = callback; };
+	app.openElicitationRequest({
+		params: { mode: "url", message: "Sign in", url: secretUrl },
+		resolve: (result) => results.push(result),
+	});
+	await select({ value: "open" });
+	assert.equal(openAttempts, 1);
+	assert.deepEqual(results, [], "a failed browser launch is not acknowledged");
+	assert.equal(closed, 0, "the picker remains open after a failed browser launch");
+	assert.equal(drained, 0);
+	assert.equal(app.permissionPromptActive, true);
+	assert.doesNotMatch(messages.join("\n"), /one-time-browser-secret|https:\/\//u);
+	openShouldFail = false;
+	await select({ value: "open" });
+	assert.equal(openAttempts, 2, "the browser option can be retried after failure");
+	assert.deepEqual(results, [{ action: "accept" }]);
+	assert.equal(closed, 1);
+	assert.equal(drained, 1);
+	assert.equal(app.permissionPromptActive, false);
+})();
+
 // Esc still settles an elicitation while the browser opener is in flight. An
 // unsupported scheme gives this test an async rejection without launching an
 // external application.
