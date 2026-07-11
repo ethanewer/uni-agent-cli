@@ -9,8 +9,24 @@ import { createAdapter } from "./registry.mjs";
  * Build the host bundle cc passes to an adapter. cc owns rendering + the
  * permission/interaction UI; the adapter calls back into these.
  */
-export function createAdapterHost({ onEvent, requestPermission, requestInteraction }) {
-	return { onEvent, requestPermission, requestInteraction };
+export function createAdapterHost({
+	onEvent,
+	requestPermission,
+	requestInteraction,
+	onElicitationRequest,
+	elicitationCapabilities,
+	runTerminalAuthentication,
+	collectEnvironmentVariables,
+}) {
+	return {
+		onEvent,
+		requestPermission,
+		requestInteraction,
+		onElicitationRequest,
+		elicitationCapabilities,
+		runTerminalAuthentication,
+		collectEnvironmentVariables,
+	};
 }
 
 /** Construct + connect an adapter the way cc would (one resolution point). */

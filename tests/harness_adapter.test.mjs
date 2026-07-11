@@ -14,12 +14,19 @@
 // Run: node tests/harness_adapter.test.mjs
 
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { applyHarnessSettings } from "../src/pi-harness.mjs";
+import { applyHarnessSettings, collectEnvironmentAuthenticationVariables, loadForkParents } from "../src/pi-harness.mjs";
 import { BaseAcpAdapter } from "../src/harness/acp-base.mjs";
-import { assertAdapterConformance, checkAdapterConformance, emptyCapabilities, REQUIRED_METHODS } from "../src/harness/interface.mjs";
+import {
+	assertAdapterConformance,
+	capabilitiesFromWire,
+	checkAdapterConformance,
+	emptyCapabilities,
+	REQUIRED_METHODS,
+} from "../src/harness/interface.mjs";
 import { ADAPTER_REGISTRY, createAdapter, registerAdapter } from "../src/harness/registry.mjs";
 import { armUnsend, canUnsend, dispatchSlashCommand, openSideThread } from "../src/harness/host-example.mjs";
 
@@ -82,6 +89,10 @@ class FakeConnection {
 		this.onEvent?.({ type: "session_info", sessionInfo: this.getSessionInfo() });
 		return {};
 	}
+	async deleteSession(id) {
+		this.calls.push(["deleteSession", id]);
+		return {};
+	}
 	async forkSession(parentId) {
 		this.calls.push(["forkSession", parentId]);
 		this.sessionId = "native-fork";
@@ -96,6 +107,14 @@ class FakeConnection {
 	}
 	async setMode(id) {
 		this.calls.push(["setMode", id]);
+		return {};
+	}
+	async authenticate(methodId, meta = undefined) {
+		this.calls.push(["authenticate", methodId, meta]);
+		return {};
+	}
+	async logout() {
+		this.calls.push(["logout"]);
 		return {};
 	}
 	getSessionInfo() {
@@ -116,6 +135,9 @@ class FakeConnection {
 	emitCursor(method, params) {
 		return this.options.onCursorRequest?.(method, params);
 	}
+	emitElicitation(params) {
+		return this.options.onElicitationRequest?.(params);
+	}
 }
 
 function factoryFor(profile) {
@@ -126,7 +148,7 @@ function factoryFor(profile) {
 const PROFILES = {
 	codex: {
 		agentInfo: { name: "@agentclientprotocol/codex-acp" },
-		capabilities: { loadSession: true, sessionCapabilities: { list: {}, resume: {} }, promptCapabilities: { image: false } },
+		capabilities: { loadSession: true, sessionCapabilities: { list: {}, resume: {}, delete: {} }, promptCapabilities: { image: false } },
 		configOptions: [{ id: "model", category: "model" }, { id: "mode", category: "mode" }, { id: "thought_level", category: "thought_level" }],
 		modes: { currentModeId: "agent", availableModes: [{ id: "agent" }] },
 	},
@@ -254,18 +276,955 @@ async function main() {
 		assert.equal(checkAdapterConformance(good).ok, true);
 		ok("conformance:fork-value-validated");
 	}
+	// A deletion capability must have a matching optional method.
+	{
+		const required = {};
+		for (const m of REQUIRED_METHODS) required[m] = () => {};
+		const missing = { key: "missing-delete", label: "Missing delete", capabilities: { ...emptyCapabilities(), delete: true }, ...required };
+		const report = checkAdapterConformance(missing);
+		assert.equal(report.ok, false);
+		assert.ok(report.problems.some((problem) => problem.includes("deleteSession")));
+		const complete = { ...missing, deleteSession: () => {} };
+		assert.equal(checkAdapterConformance(complete).ok, true);
+		ok("conformance:delete-method-required");
+	}
+	// Authentication methods and logout are independently capability-gated.
+	{
+		const required = {};
+		for (const method of REQUIRED_METHODS) required[method] = () => {};
+		const authMissing = { key: "missing-auth", label: "Missing auth", capabilities: { ...emptyCapabilities(), auth: true }, ...required };
+		assert.ok(checkAdapterConformance(authMissing).problems.some((problem) => problem.includes("authenticate")));
+		const logoutMissing = { key: "missing-logout", label: "Missing logout", capabilities: { ...emptyCapabilities(), logout: true }, ...required };
+		assert.ok(checkAdapterConformance(logoutMissing).problems.some((problem) => problem.includes("logout")));
+		assert.equal(checkAdapterConformance({ ...authMissing, authenticate: () => {} }).ok, true);
+		assert.equal(checkAdapterConformance({ ...logoutMissing, logout: () => {} }).ok, true);
+		ok("conformance:authentication-methods-required");
+	}
 
 	// =====================================================================
 	// (2a) NO FEATURES LOST — capability gating matches the audit.
 	// =====================================================================
+	assert.equal(
+		capabilitiesFromWire({ capabilities: { mcpCapabilities: { http: false, sse: false, acp: false } } }).mcp,
+		true,
+		"an all-false optional-transport descriptor still supports baseline stdio MCP",
+	);
+	assert.equal(
+		capabilitiesFromWire({ capabilities: {} }).mcp,
+		true,
+		"omitting the optional-transport descriptor still supports baseline stdio MCP",
+	);
+	ok("capabilities:mcp-stdio-baseline");
+	{
+		const wire = capabilitiesFromWire({
+			capabilities: { auth: { logout: {} } },
+			authMethods: [{ id: "browser", name: "Browser" }],
+		});
+		assert.equal(wire.auth, true);
+		assert.equal(wire.logout, true);
+		assert.equal(capabilitiesFromWire({ capabilities: { auth: {} }, authMethods: [] }).logout, false);
+		ok("capabilities:auth-and-logout-negotiated-separately");
+	}
+	{
+		const adapter = new BaseAcpAdapter("auth", { label: "Auth", acp: { command: "auth-agent" } }, noopHost(), {
+			connectionFactory: factoryFor({
+				capabilities: { auth: { logout: {} } },
+				authMethods: [{ id: "browser", name: "Browser" }],
+			}),
+		});
+		await adapter.connect();
+		assert.equal(adapter.capabilities.auth, true);
+		assert.equal(adapter.capabilities.logout, true);
+		await adapter.authenticate("browser", { test: true });
+		const authenticatedConnection = adapter.connection;
+		await adapter.logout();
+		assert.deepEqual(authenticatedConnection.calls, [
+			["authenticate", "browser", { test: true }],
+			["logout"],
+			["stop"],
+		]);
+		assert.notEqual(adapter.connection, authenticatedConnection, "logout retires the ACP process even without environment credentials");
+		assert.equal(adapter.connection.sessionId, undefined, "the signed-out replacement starts without a session");
+		ok("base-adapter:authentication-forwarding");
+	}
+	{
+		const connections = [];
+		const apiKeyMethod = { id: "api-key", name: "API Key" };
+		const adapter = new BaseAcpAdapter(
+			"codex",
+			{
+				label: "Codex API auth",
+				env: { CODEX_API_KEY: "configured-key" },
+				acp: { command: "auth-agent" },
+			},
+			noopHost(),
+			{
+				connectionFactory(agent, onEvent, options) {
+					const connection = new FakeConnection(agent, onEvent, options, {
+						capabilities: { auth: { logout: {} } },
+						agentInfo: { name: "@agentclientprotocol/codex-acp" },
+						authMethods: [apiKeyMethod],
+					});
+					connections.push(connection);
+					return connection;
+				},
+			},
+		);
+		await adapter.connect();
+		await adapter.logout();
+		assert.equal(connections.length, 2, "configured API credentials force a credential-free replacement");
+		assert.deepEqual(
+			new Set(adapter.launchSpec._signedOutAuthEnvNames),
+			new Set(["CODEX_API_KEY", "OPENAI_API_KEY"]),
+		);
+		await adapter.authenticate("api-key");
+		assert.deepEqual(connections[1].calls[0], [
+			"authenticate",
+			"api-key",
+			{ "api-key": { apiKey: "configured-key" } },
+		]);
+		assert.equal(Object.hasOwn(adapter.launchSpec, "_signedOutAuthEnvNames"), false);
+		ok("base-adapter:logout-mask-allows-explicit-api-key-login");
+	}
+	{
+		const connections = [];
+		const apiKeyMethod = { id: "api-key", name: "API Key" };
+		let markAuthenticationStarted;
+		let releaseAuthentication;
+		const authenticationStarted = new Promise((resolve) => { markAuthenticationStarted = resolve; });
+		const authenticationGate = new Promise((resolve) => { releaseAuthentication = resolve; });
+		const adapter = new BaseAcpAdapter(
+			"codex",
+			{
+				label: "Stale API auth",
+				env: { CODEX_API_KEY: "configured-key" },
+				acp: { command: "auth-agent" },
+			},
+			noopHost(),
+			{
+				connectionFactory(agent, onEvent, options) {
+					const connection = new FakeConnection(agent, onEvent, options, {
+						capabilities: { auth: { logout: {} } },
+						agentInfo: { name: "@agentclientprotocol/codex-acp" },
+						authMethods: [apiKeyMethod],
+					});
+					if (connections.length === 1) {
+						connection.authenticate = async function authenticate(methodId, meta = undefined) {
+							this.calls.push(["authenticate", methodId, meta]);
+							markAuthenticationStarted();
+							await authenticationGate;
+							return { authenticated: true };
+						};
+					}
+					connections.push(connection);
+					return connection;
+				},
+			},
+		);
+		await adapter.connect();
+		await adapter.logout();
+		assert.equal(connections.length, 2);
+		const staleConnection = connections[1];
+		const authentication = adapter.authenticate("api-key");
+		await authenticationStarted;
+		await adapter.logout();
+		assert.equal(connections.length, 3, "the racing logout installs a signed-out replacement");
+		const signedOutReplacement = connections[2];
+		assert.equal(adapter.connection, signedOutReplacement);
+		assert.deepEqual(
+			new Set(adapter.launchSpec._signedOutAuthEnvNames),
+			new Set(["CODEX_API_KEY", "OPENAI_API_KEY"]),
+		);
+		releaseAuthentication();
+		await assert.rejects(authentication, (error) => error?.code === "ACP_CONNECTION_REPLACED");
+		assert.equal(adapter.connection, signedOutReplacement, "stale authentication cannot replace the live connection");
+		assert.deepEqual(
+			new Set(adapter.launchSpec._signedOutAuthEnvNames),
+			new Set(["CODEX_API_KEY", "OPENAI_API_KEY"]),
+			"stale authentication cannot lift the replacement's logout mask",
+		);
+		assert.equal(staleConnection.calls.some(([name]) => name === "newSession"), false);
+		ok("base-adapter:stale-agent-authentication-cannot-undo-racing-logout");
+	}
+	{
+		const adapter = new BaseAcpAdapter(
+			"other",
+			{ env: { OPENAI_API_KEY: "must-not-leak" }, acp: { command: "other-agent" } },
+			noopHost(),
+			{ connectionFactory: factoryFor({ authMethods: [{ id: "api-key", name: "Unrelated API key" }] }) },
+		);
+		await adapter.connect();
+		await adapter.authenticate("api-key");
+		assert.deepEqual(adapter.connection.calls[0], ["authenticate", "api-key", undefined]);
+		ok("base-adapter:api-key-meta-is-codex-only");
+	}
+	{
+		const authMethod = { id: "browser", name: "Browser" };
+		let authenticated = false;
+		let connection;
+		const adapter = new BaseAcpAdapter(
+			"auth-session-recovery",
+			{ label: "Auth session recovery", acp: { command: "auth-agent" } },
+			noopHost(),
+			{
+				connectionFactory(agent, onEvent, options) {
+					connection = new FakeConnection(agent, onEvent, options, { authMethods: [authMethod] });
+					connection.newSession = async function newSession() {
+						this.calls.push(["newSession"]);
+						if (!authenticated) throw new Error("authentication required");
+						this.sessionId = "authenticated-session";
+						return { sessionId: this.sessionId };
+					};
+					connection.authenticate = async function authenticate(methodId, meta = undefined) {
+						this.calls.push(["authenticate", methodId, meta]);
+						authenticated = true;
+						return { authenticated: true };
+					};
+					return connection;
+				},
+			},
+		);
+		await assert.rejects(() => adapter.connect(), /authentication required/);
+		assert.equal(adapter.sessionId, undefined);
+		assert.equal(adapter.capabilities.auth, true, "failed initial session creation still exposes authentication");
+		assert.deepEqual(await adapter.authenticate("browser", { source: "test" }), { authenticated: true });
+		assert.equal(adapter.sessionId, "authenticated-session", "successful authentication creates the missing session");
+		await adapter.prompt([{ type: "text", text: "ready" }]);
+		assert.deepEqual(connection.calls, [
+			["newSession"],
+			["authenticate", "browser", { source: "test" }],
+			["newSession"],
+			["prompt", [{ type: "text", text: "ready" }]],
+		]);
+		ok("base-adapter:agent-authentication-recovers-missing-initial-session");
+	}
+	{
+		let markTreeStopStarted;
+		let releaseTreeStop;
+		const treeStopStarted = new Promise((resolve) => { markTreeStopStarted = resolve; });
+		const treeStopGate = new Promise((resolve) => { releaseTreeStop = resolve; });
+		let connection;
+		const adapter = new BaseAcpAdapter(
+			"awaitable-stop",
+			{ label: "Awaitable stop", acp: { command: "agent" } },
+			noopHost(),
+			{
+				connectionFactory(agent, onEvent, options) {
+					connection = new FakeConnection(agent, onEvent, options, {});
+					connection.stopAndWait = async function stopAndWait() {
+						this.calls.push(["stopAndWait:start"]);
+						markTreeStopStarted();
+						await treeStopGate;
+						this.calls.push(["stopAndWait:end"]);
+					};
+					return connection;
+				},
+			},
+		);
+		await adapter.connect();
+		let stopSettled = false;
+		const stopped = adapter.stop().then(() => { stopSettled = true; });
+		await treeStopStarted;
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(stopSettled, false, "adapter stop waits for the complete ACP process tree");
+		assert.deepEqual(connection.calls, [["stopAndWait:start"]]);
+		releaseTreeStop();
+		await stopped;
+		assert.deepEqual(connection.calls, [["stopAndWait:start"], ["stopAndWait:end"]]);
+		ok("base-adapter:stop-awaits-production-process-tree");
+	}
+	{
+		const terminalMethod = {
+			type: "terminal",
+			id: "terminal-login",
+			name: "Terminal login",
+			args: ["--login"],
+		};
+		const connections = [];
+		const terminalCalls = [];
+		const spawnedAuthenticationEnvironments = [];
+		const events = [];
+		let staleHostCalls = 0;
+		const adapter = new BaseAcpAdapter(
+			"auth",
+			{
+				label: "Auth",
+				acp: { command: "auth-agent", args: ["acp"] },
+				_sessionAuthEnv: { SERVICE_TOKEN: "stale-session-token" },
+			},
+			{
+				...noopHost(),
+				onEvent: (event) => events.push(event),
+				requestPermission: () => {
+					staleHostCalls += 1;
+					return { outcome: "cancelled" };
+				},
+				requestInteraction: () => {
+					staleHostCalls += 1;
+					return undefined;
+				},
+				onElicitationRequest: () => {
+					staleHostCalls += 1;
+					return { action: "accept" };
+				},
+				runTerminalAuthentication: async (launchSpec, method, context) => {
+					terminalCalls.push({ launchSpec, method, context });
+				},
+			},
+			{
+				connectionFactory(agent, onEvent, options) {
+					spawnedAuthenticationEnvironments.push(
+						Object.hasOwn(agent, "_sessionAuthEnv") ? { ...agent._sessionAuthEnv } : undefined,
+					);
+					const connection = new FakeConnection(agent, onEvent, options, { authMethods: [terminalMethod] });
+					connections.push(connection);
+					return connection;
+				},
+			},
+		);
+		await adapter.connect({ createSession: false });
+		await adapter.authenticate("terminal-login", { source: "test" });
+		assert.equal(terminalCalls.length, 1);
+		assert.equal(terminalCalls[0].launchSpec, adapter.launchSpec);
+		assert.equal(terminalCalls[0].method, terminalMethod);
+		assert.equal(terminalCalls[0].context.adapter, adapter);
+		assert.deepEqual(terminalCalls[0].context.meta, { source: "test" });
+		assert.equal(connections.length, 2, "terminal authentication reconnects the ACP process");
+		assert.deepEqual(
+			spawnedAuthenticationEnvironments,
+			[{ SERVICE_TOKEN: "stale-session-token" }, undefined],
+			"terminal authentication replaces any prior session-only environment",
+		);
+		assert.equal(Object.hasOwn(adapter.launchSpec, "_sessionAuthEnv"), false);
+		assert.deepEqual(connections[0].calls, [["stop"]]);
+		assert.equal(connections[1].calls.some(([name]) => name === "authenticate"), false);
+		connections[1].onEvent({ type: "text", text: "live" });
+		connections[0].onEvent({ type: "text", text: "stale" });
+		assert.deepEqual(events, [{ type: "text", text: "live" }]);
+		assert.deepEqual(await connections[0].emitPermission({}), { outcome: "cancelled" });
+		await connections[0].emitCursor("cursor/create_plan", {});
+		assert.deepEqual(await connections[0].emitElicitation({ mode: "url" }), { action: "cancel" });
+		assert.equal(staleHostCalls, 0, "stopped adapter connections cannot reach host callbacks");
+		ok("base-adapter:terminal-authentication-is-client-run");
+	}
+	{
+		const terminalMethod = {
+			type: "terminal",
+			id: "terminal-login",
+			name: "Terminal login",
+		};
+		const connections = [];
+		const spawnedAuthenticationEnvironments = [];
+		const adapter = new BaseAcpAdapter(
+			"terminal-auth-retirement-failure",
+			{
+				label: "Terminal auth retirement failure",
+				acp: { command: "auth-agent" },
+				_sessionAuthEnv: { SERVICE_TOKEN: "stale-session-token" },
+			},
+			{
+				...noopHost(),
+				runTerminalAuthentication: async () => {},
+			},
+			{
+				connectionFactory(agent, onEvent, options) {
+					spawnedAuthenticationEnvironments.push(
+						Object.hasOwn(agent, "_sessionAuthEnv") ? { ...agent._sessionAuthEnv } : undefined,
+					);
+					const connection = new FakeConnection(agent, onEvent, options, { authMethods: [terminalMethod] });
+					if (connections.length === 0) {
+						connection.stop = function stop() {
+							this.calls.push(["stop"]);
+							throw new Error("recoverable retirement failure");
+						};
+					}
+					connections.push(connection);
+					return connection;
+				},
+			},
+		);
+		await adapter.connect();
+		await assert.rejects(() => adapter.authenticate("terminal-login"), /recoverable retirement failure/);
+		assert.equal(
+			Object.hasOwn(adapter.launchSpec, "_sessionAuthEnv"),
+			false,
+			"a failed old-process retirement cannot restore the stale terminal-auth environment",
+		);
+		await adapter.connect({ createSession: false });
+		assert.deepEqual(spawnedAuthenticationEnvironments, [{ SERVICE_TOKEN: "stale-session-token" }, undefined]);
+		assert.equal(adapter.connection, connections[1]);
+		ok("base-adapter:terminal-auth-clears-stale-env-before-recoverable-retirement");
+	}
+	{
+		const terminalMethod = {
+			type: "terminal",
+			id: "terminal-login",
+			name: "Terminal login",
+			args: ["--login"],
+		};
+		const connections = [];
+		let markAuthenticationStarted;
+		let markAuthenticationStopStarted;
+		let releaseAuthenticationStop;
+		const authenticationStarted = new Promise((resolve) => { markAuthenticationStarted = resolve; });
+		const authenticationStopStarted = new Promise((resolve) => { markAuthenticationStopStarted = resolve; });
+		const authenticationStopGate = new Promise((resolve) => { releaseAuthenticationStop = resolve; });
+		let terminalContext;
+		const adapter = new BaseAcpAdapter(
+			"terminal-auth-stop-race",
+			{ label: "Terminal auth stop race", acp: { command: "auth-agent" } },
+			{
+				...noopHost(),
+				runTerminalAuthentication: async (_launchSpec, _method, context) => {
+					terminalContext = context;
+					context.processTracker.assertOpen();
+					context.processTracker.register(async () => {
+						markAuthenticationStopStarted();
+						await authenticationStopGate;
+					});
+					markAuthenticationStarted();
+					await new Promise((resolve, reject) => {
+						context.signal.addEventListener("abort", () => reject(context.signal.reason), { once: true });
+					});
+				},
+			},
+			{
+				connectionFactory(agent, onEvent, options) {
+					const connection = new FakeConnection(agent, onEvent, options, { authMethods: [terminalMethod] });
+					connections.push(connection);
+					return connection;
+				},
+			},
+		);
+		await adapter.connect();
+		const authentication = adapter.authenticate("terminal-login");
+		await authenticationStarted;
+		const stopped = adapter.stop();
+		assert.equal(adapter.stop(), stopped, "stop is idempotent and exposes one awaitable shutdown");
+		await authenticationStopStarted;
+		const rejected = assert.rejects(authentication, (error) => {
+			assert.equal(error?.code, "ADAPTER_STOPPED");
+			return true;
+		});
+		let stopSettled = false;
+		void stopped.then(() => { stopSettled = true; });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(terminalContext.signal.aborted, true, "stop aborts active terminal authentication");
+		assert.equal(stopSettled, false, "stop waits for the terminal authentication process tree");
+		releaseAuthenticationStop();
+		await Promise.all([stopped, rejected]);
+		assert.equal(connections.length, 1, "terminal authentication cannot reconnect after stop starts");
+		assert.equal(adapter.connection, undefined);
+		assert.deepEqual(connections[0].calls, [["stop"]]);
+		await assert.rejects(() => adapter.connect(), (error) => error?.code === "ADAPTER_STOPPED");
+		assert.equal(connections.length, 1, "a stopped adapter cannot be connected again");
+		ok("base-adapter:stop-blocks-delayed-terminal-authentication-reconnect");
+	}
+	{
+		const envMethod = {
+			type: "env_var",
+			id: "token",
+			name: "Token",
+			vars: [{ name: "SERVICE_TOKEN" }, { name: "OPTIONAL_REGION", optional: true }],
+		};
+		const connections = [];
+		const spawnedAuthenticationEnvironments = [];
+		const textEvents = [];
+		let collected;
+		const adapter = new BaseAcpAdapter(
+			"auth",
+			{
+				label: "Auth",
+				env: { AUTH_ROOT: "root" },
+				acp: { command: "auth-agent", env: { AUTH_CHILD: "child" } },
+			},
+			{
+				...noopHost(),
+				onEvent: (event) => {
+					if (event?.type === "text") textEvents.push(event.text);
+				},
+				collectEnvironmentVariables: async (method, environment, context) => {
+					collected = { method, environment, context };
+					return { SERVICE_TOKEN: "session-secret" };
+				},
+			},
+			{
+				connectionFactory(agent, onEvent, options) {
+					spawnedAuthenticationEnvironments.push(
+						Object.hasOwn(agent, "_sessionAuthEnv") ? { ...agent._sessionAuthEnv } : undefined,
+					);
+					const connection = new FakeConnection(agent, onEvent, options, { authMethods: [envMethod] });
+					connections.push(connection);
+					return connection;
+				},
+			},
+		);
+		await adapter.connect();
+		await adapter.authenticate("token");
+		assert.equal(collected.method, envMethod);
+		assert.equal(collected.environment.AUTH_ROOT, "root");
+		assert.equal(collected.environment.AUTH_CHILD, "child");
+		assert.equal(collected.context.adapter, adapter);
+		assert.deepEqual(adapter.launchSpec._sessionAuthEnv, { SERVICE_TOKEN: "session-secret" });
+		assert.equal(connections.length, 2, "environment authentication reconnects with the session credential");
+		assert.deepEqual(connections[0].calls, [["stop"]]);
+		assert.deepEqual(spawnedAuthenticationEnvironments, [undefined, { SERVICE_TOKEN: "session-secret" }]);
+		assert.equal(connections[1].calls.some(([name]) => name === "authenticate"), false);
+		const credentialConnection = connections[1];
+		assert.deepEqual(await adapter.logout(), {});
+		assert.equal(Object.hasOwn(adapter.launchSpec, "_sessionAuthEnv"), false);
+		assert.equal(connections.length, 3, "logout replaces the credential-bearing ACP process");
+		assert.deepEqual(credentialConnection.calls, [["logout"], ["stop"]]);
+		assert.equal(adapter.connection, connections[2]);
+		assert.equal(adapter.connection.sessionId, undefined, "the signed-out replacement does not create a session");
+		assert.deepEqual(adapter.connectOptions, {}, "logout preserves the normal connection preference for a later login");
+		assert.deepEqual(spawnedAuthenticationEnvironments, [undefined, { SERVICE_TOKEN: "session-secret" }, undefined]);
+		connections[2].onEvent({ type: "text", text: "credential-free" });
+		credentialConnection.onEvent({ type: "text", text: "stale-authenticated" });
+		assert.deepEqual(textEvents, ["credential-free"], "retired authenticated callbacks stay detached");
+		ok("base-adapter:environment-authentication-is-client-run");
+	}
+	{
+		const envMethod = {
+			type: "env_var",
+			id: "token",
+			name: "Token",
+			vars: [{ name: "SERVICE_TOKEN" }],
+		};
+		const connections = [];
+		let markCollectionStarted;
+		let releaseCollection;
+		const collectionStarted = new Promise((resolve) => { markCollectionStarted = resolve; });
+		const collectionGate = new Promise((resolve) => { releaseCollection = resolve; });
+		let collectionContext;
+		const adapter = new BaseAcpAdapter(
+			"env-auth-stop-race",
+			{ label: "Environment auth stop race", acp: { command: "auth-agent" } },
+			{
+				...noopHost(),
+				collectEnvironmentVariables: async (_method, _environment, context) => {
+					collectionContext = context;
+					markCollectionStarted();
+					await collectionGate;
+					return { SERVICE_TOKEN: "too-late" };
+				},
+			},
+			{
+				connectionFactory(agent, onEvent, options) {
+					const connection = new FakeConnection(agent, onEvent, options, { authMethods: [envMethod] });
+					connections.push(connection);
+					return connection;
+				},
+			},
+		);
+		await adapter.connect();
+		const authentication = adapter.authenticate("token");
+		await collectionStarted;
+		const stopped = adapter.stop();
+		const rejected = assert.rejects(authentication, (error) => {
+			assert.equal(error?.code, "ADAPTER_STOPPED");
+			return true;
+		});
+		let stopSettled = false;
+		void stopped.then(() => { stopSettled = true; });
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(collectionContext.signal.aborted, true, "stop aborts active environment collection");
+		assert.equal(stopSettled, false, "stop waits until the environment collector has settled");
+		releaseCollection();
+		await Promise.all([stopped, rejected]);
+		assert.equal(connections.length, 1, "collected credentials cannot spawn a backend after stop starts");
+		assert.equal(Object.hasOwn(adapter.launchSpec, "_sessionAuthEnv"), false);
+		assert.equal(adapter.connection, undefined);
+		assert.deepEqual(connections[0].calls, [["stop"]]);
+		ok("base-adapter:stop-blocks-delayed-environment-authentication-reconnect");
+	}
+	{
+		const listeners = new Map();
+		const rawModes = [];
+		let pauseCalls = 0;
+		const input = {
+			isTTY: true,
+			isRaw: false,
+			isPaused: () => true,
+			on(name, listener) {
+				listeners.set(name, listener);
+			},
+			off(name, listener) {
+				if (listeners.get(name) === listener) listeners.delete(name);
+			},
+			setRawMode(value) {
+				rawModes.push(value);
+			},
+			resume() {},
+			pause() {
+				pauseCalls += 1;
+			},
+		};
+		const output = { isTTY: true, write() {} };
+		const controller = new AbortController();
+		const stoppedError = new Error("adapter stopped");
+		stoppedError.code = "ADAPTER_STOPPED";
+		const collection = collectEnvironmentAuthenticationVariables(
+			{ type: "env_var", vars: [{ name: "SERVICE_TOKEN", secret: true }] },
+			{},
+			{ input, output, signal: controller.signal },
+		);
+		await new Promise((resolve) => setImmediate(resolve));
+		assert.equal(listeners.has("data"), true, "the built-in collector is waiting on terminal input");
+		controller.abort(stoppedError);
+		await assert.rejects(collection, (error) => error === stoppedError);
+		assert.equal(listeners.has("data"), false, "abort removes the built-in collector's input listener");
+		assert.deepEqual(rawModes, [true, false]);
+		assert.equal(pauseCalls, 1, "abort restores the input's prior paused state");
+		ok("base-adapter:built-in-environment-collector-is-abortable");
+	}
+	{
+		const envMethod = {
+			type: "env_var",
+			id: "token",
+			name: "Token",
+			vars: [{ name: "SERVICE_TOKEN" }],
+		};
+		const connections = [];
+		let markRetirementStarted;
+		let releaseRetirement;
+		const retirementStarted = new Promise((resolve) => { markRetirementStarted = resolve; });
+		const retirementGate = new Promise((resolve) => { releaseRetirement = resolve; });
+		const adapter = new BaseAcpAdapter(
+			"auth-reconnect-stop-race",
+			{ label: "Auth reconnect stop race", acp: { command: "auth-agent" } },
+			{
+				...noopHost(),
+				collectEnvironmentVariables: async () => ({ SERVICE_TOKEN: "session-secret" }),
+			},
+			{
+				connectionFactory(agent, onEvent, options) {
+					const connection = new FakeConnection(agent, onEvent, options, { authMethods: [envMethod] });
+					connection.stopAndWait = async function stopAndWait() {
+						this.calls.push(["stopAndWait:start"]);
+						markRetirementStarted();
+						await retirementGate;
+						this.calls.push(["stopAndWait:end"]);
+					};
+					connections.push(connection);
+					return connection;
+				},
+			},
+		);
+		await adapter.connect();
+		const authentication = adapter.authenticate("token");
+		await retirementStarted;
+		const stopped = adapter.stop();
+		const rejected = assert.rejects(authentication, (error) => error?.code === "ADAPTER_STOPPED");
+		releaseRetirement();
+		await Promise.all([stopped, rejected]);
+		assert.equal(connections.length, 1, "stop during old-tree retirement prevents the replacement spawn");
+		assert.equal(Object.hasOwn(adapter.launchSpec, "_sessionAuthEnv"), false);
+		assert.equal(adapter.connection, undefined);
+		assert.deepEqual(connections[0].calls, [["stopAndWait:start"], ["stopAndWait:end"]]);
+		ok("base-adapter:stop-blocks-in-progress-authentication-reconnect");
+	}
+	{
+		const envMethod = {
+			type: "env_var",
+			id: "token",
+			name: "Token",
+			vars: [{ name: "SERVICE_TOKEN" }],
+		};
+		const connections = [];
+		let releaseCredentialStop;
+		let markCredentialStopStarted;
+		const credentialStopStarted = new Promise((resolve) => { markCredentialStopStarted = resolve; });
+		const credentialStopGate = new Promise((resolve) => { releaseCredentialStop = resolve; });
+		const adapter = new BaseAcpAdapter(
+			"auth-stop-gate",
+			{ label: "Auth stop gate", acp: { command: "auth-agent" } },
+			{
+				...noopHost(),
+				collectEnvironmentVariables: async () => ({ SERVICE_TOKEN: "session-secret" }),
+			},
+			{
+				connectionFactory(agent, onEvent, options) {
+					const connection = new FakeConnection(agent, onEvent, options, { authMethods: [envMethod] });
+					if (Object.hasOwn(agent, "_sessionAuthEnv")) {
+						connection.stopAndWait = async function stopAndWait() {
+							this.calls.push(["stopAndWait:start"]);
+							markCredentialStopStarted();
+							await credentialStopGate;
+							this.calls.push(["stopAndWait:end"]);
+						};
+					}
+					connections.push(connection);
+					return connection;
+				},
+			},
+		);
+		await adapter.connect();
+		await adapter.authenticate("token");
+		assert.equal(connections.length, 2);
+		const credentialConnection = connections[1];
+		const logout = adapter.logout();
+		await credentialStopStarted;
+		assert.equal(connections.length, 2, "credential-free replacement waits for old process reaping");
+		assert.equal(adapter.connection, undefined, "credential callbacks are detached while shutdown is pending");
+		releaseCredentialStop();
+		await logout;
+		assert.equal(connections.length, 3);
+		assert.deepEqual(credentialConnection.calls.slice(-3), [
+			["logout"],
+			["stopAndWait:start"],
+			["stopAndWait:end"],
+		]);
+		ok("base-adapter:credential-process-reaped-before-logout-reconnect");
+	}
+	{
+		const envMethod = {
+			type: "env_var",
+			id: "token",
+			name: "Token",
+			vars: [{ name: "SERVICE_TOKEN" }],
+		};
+		const connections = [];
+		const adapter = new BaseAcpAdapter(
+			"auth-fatal-fence",
+			{ label: "Auth fatal fence", acp: { command: "auth-agent" } },
+			{
+				...noopHost(),
+				collectEnvironmentVariables: async () => ({ SERVICE_TOKEN: "session-secret" }),
+			},
+			{
+				connectionFactory(agent, onEvent, options) {
+					const connection = new FakeConnection(agent, onEvent, options, { authMethods: [envMethod] });
+					if (Object.hasOwn(agent, "_sessionAuthEnv")) {
+						connection.stopAndWait = async function stopAndWait() {
+							const error = new Error("credential process tree remains live");
+							error.code = "PROCESS_TREE_TERMINATION_FAILED";
+							throw error;
+						};
+					}
+					connections.push(connection);
+					return connection;
+				},
+			},
+		);
+		await adapter.connect();
+		await adapter.authenticate("token");
+		assert.equal(connections.length, 2);
+		await assert.rejects(() => adapter.logout(), /restart cc.*credential process tree remains live/);
+		assert.equal(connections.length, 2, "fatal logout stop must not create a replacement");
+		await assert.rejects(() => adapter.connect(), /restart cc.*credential process tree remains live/);
+		assert.equal(connections.length, 2, "later connect remains fenced for the adapter lifetime");
+		ok("base-adapter:fatal-process-tree-fences-future-connects");
+	}
+	{
+		const envMethod = {
+			type: "env_var",
+			id: "token",
+			name: "Token",
+			vars: [{ name: "SERVICE_TOKEN" }],
+		};
+		const connections = [];
+		const spawnedAuthenticationEnvironments = [];
+		const adapter = new BaseAcpAdapter(
+			"auth-race",
+			{ label: "Auth race", acp: { command: "auth-agent" } },
+			{
+				...noopHost(),
+				collectEnvironmentVariables: async () => ({ SERVICE_TOKEN: "racing-secret" }),
+			},
+			{
+				connectionFactory(agent, onEvent, options) {
+					spawnedAuthenticationEnvironments.push(
+						Object.hasOwn(agent, "_sessionAuthEnv") ? { ...agent._sessionAuthEnv } : undefined,
+					);
+					const connection = new FakeConnection(agent, onEvent, options, { authMethods: [envMethod] });
+					connections.push(connection);
+					return connection;
+				},
+			},
+		);
+		await adapter.connect();
+		let releaseLogout;
+		let markLogoutStarted;
+		const logoutStarted = new Promise((resolve) => { markLogoutStarted = resolve; });
+		const logoutGate = new Promise((resolve) => { releaseLogout = resolve; });
+		connections[0].logout = async function () {
+			this.calls.push(["logout"]);
+			markLogoutStarted();
+			await logoutGate;
+			return {};
+		};
+
+		const logout = adapter.logout();
+		await logoutStarted;
+		await adapter.authenticate("token");
+		const credentialConnection = connections[1];
+		assert.equal(adapter.connection, credentialConnection);
+		assert.deepEqual(spawnedAuthenticationEnvironments, [undefined, { SERVICE_TOKEN: "racing-secret" }]);
+		releaseLogout();
+		await logout;
+
+		assert.equal(Object.hasOwn(adapter.launchSpec, "_sessionAuthEnv"), false);
+		assert.equal(connections.length, 3, "racing logout reconnects after the credential-bearing replacement");
+		assert.equal(credentialConnection.calls.some(([name]) => name === "stop"), true);
+		assert.equal(adapter.connection, connections[2]);
+		assert.equal(adapter.connection.sessionId, undefined);
+		assert.deepEqual(spawnedAuthenticationEnvironments, [undefined, { SERVICE_TOKEN: "racing-secret" }, undefined]);
+		ok("base-adapter:logout-retires-racing-environment-authentication");
+	}
+	{
+		const envMethod = {
+			type: "env_var",
+			id: "token",
+			name: "Token",
+			vars: [{ name: "SERVICE_TOKEN" }],
+		};
+		const connections = [];
+		const spawnedAuthenticationEnvironments = [];
+		let credentialSequence = 0;
+		let releaseInitialStop;
+		let markInitialStopStarted;
+		const initialStopStarted = new Promise((resolve) => { markInitialStopStarted = resolve; });
+		const initialStopGate = new Promise((resolve) => { releaseInitialStop = resolve; });
+		const adapter = new BaseAcpAdapter(
+			"auth-reconnect-mutex",
+			{ label: "Auth reconnect mutex", acp: { command: "auth-agent" } },
+			{
+				...noopHost(),
+				collectEnvironmentVariables: async () => ({ SERVICE_TOKEN: `serialized-secret-${++credentialSequence}` }),
+			},
+			{
+				connectionFactory(agent, onEvent, options) {
+					spawnedAuthenticationEnvironments.push(
+						Object.hasOwn(agent, "_sessionAuthEnv") ? { ...agent._sessionAuthEnv } : undefined,
+					);
+					const connection = new FakeConnection(agent, onEvent, options, { authMethods: [envMethod] });
+					if (connections.length === 0) {
+						connection.stopAndWait = async function stopAndWait() {
+							this.calls.push(["stopAndWait:start"]);
+							markInitialStopStarted();
+							await initialStopGate;
+							this.calls.push(["stopAndWait:end"]);
+						};
+					}
+					connections.push(connection);
+					return connection;
+				},
+			},
+		);
+		await adapter.connect();
+		const first = adapter.authenticate("token");
+		const second = adapter.authenticate("token");
+		await initialStopStarted;
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		assert.equal(connections.length, 1, "a queued reconnect cannot launch while the prior tree is still stopping");
+		releaseInitialStop();
+		await Promise.all([first, second]);
+		assert.equal(connections.length, 3, "both authentication requests complete in serialized lifecycle turns");
+		assert.equal(adapter.connection, connections[2]);
+		assert.deepEqual(
+			spawnedAuthenticationEnvironments,
+			[
+				undefined,
+				{ SERVICE_TOKEN: "serialized-secret-1" },
+				{ SERVICE_TOKEN: "serialized-secret-2" },
+			],
+			"each queued reconnect launches with the credentials collected for that authentication request",
+		);
+		assert.equal(
+			connections[1].calls.some(([name]) => name === "stop"),
+			true,
+			"the second reconnect retires the first replacement instead of orphaning it",
+		);
+		ok("base-adapter:authentication-reconnects-are-serialized");
+	}
+	{
+		const envMethod = {
+			type: "env_var",
+			id: "token",
+			name: "Token",
+			vars: [{ name: "SERVICE_TOKEN" }],
+		};
+		const connections = [];
+		let releaseFatalStop;
+		let markFatalStopStarted;
+		const fatalStopStarted = new Promise((resolve) => { markFatalStopStarted = resolve; });
+		const fatalStopGate = new Promise((resolve) => { releaseFatalStop = resolve; });
+		const adapter = new BaseAcpAdapter(
+			"auth-reconnect-fence",
+			{ label: "Auth reconnect fence", acp: { command: "auth-agent" } },
+			{
+				...noopHost(),
+				collectEnvironmentVariables: async () => ({ SERVICE_TOKEN: "fenced-secret" }),
+			},
+			{
+				connectionFactory(agent, onEvent, options) {
+					const connection = new FakeConnection(agent, onEvent, options, { authMethods: [envMethod] });
+					connection.stopAndWait = async function stopAndWait() {
+						markFatalStopStarted();
+						await fatalStopGate;
+						const error = new Error("old authentication process tree remains live");
+						error.code = "PROCESS_TREE_TERMINATION_FAILED";
+						throw error;
+					};
+					connections.push(connection);
+					return connection;
+				},
+			},
+		);
+		await adapter.connect();
+		const first = adapter.authenticate("token");
+		const second = adapter.authenticate("token");
+		await fatalStopStarted;
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		assert.equal(connections.length, 1);
+		releaseFatalStop();
+		const outcomes = await Promise.allSettled([first, second]);
+		assert.deepEqual(outcomes.map((outcome) => outcome.status), ["rejected", "rejected"]);
+		assert.equal(connections.length, 1, "a queued reconnect cannot bypass a fatal lifecycle fence");
+		assert.equal(adapter.connection, undefined);
+		assert.ok(adapter.replacementProcessFence);
+		ok("base-adapter:fatal-reconnect-fence-blocks-concurrent-authentication");
+	}
+	{
+		const requests = [];
+		const params = { mode: "url", url: "https://example.test/sign-in" };
+		const adapter = new BaseAcpAdapter(
+			"elicitation",
+			{ label: "Elicitation", acp: { command: "agent" } },
+			{
+				...noopHost(),
+				elicitationCapabilities: { url: true, form: true },
+				onElicitationRequest: async (request) => {
+					requests.push(request);
+					return { action: "accept" };
+				},
+			},
+			{ connectionFactory: factoryFor({}) },
+		);
+		await adapter.connect();
+		assert.deepEqual(await adapter.connection.emitElicitation(params), { action: "accept" });
+		assert.deepEqual(requests, [params]);
+		assert.deepEqual(adapter.connection.options.elicitationCapabilities, { url: true, form: true });
+
+		const withoutHandler = new BaseAcpAdapter(
+			"elicitation",
+			{ label: "Elicitation", acp: { command: "agent" } },
+			noopHost(),
+			{ connectionFactory: factoryFor({}) },
+		);
+		await withoutHandler.connect();
+		assert.equal(withoutHandler.connection.options.onElicitationRequest, undefined);
+		ok("base-adapter:elicitation-handler-wired-only-when-supported");
+	}
 	const EXPECTED = {
-		codex: { fork: "copy", resume: true, sessionList: true, models: true, modes: true, reasoningEffort: true, image: false, retractPrompt: true, interactiveRequests: false },
-		claude: { fork: "native", resume: true, sessionList: true, models: false, modes: true, reasoningEffort: false, image: true, retractPrompt: false, interactiveRequests: false },
-		cursor: { fork: false, resume: false, sessionList: false, models: true, modes: true, reasoningEffort: false, image: true, retractPrompt: false, interactiveRequests: true },
-		"terminus-2": { fork: false, resume: false, sessionList: false, models: false, modes: true, reasoningEffort: false, image: false, retractPrompt: false, interactiveRequests: false },
-		"mini-swe-agent": { fork: false, resume: false, sessionList: false, models: false, modes: false, reasoningEffort: false, image: false, retractPrompt: false, interactiveRequests: false },
-		opencode: { fork: "native", resume: true, sessionList: true, models: true, modes: true, reasoningEffort: false, image: true, retractPrompt: false, interactiveRequests: false, mcp: true },
-		pi: { fork: false, resume: true, sessionList: true, models: true, modes: true, reasoningEffort: false, image: true, retractPrompt: false, interactiveRequests: false },
+		codex: { fork: "copy", resume: true, sessionList: true, delete: true, models: true, modes: true, reasoningEffort: true, image: false, retractPrompt: true, interactiveRequests: false },
+		claude: { fork: "native", resume: true, sessionList: true, delete: false, models: false, modes: true, reasoningEffort: false, image: true, retractPrompt: false, interactiveRequests: false },
+		cursor: { fork: false, resume: false, sessionList: false, delete: false, models: true, modes: true, reasoningEffort: false, image: true, retractPrompt: false, interactiveRequests: true },
+		"terminus-2": { fork: false, resume: false, sessionList: false, delete: false, models: false, modes: true, reasoningEffort: false, image: false, retractPrompt: false, interactiveRequests: false },
+		"mini-swe-agent": { fork: false, resume: false, sessionList: false, delete: false, models: false, modes: false, reasoningEffort: false, image: false, retractPrompt: false, interactiveRequests: false },
+		opencode: { fork: "native", resume: true, sessionList: true, delete: false, models: true, modes: true, reasoningEffort: false, image: true, retractPrompt: false, interactiveRequests: false, mcp: true },
+		pi: { fork: false, resume: true, sessionList: true, delete: false, models: true, modes: true, reasoningEffort: false, image: true, retractPrompt: false, interactiveRequests: false },
 	};
 	for (const [key, expected] of Object.entries(EXPECTED)) {
 		const adapter = createAdapter(key, CONFIGS[key], noopHost(), { connectionFactory: factoryFor(PROFILES[key]) });
@@ -279,6 +1238,18 @@ async function main() {
 	assert.deepEqual(createAdapter("codex", CONFIGS.codex, noopHost(), { connectionFactory: factoryFor(PROFILES.codex) }).capabilities.commandPresets, ["review"]);
 	assert.deepEqual(createAdapter("terminus-2", CONFIGS["terminus-2"], noopHost(), { connectionFactory: factoryFor(PROFILES["terminus-2"]) }).capabilities.commandPresets, []);
 	ok("capabilities:commandPresets");
+	// session/delete is wire-derived and forwarded without backend-specific code.
+	{
+		const codex = createAdapter("codex", CONFIGS.codex, noopHost(), { connectionFactory: factoryFor(PROFILES.codex) });
+		await codex.connect();
+		assert.equal(codex.capabilities.delete, true);
+		await codex.deleteSession("doomed-session");
+		assert.deepEqual(codex.connection.calls.at(-1), ["deleteSession", "doomed-session"]);
+		const cursor = createAdapter("cursor", CONFIGS.cursor, noopHost(), { connectionFactory: factoryFor(PROFILES.cursor) });
+		await cursor.connect();
+		assert.equal(cursor.capabilities.delete, false);
+		ok("sessions:delete-wire-derived-and-forwarded");
+	}
 	// pre-connect capabilities expose the DECLARED subset (contract): codex unsend is
 	// declared true before connect, then narrowed to the live wire identity after.
 	{
@@ -425,31 +1396,62 @@ async function main() {
 	// codex copy-fork end-to-end against a temp $CODEX_HOME (no real codex).
 	{
 		const prevHome = process.env.CODEX_HOME;
+		const prevForks = process.env.CC_FORKS;
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-codex-fork-"));
 		try {
-			process.env.CODEX_HOME = dir;
+			delete process.env.CODEX_HOME;
+			process.env.CC_FORKS = path.join(dir, "forks.json");
 			const parentId = "11111111-1111-1111-1111-111111111111";
 			const day = path.join(dir, "sessions", "2026", "06", "23");
 			fs.mkdirSync(day, { recursive: true });
 			const rollout = path.join(day, `rollout-2026-06-23T12-00-00-${parentId}.jsonl`);
-			fs.writeFileSync(rollout, `${JSON.stringify({ thread_id: parentId, type: "meta" })}\n${JSON.stringify({ thread_id: parentId, type: "msg" })}\n`);
+			fs.writeFileSync(
+				rollout,
+				`${JSON.stringify({ type: "session_meta", payload: { id: parentId, session_id: parentId } })}\n` +
+					`${JSON.stringify({ type: "msg", text: `literal ${parentId}` })}\n`,
+			);
 
-			const codex = createAdapter("codex", CONFIGS.codex, noopHost(), { connectionFactory: factoryFor(PROFILES.codex) });
+			const codexConfig = {
+				...CONFIGS.codex,
+				env: { ...(CONFIGS.codex.env ?? {}), CODEX_HOME: dir },
+			};
+			const codex = createAdapter("codex", codexConfig, noopHost(), { connectionFactory: factoryFor(PROFILES.codex) });
+			assert.equal(codex.codexEnvironment().CODEX_HOME, dir, "adapter storage helpers honor configured CODEX_HOME");
 			await codex.connect({ createSession: false });
 			assert.equal(codex.capabilities.fork, "copy");
 			await codex.fork(parentId);
 			// loadSession set the session id to the new (copied) uuid.
 			assert.notEqual(codex.sessionId, parentId);
 			assert.match(codex.sessionId, /^[0-9a-f-]{36}$/);
-			// the copy exists, named with the new id, with the id rewritten inside.
+			// The copy exists, named with the new id, with metadata rewritten while
+			// transcript content remains byte-for-byte faithful.
 			const copied = path.join(day, `rollout-2026-06-23T12-00-00-${codex.sessionId}.jsonl`);
 			assert.ok(fs.existsSync(copied), "copied rollout exists");
-			const copiedText = fs.readFileSync(copied, "utf8");
-			assert.ok(copiedText.includes(codex.sessionId) && !copiedText.includes(parentId), "ids rewritten in copy");
+			const copiedRecords = fs.readFileSync(copied, "utf8").trimEnd().split("\n").map(JSON.parse);
+			assert.equal(copiedRecords[0].payload.id, codex.sessionId);
+			assert.equal(copiedRecords[0].payload.session_id, codex.sessionId);
+			assert.equal(copiedRecords[0].payload.forked_from_id, parentId);
+			assert.equal(copiedRecords[1].text, `literal ${parentId}`);
+			assert.equal(loadForkParents().get(codex.sessionId), parentId);
+			const dbPath = path.join(dir, "state_5.sqlite");
+			const sqlPath = copied.replaceAll("'", "''");
+			const sqlite = spawnSync("sqlite3", [dbPath, [
+				"create table threads (id text, rollout_path text, updated_at integer, updated_at_ms integer,",
+				"has_user_event integer, archived integer, tokens_used integer, title text,",
+				"first_user_message text, preview text, model text, reasoning_effort text);",
+				`insert into threads values ('${codex.sessionId}', '${sqlPath}', 1, 1000, 1, 0, 0, 'fork', '', '', 'gpt', 'high');`,
+			].join(" ")], { encoding: "utf8" });
+			if (!sqlite.error && sqlite.status === 0) {
+				const snapshot = codex.snapshotRetractionState();
+				assert.equal(snapshot?.sessionId, codex.sessionId, "unsend snapshots use configured CODEX_HOME");
+				assert.equal(codex.canRetract(snapshot), true);
+			}
 			ok("fork:codex-copy-e2e");
 		} finally {
 			if (prevHome === undefined) delete process.env.CODEX_HOME;
 			else process.env.CODEX_HOME = prevHome;
+			if (prevForks === undefined) delete process.env.CC_FORKS;
+			else process.env.CC_FORKS = prevForks;
 			fs.rmSync(dir, { recursive: true, force: true });
 		}
 	}

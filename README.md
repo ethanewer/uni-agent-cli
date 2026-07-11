@@ -6,13 +6,13 @@ A fast, low-latency `cc` CLI for driving **Claude Code**, **Codex**, and **Curso
 
 ## Install
 
-One command (requires Node 18+ and `git`):
+One command (requires Node 20+ and `git`):
 
 ```sh
 npm install -g github:ethanewer/uni-agent-cli
 ```
 
-The post-install step installs the ACP adapters for Claude and Codex (`@agentclientprotocol/claude-agent-acp` and `@agentclientprotocol/codex-acp`) if they aren't already on your `PATH`. It also replaces the deprecated `@zed-industries/codex-acp`, which `cc` no longer supports. A failed migration restores the prior package non-destructively but reports that the maintained adapter must be installed before Codex can run. To skip adapter installation, set `CC_SKIP_ADAPTER_INSTALL=1`.
+The post-install step installs the ACP adapters for Claude and Codex (`@agentclientprotocol/claude-agent-acp` and `@agentclientprotocol/codex-acp`) if compatible versions aren't already on your `PATH`. Codex requires `@agentclientprotocol/codex-acp` 1.1.2 or newer. The installer also replaces the deprecated `@zed-industries/codex-acp`, which `cc` no longer supports. Failed installs restore the prior package non-destructively and report how to finish the upgrade. To skip adapter installation, set `CC_SKIP_ADAPTER_INSTALL=1`.
 
 Then run:
 
@@ -68,18 +68,62 @@ The harness you pick with `/harness` is remembered (written to `settings.json` a
 
 ## Slash commands
 
-Agent-advertised ACP commands appear in autocomplete and are forwarded to that backend (a backend command always takes precedence over a same-named local command, except the reserved UI commands below). `cc` implements these locally for every backend:
+Agent-advertised ACP commands appear in autocomplete and are forwarded to that backend (a backend command always takes precedence over a same-named local command, except the reserved UI commands below). This keeps Codex commands such as `/review`, `/compact`, and `/skills` available without `cc` needing to duplicate them. Bare `/mcp` and `/mcp verbose` likewise stay on the live ACP session; only the explicit management subcommands documented below are handled locally. `cc` also provides these commands:
 
-- `/new` — start a fresh ACP session and clear the visible thread.
+- `/new`, `/clear` — start a fresh ACP session and clear the visible thread.
 - `/resume` — open the session picker (when the backend supports `session/list`).
 - `/model`, `/mode`, `/effort` (aka `/reasoning`, `/thinking`) — open ACP config selectors when the backend advertises them.
-- `/plan` — switch to a Plan mode when the backend advertises one.
-- `/btw <question>` — ask an **ephemeral side question** in a transient overlay (see below).
-- `/diff` — show the working-tree git diff (`git diff HEAD`; pass args like `/diff --staged`).
+- `/config [option [value]]` — inspect or change any session option advertised by the backend, including options that do not have a dedicated command.
+- `/fast [on|off]` — toggle the advertised fast-mode option for the selected model. Bare `/fast` toggles immediately.
+- `/plan [prompt]` — switch to an advertised Plan mode, then optionally submit the inline request. The current Codex ACP adapter does not expose native collaboration mode, so `cc` clearly labels and uses a read-only, prompt-based planning fallback instead.
+- `/permissions [read-only|auto|full-access|show|clear]` — select Codex's advertised sandbox/approval preset while keeping `cc`'s host-side permission gate synchronized, or inspect/clear remembered grants.
+- `/status` — use the backend's richer status command when it advertises one; otherwise show the local session summary.
+- `/cc-status` — always show the `cc`/ACP summary (agent, model, mode, reasoning, fast mode, context usage, theme, and session id when available).
+- `/delete [session-id|name]` — permanently delete the current or supplied session after confirmation. Names are resolved for Codex and ACP backends that advertise `session/list`; other backends require a session id. Codex deletion also removes descendant sessions, and duplicate Codex names must be disambiguated with a UUID.
+- `/login [method]`, `/logout` — run the active backend's advertised ACP authentication flow without leaving `cc`. Choosing Codex's ChatGPT method may let `codex-acp` open the sign-in page directly; URL confirmation prompts in `cc` are used for MCP authorization requests.
+- `/btw <question>` (also `/side`) — ask an **ephemeral side question** in a transient overlay (see below).
+- `/diff` — show tracked and untracked working-tree changes; pass explicit git arguments such as `/diff --staged` when needed.
 - `/copy` — copy the last response to the clipboard.
 - `/voice` — return the empty input box to voice mode.
 - `/theme` — pick a color theme (persisted).
-- `/help`, `/status`, `/clear` — handled locally.
+- `/init` — ask the agent to create or improve the repository's `AGENTS.md` guidance.
+- `/help` — show every currently available local and backend command.
+- `/exit`, `/quit` — close `cc`.
+
+The following commands expose Codex CLI features that are not carried by ACP itself:
+
+- `/fork [last-turn-id]` — create a durable native Codex fork of the active main session, optionally ending at the supplied turn UUID, then switch the main pane to it with full ACP history replay. The source remains unchanged. This command is intentionally unavailable inside `/btw`.
+- `/archive [session-id|name]` and `/unarchive <session-id|name>` — archive or restore Codex sessions.
+- `/plugins` — browse installed and discoverable plugins; `/plugins install <plugin[@marketplace]>` and `/plugins remove <plugin[@marketplace]>` are the direct forms. `/plugins refresh` upgrades configured Git marketplace snapshots before reopening the browser. Manage sources with `/plugins marketplace list`, `/plugins marketplace add <source> [--ref <ref>] [--sparse <path>]`, `/plugins marketplace upgrade [name]`, and `/plugins marketplace remove <name>`. Start a new session after changing plugins so their skills and tools refresh.
+- `/hooks` — inspect the current working directory's lifecycle hooks, including event, handler type, source, enabled state, trust state, and configuration diagnostics. This view is read-only because the public app-server API has no hook mutation method; use the native Codex CLI to enable or trust hooks.
+- `/app` — open the active main or `/btw` thread in Codex Desktop on macOS or Windows. The handoff uses a validated `codex://threads/<uuid>` deep link and is hidden on unsupported platforms.
+- `/apps [refresh]` — browse account-available Codex apps (connectors) and insert a ready app's structured `[$app-slug](app://id)` mention into the main or `/btw` composer. Disabled and inaccessible apps remain visible with their status; `refresh` bypasses the app cache.
+- `/feedback [bug|bad-result|good-result|safety-check|other] [note]` — send Codex product feedback. Before every upload, `cc` asks whether to attach logs; **Send without logs** is the first/default choice. Including logs is explicit per report and may attach Codex logs, transcripts, and diagnostics. Notes are never echoed into the conversation or error messages.
+- `/import` — detect Claude Code configuration and artifacts in the home directory and current repository, then import either one detected group or everything after confirmation. `cc` keeps the app-server alive until Codex reports background import completion and summarizes per-item failures. Start a new session afterward to load imported skills, plugins, hooks, and MCP servers.
+- `/memories [status|enable|on|off|use on|off|generate on|off|reset]` — inspect and control Codex memories, including the current task's generation mode. For a mutation, `cc` stops the live ACP owner, updates cold task metadata and global configuration, then resumes the same thread; close `/btw` first so no side process keeps stale memory state. Reset requires confirmation.
+- `/debug-config` — show the Codex config-layer stack and managed requirements. Layer contents and effective values are deliberately omitted so API keys and MCP credentials cannot be printed.
+- `/mcp list`, `/mcp get <name>`, `/mcp add <name> [--env KEY=VALUE] (--url <url> | -- <command>...)`, `/mcp remove <name>`, `/mcp login <name> [--scopes <scope,...>]`, and `/mcp logout <name>` — manage Codex's persisted MCP server configuration. URL servers also accept the native `--bearer-token-env-var`, `--oauth-client-id`, and `--oauth-resource` options. Removal and logout require confirmation, rendered configuration redacts environment/header/secret values, and changes take effect in `cc` after `/new`.
+- `/doctor` — run Codex installation diagnostics and render the summary in the conversation.
+- `/experimental` — browse Codex feature flags; `/experimental enable <feature>` and `/experimental disable <feature>` toggle them.
+- `/rename <name>` — rename the active persisted Codex session.
+- `/usage` — show historical daily/lifetime account tokens, all advertised rate-limit buckets, balances, and earned reset credits. `/usage reset` redeems a credit only after confirmation.
+- `/goal` and `/goal edit` — view the active session's goal or put its objective back in the editor. Goal creation, pause, resume, and clear continue through the backend's advertised `/goal` command.
+- `/cloud list|status|diff|apply|exec ...` — use Codex Cloud from `cc`; applying a task diff requires confirmation.
+
+These integrations are exposed only while Codex is active. The Codex form of `/delete` and CLI/app-server operations above use `CODEX_PATH` when explicitly configured, then the compatible Codex bundled with `codex-acp`, then a `codex` executable on `PATH`. This keeps an older standalone CLI from breaking newer adapter-backed features. They report an error instead of changing state when no CLI can be found. Persistent forking, import, memory management, config diagnostics, app discovery, hook inspection, feedback, rename, usage, and goal inspection use initialized app-server connections; none runs a competing model turn. `/fork` waits for the native process tree to finish and then loads the confirmed child through ACP. `/memories` goes further for task metadata: it first proves the ACP owner has stopped, performs the cold mutation, and resumes the same thread. MCP management launches the compatible CLI directly with literal argument arrays and no shell. `/app` is the exception: it hands a validated thread deep link directly to the installed desktop application and does not launch the Codex CLI.
+
+### Skills, files, and other Codex input
+
+Backend-advertised skills autocomplete with their native `$skill-name` syntax anywhere in a prompt. File mentions autocomplete after `@`, including when `fd` is not installed. If the backend advertises ACP embedded-context support, `@path` and `@"path with spaces"` are sent as structured file resources rather than plain text. Text files up to 512 KiB are embedded; larger or binary files are sent as resource links. Image and file parts keep their original prompt order.
+
+### Codex parity and ACP boundaries
+
+Most current Codex workflows are reachable through either an advertised backend command or the local integrations above. Remaining boundaries are features that need deeper live-thread adapter support:
+
+- Codex ACP 1.1.x does not expose native Plan collaboration mode. `/plan` uses the documented read-only planning fallback; it does not claim to be the native live-thread mode.
+- ACP does not expose native child-agent/thread navigation. `/fork [last-turn-id]` bridges durable main-session forks through the stable app-server storage API, while `/btw` remains the independent side-thread UI.
+- `/approve`, background-terminal `/ps`/`/stop`, and per-session personality require live-thread app-server methods that the maintained adapter does not yet expose. Starting a competing app-server turn would bypass `cc`'s approvals and event stream, so `cc` does not do that.
+- `cc` supports ACP URL and form elicitation. Form requests are bounded and validated before rendering, support text and constrained numeric/boolean/single- or multi-select fields, mask secret-like fields, and never print submitted values into the transcript.
 
 ### `/btw` — forked side thread (page view)
 
@@ -96,6 +140,8 @@ Forking support is per-backend:
 - **Claude** uses the native ACP `session/fork` (isolated branch, full context + tools).
 - **Codex** has no ACP fork, so `cc` copies the session's rollout file to a new id and `session/load`s the copy — an isolated branch with full history + tools, original untouched (this reads/writes `~/.codex` session files and is sensitive to Codex's on-disk format; if it can't fork it reports why in the pane).
 - **Cursor** does not support forking, so `/btw` reports that it's unavailable there.
+
+Codex's main-pane `/fork` is separate from `/btw`: it uses native `thread/fork`, records a durable parent relationship, and makes the returned child the active main session. Use `/fork <last-turn-id>` to branch through a specific completed turn without copying later turns.
 
 ### Effort levels, ultracode, and workflows (Claude Code)
 
@@ -142,8 +188,10 @@ have to learn each agent's native dialect just to change how it asks.
     choice as-is and does **not** record a `cc` grant (so it won't appear in
     `/permissions` and `/permissions clear` can't revoke it). `cc` says so at the
     time; the backend's own settings then govern that grant.
-- **`/permissions`** shows the effective mode and remembered grants;
-  `/permissions clear` forgets them.
+- **`/permissions`** opens Codex's read-only/agent/full-access picker while Codex
+  is active; `/permissions show` displays the effective host policy and grants,
+  and `/permissions clear` forgets them. On other backends, bare `/permissions`
+  keeps showing the host policy and grants.
 
 When you set an explicit mode, `cc` also aligns the backend's own native dialect so
 the two never disagree: `auto` enables it (claude `bypassPermissions`, codex
@@ -185,13 +233,22 @@ Create `~/.config/cc/settings.json` (or point `CC_SETTINGS` at another file) to 
   "theme": "tokyonight",
   "agents": {
     "claude": { "settings": { "permissions": { "defaultMode": "bypassPermissions" }, "model": "sonnet" } },
-    "codex":  { "config": { "approval_policy": "never", "sandbox_mode": "danger-full-access", "model": "gpt-5" } },
+    "codex": {
+      "config": { "approval_policy": "never", "sandbox_mode": "danger-full-access", "model": "gpt-5" },
+      "additionalDirectories": ["~/shared-repo"],
+      "mcpServers": [
+        { "name": "local-tools", "command": "npx", "args": ["-y", "@example/mcp-server"] },
+        { "type": "http", "name": "docs", "url": "https://mcp.example.com" }
+      ]
+    },
     "cursor": { "args": ["--force", "--sandbox", "disabled", "--approve-mcps", "--model", "gpt-5"] }
   }
 }
 ```
 
 These mirror each backend as closely as the ACP wrapper allows: Claude uses its `settings.permissions.defaultMode`, Codex passes config through `CODEX_CONFIG` and selects the matching ACP mode, and Cursor uses command-line args before the `acp` subcommand. The Codex adapter uses its bundled compatible Codex by default, avoiding app-server protocol mismatches with an unrelated CLI on `PATH`. Set `env.CODEX_PATH` explicitly only when you want to supply a known-compatible Codex executable. When these imply bypass/force mode, `cc` also auto-accepts ACP permission requests the backend still emits. `args` are appended to the backend command (Cursor args are inserted before the `acp` subcommand).
+
+`additionalDirectories` adds roots to the ACP session when the backend advertises that capability. Relative paths and `~` are resolved to absolute paths; duplicates and the current working directory are omitted. `mcpServers` accepts stdio servers (`name`, `command`, optional `args` and `env`) and HTTP servers (`type: "http"`, `name`, `url`, and optional `headers`). Commands must be executable by absolute path or available on `PATH`, and HTTP servers are sent only when the backend advertises HTTP MCP support. Both `env` and `headers` may be JSON objects or ACP-style arrays of `{ "name", "value" }` entries.
 
 ### Unified permissions
 
@@ -228,7 +285,7 @@ harness-agnostic policy that works for every backend:
 npm test
 ```
 
-This runs syntax/compile checks, the settings/queue unit tests, the permission-engine unit tests (`tests/permissions.test.mjs`), and the tmux-driven TUI smoke tests (resize, scroll-during-streaming, the message queue, slash commands, permission auto-accept, "allow always" persistence + `/yolo`, and the `/btw` / `/diff` / `/copy` commands).
+This runs syntax/compile checks, settings/queue and Codex feature-parity tests, the permission-engine unit tests (`tests/permissions.test.mjs`), and the tmux-driven TUI smoke tests (resize, scroll-during-streaming, the message queue, slash commands, permission auto-accept, "allow always" persistence + `/yolo`, and the `/btw` / `/diff` / `/copy` commands).
 
 ## Notes
 

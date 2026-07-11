@@ -3,8 +3,20 @@
 // the /review preset dialog, and CODEX_CONFIG translation. It reuses the
 // exact exported production helpers so behavior is identical.
 
-import { copyCodexRolloutWithNewId, findCodexRolloutPath, readCodexThreadState } from "../../pi-harness.mjs";
+import {
+	acquireForkOperationLock,
+	codexHome,
+	copyCodexRolloutWithNewId,
+	findCodexRolloutPath,
+	forgetForkIds,
+	mergeEnvironments,
+	readCodexThreadState,
+	recordForkId,
+	stopClientsForReplacement,
+} from "../../pi-harness.mjs";
 import { randomUUID } from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
 import { BaseAcpAdapter, REVIEW_PRESET } from "../acp-base.mjs";
 
 const CODEX_ACP_AGENT_NAME = "@agentclientprotocol/codex-acp";
@@ -57,27 +69,60 @@ export class CodexAdapter extends BaseAcpAdapter {
 
 	// Permission intent maps to the successor adapter's ACP modes through the
 	// unified engine in BaseAcpAdapter.
+	codexEnvironment() {
+		const command = this.launchSpec?.acp ?? this.launchSpec;
+		return mergeEnvironments([process.env, this.launchSpec?.env, command?.env]);
+	}
 
 	// codex-acp exposes no session/fork. Copy the parent's rollout JSONL to a new
 	// id and session/load the copy: an isolated branch, parent untouched.
 	async fork(parentSessionId) {
-		const rolloutPath = findCodexRolloutPath(parentSessionId);
-		if (!rolloutPath) throw new Error("could not locate the Codex session rollout to fork");
-		if (rolloutPath.endsWith(".zst")) throw new Error("the Codex session rollout is compressed; cannot fork it");
-		const newId = randomUUID();
-		copyCodexRolloutWithNewId(rolloutPath, parentSessionId, newId);
-		await this.loadSession(newId);
+		const releaseForkOperation = await acquireForkOperationLock({ operation: `fork ${parentSessionId}` });
+		try {
+			const environment = this.codexEnvironment();
+			const rolloutPath = findCodexRolloutPath(parentSessionId, path.join(codexHome(environment), "sessions"));
+			if (!rolloutPath) throw new Error("could not locate the Codex session rollout to fork");
+			if (rolloutPath.endsWith(".zst")) throw new Error("the Codex session rollout is compressed; cannot fork it");
+			const newId = randomUUID();
+			let copiedRolloutPath;
+			try {
+				copiedRolloutPath = copyCodexRolloutWithNewId(rolloutPath, parentSessionId, newId, {
+					beforePublish: () => {
+						recordForkId(newId, parentSessionId, { required: true });
+					},
+				});
+			} catch (error) {
+				forgetForkIds(newId, { required: true });
+				throw error;
+			}
+			try {
+				await this.loadSession(newId);
+			} catch (error) {
+				await stopClientsForReplacement([this.connection]);
+				fs.rmSync(copiedRolloutPath, { force: true });
+				forgetForkIds(newId, { required: true });
+				throw error;
+			}
+		} finally {
+			releaseForkOperation();
+		}
 	}
 
 	// Unsend: snapshot the on-disk thread state, then check it is unchanged before
 	// retracting the just-sent prompt.
 	snapshotRetractionState() {
-		return readCodexThreadState(this.sessionId);
+		return readCodexThreadState(
+			this.sessionId,
+			path.join(codexHome(this.codexEnvironment()), "state_5.sqlite"),
+		);
 	}
 
 	canRetract(snapshot) {
 		if (!snapshot) return false;
-		const current = readCodexThreadState(snapshot.sessionId);
+		const current = readCodexThreadState(
+			snapshot.sessionId,
+			path.join(codexHome(this.codexEnvironment()), "state_5.sqlite"),
+		);
 		return Boolean(current && JSON.stringify(current) === JSON.stringify(snapshot));
 	}
 

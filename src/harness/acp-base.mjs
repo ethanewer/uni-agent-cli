@@ -3,7 +3,16 @@
 // real AcpClient from pi-harness.mjs; tests inject a fake. Most harnesses are a
 // ~10-line subclass that overrides only the hooks for their niceties.
 
-import { AcpClient, autoCursorOutcome, cursorActionName, cursorCancelResult } from "../pi-harness.mjs";
+import {
+	AcpClient,
+	autoCursorOutcome,
+	collectEnvironmentAuthenticationVariables,
+	cursorActionName,
+	cursorCancelResult,
+	mergeEnvironments,
+	runTerminalAuthentication,
+	stopClientsForReplacement,
+} from "../pi-harness.mjs";
 import { capabilitiesFromWire, emptyCapabilities } from "./interface.mjs";
 import {
 	cancelledOutcome,
@@ -58,7 +67,7 @@ export class BaseAcpAdapter {
 	/**
 	 * @param {string} key            registry key (e.g. "codex")
 	 * @param {object} agentConfig    the registry entry { label, acp:{command,args}, ... }
-	 * @param {object} host           { onEvent, requestPermission, requestInteraction }
+	 * @param {object} host           UI callbacks (events, permissions, auth, elicitation)
 	 * @param {object} [options]      { settings, globalPermissions, grants, connectionFactory }
 	 */
 	constructor(key, agentConfig, host, options = {}) {
@@ -76,6 +85,12 @@ export class BaseAcpAdapter {
 		this.permissionGrants = Array.isArray(options.grants) ? options.grants : [];
 		this.connectionFactory = options.connectionFactory ?? defaultConnectionFactory;
 		this.connection = undefined;
+		this.connectOptions = {};
+		this.replacementProcessFence = undefined;
+		this.lifecycleTail = undefined;
+		this.lifecycleState = "open";
+		this.stopPromise = undefined;
+		this.clientAuthenticationOperations = new Set();
 
 		// The fully-resolved spawn spec, with native settings translated. This is
 		// what cc would spawn and what carries _sessionMeta / _startupMode /
@@ -139,6 +154,8 @@ export class BaseAcpAdapter {
 		}
 		applied.env = { ...(applied.env ?? {}), ...(settings.env ?? {}) };
 		if (applied.acp) applied.acp = clonePlain(applied.acp);
+		if (Array.isArray(settings.mcpServers)) applied.mcpServers = clonePlain(settings.mcpServers);
+		if (Array.isArray(settings.additionalDirectories)) applied.additionalDirectories = [...settings.additionalDirectories];
 
 		const command = applied.acp ?? applied;
 		const nativeArgs = stringArray(settings.args ?? settings.nativeArgs);
@@ -226,14 +243,69 @@ export class BaseAcpAdapter {
 
 	// ---- lifecycle (required) -------------------------------------------------
 
+	async #runLifecycleOperation(operation) {
+		this.#assertLifecycleOpen();
+		const previous = this.lifecycleTail ?? Promise.resolve();
+		let release;
+		const turn = new Promise((resolve) => { release = resolve; });
+		const tail = previous.then(() => turn);
+		this.lifecycleTail = tail;
+		await previous;
+		try {
+			// stop() marks the adapter closing before it waits for an operation that
+			// already owns the lifecycle turn. Re-check here so work queued before that
+			// mark cannot start a backend after shutdown.
+			this.#assertLifecycleOpen();
+			if (this.replacementProcessFence) throw this.#replacementProcessFenceError();
+			return await operation();
+		} finally {
+			release();
+			if (this.lifecycleTail === tail) this.lifecycleTail = undefined;
+		}
+	}
+
 	async connect(options = {}) {
-		this.connection = this.connectionFactory(this.launchSpec, (event) => this.#onConnectionEvent(event), {
-			onPermissionRequest: (params) => this.#onPermission(params),
-			onCursorRequest: (method, params) => this.handleExtensionRequest(method, params),
+		return await this.#runLifecycleOperation(() => this.#connectUnlocked(options));
+	}
+
+	async #connectUnlocked(options = {}) {
+		this.#assertLifecycleOpen();
+		if (this.replacementProcessFence) throw this.#replacementProcessFenceError();
+		this.connectOptions = { ...options };
+		let connection;
+		const isCurrentConnection = () => this.connection === connection;
+		connection = this.connectionFactory(this.launchSpec, (event) => {
+			if (isCurrentConnection()) this.#onConnectionEvent(event);
+		}, {
+			onPermissionRequest: (params) =>
+				isCurrentConnection() ? this.#onPermission(params) : cancelledOutcome(),
+			onCursorRequest: (method, params) =>
+				isCurrentConnection() ? this.handleExtensionRequest(method, params) : cursorCancelResult(method),
+			onElicitationRequest:
+				typeof this.host.onElicitationRequest === "function"
+					? (params) =>
+						isCurrentConnection()
+							? this.host.onElicitationRequest(params)
+							: { action: "cancel" }
+					: undefined,
+			elicitationCapabilities:
+				typeof this.host.onElicitationRequest === "function"
+					? this.host.elicitationCapabilities
+					: undefined,
 		});
-		const initialized = await this.connection.initialize(options);
-		this.#recomputeCapabilities();
-		return initialized;
+		this.connection = connection;
+		try {
+			const initialized = await connection.initialize(options);
+			// If stop() ran while initialize was pending it already retired this
+			// connection. Do not let the interrupted connect appear successful.
+			this.#assertLifecycleOpen();
+			return initialized;
+		} finally {
+			// Authentication methods arrive in the initialize response before a first
+			// session can fail for lack of credentials. Keep them visible to the host
+			// even when initialize() rejects while creating that session.
+			this.#recomputeCapabilities();
+		}
 	}
 
 	async newSession(options = {}) {
@@ -249,7 +321,49 @@ export class BaseAcpAdapter {
 	}
 
 	stop() {
-		this.connection?.stop?.();
+		if (this.stopPromise) return this.stopPromise;
+		// Closing is observable synchronously. Authentication may currently be
+		// waiting on terminal/UI credential collection outside the lifecycle queue;
+		// it must see this state when it resumes and never reconnect.
+		this.lifecycleState = "closing";
+		// Session credentials have no useful lifetime once this adapter is terminally
+		// closed. Drop an already-installed environment before awaiting child teardown.
+		delete this.launchSpec._sessionAuthEnv;
+		let resolveStop;
+		let rejectStop;
+		this.stopPromise = new Promise((resolve, reject) => {
+			resolveStop = resolve;
+			rejectStop = reject;
+		});
+		const connection = this.connection;
+		this.connection = undefined;
+		const lifecycleTail = this.lifecycleTail ?? Promise.resolve();
+		// Client-side authentication runs before the serialized reconnect turn. Abort
+		// it now and retain an awaitable for both the credential collector and any
+		// terminal process tree it registered.
+		const authenticationShutdowns = [...this.clientAuthenticationOperations]
+			.map((operation) => operation.stopAndWait());
+		let connectionShutdown;
+		try {
+			// Production AcpClient instances need their complete process tree reaped,
+			// not merely signalled. The helper retains the synchronous stop fallback for
+			// lightweight injected connections used by other adapters and tests.
+			connectionShutdown = stopClientsForReplacement([connection]);
+		} catch (error) {
+			connectionShutdown = Promise.reject(error);
+		}
+		void (async () => {
+			const results = await Promise.allSettled([
+				Promise.resolve(connectionShutdown),
+				lifecycleTail,
+				...authenticationShutdowns,
+			]);
+			this.lifecycleState = "stopped";
+			const failure = results.find((result) => result.status === "rejected");
+			if (failure) throw failure.reason;
+			return results[0].value;
+		})().then(resolveStop, rejectStop);
+		return this.stopPromise;
 	}
 
 	getSessionInfo() {
@@ -270,6 +384,10 @@ export class BaseAcpAdapter {
 		return this.connection.loadSession(sessionId);
 	}
 
+	async deleteSession(sessionId) {
+		return this.connection.deleteSession(sessionId);
+	}
+
 	/** Native fork. Codex overrides this with a copy-fork. */
 	async fork(parentSessionId, options = {}) {
 		if (this.connection?.supportsFork?.()) return this.connection.forkSession(parentSessionId, options);
@@ -278,12 +396,275 @@ export class BaseAcpAdapter {
 
 	// ---- config / modes (capability-gated) ------------------------------------
 
-	async setConfigOption(configId, value) {
-		return this.connection.setConfigOption(configId, value);
+	async setConfigOption(configId, value, type = undefined) {
+		return this.connection.setConfigOption(configId, value, type);
 	}
 
 	async setMode(modeId) {
 		return this.connection.setMode(modeId);
+	}
+
+	// ---- authentication (capability-gated) ------------------------------------
+
+	async authenticate(methodId, meta = undefined) {
+		this.#assertLifecycleOpen();
+		const method = (this.connection?.getSessionInfo?.().authMethods ?? []).find((entry) => entry?.id === methodId);
+		if (method?.type === "terminal") {
+			await this.#runClientAuthentication(async ({ signal, processTracker }) => {
+				const context = { adapter: this, meta, signal, processTracker };
+				if (typeof this.host.runTerminalAuthentication === "function") {
+					await this.host.runTerminalAuthentication(this.launchSpec, method, context);
+				} else {
+					await runTerminalAuthentication(this.launchSpec, method, context);
+				}
+			});
+			this.#assertLifecycleOpen();
+			delete this.launchSpec._signedOutAuthEnvNames;
+			return await this.#reconnectAfterClientAuthentication();
+		}
+		if (method?.type === "env_var") {
+			const command = this.launchSpec?.acp ?? this.launchSpec;
+			const configuredEnvironment = mergeEnvironments([process.env, this.launchSpec?.env, command?.env]);
+			const credentials = await this.#runClientAuthentication(async ({ signal }) => {
+				const context = { adapter: this, meta, signal };
+				return typeof this.host.collectEnvironmentVariables === "function"
+					? await this.host.collectEnvironmentVariables(method, configuredEnvironment, context)
+					: await collectEnvironmentAuthenticationVariables(method, configuredEnvironment, context);
+			});
+			this.#assertLifecycleOpen();
+			const authenticationEnvironment = this.#validatedAuthenticationEnvironment(method, credentials);
+			return await this.#reconnectAfterClientAuthentication(this.connection, {}, authenticationEnvironment);
+		}
+		const connection = this.connection;
+		let authenticationMeta = meta;
+		if (
+			authenticationMeta === undefined &&
+			normalizedAuthenticationMethodId(methodId) === "apikey" &&
+			connection.agentInfo?.name === "@agentclientprotocol/codex-acp"
+		) {
+			const command = this.launchSpec?.acp ?? this.launchSpec;
+			const environment = mergeEnvironments([process.env, this.launchSpec?.env, command?.env]);
+			const apiKey = authenticationEnvironmentValue(environment, "CODEX_API_KEY") ||
+				authenticationEnvironmentValue(environment, "OPENAI_API_KEY");
+			if (apiKey) authenticationMeta = { "api-key": { apiKey } };
+		}
+		const result = await connection.authenticate(methodId, authenticationMeta);
+		this.#assertLifecycleOpen();
+		// A concurrent logout can retire this connection while its authentication
+		// RPC is still pending. Treat that completion as stale: it authenticated the
+		// retired process, not the replacement that will receive future prompts.
+		if (this.connection !== connection) {
+			const error = new Error("Authentication completed after the backend connection was replaced; try signing in again");
+			error.code = "ACP_CONNECTION_REPLACED";
+			throw error;
+		}
+		// Only a successful explicit authentication lifts the post-logout launch
+		// mask. Failed attempts remain signed out.
+		delete this.launchSpec._signedOutAuthEnvNames;
+		// Some agents advertise their authentication methods during initialize, but
+		// reject the initial session/new until authenticate succeeds. Complete that
+		// interrupted startup here so a successful /login leaves the adapter ready to
+		// accept prompts instead of retaining an authenticated, sessionless connection.
+		if (this.connection === connection && !connection.sessionId) await connection.newSession();
+		return result;
+	}
+
+	async #runClientAuthentication(operation) {
+		this.#assertLifecycleOpen();
+		const controller = new AbortController();
+		const stoppers = new Set();
+		const entry = {
+			controller,
+			stoppers,
+			rawPromise: undefined,
+			stopPromise: undefined,
+			stopAndWait: () => {
+				if (entry.stopPromise) return entry.stopPromise;
+				controller.abort(this.#lifecycleStoppedError());
+				// Invoke every registered tree stop in this synchronous shutdown phase.
+				// A helper that registers after the abort observes it in register() below.
+				for (const stopper of stoppers) void stopper.start().catch(() => {});
+				entry.stopPromise = (async () => {
+					const operationResult = await Promise.allSettled([entry.rawPromise]);
+					const stopResults = await Promise.allSettled([...stoppers].map((stopper) => stopper.start()));
+					const stopFailure = stopResults.find((result) => result.status === "rejected");
+					if (stopFailure) throw stopFailure.reason;
+					const operationFailure = operationResult.find(
+						(result) => result.status === "rejected" && result.reason?.code === "PROCESS_TREE_TERMINATION_FAILED",
+					);
+					if (operationFailure) throw operationFailure.reason;
+				})();
+				return entry.stopPromise;
+			},
+		};
+		const processTracker = {
+			assertOpen: () => {
+				if (controller.signal.aborted || this.lifecycleState !== "open") throw this.#lifecycleStoppedError();
+			},
+			register: (stopAndWait) => {
+				const stopper = {
+					promise: undefined,
+					start: () => {
+						if (stopper.promise) return stopper.promise;
+						try {
+							stopper.promise = Promise.resolve(stopAndWait());
+						} catch (error) {
+							stopper.promise = Promise.reject(error);
+						}
+						return stopper.promise;
+					},
+				};
+				stoppers.add(stopper);
+				if (controller.signal.aborted) void stopper.start().catch(() => {});
+				return () => {
+					// Retain the registration until this authentication operation settles so
+					// shutdown can await a stop that raced natural process completion.
+				};
+			},
+		};
+		entry.rawPromise = Promise.resolve().then(() => operation({ signal: controller.signal, processTracker }));
+		this.clientAuthenticationOperations.add(entry);
+		try {
+			return await entry.rawPromise;
+		} catch (error) {
+			if (this.lifecycleState !== "open" && error?.code !== "PROCESS_TREE_TERMINATION_FAILED") {
+				throw this.#lifecycleStoppedError(error);
+			}
+			throw error;
+		} finally {
+			this.clientAuthenticationOperations.delete(entry);
+		}
+	}
+
+	async logout() {
+		this.#assertLifecycleOpen();
+		const connection = this.connection;
+		const authenticationEnvironmentNames = signedOutAuthenticationEnvironmentNames(
+			connection?.getSessionInfo?.().authMethods,
+			this.launchSpec,
+		);
+		const beganWithSessionAuthEnvironment = Object.hasOwn(this.launchSpec, "_sessionAuthEnv");
+		const result = await connection.logout();
+		this.#assertLifecycleOpen();
+		// Authentication can reconnect this adapter while the logout RPC is in
+		// flight. Re-read the launch spec after the await so a credential-bearing
+		// replacement created by that race is retired as well.
+		const endedWithSessionAuthEnvironment = Object.hasOwn(this.launchSpec, "_sessionAuthEnv");
+		if (
+			beganWithSessionAuthEnvironment ||
+			endedWithSessionAuthEnvironment ||
+			authenticationEnvironmentNames.length > 0
+		) {
+			maskSignedOutAuthenticationEnvironment(this.launchSpec, authenticationEnvironmentNames);
+		}
+		delete this.launchSpec._sessionAuthEnv;
+		// An ACP logout response does not guarantee that an existing session is safe
+		// to continue using. Always retire the process that handled logout, including
+		// non-environment authentication, and initialize a signed-out replacement
+		// without creating a session. Passing the original connection also lets the
+		// reconnect helper retire a replacement created by a racing lifecycle action.
+		await this.#reconnectAfterClientAuthentication(connection, { createSession: false });
+		return result;
+	}
+
+	async #reconnectAfterClientAuthentication(
+		connectionToRetire = this.connection,
+		optionOverrides = {},
+		authenticationEnvironment = undefined,
+	) {
+		return await this.#runLifecycleOperation(async () => {
+			this.#assertLifecycleOpen();
+			// Terminal authentication persists credentials outside the ACP process. Drop
+			// a stale session-only environment as soon as this serialized turn starts, so
+			// even a recoverable failure while retiring the old connection cannot make a
+			// later connect override the newly persisted login. Environment-variable auth
+			// still installs its new secret only after the old tree is confirmed gone.
+			if (authenticationEnvironment === undefined) delete this.launchSpec._sessionAuthEnv;
+			const savedConnectOptions = { ...this.connectOptions };
+			const connectOptions = { ...savedConnectOptions, ...optionOverrides };
+			const currentConnection = this.connection;
+			// Detach first so synchronous stop/exit callbacks from either retired
+			// connection are treated as stale and cannot reach the host.
+			this.connection = undefined;
+			try {
+				// Environment credentials are inherited at spawn time. Do not launch the
+				// replacement until every old connection has either exited gracefully or
+				// been force-killed with its complete process tree confirmed gone.
+				try {
+					await stopClientsForReplacement([connectionToRetire, currentConnection]);
+				} catch (error) {
+					if (error?.code === "PROCESS_TREE_TERMINATION_FAILED") {
+						this.replacementProcessFence ??= error;
+						throw this.#replacementProcessFenceError();
+					}
+					throw error;
+				}
+				// stop() may have run while the retired process tree was settling. It
+				// owns shutdown from that point onward, so neither credentials nor a new
+				// connection may be installed by this lifecycle turn.
+				this.#assertLifecycleOpen();
+				// Bind credentials to this serialized lifecycle turn. Authentication
+				// collection happens before entering the lifecycle mutex, so writing the
+				// shared launch spec any earlier lets a concurrent /login overwrite the
+				// credentials before this turn launches its replacement.
+				if (authenticationEnvironment !== undefined) this.launchSpec._sessionAuthEnv = authenticationEnvironment;
+				const initialized = await this.#connectUnlocked(connectOptions);
+				if (authenticationEnvironment !== undefined) delete this.launchSpec._signedOutAuthEnvNames;
+				return initialized;
+			} finally {
+				// Internal lifecycle reconnects must not redefine how callers requested a
+				// normal connection. In particular, the logout-only createSession:false
+				// must not suppress session creation after the next successful /login.
+				this.connectOptions = savedConnectOptions;
+			}
+		});
+	}
+
+	#assertLifecycleOpen() {
+		if (this.lifecycleState === "open") return;
+		throw this.#lifecycleStoppedError();
+	}
+
+	#lifecycleStoppedError(cause = undefined) {
+		const error = new Error(`Harness adapter "${this.key}" is stopping or has been stopped`);
+		error.code = "ADAPTER_STOPPED";
+		if (cause !== undefined) error.cause = cause;
+		return error;
+	}
+
+	#replacementProcessFenceError() {
+		const detail = this.replacementProcessFence?.message;
+		const error = new Error(
+			"Backend restart is blocked because a previous process tree could not be confirmed stopped. " +
+				"Manually terminate the old backend process tree, then restart cc" +
+				(detail ? ` (${detail})` : ""),
+		);
+		error.code = "PROCESS_TREE_TERMINATION_FAILED";
+		error.cause = this.replacementProcessFence;
+		return error;
+	}
+
+	#validatedAuthenticationEnvironment(method, value) {
+		if (!isPlainObject(value)) throw new Error("environment authentication was cancelled or returned invalid credentials");
+		const advertised = new Map(
+			(method.vars ?? [])
+				.filter((variable) => typeof variable?.name === "string")
+				.map((variable) => [variable.name, variable]),
+		);
+		const credentials = {};
+		for (const [name, entry] of Object.entries(value)) {
+			if (!advertised.has(name)) throw new Error(`environment authentication returned an unadvertised variable: ${name}`);
+			if (typeof entry !== "string" || entry.includes("\0")) {
+				throw new Error(`environment authentication variable ${name} must be text without NUL bytes`);
+			}
+			if (entry) credentials[name] = entry;
+		}
+		for (const [name, variable] of advertised) {
+			if (variable.optional !== true && !credentials[name]) {
+				throw new Error(`environment authentication variable ${name} is required`);
+			}
+		}
+		return credentials;
 	}
 
 	// ---- prompt retraction / unsend (capability-gated) ------------------------
@@ -379,4 +760,45 @@ export class BaseAcpAdapter {
 		if (event?.type === "session_info") this.#recomputeCapabilities();
 		this.host.onEvent?.(event);
 	}
+}
+
+function signedOutAuthenticationEnvironmentNames(authMethods = [], launchSpec = {}) {
+	const names = new Set();
+	for (const method of Array.isArray(authMethods) ? authMethods : []) {
+		for (const variable of Array.isArray(method?.vars) ? method.vars : []) {
+			if (isEnvironmentVariableName(variable?.name)) names.add(variable.name);
+		}
+		if (normalizedAuthenticationMethodId(method?.id) === "apikey") {
+			names.add("CODEX_API_KEY");
+			names.add("OPENAI_API_KEY");
+		}
+	}
+	for (const name of Object.keys(launchSpec?._sessionAuthEnv ?? {})) {
+		if (isEnvironmentVariableName(name)) names.add(name);
+	}
+	return [...names];
+}
+
+function maskSignedOutAuthenticationEnvironment(launchSpec, names) {
+	const merged = new Set([
+		...(Array.isArray(launchSpec?._signedOutAuthEnvNames) ? launchSpec._signedOutAuthEnvNames : []),
+		...(Array.isArray(names) ? names : []),
+	].filter(isEnvironmentVariableName));
+	if (merged.size > 0) launchSpec._signedOutAuthEnvNames = [...merged];
+}
+
+function isEnvironmentVariableName(name) {
+	return typeof name === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(name);
+}
+
+function normalizedAuthenticationMethodId(value) {
+	return String(value ?? "").toLowerCase().replace(/[-_]/g, "");
+}
+
+function authenticationEnvironmentValue(environment, name, platform = process.platform) {
+	if (!environment || typeof environment !== "object") return undefined;
+	if (platform !== "win32") return environment[name];
+	const canonical = name.toLowerCase();
+	const key = Object.keys(environment).findLast((entry) => entry.toLowerCase() === canonical);
+	return key === undefined ? undefined : environment[key];
 }

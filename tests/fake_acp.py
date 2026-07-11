@@ -8,6 +8,7 @@ import time
 next_client_request_id = 1000
 SLOW_DELAY = float(os.environ.get("FAKE_ACP_SLOW_DELAY", "0.8"))
 NEW_DELAY = float(os.environ.get("FAKE_ACP_NEW_DELAY", "0"))
+COMMANDS_GATE = os.environ.get("FAKE_ACP_COMMANDS_GATE")
 
 CONFIG_OPTIONS = [
     {
@@ -41,6 +42,25 @@ CONFIG_OPTIONS = [
         "options": [
             {"value": "low", "name": "Low"},
             {"value": "high", "name": "High"},
+        ],
+    },
+    {
+        "id": "fast-mode",
+        "name": "Fast mode",
+        "category": "model_config",
+        "type": "boolean",
+        "currentValue": False,
+        "description": "1.5x speed, increased usage",
+    },
+    {
+        "id": "verbosity",
+        "name": "Verbosity",
+        "category": "_fake_verbosity",
+        "type": "select",
+        "currentValue": "normal",
+        "options": [
+            {"value": "quiet", "name": "Quiet"},
+            {"value": "normal", "name": "Normal"},
         ],
     },
 ]
@@ -123,8 +143,15 @@ def handle_message(message):
                     "protocolVersion": 1,
                     "agentCapabilities": {
                         "loadSession": True,
-                        "promptCapabilities": {"image": True},
-                        "sessionCapabilities": {"list": {}, "resume": {}, "fork": {}},
+                        "promptCapabilities": {"image": True, "embeddedContext": True},
+                        "sessionCapabilities": {
+                            "list": {},
+                            "resume": {},
+                            "fork": {},
+                            "delete": {},
+                            "additionalDirectories": {},
+                        },
+                        "mcpCapabilities": {"http": True, "sse": False, "acp": False},
                     },
                     "agentInfo": {
                         "name": "fake-acp",
@@ -155,6 +182,8 @@ def handle_message(message):
                 },
             }
         )
+        while COMMANDS_GATE and not os.path.exists(COMMANDS_GATE):
+            time.sleep(0.01)
         send(
             {
                 "jsonrpc": "2.0",
@@ -175,6 +204,8 @@ def handle_message(message):
                             {"name": "permission-exit", "description": "Exit while a permission request is open"},
                             {"name": "rpc-parse-error", "description": "Return a structured JSON-RPC parse error"},
                             {"name": "terminal-test", "description": "Exercise ACP terminal requests"},
+                            {"name": "status", "description": "Show backend status and usage"},
+                            {"name": "$fake-skill", "description": "Use the fake skill"},
                         ],
                     },
                 },
@@ -255,6 +286,8 @@ def handle_message(message):
                 "result": {"sessionId": "fake-session", "configOptions": CONFIG_OPTIONS},
             }
         )
+    elif method == "session/delete":
+        send({"jsonrpc": "2.0", "id": request_id, "result": {}})
     elif method == "session/set_config_option":
         config_id = message["params"]["configId"]
         value = message["params"].get("value")
@@ -298,6 +331,23 @@ def handle_prompt(message):
 
     if prompt.startswith("/review"):
         send_review_response(request_id, prompt)
+        return
+
+    if prompt == "/status":
+        send(
+            {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "fake-session",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "fake backend status: tokens 12"},
+                    },
+                },
+            }
+        )
+        send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "end_turn"}})
         return
 
     if prompt == "/rpc-parse-error":
@@ -557,6 +607,11 @@ def prompt_text(parts):
         elif kind == "image":
             mime = part.get("mimeType") or part.get("mime_type") or "image"
             chunks.append(f"[image:{mime}]")
+        elif kind == "resource":
+            resource = part.get("resource", {})
+            chunks.append(f"[resource:{resource.get('uri', '')}:{resource.get('text', '')}]")
+        elif kind == "resource_link":
+            chunks.append(f"[resource-link:{part.get('uri', '')}]")
         else:
             chunks.append(f"[{kind or 'part'}]")
     return "".join(chunks)

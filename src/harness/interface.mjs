@@ -13,6 +13,7 @@ export const CAPABILITY_KEYS = [
 	"fork", // false | "native" | "copy"
 	"resume", // bool — session/load or session/resume
 	"sessionList", // bool — session/list
+	"delete", // bool — session/delete
 	"models", // bool — a "model" config option is advertised
 	"modes", // bool — modes or a "mode" config option is advertised
 	"reasoningEffort", // bool — a "thought_level" config option is advertised
@@ -22,10 +23,11 @@ export const CAPABILITY_KEYS = [
 	"interactiveRequests", // bool — backend-initiated prompts (ask_question, …)
 	"autoApprove", // bool — auto-accept permission requests (from native settings)
 	"terminal", // bool — shared terminal execution (cc is the executor)
-	"mcp", // bool — MCP servers (future)
+	"mcp", // bool — MCP servers
 	"audio", // bool — audio prompt parts (future)
-	"embeddedContext", // bool — @file embedded context (future)
-	"auth", // bool — ACP authenticate flow advertised (future)
+	"embeddedContext", // bool — @file embedded context
+	"auth", // bool — one or more ACP authentication methods advertised
+	"logout", // bool — agentCapabilities.auth.logout advertised
 ];
 
 /** A fresh, all-off capability descriptor. */
@@ -34,6 +36,7 @@ export function emptyCapabilities() {
 		fork: false,
 		resume: false,
 		sessionList: false,
+		delete: false,
 		models: false,
 		modes: false,
 		reasoningEffort: false,
@@ -47,6 +50,7 @@ export function emptyCapabilities() {
 		audio: false,
 		embeddedContext: false,
 		auth: false,
+		logout: false,
 	};
 }
 
@@ -65,6 +69,7 @@ export const REQUIRED_METHODS = [
 export const OPTIONAL_METHODS = [
 	"listSessions", // resume / sessionList
 	"loadSession", // resume
+	"deleteSession", // delete
 	"fork", // fork
 	"setConfigOption", // models / modes / reasoningEffort
 	"setMode", // modes
@@ -72,6 +77,8 @@ export const OPTIONAL_METHODS = [
 	"canRetract", // retractPrompt
 	"interceptCommand", // commandPresets
 	"handleExtensionRequest", // interactiveRequests
+	"authenticate", // auth
+	"logout", // logout
 ];
 
 /** The set of normalized UI event types an adapter may emit to host.onEvent. */
@@ -123,6 +130,7 @@ export function checkAdapterConformance(adapter) {
 		if (caps.fork && typeof adapter.fork !== "function") problems.push("capability fork set but fork() missing");
 		if (caps.resume && typeof adapter.loadSession !== "function") problems.push("capability resume set but loadSession() missing");
 		if (caps.sessionList && typeof adapter.listSessions !== "function") problems.push("capability sessionList set but listSessions() missing");
+		if (caps.delete && typeof adapter.deleteSession !== "function") problems.push("capability delete set but deleteSession() missing");
 		if ((caps.models || caps.modes || caps.reasoningEffort) && typeof adapter.setConfigOption !== "function") {
 			problems.push("config capability set but setConfigOption() missing");
 		}
@@ -134,6 +142,12 @@ export function checkAdapterConformance(adapter) {
 		}
 		if (caps.interactiveRequests && typeof adapter.handleExtensionRequest !== "function") {
 			problems.push("capability interactiveRequests set but handleExtensionRequest() missing");
+		}
+		if (caps.auth && typeof adapter.authenticate !== "function") {
+			problems.push("capability auth set but authenticate() missing");
+		}
+		if (caps.logout && typeof adapter.logout !== "function") {
+			problems.push("capability logout set but logout() missing");
 		}
 	}
 
@@ -166,13 +180,18 @@ export function capabilitiesFromWire(sessionInfo = {}) {
 		resume,
 		// Matches pi-harness supportsSessionList: list AND a way to load/resume.
 		sessionList: Boolean(sessionCaps.list) && resume,
+		delete: Boolean(sessionCaps.delete),
 		models: categories.has("model") || Boolean(sessionInfo.models),
 		modes: modeCount > 0,
 		reasoningEffort: categories.has("thought_level"),
 		image: acp.promptCapabilities?.image === true,
-		mcp: Boolean(acp.mcpCapabilities),
+		// Stdio MCP is the ACP v1 baseline; mcpCapabilities only negotiates optional
+		// transports such as HTTP/SSE. It may be omitted entirely by a compliant
+		// agent, and an all-false descriptor still supports stdio.
+		mcp: true,
 		audio: acp.promptCapabilities?.audio === true,
 		embeddedContext: acp.promptCapabilities?.embeddedContext === true,
 		auth: Array.isArray(sessionInfo.authMethods) && sessionInfo.authMethods.length > 0,
+		logout: Boolean(acp.auth?.logout),
 	};
 }

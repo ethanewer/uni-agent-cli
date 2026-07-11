@@ -12,6 +12,8 @@ WRITE_LOG="$(mktemp -t cc-tui-write-log.XXXXXX)"
 SETTINGS_FILE="$(mktemp -t cc-tui-settings.XXXXXX)"
 CONFIG_SETTINGS_THEME_FILE="$(mktemp -t cc-tui-config-settings-theme.XXXXXX)"
 CONFIG_TOP_THEME_FILE="$(mktemp -t cc-tui-config-top-theme.XXXXXX)"
+COMMANDS_GATE="$(mktemp -t cc-tui-commands-gate.XXXXXX)"
+rm -f "$COMMANDS_GATE"
 # Isolate the permission grant store so cc never reads the developer's real
 # ~/.config/cc/permissions.json (a stray grant could auto-resolve the permission
 # prompt step). Point at a fresh, nonexistent file -> no grants.
@@ -24,6 +26,7 @@ SETTINGS_FILE_Q="$(printf "%q" "$SETTINGS_FILE")"
 PERMS_FILE_Q="$(printf "%q" "$PERMS_FILE")"
 CONFIG_SETTINGS_THEME_FILE_Q="$(printf "%q" "$CONFIG_SETTINGS_THEME_FILE")"
 CONFIG_TOP_THEME_FILE_Q="$(printf "%q" "$CONFIG_TOP_THEME_FILE")"
+COMMANDS_GATE_Q="$(printf "%q" "$COMMANDS_GATE")"
 TERM_PROGRAM_Q="$(printf "%q" "${TERM_PROGRAM:-}")"
 VSCODE_PID_Q="$(printf "%q" "${VSCODE_PID:-}")"
 VSCODE_INJECTION_Q="$(printf "%q" "${VSCODE_INJECTION:-}")"
@@ -44,7 +47,7 @@ fi
 
 cleanup() {
 	tmux kill-session -t "$SESSION" >/dev/null 2>&1 || true
-	rm -f "$WRITE_LOG" "$SETTINGS_FILE" "$CONFIG_SETTINGS_THEME_FILE" "$CONFIG_TOP_THEME_FILE" "$PERMS_FILE"
+	rm -f "$WRITE_LOG" "$SETTINGS_FILE" "$CONFIG_SETTINGS_THEME_FILE" "$CONFIG_TOP_THEME_FILE" "$COMMANDS_GATE" "$PERMS_FILE"
 }
 trap cleanup EXIT
 
@@ -196,6 +199,18 @@ assert_no_mouse_tracking_enabled() {
 		exit 1
 	fi
 }
+
+# Backend commands arrive after the editor is already usable. Typing /r during
+# that cold-start window must refresh in place when command discovery finishes;
+# the user should not have to erase and retype it.
+tmux new-session -d -s "$SESSION" -x 100 -y 30 "cd $ROOT_Q && $PANE_ENV PI_TUI_WRITE_LOG=$WRITE_LOG_Q CC_CONFIG=tests/fake_config.json CC_SETTINGS=$SETTINGS_FILE_Q CC_BACKGROUND_CONNECT_DELAY_MS=0 FAKE_ACP_COMMANDS_GATE=$COMMANDS_GATE_Q ./src/cc fake"
+wait_for_text "Space to record"
+tmux send-keys -t "$SESSION" / r
+: > "$COMMANDS_GATE"
+wait_for_text "Review current changes"
+wait_for_text "/r"
+tmux kill-session -t "$SESSION"
+: > "$WRITE_LOG"
 
 tmux new-session -d -s "$SESSION" -x 100 -y 30 "cd $ROOT_Q && printf 'outside-before-cc\n' && $PANE_ENV PI_TUI_WRITE_LOG=$WRITE_LOG_Q CC_CONFIG=tests/fake_config.json CC_SETTINGS=$SETTINGS_FILE_Q CC_BACKGROUND_CONNECT_DELAY_MS=0 FAKE_ACP_NEW_DELAY=0.4 ./src/cc fake"
 
@@ -455,6 +470,27 @@ wait_for_text "Mode"
 tmux send-keys -t "$SESSION" Down Enter
 wait_for_text "/mode (Plan)"
 wait_without_text "Mode:"
+
+# Boolean ACP config is negotiated and exposed through /fast; arbitrary options
+# stay reachable through the generic /config command.
+tmux send-keys -t "$SESSION" / f a s t Space o n Enter
+wait_for_text "/fast on (On)"
+tmux send-keys -t "$SESSION" / c o n f i g Space v e r b o s i t y Space q u i e t Enter
+wait_for_text "/config verbosity quiet (Quiet)"
+
+# The backend's richer status remains reachable; wrapper-only diagnostics use
+# /cc-status so command ownership is unambiguous.
+tmux send-keys -t "$SESSION" / s t a t u s Enter
+wait_for_text "fake backend status: tokens 12"
+tmux send-keys -t "$SESSION" / c c - s t a t u s Enter
+wait_for_text "/cc-status"
+wait_for_text "theme"
+
+# Skills use native $skill syntax and complete without a leading slash.
+tmux send-keys -t "$SESSION" -l '$fa'
+tmux send-keys -t "$SESSION" Enter
+tmux send-keys -t "$SESSION" Enter
+wait_for_text 'echo: $fake-skill'
 
 tmux send-keys -t "$SESSION" / c l e a r Enter
 wait_without_text "/model (Deep)"

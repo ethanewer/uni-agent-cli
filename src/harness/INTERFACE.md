@@ -15,6 +15,8 @@ name-keyed `switch` statements:
 | Codex copy-fork (`~/.codex` rollout) | `runBtw` ladder + `forkCodexSession` |
 | Codex prompt **unsend** | `isCodexAcpActive` + `readCodexThreadState` + `tryUnsendPendingPrompt` |
 | Codex `/review` preset dialog | `shouldOpenCodexReviewDialog` / `openCodexReviewDialog` |
+| Codex storage/account commands (`/rename`, `/usage`, goal view) | short-lived `runCodexAppServerRequests` calls; no competing live-thread turn |
+| Codex Cloud workflows | resolved compatible native CLI invocation |
 | Codex `CODEX_CONFIG` JSON | `applyConfigSettings` (key === "codex") |
 | Claude `_meta` settings | `applyNativeSettings` (key === "claude") |
 | Cursor arg-insert-before-`acp` | `applyNativeArgs` (key === "cursor") |
@@ -74,6 +76,7 @@ degrades gracefully. Flags are either **declared** by the adapter (static) or
 | `fork` | `false \| "native" \| "copy"` | declared + wire | `/btw` side thread |
 | `resume` | bool | wire (`loadSession`/`resume`) | `/resume` load |
 | `sessionList` | bool | wire (`sessionCapabilities.list`) | `/resume` picker |
+| `delete` | bool | wire (`sessionCapabilities.delete`) | session deletion |
 | `models` | bool | wire (`configOptions` model) | `/model` |
 | `modes` | bool | wire (`modes`/`configOptions`) | `/mode`, `/plan` |
 | `reasoningEffort` | bool | wire (`configOptions` thought_level) | `/effort` |
@@ -83,10 +86,11 @@ degrades gracefully. Flags are either **declared** by the adapter (static) or
 | `interactiveRequests` | bool | declared | backend-initiated prompts (`ask_question`…) |
 | `autoApprove` | bool | unified engine (`permissions.mjs`, from mode) | permission auto-accept |
 | `terminal` | bool | always true (cc executes) | shared terminal |
-| `mcp` | bool | wire (future) | MCP servers |
+| `mcp` | bool | ACP v1 stdio baseline (`mcpCapabilities` adds optional transports) | MCP servers supplied when a session starts |
 | `audio` | bool | wire (future) | audio prompt parts |
-| `embeddedContext` | bool | wire (future) | `@file` embedded context |
-| `auth` | bool | wire (`authMethods`) (future) | ACP auth flow |
+| `embeddedContext` | bool | wire (`promptCapabilities.embeddedContext`) | structured `@file` prompt resources |
+| `auth` | bool | wire (`authMethods`) | ACP authentication-method selection |
+| `logout` | bool | wire (`agentCapabilities.auth.logout`) | ACP logout flow |
 
 ## The contract
 
@@ -110,9 +114,12 @@ getSessionInfo(): SessionInfo        // sessionId, capabilities, configOptions, 
 ```text
 async listSessions(): Session[]                 // sessionList
 async loadSession(id)                           // resume
+async deleteSession(id)                         // delete
 async fork(parentSessionId)                     // fork !== false  (base = native; codex = copy)
-async setConfigOption(id, value)                // models/modes/reasoningEffort
+async setConfigOption(id, value, type?)         // all advertised config options, including booleans
 async setMode(id)                               // modes
+async authenticate(methodId, meta?)             // auth; agent RPC or client-run terminal/env flow
+async logout()                                  // logout
 snapshotRetractionState(): token | undefined    // retractPrompt
 canRetract(token): boolean                      // retractPrompt
 interceptCommand(name, arg, backendNames): PresetDialog | null   // commandPresets
@@ -125,7 +132,21 @@ async handleExtensionRequest(method, params): result | undefined // interactiveR
 onEvent(event)                          // normalized UI events (see below)
 async requestPermission(params): outcome
 async requestInteraction(method, params): result
+async onElicitationRequest(params): result       // optional; settles negotiated URL/form elicitation
+elicitationCapabilities: { url?, form? }         // optional mode support; form must be explicit
+async runTerminalAuthentication(spec, method)   // optional override for terminal auth/TUI suspension
+async collectEnvironmentVariables(method, env)  // optional override for env_var credential input
 ```
+
+`BaseAcpAdapter` resolves each advertised authentication method by type. Agent
+methods use the ACP `authenticate` request. Client-run `terminal` and `env_var`
+methods use the host overrides above (or the built-in terminal/prompt helpers),
+then restart the ACP connection with the same resolved launch spec. Environment
+credentials are kept only on that in-memory launch spec. Elicitation is
+advertised only when `onElicitationRequest` is present. URL support remains the
+compatibility default; form support must be explicitly declared through
+`elicitationCapabilities.form`, so an agent cannot choose a UI flow the host
+would necessarily cancel.
 
 ### Normalized events (identical to today's `AcpClient.onEvent` shape)
 
