@@ -224,6 +224,27 @@ await (async () => {
 	assert.deepEqual(missingClient.thread.queue.map((entry) => entry.text), ["missing second"]);
 })();
 
+// A dead side backend no longer owns autocomplete. Keeping its last advertised
+// list authoritative made a focused /btw pane show and route stale commands.
+{
+	let autocompleteUpdates = 0;
+	const app = {
+		btwThread: undefined,
+		focusedThread: "btw",
+		ui: { terminal: { rows: 24 } },
+		updateAutocomplete() { autocompleteUpdates += 1; },
+		onThreadActivity() {},
+	};
+	const thread = new BtwThread(app, { exited: true }, "");
+	app.btwThread = thread;
+	thread.availableCommands = [{ name: "stale-side-command" }];
+	thread.commandsLoaded = true;
+	thread.handleEvent({ type: "backend_exit" });
+	assert.deepEqual(thread.availableCommands, []);
+	assert.equal(thread.commandsLoaded, false);
+	assert.equal(autocompleteUpdates, 1);
+}
+
 function unsendHarness({ initialState, currentState = initialState } = {}) {
 	const prompts = [];
 	let cancelCount = 0;
@@ -5449,10 +5470,19 @@ await (async () => {
 	app.activeKey = "codex";
 	app.transport = "acp";
 	app.config = { agents: { codex: agent } };
+	app.availableCommands = new Map([["codex", [{ name: "old-account-command" }]]]);
+	app.commandsLoaded = new Set(["codex"]);
+	let invalidations = 0;
+	app.backendCommandCatalog = { invalidate: () => { invalidations += 1; } };
 	app.client = {
 		sessionId: "s",
 		agentInfo: { name: "@agentclientprotocol/codex-acp" },
-		authenticate: async (id, meta) => calls.push([id, meta]),
+		authenticate: async (id, meta) => {
+			calls.push([id, meta]);
+			// Simulate an authenticated command update arriving before the RPC
+			// response. The post-auth cleanup must not erase this live authority.
+			app.availableCommands.set("codex", [{ name: "new-account-command" }]);
+		},
 	};
 	app.ready = true;
 	app.statusState = "";
@@ -5465,6 +5495,9 @@ await (async () => {
 	app.ui = { requestRender() {} };
 	await app.authenticateWithMethod({ id: "api-key", name: "API Key" });
 	assert.deepEqual(calls, [["api-key", { "api-key": { apiKey: "agent-scoped-key" } }]]);
+	assert.equal(invalidations, 1, "successful authentication invalidates last-seen account metadata");
+	assert.deepEqual(app.availableCommands.get("codex"), [{ name: "new-account-command" }]);
+	assert.equal(app.commandsLoaded.has("codex"), true, "an existing session retains its live command authority");
 	assert.equal(Object.hasOwn(agent, "_signedOutAuthEnvNames"), false, "successful explicit login lifts the mask");
 	assert.equal(Object.hasOwn(agent, "_sessionAuthEnv"), false, "API-key metadata is not retained on the launch spec");
 })();
@@ -5652,6 +5685,8 @@ await (async () => {
 	app.activeKey = "fake";
 	app.transport = "acp";
 	app.config = { agents: { fake: agent } };
+	app.availableCommands = new Map([["fake", [{ name: "old-account-command" }]]]);
+	app.commandsLoaded = new Set(["fake"]);
 	app.client = { authenticate: async () => assert.fail("terminal auth must not call authenticate RPC") };
 	app.ready = false;
 	app.statusState = "";
@@ -5659,6 +5694,7 @@ await (async () => {
 	app.addNotice = (message) => calls.push(["notice", message]);
 	app.addError = (message) => assert.fail(message);
 	app.updateSpinner = () => {};
+	app.updateAutocomplete = () => calls.push(["autocomplete"]);
 	app.ui = {
 		requestRender(force) { calls.push(["render", force]); },
 		stop() { calls.push(["ui", "stop"]); },
@@ -5681,6 +5717,10 @@ await (async () => {
 		calls.filter(([kind]) => ["ui", "runner", "switch"].includes(kind)),
 		[["ui", "stop"], ["runner"], ["ui", "start"], ["switch", undefined]],
 	);
+	assert.ok(
+		calls.findIndex(([kind]) => kind === "autocomplete") < calls.findIndex(([kind]) => kind === "switch"),
+		"invalid account commands are removed before a potentially slow reconnect",
+	);
 	assert.equal(Object.hasOwn(agent, "_sessionAuthEnv"), false);
 	assert.ok(calls.some(([kind, value]) => kind === "render" && value === true), "TUI must force a repaint after terminal auth");
 })();
@@ -5695,6 +5735,8 @@ await (async () => {
 	app.activeKey = "original";
 	app.transport = "acp";
 	app.config = { agents: { original: originalAgent, replacement: replacementAgent } };
+	const invalidatedHarnesses = [];
+	app.backendCommandCatalog = { invalidate: (key) => { invalidatedHarnesses.push(key); return true; } };
 	app.client = {};
 	app.ready = false;
 	app.statusState = "";
@@ -5723,6 +5765,7 @@ await (async () => {
 	);
 	assert.equal(Object.hasOwn(originalAgent, "_sessionAuthEnv"), false);
 	assert.deepEqual(replacementAgent._sessionAuthEnv, { SERVICE_TOKEN: "keep-replacement" });
+	assert.deepEqual(invalidatedHarnesses, ["original"], "persistent terminal auth invalidates the harness that authenticated");
 })();
 
 // A failed terminal process still restores the TUI and does not reconnect as if
@@ -6069,6 +6112,8 @@ await (async () => {
 	app.activeKey = "fake";
 	app.transport = "acp";
 	app.config = { agents: { fake: agent } };
+	app.availableCommands = new Map([["fake", [{ name: "old-account-command" }]]]);
+	app.commandsLoaded = new Set(["fake"]);
 	app.client = { authenticate: async () => assert.fail("env_var auth must not call authenticate RPC") };
 	app.ready = false;
 	app.statusState = "";
@@ -6076,6 +6121,7 @@ await (async () => {
 	app.addNotice = (message) => calls.push(["notice", message]);
 	app.addError = (message) => assert.fail(message);
 	app.updateSpinner = () => {};
+	app.updateAutocomplete = () => calls.push(["autocomplete"]);
 	app.ui = {
 		requestRender(force) { calls.push(["render", force]); },
 		stop() { calls.push(["ui", "stop"]); },
@@ -6095,6 +6141,10 @@ await (async () => {
 	assert.deepEqual(
 		calls.filter(([kind]) => ["ui", "switch"].includes(kind)),
 		[["ui", "stop"], ["ui", "start"], ["switch", { SERVICE_TOKEN: "session-secret" }]],
+	);
+	assert.ok(
+		calls.findIndex(([kind]) => kind === "autocomplete") < calls.findIndex(([kind]) => kind === "switch"),
+		"invalid account commands are removed before a potentially slow reconnect",
 	);
 })();
 

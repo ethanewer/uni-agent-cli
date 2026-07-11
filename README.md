@@ -70,6 +70,8 @@ The harness you pick with `/harness` is remembered (written to `settings.json` a
 
 Agent-advertised ACP commands appear in autocomplete and are forwarded to that backend (a backend command always takes precedence over a same-named local command, except the reserved UI commands below). This keeps Codex commands such as `/review`, `/compact`, and `/skills` available without `cc` needing to duplicate them. Bare `/mcp` and `/mcp verbose` likewise stay on the live ACP session; only the explicit management subcommands documented below are handled locally. `cc` also provides these commands:
 
+Autocomplete does not wait for the ACP process on every launch. `cc` seeds the fixed commands of the version-checked Codex adapter and privately caches each harness's last advertised command list for the current working directory. Cached entries are display hints only: live ACP advertisements replace them, including with an empty list, and command routing never treats a cached name as local or authoritative. Dynamic project, plugin, account, and skill commands become immediate after their first discovery in that directory. The bounded cache is stored in the platform cache directory (`~/Library/Caches/cc/commands.json` on macOS), expires after 30 days, and can be disabled with `CC_DISABLE_COMMAND_CACHE=1` or relocated with `CC_COMMAND_CACHE`.
+
 - `/new`, `/clear` — start a fresh ACP session and clear the visible thread.
 - `/resume` — open the session picker (when the backend supports `session/list`).
 - `/model`, `/mode`, `/effort` (aka `/reasoning`, `/thinking`) — open ACP config selectors when the backend advertises them.
@@ -223,6 +225,8 @@ Create `~/.config/cc/config.json` to override commands (or point `CC_CONFIG` at 
   }
 }
 ```
+
+For a custom ACP harness with stable commands, `commandHints` can make those names available before its first connection. Hints accept strings or `{ "name", "description", "argumentHint" }` objects. They affect autocomplete and `/help` only; the backend still owns execution and its live advertisement replaces them for the active session.
 
 ## Settings
 

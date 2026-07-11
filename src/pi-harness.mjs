@@ -65,6 +65,7 @@ import {
 	normalizeElicitationResponse,
 	validateElicitationFieldValue,
 } from "./harness/elicitation.mjs";
+import { BackendCommandCatalog, backendCommandCachePath, normalizeBackendCommands } from "./harness/command-catalog.mjs";
 
 const HARNESS = "/harness";
 // Commands the shared UI owns when localSlashCommands exposes them, even if a
@@ -1631,9 +1632,14 @@ export class BtwThread {
 			this.busy = false;
 			this.statusState = "";
 			this.state = "error";
+			this.availableCommands = [];
+			this.commandsLoaded = false;
 			this.settleReadyWaiters(false);
 			this.cancelDeferredLocalCommands();
 			this.closeCurrentAssistantText();
+			if (this.app.btwThread === this && this.app.focusedThread === "btw") {
+				this.app.updateAutocomplete();
+			}
 			this.app.onThreadActivity();
 			return;
 		}
@@ -3161,8 +3167,9 @@ class VoiceController {
 }
 
 export class HarnessApp {
-	constructor(config, initialAgent, initialTransport) {
+	constructor(config, initialAgent, initialTransport, options = {}) {
 		this.config = config;
+		this.backendCommandCatalog = options.backendCommandCatalog ?? new BackendCommandCatalog(config.agents);
 		this.themeName = resolveThemeName(config.theme ?? config.settings?.theme) ?? "system";
 		this.previewThemeName = undefined;
 		setActiveTheme(this.themeName);
@@ -3224,6 +3231,7 @@ export class HarnessApp {
 		this.editorTargetThread = undefined;
 		this.availableCommands = new Map();
 		this.commandsLoaded = new Set();
+		this.backendCommandCacheTimers = new Map();
 		this.lastAutocompleteKey = undefined;
 		this.sessionStates = new Map();
 		this.voiceController = undefined;
@@ -3563,6 +3571,7 @@ export class HarnessApp {
 		}
 		this.activeKey = key;
 		this.transport = transport;
+		this.clearLiveBackendCommands(key);
 		// Remember an explicit harness pick so it carries over to the next `cc`
 		// session, mirroring how /theme persists. Best-effort: a failed write
 		// should not block switching.
@@ -5736,14 +5745,7 @@ export class HarnessApp {
 	}
 
 	showHelp() {
-		const sideCommands =
-			this.focusedThread === "btw" && this.btwThread?.commandsLoaded
-				? this.btwThread.availableCommands
-				: undefined;
-		const commands = dedupeCommands([
-			...localSlashCommands(this),
-			...(sideCommands ?? this.availableCommands.get(this.activeKey) ?? []),
-		]);
+		const commands = this.displayCommandCatalog();
 		const lines = commands.map((command) => {
 			const hint = command.argumentHint ? ` ${command.argumentHint}` : "";
 			const desc = command.description ? `  ${command.description}` : "";
@@ -5751,6 +5753,52 @@ export class HarnessApp {
 			return `${prefix}${command.name}${hint}${desc}`;
 		});
 		this.addNotice(lines.join("\n"));
+	}
+
+	backendCommandsForDisplay() {
+		if (this.focusedThread === "btw" && this.btwThread?.commandsLoaded) {
+			return normalizeBackendCommands(this.btwThread.availableCommands);
+		}
+		// A loaded empty list is authoritative. Map.has() preserves that distinction
+		// from a cold backend for both the main pane and a connecting /btw pane.
+		if (this.availableCommands?.has(this.activeKey)) {
+			return normalizeBackendCommands(this.availableCommands.get(this.activeKey));
+		}
+		return this.backendCommandCatalog?.commandsFor(this.activeKey) ?? [];
+	}
+
+	clearLiveBackendCommands(key = this.activeKey) {
+		const hadCommands = this.availableCommands?.delete(key) ?? false;
+		const wasLoaded = this.commandsLoaded?.delete(key) ?? false;
+		return hadCommands || wasLoaded;
+	}
+
+	invalidateBackendCommandHints(key = this.activeKey, options = {}) {
+		// Cache and live stores are deliberately separate, but an identity or
+		// process transition must demote both before rebuilding autocomplete. Do
+		// not short-circuit these calls: either store can change independently.
+		const invalidated = this.backendCommandCatalog?.invalidate?.(key) ?? false;
+		const cleared = options.preserveLive === true ? false : this.clearLiveBackendCommands(key);
+		if (invalidated || cleared) this.updateAutocomplete();
+		return invalidated || cleared;
+	}
+
+	scheduleBackendCommandCatalogPersist(key) {
+		const existing = this.backendCommandCacheTimers?.get(key);
+		if (existing) clearTimeout(existing);
+		const timer = setTimeout(() => {
+			this.backendCommandCacheTimers?.delete(key);
+			this.backendCommandCatalog?.persist?.(key);
+		}, 0);
+		timer.unref?.();
+		this.backendCommandCacheTimers?.set(key, timer);
+	}
+
+	displayCommandCatalog() {
+		return dedupeCommands([
+			...localSlashCommands(this),
+			...this.backendCommandsForDisplay(),
+		]);
 	}
 
 	showStatus() {
@@ -6481,6 +6529,7 @@ export class HarnessApp {
 		}
 		const transitionKey = this.activeKey;
 		const client = this.client;
+		const commandsBeforeAuthentication = this.availableCommands?.get(transitionKey);
 		this.sessionSwitchInProgress = true;
 		try {
 			if (method?.type === "terminal") {
@@ -6512,7 +6561,34 @@ export class HarnessApp {
 			// cannot silently sign the user straight back in; do not lift that mask for
 			// a failed or stale authentication attempt.
 			clearSignedOutAuthenticationEnvironment(this.config?.agents?.[transitionKey]);
-			if (!client.sessionId) await client.newSession();
+			const authenticatedCommands = this.availableCommands?.get(transitionKey);
+			const learnedCommandsDuringAuthentication =
+				this.commandsLoaded?.has(transitionKey) === true &&
+				authenticatedCommands !== commandsBeforeAuthentication;
+			this.invalidateBackendCommandHints(transitionKey, { preserveLive: true });
+			// Some agents publish the authenticated command list before resolving the
+			// authenticate request. Owner-wide invalidation above removes the old
+			// identity and any early write; re-home only a list that actually changed
+			// during the request under the now-authenticated cache scope.
+			if (
+				learnedCommandsDuringAuthentication &&
+				this.backendCommandCatalog?.remember?.(transitionKey, authenticatedCommands, {
+					agentInfo: client.agentInfo,
+					persist: false,
+				})
+			) {
+				this.scheduleBackendCommandCatalogPersist(transitionKey);
+			}
+			if (!client.sessionId) {
+				// A sessionless connection has no authoritative command list yet. Demote
+				// anything provisional before session/new publishes the authenticated list.
+				if (this.clearLiveBackendCommands(transitionKey)) this.updateAutocomplete();
+				await client.newSession();
+			}
+			// An existing ACP session remains the same live authority across an
+			// in-process authenticate request. Keep its list visible unless the backend
+			// publishes a replacement; clearing it here made account/skill commands
+			// disappear for the rest of otherwise-valid sessions.
 			if (this.client !== client || this.activeKey !== transitionKey) return;
 			this.ready = true;
 			this.updateAutocomplete();
@@ -6580,6 +6656,7 @@ export class HarnessApp {
 		// ACP env_var authentication is completed by restarting the agent with the
 		// supplied variables. Keep them on the in-memory launch spec only: they are
 		// neither copied into process.env nor persisted to cc settings.
+		this.invalidateBackendCommandHints(authenticationKey);
 		authenticationAgent._sessionAuthEnv = { ...credentials };
 		await this.switchAgent(authenticationKey, authenticationTransport, {
 			quiet: true,
@@ -6642,6 +6719,8 @@ export class HarnessApp {
 		// terminal flow just persisted in the replacement process.
 		delete authenticationAgent._sessionAuthEnv;
 		clearSignedOutAuthenticationEnvironment(authenticationAgent);
+		const invalidatedAuthenticationHints =
+			this.backendCommandCatalog?.invalidate?.(authenticationKey) ?? false;
 		// A lifecycle turn that was already queued can replace the active harness
 		// while the real terminal is owned by the login process. Clear the credentials
 		// on the agent that actually authenticated, but never reconnect or mutate the
@@ -6652,6 +6731,8 @@ export class HarnessApp {
 			this.transport !== authenticationTransport ||
 			this.config.agents[authenticationKey] !== authenticationAgent
 		) return;
+		const clearedAuthenticationCommands = this.clearLiveBackendCommands(authenticationKey);
+		if (invalidatedAuthenticationHints || clearedAuthenticationCommands) this.updateAutocomplete();
 		await this.switchAgent(authenticationKey, authenticationTransport, {
 			quiet: true,
 			statusState: "connecting",
@@ -6701,6 +6782,7 @@ export class HarnessApp {
 			await client.logout();
 			if (this.client !== client || this.activeKey !== transitionKey) return;
 			signedOut = true;
+			this.invalidateBackendCommandHints(transitionKey);
 			maskSignedOutAuthenticationEnvironment(agent, authenticationEnvironmentNames);
 			// /btw owns a separate authenticated ACP process. Keep it intact when the
 			// logout RPC fails, but close it after success so it cannot keep prompting
@@ -6710,6 +6792,7 @@ export class HarnessApp {
 			delete agent._sessionAuthEnv;
 			this.ready = false;
 			await stopClientsForReplacement([client, btwClient]);
+			this.invalidateBackendCommandHints(transitionKey);
 			this.addNotice("Signed out. Run /login to authenticate again.");
 		} catch (error) {
 			if (this.client === client && this.activeKey === transitionKey) {
@@ -8614,6 +8697,7 @@ export class HarnessApp {
 					// child session. Replay then replaces the transcript atomically.
 					if (this.btwThread) this.closeBtw();
 					switched = true;
+					this.clearLiveBackendCommands(context.key);
 					this.resetConversationView();
 					const title = singleLineMenuText(forked.title).slice(0, 160) || "Forked session";
 					this.addCommandMessage(slashPromptDisplay(displayText, title));
@@ -8773,6 +8857,7 @@ export class HarnessApp {
 					// after load commits so a failed resume remains nondestructive.
 					if (this.btwThread) this.closeBtw();
 					switched = true;
+					this.clearLiveBackendCommands(this.activeKey);
 					this.resetConversationView();
 					this.addCommandMessage(displayText);
 					this.updateAutocomplete();
@@ -8875,6 +8960,7 @@ export class HarnessApp {
 				beforeReplay: async () => {
 					if (this.client !== client) return;
 					switched = true;
+					this.clearLiveBackendCommands(this.activeKey);
 					this.resetConversationView();
 					this.addCommandMessage(displayText);
 					this.updateAutocomplete();
@@ -10306,6 +10392,7 @@ export class HarnessApp {
 			this.pendingUnsendPrompt = undefined;
 			this.statusState = "";
 			this.updateSpinner();
+			if (this.clearLiveBackendCommands(this.activeKey)) this.updateAutocomplete();
 		} else if (event.type === "cursor_todos") {
 			this.disarmPendingUnsendPrompt();
 			this.addNotice(cursorTodosText(event.todos));
@@ -10313,10 +10400,15 @@ export class HarnessApp {
 			this.availableCommands.set(this.activeKey, event.commands);
 			this.commandsLoaded.add(this.activeKey);
 			this.updateAutocomplete();
-			} else if (event.type === "session_info") {
-				this.sessionStates.set(this.activeKey, event.sessionInfo);
-				this.syncRuntimePermissionModeFromSessionInfo(event.sessionInfo);
-				this.refreshCodexThreadStateSnapshot(event.sessionInfo);
+			if (this.backendCommandCatalog?.remember?.(this.activeKey, event.commands, {
+				agentInfo: this.client?.agentInfo,
+				persist: false,
+			})) this.scheduleBackendCommandCatalogPersist(this.activeKey);
+		} else if (event.type === "session_info") {
+			this.sessionStates.set(this.activeKey, event.sessionInfo);
+			this.syncRuntimePermissionModeFromSessionInfo(event.sessionInfo);
+			this.refreshCodexThreadStateSnapshot(event.sessionInfo);
+			this.backendCommandCatalog?.validateIdentity?.(this.activeKey, event.sessionInfo?.agentInfo);
 			this.updateAutocomplete();
 		}
 		this.ui.requestRender();
@@ -10395,14 +10487,7 @@ export class HarnessApp {
 	}
 
 	updateAutocomplete() {
-		const sideCommands =
-			this.focusedThread === "btw" && this.btwThread?.commandsLoaded
-				? this.btwThread.availableCommands
-				: undefined;
-		const commands = dedupeCommands([
-			...localSlashCommands(this),
-			...(sideCommands ?? this.availableCommands.get(this.activeKey) ?? []),
-		]);
+		const commands = this.displayCommandCatalog();
 		// Skip frequent no-op config/mode/session updates while the user is mid-type.
 		const key = `${this.activeKey}\t${JSON.stringify(commands.map((command) => [command.name, command.description, command.argumentHint]))}`;
 		if (key === this.lastAutocompleteKey) return;
@@ -10530,6 +10615,11 @@ export class HarnessApp {
 
 	async stopAndExit(options = {}) {
 		this.stopping = true;
+		for (const [key, timer] of this.backendCommandCacheTimers ?? []) {
+			clearTimeout(timer);
+			this.backendCommandCatalog?.persist(key);
+		}
+		this.backendCommandCacheTimers?.clear();
 		if (this.spinnerTimer) clearInterval(this.spinnerTimer);
 		if (this.markdownPreloadTimer) clearTimeout(this.markdownPreloadTimer);
 		if (this.startupConnectTimer) clearTimeout(this.startupConnectTimer);
@@ -15705,7 +15795,11 @@ export async function runCli(args = process.argv.slice(2)) {
 
 	const initialAgent = args.find((arg) => !arg.startsWith("-") && config.agents[arg]) ?? config.defaultAgent;
 
-	const app = new HarnessApp(config, initialAgent);
+	const backendCommandCatalog = new BackendCommandCatalog(config.agents, {
+		cwd: process.cwd(),
+		cachePath: backendCommandCachePath(),
+	});
+	const app = new HarnessApp(config, initialAgent, undefined, { backendCommandCatalog });
 	process.on("SIGINT", () => app.handleInterrupt("signal"));
 	for (const signal of ["SIGTERM", "SIGHUP"]) {
 		process.once(signal, () => app.stop());

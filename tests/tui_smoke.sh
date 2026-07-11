@@ -14,6 +14,8 @@ CONFIG_SETTINGS_THEME_FILE="$(mktemp -t cc-tui-config-settings-theme.XXXXXX)"
 CONFIG_TOP_THEME_FILE="$(mktemp -t cc-tui-config-top-theme.XXXXXX)"
 COMMANDS_GATE="$(mktemp -t cc-tui-commands-gate.XXXXXX)"
 rm -f "$COMMANDS_GATE"
+COMMAND_CACHE="$(mktemp -t cc-tui-command-cache.XXXXXX)"
+rm -f "$COMMAND_CACHE"
 # Isolate the permission grant store so cc never reads the developer's real
 # ~/.config/cc/permissions.json (a stray grant could auto-resolve the permission
 # prompt step). Point at a fresh, nonexistent file -> no grants.
@@ -27,10 +29,11 @@ PERMS_FILE_Q="$(printf "%q" "$PERMS_FILE")"
 CONFIG_SETTINGS_THEME_FILE_Q="$(printf "%q" "$CONFIG_SETTINGS_THEME_FILE")"
 CONFIG_TOP_THEME_FILE_Q="$(printf "%q" "$CONFIG_TOP_THEME_FILE")"
 COMMANDS_GATE_Q="$(printf "%q" "$COMMANDS_GATE")"
+COMMAND_CACHE_Q="$(printf "%q" "$COMMAND_CACHE")"
 TERM_PROGRAM_Q="$(printf "%q" "${TERM_PROGRAM:-}")"
 VSCODE_PID_Q="$(printf "%q" "${VSCODE_PID:-}")"
 VSCODE_INJECTION_Q="$(printf "%q" "${VSCODE_INJECTION:-}")"
-PANE_ENV="env -u TERM_PROGRAM -u VSCODE_PID -u VSCODE_INJECTION CC_PERMISSIONS=$PERMS_FILE_Q"
+PANE_ENV="env -u TERM_PROGRAM -u VSCODE_PID -u VSCODE_INJECTION CC_PERMISSIONS=$PERMS_FILE_Q CC_COMMAND_CACHE=$COMMAND_CACHE_Q"
 VSCODE_TERMINAL=0
 if [ "${TERM_PROGRAM:-}" = "vscode" ] || [ -n "${VSCODE_PID:-}" ] || [ -n "${VSCODE_INJECTION:-}" ]; then
 	VSCODE_TERMINAL=1
@@ -47,7 +50,7 @@ fi
 
 cleanup() {
 	tmux kill-session -t "$SESSION" >/dev/null 2>&1 || true
-	rm -f "$WRITE_LOG" "$SETTINGS_FILE" "$CONFIG_SETTINGS_THEME_FILE" "$CONFIG_TOP_THEME_FILE" "$COMMANDS_GATE" "$PERMS_FILE"
+	rm -f "$WRITE_LOG" "$SETTINGS_FILE" "$CONFIG_SETTINGS_THEME_FILE" "$CONFIG_TOP_THEME_FILE" "$COMMANDS_GATE" "$COMMAND_CACHE" "$PERMS_FILE"
 }
 trap cleanup EXIT
 
@@ -209,6 +212,17 @@ tmux send-keys -t "$SESSION" / r
 : > "$COMMANDS_GATE"
 wait_for_text "Review current changes"
 wait_for_text "/r"
+tmux kill-session -t "$SESSION"
+: > "$WRITE_LOG"
+
+# The first live advertisement above is now a workspace-scoped display hint.
+# On the next process launch it must be present before the deliberately gated
+# backend publishes anything, while still remaining backend-owned for routing.
+rm -f "$COMMANDS_GATE"
+tmux new-session -d -s "$SESSION" -x 100 -y 30 "cd $ROOT_Q && $PANE_ENV PI_TUI_WRITE_LOG=$WRITE_LOG_Q CC_CONFIG=tests/fake_config.json CC_SETTINGS=$SETTINGS_FILE_Q CC_BACKGROUND_CONNECT_DELAY_MS=0 FAKE_ACP_COMMANDS_GATE=$COMMANDS_GATE_Q ./src/cc fake"
+wait_for_text "Space to record"
+tmux send-keys -t "$SESSION" / r
+wait_for_text "Review current changes"
 tmux kill-session -t "$SESSION"
 : > "$WRITE_LOG"
 

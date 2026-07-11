@@ -2620,7 +2620,10 @@ rl.on("line", (line) => {
 				[{ method: "externalAgentConfig/import", params: { migrationItems: [] } }],
 				{},
 				{
-					timeoutMs: 75,
+					// The helper's deadline includes spawning the fixture process. Leave
+					// enough room for a cold Node startup so this specifically exercises
+					// the post-response missing-notification path.
+					timeoutMs: 1_000,
 					waitForNotification: {
 						method: "externalAgentConfig/import/completed",
 						matches: () => false,
