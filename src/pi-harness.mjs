@@ -8368,7 +8368,19 @@ export class HarnessApp {
 				this.addSessionTargetNotice(target, formatCodexGoal(goal));
 			}
 		} catch (error) {
-			if (this.isSessionCommandTargetActive(target)) this.addSessionTargetError(target, `Could not read goal: ${error.message ?? error}`);
+			if (!this.isSessionCommandTargetActive(target)) return;
+			const unmaterializedSession =
+				isCodexGoalThreadNotFoundError(error, sessionId) &&
+				codexGoalSessionIsUnmaterialized(sessionId, context.agent);
+			if (unmaterializedSession) {
+				this.addSessionTargetNotice(
+					target,
+					"No goal is set for this new session yet. Use /goal <objective> to create one, " +
+						"or send a regular message first so Codex can save the session.",
+				);
+			} else {
+				this.addSessionTargetError(target, `Could not read goal: ${error.message ?? error}`);
+			}
 		} finally {
 			if (this.isActiveAgentContext(context) && !this.busy && !this.sessionSwitchInProgress) {
 				this.statusState = "";
@@ -12066,6 +12078,13 @@ function formatCodexGoal(goal = {}) {
 	return lines.join("\n");
 }
 
+function isCodexGoalThreadNotFoundError(error, sessionId) {
+	const match = /^thread\/goal\/get failed \(-32600\): thread not found:\s*([0-9a-f-]+)\s*$/iu.exec(
+		String(error?.message ?? error).trim(),
+	);
+	return Boolean(match && sameSessionId(match[1], sessionId));
+}
+
 function formatInteger(value) {
 	return Number(value).toLocaleString("en-US", { maximumFractionDigits: 0 });
 }
@@ -14035,6 +14054,13 @@ function codexStateDbSessionPresence(sessionId, env = process.env) {
 		timeout: 1_000,
 		windowsHide: true,
 	});
+	if (result.error?.code === "ENOENT") {
+		return {
+			status: "unknown",
+			reason: "could not query the Codex session index because sqlite3 is unavailable",
+			readerUnavailable: true,
+		};
+	}
 	if (result.error || result.status !== 0) {
 		const detail = result.error?.message ?? (String(result.stderr ?? "").trim() || `exit status ${result.status}`);
 		return { status: "unknown", reason: `could not query the Codex session index: ${detail}` };
@@ -14057,6 +14083,14 @@ export function codexStoredSessionPresence(sessionId, agent = {}) {
 	if (filesystem.status === "unknown") return filesystem;
 	if (database.status === "unknown") return database;
 	return { status: "absent" };
+}
+
+function codexGoalSessionIsUnmaterialized(sessionId, agent = {}) {
+	const env = mergedAgentEnvironment(agent);
+	const filesystem = codexRolloutStoragePresence(sessionId, env);
+	if (filesystem.status !== "absent") return false;
+	const database = codexStateDbSessionPresence(sessionId, env);
+	return database.status === "absent" || database.readerUnavailable === true;
 }
 
 function readCompressedCodexRollout(rolloutPath, maxBytes) {

@@ -2097,6 +2097,10 @@ rl.on("line", (line) => {
     return;
   }
   if (message.method === "thread/goal/get") {
+    if (process.env.CC_TEST_MODE === "goal-not-found") {
+      send({ id: message.id, error: { code: -32600, message: "thread not found: " + message.params.threadId } });
+      return;
+    }
     setTimeout(() => send({ id: message.id, result: { goal: { objective: "Ship parity", status: "active", tokensUsed: 12, timeUsedSeconds: 5 } } }), Number(process.env.CC_GOAL_DELAY || 0));
     return;
   }
@@ -2299,6 +2303,62 @@ rl.on("line", (line) => {
 			const goal = appHarness(featureAgent);
 		await goal.app.runCodexGoalView("edit");
 		assert.equal(goal.app.editor.getText(), "/goal Ship parity");
+
+		const newGoalHome = path.join(root, "new-goal-home");
+		fs.mkdirSync(newGoalHome, { recursive: true });
+		const newGoal = appHarness({
+			env: {
+				...featureAgent.env,
+				CC_TEST_MODE: "goal-not-found",
+				CODEX_HOME: newGoalHome,
+			},
+		});
+		await newGoal.app.runCodexGoalView();
+		assert.equal(newGoal.errors.length, 0, "an unmaterialized new session does not surface a backend error");
+		assert.match(newGoal.notices.at(-1), /No goal is set for this new session yet/);
+		assert.match(newGoal.notices.at(-1), /\/goal <objective>/);
+
+		const noSqliteGoalHome = path.join(root, "new-goal-home-with-state-db");
+		fs.mkdirSync(noSqliteGoalHome, { recursive: true });
+		fs.writeFileSync(path.join(noSqliteGoalHome, "state_5.sqlite"), "sqlite reader should not run");
+		const noSqliteGoal = appHarness({
+			env: {
+				...featureAgent.env,
+				CC_TEST_MODE: "goal-not-found",
+				CODEX_HOME: noSqliteGoalHome,
+			},
+		});
+		const originalPath = process.env.PATH;
+		try {
+			process.env.PATH = path.join(root, "empty-command-path");
+			await noSqliteGoal.app.runCodexGoalView();
+		} finally {
+			if (originalPath === undefined) delete process.env.PATH;
+			else process.env.PATH = originalPath;
+		}
+		assert.equal(noSqliteGoal.errors.length, 0, "the new-session hint does not require an external sqlite3 executable");
+		assert.match(noSqliteGoal.notices.at(-1), /No goal is set for this new session yet/);
+
+		const persistedGoalHome = path.join(root, "persisted-goal-home");
+		const persistedGoalSessions = path.join(persistedGoalHome, "sessions", "2026", "07", "11");
+		fs.mkdirSync(persistedGoalSessions, { recursive: true });
+		fs.writeFileSync(
+			path.join(persistedGoalSessions, `rollout-2026-07-11T12-00-00-${newGoal.app.client.sessionId}.jsonl`),
+			"{}\n",
+		);
+		const missingPersistedGoal = appHarness({
+			env: {
+				...featureAgent.env,
+				CC_TEST_MODE: "goal-not-found",
+				CODEX_HOME: persistedGoalHome,
+			},
+		});
+		await missingPersistedGoal.app.runCodexGoalView();
+		assert.match(
+			missingPersistedGoal.errors.at(-1),
+			/Could not read goal: thread\/goal\/get failed/,
+			"a missing persisted thread remains an actionable error",
+		);
 
 		const goalRace = appHarness({
 			env: { CODEX_PATH: cli, PATH: "", CC_TEST_LOG: log, CC_GOAL_DELAY: "50" },
