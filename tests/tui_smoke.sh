@@ -391,6 +391,23 @@ tmux send-keys -t "$SESSION" e c h o Enter
 sleep 0.1
 assert_no_mouse_tracking_enabled
 wait_for_text "echo: echo"
+
+# Option+Return is Alt+Enter at the terminal protocol layer. Exercise the
+# CSI-u form through a real tmux pane: it must add a line to the composer and
+# wait for an unmodified Return before submitting the combined prompt.
+tmux send-keys -t "$SESSION" o p t i o n - l i n e - o n e
+tmux send-keys -l -t "$SESSION" "$(printf '\033[13;3u')"
+tmux send-keys -t "$SESSION" o p t i o n - l i n e - t w o
+sleep 0.1
+if capture | grep -Fq "echo: option-line-one"; then
+	echo "Option+Return submitted instead of inserting a newline" >&2
+	capture >&2
+	exit 1
+fi
+tmux send-keys -t "$SESSION" Enter
+wait_for_text "echo: option-line-one"
+wait_for_text "option-line-two"
+
 tmux send-keys -t "$SESSION" c o n d a
 sleep 0.05
 tmux send-keys -t "$SESSION" Space a c t i v a t e

@@ -11,6 +11,7 @@ import * as zlib from "node:zlib";
 import { Editor } from "@mariozechner/pi-tui/dist/components/editor.js";
 import { Spacer } from "@mariozechner/pi-tui/dist/components/spacer.js";
 import { Text } from "@mariozechner/pi-tui/dist/components/text.js";
+import { KeybindingsManager, TUI_KEYBINDINGS, setKeybindings } from "@mariozechner/pi-tui/dist/keybindings.js";
 import { isKeyRelease, matchesKey } from "@mariozechner/pi-tui/dist/keys.js";
 import { ProcessTerminal } from "@mariozechner/pi-tui/dist/terminal.js";
 import { Container, TUI } from "@mariozechner/pi-tui/dist/tui.js";
@@ -276,6 +277,17 @@ const DEFAULT_SETTINGS = {
 	agents: {},
 	theme: "system",
 };
+
+export function configureCcKeybindings() {
+	const keybindings = new KeybindingsManager(TUI_KEYBINDINGS, {
+		// macOS terminals report Option as Alt. Keep Pi's Shift+Return default
+		// while accepting the protocol-aware CSI-u/modifyOtherKeys forms of
+		// Option+Return as the same multiline-editor action.
+		"tui.input.newLine": ["shift+enter", "alt+enter"],
+	});
+	setKeybindings(keybindings);
+	return keybindings;
+}
 
 const THEME_ROLE_ORDER = [
 	"primary",
@@ -3195,6 +3207,7 @@ class VoiceController {
 export class HarnessApp {
 	constructor(config, initialAgent, initialTransport, options = {}) {
 		this.config = config;
+		this.inputKeybindings = configureCcKeybindings();
 		this.backendCommandCatalog = options.backendCommandCatalog ?? new BackendCommandCatalog(config.agents);
 		this.themeName = resolveThemeName(config.theme ?? config.settings?.theme) ?? "system";
 		this.previewThemeName = undefined;

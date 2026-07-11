@@ -42,6 +42,10 @@ npm link
 
 `cc` mirrors Codex's steering model so you never have to wait for a turn to finish:
 
+While composing, **Return** submits and **Shift+Return** inserts a newline. On macOS,
+**Option+Return** is also supported for newlines (**Alt+Enter** on other platforms),
+including the CSI-u and modifyOtherKeys encodings used by modern terminals and tmux.
+
 | Key (while the agent is working) | What it does |
 | --- | --- |
 | **Enter** (with text) | Queue the message **after the next tool call** — `cc` interrupts at the next tool boundary and sends it. |

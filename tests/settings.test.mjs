@@ -14,6 +14,7 @@ import {
 	buildEmbeddedFilePromptParts,
 	BtwThread,
 	collectEnvironmentAuthenticationVariables,
+	configureCcKeybindings,
 	copyCodexRolloutWithNewId,
 	findCodexRolloutPath,
 	forgetForkIds,
@@ -62,6 +63,21 @@ import {
 assert.equal(singleLineMenuText("first\nsecond\tthird"), "first second third");
 assert.equal(singleLineMenuText("safe\x1b[2J\x1b]0;owned\x07 title"), "safe title");
 assert.equal(singleLineMenuText("\x1b[31msession\nidentifier\x1b[0m"), "session identifier");
+{
+	const keybindings = configureCcKeybindings();
+	for (const sequence of [
+		"\x1b[13;2u", // Kitty Shift+Return
+		"\x1b[13;3u", // Kitty Option/Alt+Return
+		"\x1b[57414;3u", // Kitty Option/Alt+numpad Enter
+		"\x1b[27;3;13~", // xterm modifyOtherKeys Option/Alt+Return
+		"\x1b\r", // legacy Meta/Option+Return
+	]) {
+		assert.equal(keybindings.matches(sequence, "tui.input.newLine"), true, `expected ${JSON.stringify(sequence)} to insert a newline`);
+	}
+	assert.equal(keybindings.matches("\r", "tui.input.newLine"), false, "plain Return must not insert a newline");
+	assert.equal(keybindings.matches("\r", "tui.input.submit"), true, "plain Return still submits");
+	assert.deepEqual(keybindings.getConflicts(), []);
+}
 {
 	const panel = new SelectionPanel("Resume\nsession", [{ label: "first\nsecond", description: "date\npath" }], () => {});
 	const lines = panel.render(80);
@@ -5192,6 +5208,20 @@ await (async () => {
 
 	const app = new HarnessApp(config, "codex", "acp");
 	app.ui.requestRender = () => {};
+	const originalOnSubmit = app.editor.onSubmit;
+	const submitted = [];
+	app.editor.onSubmit = (text) => submitted.push(text);
+	for (const sequence of ["\x1b[13;3u", "\x1b[27;3;13~", "\x1b\r"]) {
+		app.editor.setText("first line");
+		app.editor.handleInput(sequence);
+		for (const character of "second line") app.editor.handleInput(character);
+		assert.equal(app.editor.getText(), "first line\nsecond line");
+		assert.deepEqual(submitted, [], "Option+Return inserts a newline without submitting");
+	}
+	app.editor.setText("submit normally");
+	app.editor.handleInput("\r");
+	assert.deepEqual(submitted, ["submit normally"], "plain Return still submits the editor contents");
+	app.editor.onSubmit = originalOnSubmit;
 	app.availableCommands.set("codex", [{ name: "$fake-skill", description: "Use the fake skill" }]);
 	app.updateAutocomplete();
 	// Paste handling cancels Pi's popup. The wrapper must reopen it from the
