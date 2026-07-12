@@ -185,6 +185,15 @@ Agent-advertised ACP commands appear in autocomplete and are forwarded to that b
 
 Autocomplete does not wait for the ACP process on every launch. `cc` seeds an identity-and-version-gated snapshot of first-party commands from its pinned Claude and Codex adapters, then privately caches each harness's last advertised command list for the current working directory. Cached entries are display hints only: live ACP advertisements replace them, including with an empty list, and command routing never treats a cached name as local or authoritative. Dynamic project, plugin, account, and skill commands become immediate after their first discovery in that directory. The bounded cache is stored in the platform cache directory (`~/Library/Caches/cc/commands.json` on macOS), expires after 30 days, and can be disabled with `CC_DISABLE_COMMAND_CACHE=1` or relocated with `CC_COMMAND_CACHE`.
 
+The TUI and cached autocomplete remain usable while the ACP backend warms in the
+background. The footer shows a live connection state instead of looking idle.
+If a command such as `/resume` needs the still-starting backend, cc joins that
+single startup and shows the command's progress continuously through its picker.
+Typing remains responsive, but a second Enter preserves the draft in the
+composer rather than starting a conflicting action. Press Ctrl+C to cancel the
+pending UI action; already-started background work may safely finish without
+reopening the interaction.
+
 - `/new`, `/clear` — start a fresh ACP session and clear the visible thread.
 - `/resume` — open the session picker (when the backend supports `session/list`).
 - `/model`, `/mode`, `/effort` (aka `/reasoning`, `/thinking`) — open ACP config selectors when the backend advertises them.

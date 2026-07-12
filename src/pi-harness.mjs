@@ -260,6 +260,12 @@ const VS_CODE_AUTO_ACTIVATION_MAX_INPUT_GAP_MS = 15;
 const VS_CODE_AUTO_ACTIVATION_MAX_SUBMIT_AGE_MS = 75;
 const CLIPBOARD_IMAGE_TIMEOUT_MS = 2_500;
 const CODEX_COMMAND_TIMEOUT_MS = 30_000;
+const CODEX_SESSION_INDEX_TIMEOUT_MS = 2_000;
+// Match spawnSync's historical default stdout ceiling while making the async
+// reader's memory contract explicit. An oversized response is unavailable, not
+// an authoritative empty index, so /resume can fall back to ACP session/list.
+const CODEX_SESSION_INDEX_STDOUT_MAX_BYTES = 1024 * 1024;
+const CODEX_SESSION_INDEX_STDERR_MAX_BYTES = 64 * 1024;
 const CODEX_THREAD_SOURCE_KINDS = [
 	"cli",
 	"vscode",
@@ -981,6 +987,10 @@ export function statusLineText(status = {}, cwd = process.cwd()) {
 		compactCwd(cwd),
 	].filter(Boolean);
 	return `${state}${parts.join(" · ")}`;
+}
+
+export function effectiveActivityStatus(owner = {}) {
+	return owner.statusState || ((owner.shellInputsRunning ?? 0) > 0 ? "running shell command" : "");
 }
 
 class StatusLine extends Text {
@@ -3719,7 +3729,12 @@ export class HarnessApp {
 		this.busy = false;
 		this.client = undefined;
 		this.connectionAttempt = undefined;
+		this.connectionStatusOwner = undefined;
 		this.agentSwitchTail = undefined;
+		// Metadata for the complete queued lifecycle, published before switchAgent's
+		// first await. Cold commands can therefore join background startup even in the
+		// short window before that lifecycle has installed its adapter/client.
+		this.agentSwitchAttempt = undefined;
 		this.workingDirectoryShutdownTail = undefined;
 		this.replacementProcessFence = undefined;
 		this.menuHandle = undefined;
@@ -3730,6 +3745,12 @@ export class HarnessApp {
 		this.configUpdateCount = 0;
 		this.asyncPickerLoads = new Set();
 		this.asyncPickerLoadCount = 0;
+		// A user-requested UI action may need to wait for lazy ACP startup before it
+		// can open a picker or mutate session state. Keep that intent in the TUI,
+		// separate from adapter lifecycle flags, so startup stays non-blocking until
+		// the user actually submits an action.
+		this.foregroundOperation = undefined;
+		this.foregroundOperationSequence = 0;
 		this.currentAssistantText = undefined;
 		this.currentUserText = undefined;
 		this.currentToolSummary = undefined;
@@ -3823,7 +3844,11 @@ export class HarnessApp {
 		this.editor = new VoiceEditor(this.ui, EDITOR_THEME, { paddingX: 0, autocompleteMaxVisible: 8 });
 		this.status = new StatusLine(() => {
 			const btwFocused = this.focusedThread === "btw" && this.btwThread;
-			const state = btwFocused ? this.btwThread.statusState : this.statusState;
+			// A root operation blocks submissions in every pane, so its progress must
+			// remain visible even when the /btw pane currently owns editor focus.
+			const state = this.foregroundOperation?.status || effectiveActivityStatus(
+				btwFocused ? this.btwThread : this,
+			);
 			return {
 				agent: btwFocused ? `${this.activeKey} · btw` : this.activeKey,
 				state,
@@ -4028,6 +4053,31 @@ export class HarnessApp {
 		process.env.CC_ADOPTED_PREPAINT = "1";
 	}
 
+	setConnectionStatus(owner, status) {
+		const next = String(status || "connecting");
+		if (owner) {
+			owner.statusState = next;
+			this.connectionStatusOwner = owner;
+		} else {
+			this.connectionStatusOwner = undefined;
+		}
+		this.statusState = next;
+	}
+
+	clearConnectionStatus(owner = undefined) {
+		if (!owner) {
+			this.connectionStatusOwner = undefined;
+			this.statusState = "";
+			return true;
+		}
+		if (this.connectionStatusOwner !== owner) return false;
+		// A separate operation may have published a newer state while connection
+		// setup was pending. Retire only the state this lifecycle still owns.
+		if (this.statusState === owner.statusState) this.statusState = "";
+		this.connectionStatusOwner = undefined;
+		return true;
+	}
+
 	recordReplacementProcessFence(error, options = {}) {
 		if (!isProcessTreeTerminationFailure(error)) return false;
 		this.replacementProcessFence ??= error;
@@ -4126,6 +4176,16 @@ export class HarnessApp {
 		const turn = new Promise((resolve) => { release = resolve; });
 		const tail = previous.then(() => turn);
 		this.agentSwitchTail = tail;
+		const lifecycleAttempt = {
+			key,
+			transport,
+			generation: this.activeAgentGeneration ?? 0,
+			agentDefinition: this.config?.agents?.[key],
+			statusState: options.statusState,
+			connectionStatusState: options.statusState,
+			promise: tail,
+		};
+		this.agentSwitchAttempt = lifecycleAttempt;
 		await previous;
 		try {
 			// Shutdown may have started while this replacement was queued behind an
@@ -4144,14 +4204,15 @@ export class HarnessApp {
 				this.reportReplacementProcessFence();
 				return;
 			}
-			return await this.switchAgentUnlocked(key, transport, options);
+			return await this.switchAgentUnlocked(key, transport, options, lifecycleAttempt);
 		} finally {
 			release();
 			if (this.agentSwitchTail === tail) this.agentSwitchTail = undefined;
+			if (this.agentSwitchAttempt === lifecycleAttempt) this.agentSwitchAttempt = undefined;
 		}
 	}
 
-	async switchAgentUnlocked(key, transport = "acp", options = {}) {
+	async switchAgentUnlocked(key, transport = "acp", options = {}, lifecycleAttempt = undefined) {
 		if (this.stopping) return;
 		if (this.startupConnectTimer) {
 			clearTimeout(this.startupConnectTimer);
@@ -4190,14 +4251,14 @@ export class HarnessApp {
 			if (this.client === previousClient) this.client = undefined;
 			this.ready = false;
 			this.sessionSwitchInProgress = true;
-			this.statusState = options.statusState ?? "stopping previous backend";
+			this.setConnectionStatus(lifecycleAttempt, options.statusState ?? "stopping previous backend");
 			this.updateSpinner();
 			this.ui.requestRender();
 			try {
 				await stopClientsForReplacement([previousClient, previousBtwClient]);
 			} catch (error) {
 				this.sessionSwitchInProgress = transitionWasInProgress;
-				this.statusState = "";
+				this.clearConnectionStatus(lifecycleAttempt);
 				this.updateSpinner();
 				if (this.recordReplacementProcessFence(error)) this.reportReplacementProcessFence();
 				else {
@@ -4211,12 +4272,21 @@ export class HarnessApp {
 			// starting a replacement that stopAndExit did not get a chance to snapshot.
 			if (this.stopping) {
 				this.sessionSwitchInProgress = false;
-				this.statusState = "";
+				this.clearConnectionStatus(lifecycleAttempt);
 				return;
 			}
 		}
 		this.activeKey = key;
 		this.transport = transport;
+		if (lifecycleAttempt) {
+			// An explicit or cross-harness replacement may have advanced generation
+			// since the lifecycle was queued. Publish its definitive target identity so
+			// commands entered during connect can join it without claiming an old one.
+			lifecycleAttempt.key = key;
+			lifecycleAttempt.transport = transport;
+			lifecycleAttempt.generation = this.activeAgentGeneration ?? 0;
+			lifecycleAttempt.agentDefinition = this.config?.agents?.[key];
+		}
 		this.clearLiveBackendCommands(key);
 		// Remember an explicit harness pick so it carries over to the next `cc`
 		// session, mirroring how /theme persists. Best-effort: a failed write
@@ -4259,7 +4329,13 @@ export class HarnessApp {
 		this.pendingUserEchoes = [];
 		this.pendingUnsendPrompt = undefined;
 		this.codexThreadStateSnapshot = undefined;
-		this.statusState = options.statusState ?? (this.promptQueue.length > 0 ? "connecting" : "");
+		// Starting the TUI remains independent of backend startup, but once the
+		// lifecycle actually begins it must never look idle. A command joining a
+		// pre-client attempt can promote this label before we reach this point.
+		this.setConnectionStatus(
+			lifecycleAttempt,
+			lifecycleAttempt?.connectionStatusState ?? options.statusState ?? "connecting",
+		);
 		this.updateSpinner();
 		this.updateAutocomplete();
 		if (!options.quiet) this.addCommandMessage(options.displayText ?? slashPromptDisplay("/harness", agent.label ?? key));
@@ -4276,7 +4352,13 @@ export class HarnessApp {
 		});
 		this.client = client;
 		let settleConnectionAttempt;
-		const connectionAttempt = { client };
+		const connectionAttempt = {
+			client,
+			key,
+			transport,
+			generation: this.activeAgentGeneration ?? 0,
+			agentDefinition: this.config?.agents?.[key],
+		};
 		connectionAttempt.promise = new Promise((resolve) => {
 			settleConnectionAttempt = resolve;
 		});
@@ -4294,7 +4376,7 @@ export class HarnessApp {
 				return;
 			}
 			this.ready = true;
-			this.statusState = "";
+			this.clearConnectionStatus(lifecycleAttempt);
 			this.updateSpinner();
 			// Load the markdown renderer now (before the first token) so it never
 			// flips plain->markdown mid-stream and re-styles already-scrolled lines.
@@ -4317,7 +4399,7 @@ export class HarnessApp {
 			// teardown failures into unhandled promise rejections.
 			if (!authenticationPending) await this.retireSupersededClient(client);
 			this.ready = false;
-			this.statusState = "";
+			this.clearConnectionStatus(lifecycleAttempt);
 			this.updateSpinner();
 			this.addError(error.message ?? String(error));
 			if (authenticationPending) {
@@ -4360,6 +4442,27 @@ export class HarnessApp {
 		if (action === "cc.app.interrupt" || action === "cc.chat.cancel") return this.cancelFromCcKeybinding();
 		if (action === "cc.app.redraw") {
 			this.forceFullRepaint({ immediate: true });
+			return true;
+		}
+		if (
+			this.foregroundOperation &&
+			[
+				"cc.app.toggleTodos",
+				"cc.chat.killAgents",
+				"cc.chat.cycleMode",
+				"cc.chat.modelPicker",
+				"cc.chat.fastMode",
+				"cc.chat.imagePaste",
+				"cc.task.background",
+				"cc.voice.pushToTalk",
+			].includes(action)
+		) {
+			const operation = this.foregroundOperation;
+			if (!operation.blockedSubmissionNoticeShown) {
+				operation.blockedSubmissionNoticeShown = true;
+				this.addNotice(`/${operation.commandName} is still in progress. Wait or press Ctrl+C to cancel.`);
+			}
+			this.ui.requestRender();
 			return true;
 		}
 		if (action === "cc.app.toggleTodos") {
@@ -4450,6 +4553,12 @@ export class HarnessApp {
 		if (this.voiceController?.isRecording() || this.voiceController?.isTranscribing()) {
 			this.voiceController.cancel();
 			this.exitVoiceMode();
+			return true;
+		}
+		// Menus and foreground command intents are global interaction owners. Their
+		// documented Ctrl+C cancellation wins even when a busy /btw pane has focus.
+		if (this.menuHandle || this.foregroundOperation) {
+			this.handleInterrupt("keybinding");
 			return true;
 		}
 		if (this.focusedThread === "btw" && this.btwThread?.busy) {
@@ -4684,6 +4793,11 @@ export class HarnessApp {
 				return;
 			}
 			this.closeMenu();
+			return;
+		}
+		if (this.foregroundOperation) {
+			this.suppressNextPairedEmptyInterrupt = false;
+			this.cancelForegroundOperation();
 			return;
 		}
 		if (this.editor.getText()) {
@@ -5104,6 +5218,15 @@ export class HarnessApp {
 			this.editorTargetThread = undefined;
 			return;
 		}
+		// The editor is intentionally usable while a slow backend starts, so typing
+		// and autocomplete stay instantaneous. Enter must not launch a competing
+		// action, though: restore the submitted draft and leave the foreground
+		// operation as the sole owner until it opens its picker, fails, or is
+		// cancelled. Explicit exit commands remain available just like Ctrl+D.
+		if (this.foregroundOperation && !/^\/(?:exit|quit)(?:\s|$)/u.test(text)) {
+			this.preserveSubmissionDuringForegroundOperation(rawText);
+			return;
+		}
 		const boundSideThread = this.editorTargetThread;
 		this.editorTargetThread = undefined;
 		if (boundSideThread && (this.btwThread !== boundSideThread || boundSideThread.client?.exited)) {
@@ -5212,14 +5335,6 @@ export class HarnessApp {
 		const owner = targetThread ?? this;
 		this.activeShellInputCount = Math.max(0, (this.activeShellInputCount ?? 0) + (running ? 1 : -1));
 		owner.shellInputsRunning = Math.max(0, (owner.shellInputsRunning ?? 0) + (running ? 1 : -1));
-		if (running && owner.shellInputsRunning === 1 && !owner.statusState) {
-			owner.statusState = "running shell command";
-			owner.shellInputOwnsStatus = true;
-		}
-		if (!running && owner.shellInputsRunning === 0 && owner.shellInputOwnsStatus) {
-			if (owner.statusState === "running shell command") owner.statusState = "";
-			owner.shellInputOwnsStatus = false;
-		}
 		if (targetThread) this.onThreadActivity();
 		else {
 			this.updateSpinner();
@@ -5351,6 +5466,7 @@ export class HarnessApp {
 		}
 		if (
 			this.busy ||
+			this.foregroundOperation ||
 			this.sessionSwitchInProgress ||
 			this.flushingDeferredLocalSlashCommands ||
 			this.selectionActionInProgress ||
@@ -5680,7 +5796,7 @@ export class HarnessApp {
 			return this.isSessionCommandTargetActive(target) ? target : undefined;
 		}
 		if (!this.client || !this.ready || this.client.exited) {
-			const connected = await this.ensureConnected();
+			const connected = await this.ensureConnected({ commandName });
 			if (!connected) return undefined;
 			target = this.captureSessionCommandTarget();
 		}
@@ -5880,8 +5996,10 @@ export class HarnessApp {
 
 	async flushPromptQueue() {
 		if (
+			this.stopping ||
 			!this.ready ||
 			this.busy ||
+			this.foregroundOperation ||
 			this.sessionSwitchInProgress ||
 			this.flushingDeferredLocalSlashCommands ||
 			this.selectionActionInProgress ||
@@ -5896,6 +6014,7 @@ export class HarnessApp {
 			while (
 				this.ready &&
 				!this.busy &&
+				!this.foregroundOperation &&
 				!this.sessionSwitchInProgress &&
 				!this.flushingDeferredLocalSlashCommands &&
 				!this.selectionActionInProgress &&
@@ -5947,8 +6066,9 @@ export class HarnessApp {
 		// The transition owner must first apply deferred local commands (for
 		// example /model) to the target session. It explicitly schedules the queue
 		// after those commands finish, so never leave an early timer armed here.
-		if (!Array.isArray(this.promptQueue) || this.promptQueue.length === 0) return;
+		if (this.stopping || !Array.isArray(this.promptQueue) || this.promptQueue.length === 0) return;
 		if (
+			this.foregroundOperation ||
 			this.sessionSwitchInProgress ||
 			this.flushingDeferredLocalSlashCommands ||
 			this.selectionActionInProgress ||
@@ -6610,7 +6730,7 @@ export class HarnessApp {
 			return false;
 		}
 		if (!this.client || !this.ready || this.client.exited) {
-			const connected = await this.ensureConnected();
+			const connected = await this.ensureConnected({ commandName });
 			if (!connected) return false;
 		}
 		const context = this.captureActiveAgentContext({ includeClient: true });
@@ -6908,7 +7028,7 @@ export class HarnessApp {
 			return false;
 		}
 		if (!this.client || !this.ready || this.client.exited) {
-			const connected = await this.ensureConnected();
+			const connected = await this.ensureConnected({ commandName });
 			if (!connected) return false;
 		}
 		// Connection setup is asynchronous. Re-check every main-session gate before
@@ -7398,10 +7518,16 @@ export class HarnessApp {
 		// A config/picker finalizer can fire while the drain that started it is
 		// still awaiting the command. Never let that finalizer create a second
 		// consumer for the same FIFO.
-		if (this.flushingDeferredLocalSlashCommands) return;
+		if (this.stopping || this.flushingDeferredLocalSlashCommands) return;
 		this.flushingDeferredLocalSlashCommands = true;
 		try {
-			while (!this.sessionSwitchInProgress && !this.menuHandle && this.deferredLocalSlashCommands.length > 0) {
+			while (
+				!this.stopping &&
+				!this.foregroundOperation &&
+				!this.sessionSwitchInProgress &&
+				!this.menuHandle &&
+				this.deferredLocalSlashCommands.length > 0
+			) {
 				const command = this.deferredLocalSlashCommands[0];
 				// Mirror runLocalSlashCommand's gates before removing the head. If it
 				// cannot run yet, leave it in place; shifting and immediately re-adding
@@ -7461,6 +7587,99 @@ export class HarnessApp {
 		this.ui.requestRender();
 	}
 
+	beginForegroundOperation(options = {}) {
+		if (this.foregroundOperation) return undefined;
+		const commandName = String(options.commandName ?? "operation").replace(/^\//u, "");
+		this.foregroundOperationSequence = (this.foregroundOperationSequence ?? 0) + 1;
+		const token = {
+			id: this.foregroundOperationSequence,
+			commandName,
+			status: String(options.status ?? "working"),
+			cancelled: false,
+			blockedSubmissionNoticeShown: false,
+			onCancel: undefined,
+		};
+		this.foregroundOperation = token;
+		this.updateSpinner?.();
+		this.ui?.requestRender?.();
+		return token;
+	}
+
+	isForegroundOperationActive(token) {
+		return Boolean(token && !token.cancelled && this.foregroundOperation === token);
+	}
+
+	updateForegroundOperation(token, status) {
+		if (!this.isForegroundOperationActive(token)) return false;
+		token.status = String(status || "working");
+		this.updateSpinner?.();
+		this.ui?.requestRender?.();
+		return true;
+	}
+
+	schedulePostForegroundOperationDrain() {
+		// Let the caller resume from its await and install the next picker/config
+		// gate before considering older queued work. Running that work inline here
+		// would recreate the exact connect->late-menu race this coordinator prevents.
+		if ((this.deferredLocalSlashCommands?.length ?? 0) > 0) {
+			const timer = setTimeout(() => {
+				if (
+					!this.stopping &&
+					!this.foregroundOperation &&
+					!this.flushingDeferredLocalSlashCommands &&
+					!this.sessionSwitchInProgress &&
+					!this.selectionActionInProgress &&
+					!this.menuHandle
+				) void this.flushDeferredLocalSlashCommands();
+			}, 0);
+			timer.unref?.();
+			return;
+		}
+		if (!this.stopping) this.schedulePromptQueueDrain();
+	}
+
+	endForegroundOperation(token) {
+		if (!token || this.foregroundOperation !== token) return false;
+		this.foregroundOperation = undefined;
+		this.updateSpinner?.();
+		this.ui?.requestRender?.();
+		this.schedulePostForegroundOperationDrain();
+		return true;
+	}
+
+	cancelForegroundOperation() {
+		const token = this.foregroundOperation;
+		if (!token) return false;
+		token.cancelled = true;
+		this.foregroundOperation = undefined;
+		try {
+			token.onCancel?.();
+		} catch (error) {
+			this.addError(`Could not cancel /${token.commandName}: ${error.message ?? error}`);
+		}
+		this.addNotice(`Cancelled /${token.commandName}. Background work may finish without reopening the interaction.`);
+		this.updateSpinner?.();
+		this.ui?.requestRender?.();
+		this.schedulePostForegroundOperationDrain();
+		return true;
+	}
+
+	preserveSubmissionDuringForegroundOperation(rawText) {
+		const operation = this.foregroundOperation;
+		if (!operation) return false;
+		const text = String(rawText ?? "");
+		this.editor.setText(text);
+		this.lastKnownEditorText = text;
+		if (!operation.blockedSubmissionNoticeShown) {
+			operation.blockedSubmissionNoticeShown = true;
+			this.addNotice(
+				`/${operation.commandName} is still in progress. Your input remains in the composer; wait or press Ctrl+C to cancel.`,
+			);
+		}
+		this.ui?.requestRender?.();
+		return true;
+	}
+
 	beginAsyncPickerLoad() {
 		this.asyncPickerLoads ??= new Set();
 		const token = Symbol("async-picker-load");
@@ -7473,6 +7692,7 @@ export class HarnessApp {
 		this.asyncPickerLoads ??= new Set();
 		this.asyncPickerLoads.delete(token);
 		this.asyncPickerLoadCount = this.asyncPickerLoads.size;
+		if (this.stopping) return;
 		if (this.asyncPickerLoadCount === 0) this.btwThread?.drainQueue?.();
 		if (
 			this.asyncPickerLoadCount === 0 &&
@@ -7544,15 +7764,102 @@ export class HarnessApp {
 
 	async ensureConnected(options = {}) {
 		if (this.ready && this.client && !this.client.exited) return true;
+		const commandName = typeof options.commandName === "string"
+			? options.commandName.replace(/^\//u, "")
+			: "";
+		let operation = options.foregroundOperation;
+		let ownsOperation = false;
+		if (commandName && !operation) {
+			const agentLabel = oneLine(this.config?.agents?.[this.activeKey]?.label ?? this.activeKey).slice(0, 80) || "backend";
+			operation = this.beginForegroundOperation({
+				commandName,
+				status: options.foregroundStatus ?? `starting ${agentLabel} for /${commandName}`,
+			});
+			if (!operation) return false;
+			ownsOperation = true;
+		}
+		try {
+			const connected = await this.ensureConnectedSingleFlight(options);
+			if (!connected || (operation && !this.isForegroundOperationActive(operation))) return false;
+			if (
+				commandName &&
+				(this.permissionPromptActive || this.menuHandle || this.selectionActionInProgress)
+			) {
+				this.addNotice(`/${commandName} is ready, but another interaction is active. Finish it, then run /${commandName} again.`);
+				this.ui?.requestRender?.();
+				return false;
+			}
+			return true;
+		} finally {
+			if (ownsOperation) this.endForegroundOperation(operation);
+		}
+	}
+
+	async ensureConnectedSingleFlight(options = {}) {
+		if (this.ready && this.client && !this.client.exited) return true;
 		if (this.client?.exited) this.ready = false;
 		const context = this.captureActiveAgentContext();
+		const statusState = options.statusState ?? "connecting";
+		const showWaitingStatus = (attempt = undefined) => {
+			if (attempt) attempt.connectionStatusState = statusState;
+			this.setConnectionStatus(attempt, statusState);
+			this.updateSpinner?.();
+			this.ui?.requestRender?.();
+		};
+		const connectedInContext = () => Boolean(
+			this.isActiveAgentContext(context) &&
+			this.ready &&
+			this.client &&
+			!this.client.exited
+		);
+		const attemptMatchesContext = (attempt) => Boolean(
+			attempt &&
+			attempt.key === context.key &&
+			attempt.transport === context.transport &&
+			(attempt.generation ?? 0) === (context.generation ?? 0) &&
+			attempt.agentDefinition === context.agentDefinition
+		);
+		const finishJoinedAttempt = (attempt) => {
+			const connected = connectedInContext();
+			this.clearConnectionStatus(attempt);
+			this.updateSpinner?.();
+			this.ui?.requestRender?.();
+			return connected;
+		};
+
+		// switchAgent publishes this before its first await, closing the small window
+		// where background startup owns the lifecycle but has not installed a client.
+		// Join it once and report its outcome; a failed attempt must not immediately
+		// spawn an indistinguishable second backend behind the user's command.
+		const lifecycleAttempt = this.agentSwitchAttempt;
+		if (lifecycleAttempt) {
+			if (!attemptMatchesContext(lifecycleAttempt)) return false;
+			showWaitingStatus(lifecycleAttempt);
+			await lifecycleAttempt.promise;
+			return finishJoinedAttempt(lifecycleAttempt);
+		}
+
+		// The lifecycle metadata can be absent in injected hosts/tests and briefly
+		// after its outer turn releases. The exact live adapter still provides a safe
+		// single-flight identity for an initialize/session-new request in progress.
+		const connectionAttempt = this.connectionAttempt;
+		if (connectionAttempt && connectionAttempt.client === this.client) {
+			if (
+				Object.hasOwn(connectionAttempt, "key") &&
+				!attemptMatchesContext(connectionAttempt)
+			) return false;
+			showWaitingStatus(connectionAttempt);
+			await connectionAttempt.promise;
+			return finishJoinedAttempt(connectionAttempt);
+		}
+
 		await this.switchAgent(context.key, context.transport, {
 			quiet: true,
-			statusState: options.statusState ?? "connecting",
+			statusState,
 			continueSessionSwitch: options.continueSessionSwitch === true,
 			preserveDeferredCommands: this.flushingDeferredLocalSlashCommands === true,
 		});
-		return Boolean(this.isActiveAgentContext(context) && this.ready && this.client && !this.client.exited);
+		return connectedInContext();
 	}
 
 	showHelp() {
@@ -7904,8 +8211,9 @@ export class HarnessApp {
 			this.reportClosedSessionCommandTarget(commandName, argument);
 			return;
 		}
-		if (!targetThread && (!this.client || this.client.exited)) {
-			await this.switchAgent(this.activeKey, this.transport, { quiet: true, statusState: "connecting" });
+		if (!targetThread && (!this.client || !this.ready || this.client.exited)) {
+			const connected = await this.ensureConnected({ commandName });
+			if (!connected) return;
 			if (!this.isActiveAgentContext(requestedAgentContext)) return;
 			requestedTarget = this.captureSessionCommandTarget();
 		}
@@ -8335,32 +8643,57 @@ export class HarnessApp {
 		}
 		const requestedKey = this.activeKey;
 		const requestedContext = this.captureActiveAgentContext();
-		while (!this.ready) {
-			const pendingConnection = this.connectionAttempt;
-			if (!pendingConnection || pendingConnection.client !== this.client) break;
-			await pendingConnection.promise;
-			if (this.activeKey !== requestedKey) return;
-			if (this.sessionSwitchInProgress) {
-				this.deferLocalSlashCommand(commandName, argument);
+		let startupOperation;
+		let startupJoined;
+		const authenticationClientReady = Boolean(
+			!this.ready &&
+			this.client &&
+			!this.client.exited &&
+			(this.client.authMethods?.length ?? 0) > 0 &&
+			!this.agentSwitchAttempt &&
+			!(this.connectionAttempt && this.connectionAttempt.client === this.client)
+		);
+		if (!this.ready && !authenticationClientReady) {
+			const agentLabel = oneLine(this.config?.agents?.[requestedKey]?.label ?? requestedKey).slice(0, 80) || "backend";
+			startupOperation = this.beginForegroundOperation({
+				commandName,
+				status: `starting ${agentLabel} for /${commandName}`,
+			});
+			if (!startupOperation) {
+				this.addCommandMessage(slashCommandText(commandName, argument));
+				this.addNotice(`/${this.foregroundOperation?.commandName ?? "operation"} is still in progress`);
 				return;
 			}
+			startupJoined = false;
+			try {
+				// Authentication is the one cold path where a failed session creation
+				// can still be useful: initialize may have advertised login methods.
+				// Join the shared lifecycle, then inspect those methods even when ready
+				// remains false instead of launching a second backend.
+				startupJoined = await this.ensureConnectedSingleFlight({ statusState: "connecting" });
+			} finally {
+				this.endForegroundOperation(startupOperation);
+			}
+			if (startupOperation.cancelled || this.stopping || this.activeKey !== requestedKey) return;
 		}
 		if (this.sessionSwitchInProgress) {
 			this.deferLocalSlashCommand(commandName, argument);
 			return;
 		}
-		if (
-			!this.client ||
-			this.client.exited ||
-			(!this.ready && (this.client.authMethods?.length ?? 0) === 0)
-		) {
-			await this.switchAgent(this.activeKey, this.transport, { quiet: true, statusState: "connecting" });
-		}
+		// A failed session creation may intentionally leave authentication methods
+		// on its client. A still-live mismatched lifecycle is different: it owns a
+		// replacement, so never present methods from the client it is superseding.
+		if (startupOperation && !startupJoined && (this.agentSwitchAttempt || this.connectionAttempt)) return;
 		if (!this.isActiveAgentContext(requestedContext)) return;
 		const methods = this.client?.authMethods ?? [];
 		if (methods.length === 0) {
 			this.addCommandMessage(slashCommandText(commandName, argument));
 			this.addNotice("This agent does not advertise authentication methods");
+			return;
+		}
+		if (!this.canOpenAsyncPicker()) {
+			this.addCommandMessage(slashCommandText(commandName, argument));
+			this.addNotice(`Authentication is ready, but another interaction is active. Finish it, then run /${commandName} again.`);
 			return;
 		}
 		if (argument) {
@@ -10196,7 +10529,7 @@ export class HarnessApp {
 			return;
 		}
 		if (!options.targetThread && (!this.ready || !this.client || this.client.exited)) {
-			const connected = await this.ensureConnected();
+			const connected = await this.ensureConnected({ commandName });
 			if (!connected) return;
 			target = this.captureSessionCommandTarget();
 		}
@@ -10337,7 +10670,7 @@ export class HarnessApp {
 			return;
 		}
 		if (!options.targetThread && (!this.ready || !this.client || this.client.exited)) {
-			const connected = await this.ensureConnected();
+			const connected = await this.ensureConnected({ commandName });
 			if (!connected) return;
 			target = this.captureSessionCommandTarget();
 		}
@@ -10664,51 +10997,77 @@ export class HarnessApp {
 
 	async openResumeDialog(commandName = "resume") {
 		const requestedKey = this.activeKey;
-		if (this.busy || (this.asyncPickerLoadCount ?? 0) > 0) {
+		if (this.busy || this.foregroundOperation || (this.asyncPickerLoadCount ?? 0) > 0) {
 			this.addCommandMessage(`/${commandName}`);
-			this.addNotice(this.busy ? "A session cannot be resumed while a turn is running" : "Another picker is still loading");
+			this.addNotice(this.busy
+				? "A session cannot be resumed while a turn is running"
+				: this.foregroundOperation
+					? `/${this.foregroundOperation.commandName} is still in progress`
+					: "Another picker is still loading");
 			return;
 		}
-		if (!this.client || !this.ready || this.client.exited) {
-			const connected = await this.ensureConnected();
-			if (!connected) return;
-		}
-		if (this.activeKey !== requestedKey) return;
-		if (this.busy || this.sessionSwitchInProgress || (this.asyncPickerLoadCount ?? 0) > 0) {
-			this.addCommandMessage(`/${commandName}`);
-			this.addNotice(this.busy ? "A session cannot be resumed while a turn is running" : "Another session operation is active");
-			return;
-		}
-		if (this.client?.capabilities?.sessionList !== true) {
-			this.addCommandMessage(`/${commandName}`);
-			this.addNotice("This agent does not advertise session listing");
-			return;
-		}
-		const context = this.captureActiveAgentContext({ includeClient: true });
-		const client = context.client;
-		const pickerLoad = this.beginAsyncPickerLoad();
-		this.statusState = "loading sessions";
-		this.updateSpinner();
-		this.ui.requestRender();
+		const agentLabel = oneLine(this.config?.agents?.[requestedKey]?.label ?? requestedKey).slice(0, 80) || "backend";
+		const startupStatus = `starting ${agentLabel} for /${commandName}`;
+		const operation = this.beginForegroundOperation({ commandName, status: startupStatus });
+		if (!operation) return;
+		let pickerLoad;
+		operation.onCancel = () => {
+			if (pickerLoad) this.endAsyncPickerLoad(pickerLoad);
+		};
 		try {
+			if (!this.client || !this.ready || this.client.exited) {
+				const connected = await this.ensureConnected({
+					// The lifecycle retains a generic state if the user cancels this UI
+					// intent; the foreground token supplies the richer command-specific text.
+					statusState: "connecting",
+					foregroundOperation: operation,
+					commandName,
+				});
+				if (!connected || !this.isForegroundOperationActive(operation)) return;
+			}
+			if (this.activeKey !== requestedKey || !this.isForegroundOperationActive(operation)) return;
+			if (this.busy || this.sessionSwitchInProgress || (this.asyncPickerLoadCount ?? 0) > 0) {
+				this.addCommandMessage(`/${commandName}`);
+				this.addNotice(this.busy ? "A session cannot be resumed while a turn is running" : "Another session operation is active");
+				return;
+			}
+			if (this.client?.capabilities?.sessionList !== true) {
+				this.addCommandMessage(`/${commandName}`);
+				this.addNotice("This agent does not advertise session listing");
+				return;
+			}
+			const context = this.captureActiveAgentContext({ includeClient: true });
+			const client = context.client;
+			pickerLoad = this.beginAsyncPickerLoad();
+			this.updateForegroundOperation(operation, "loading sessions");
 			const codexEnvironment = mergedAgentEnvironment(context.agent);
 			// codex-acp reads MODEL_PROVIDER at process launch and supplies it as the
 			// preferred provider to thread/list. An unset value deliberately means all
 			// providers, so mirror that distinction in the SQLite fast path.
 			const preferredModelProvider = environmentValue(codexEnvironment, "MODEL_PROVIDER") || undefined;
 			const localCodexSessions = this.isCodexAcpActive() || context.key === "codex"
-				? listLocalCodexSessions(
+				? await listLocalCodexSessionsAsync(
 						process.cwd(),
 						codexStateDbPath(codexEnvironment),
 						1_000,
-						{ modelProvider: preferredModelProvider },
+						{
+							modelProvider: preferredModelProvider,
+							processTracker: this.nativeProcessTracker,
+						},
 					)
 				: undefined;
+			// SQLite lookup can outlive cancellation or an agent switch. Do not start
+			// a slower ACP request after this picker no longer owns the interaction.
+			if (
+				this.stopping ||
+				!this.isActiveAgentContext(context) ||
+				!this.isForegroundOperationActive(operation)
+			) return;
 			// `[]` is an authoritative local-index answer for this cwd. Only fall
 			// back to ACP when the index could not be queried at all (`undefined`),
 			// otherwise large global histories make an empty picker needlessly slow.
 			const sessions = localCodexSessions !== undefined ? localCodexSessions : await client.listSessions();
-			if (!this.isActiveAgentContext(context)) return;
+			if (!this.isActiveAgentContext(context) || !this.isForegroundOperationActive(operation)) return;
 			const forkIds = loadForkIds();
 			const entries = sessions.map((session) => {
 				const title = singleLineMenuText(session.title) || singleLineMenuText(session.sessionId) || "unknown session";
@@ -10737,14 +11096,13 @@ export class HarnessApp {
 				});
 			});
 		} catch (error) {
-			if (this.isActiveAgentContext(context)) this.addError(error.message ?? String(error));
-		} finally {
-			if (this.isActiveAgentContext(context) && !this.busy && !this.sessionSwitchInProgress) {
-				this.statusState = "";
-				this.updateSpinner();
-				this.ui.requestRender();
+			if (!this.stopping && this.isForegroundOperationActive(operation)) {
+				if (this.recordReplacementProcessFence(error, { preserveReady: true })) this.reportReplacementProcessFence();
+				else this.addError(error.message ?? String(error));
 			}
-			this.endAsyncPickerLoad(pickerLoad);
+		} finally {
+			if (pickerLoad) this.endAsyncPickerLoad(pickerLoad);
+			this.endForegroundOperation(operation);
 		}
 	}
 
@@ -12691,7 +13049,11 @@ export class HarnessApp {
 	}
 
 	updateSpinner() {
-		if (!this.statusState && !this.btwThread?.statusState) {
+		if (
+			!this.foregroundOperation?.status &&
+			!effectiveActivityStatus(this) &&
+			!effectiveActivityStatus(this.btwThread)
+		) {
 			if (this.spinnerTimer) clearInterval(this.spinnerTimer);
 			this.spinnerTimer = undefined;
 			this.spinnerIndex = 0;
@@ -12883,6 +13245,13 @@ export class HarnessApp {
 
 	async stopAndExit(options = {}) {
 		this.stopping = true;
+		// Invalidate pending UI intent synchronously. Native helpers are stopped by
+		// their tracker below; their late completions must not open menus or render
+		// errors after terminal ownership has returned to the shell.
+		if (this.foregroundOperation) {
+			this.foregroundOperation.cancelled = true;
+			this.foregroundOperation = undefined;
+		}
 		this.stopKeybindingsWatcher?.();
 		this.stopKeybindingsWatcher = undefined;
 		this.keybindingDispatcher?.dispose();
@@ -12919,7 +13288,16 @@ export class HarnessApp {
 		// process.exit remains behind the bounded TERM/KILL tree waiters.
 		const nativeShutdown = this.nativeProcessTracker?.stopAndWait?.() ?? Promise.resolve();
 		this.ui.stop();
-		await Promise.allSettled([sideShutdown, mainShutdown, agentSwitchShutdown, nativeShutdown].filter(Boolean));
+		const shutdownResults = await Promise.allSettled(
+			[sideShutdown, mainShutdown, agentSwitchShutdown, nativeShutdown].filter(Boolean),
+		);
+		const failure = shutdownResults.find((result) => result.status === "rejected");
+		if (failure) {
+			const message = oneLine(failure.reason?.message ?? failure.reason ?? "unknown shutdown error");
+			if (!options.exit) process.stderr.write(`cc: shutdown failed: ${message}\n`);
+			(options.exit ?? process.exit)(1);
+			return;
+		}
 		(options.exit ?? process.exit)(0);
 	}
 }
@@ -16308,6 +16686,7 @@ function runCapture(command, args = [], options = {}) {
 		let terminating = false;
 		let terminationPromise;
 		let terminationReason;
+		let processTreeFailure;
 		let directChildClosed = false;
 		let timer;
 		let unregister = () => {};
@@ -16316,9 +16695,21 @@ function runCapture(command, args = [], options = {}) {
 			if (settled) return;
 			settled = true;
 			clearTimeout(timer);
-			unregister();
+			// Keep an unconfirmed tree registered. Even if the direct caller handles
+			// the error, app shutdown must still fail rather than report an empty,
+			// successfully reaped registry while descendants may remain alive.
+			if (!isProcessTreeTerminationFailure(error)) unregister();
 			if (error) reject(error);
 			else resolve(result);
+		};
+		const failProcessTree = (error) => {
+			const failure = isProcessTreeTerminationFailure(error)
+				? error
+				: processTreeTerminationError(
+					`${command} process-tree cleanup failed: ${oneLine(error?.message ?? error ?? "unknown error")}`,
+				);
+			processTreeFailure ??= failure;
+			finish(processTreeFailure);
 		};
 		const terminateProcessTree = (reason) => {
 			if (settled) return Promise.resolve();
@@ -16364,7 +16755,7 @@ function runCapture(command, args = [], options = {}) {
 					const prefix = reason === "timeout"
 						? `${command} timed out after ${timeoutMs}ms`
 						: nativeProcessShutdownError(command).message;
-					finish(processTreeTerminationError(`${prefix} and its process tree did not exit after SIGKILL`));
+					failProcessTree(processTreeTerminationError(`${prefix} and its process tree did not exit after SIGKILL`));
 					return;
 				}
 				if (reason === "timeout") {
@@ -16373,10 +16764,13 @@ function runCapture(command, args = [], options = {}) {
 					return;
 				}
 				finish(nativeProcessShutdownError(command));
-			})();
+			})().catch((error) => failProcessTree(error));
 			return terminationPromise;
 		};
-		unregister = options.processTracker?.register(() => terminateProcessTree("shutdown")) ?? unregister;
+		unregister = options.processTracker?.register(async () => {
+			await terminateProcessTree("shutdown");
+			if (processTreeFailure) throw processTreeFailure;
+		}) ?? unregister;
 		timer = setTimeout(() => {
 			void terminateProcessTree("timeout");
 		}, Math.max(1, timeoutMs));
@@ -16438,7 +16832,7 @@ function runCapture(command, args = [], options = {}) {
 						// The group can disappear between the existence probe and signal. Once
 						// absence is observed, retire the id without signalling it again.
 						if (!posixProcessGroupExists(pid)) settleResult();
-						else finish(processTreeTerminationError(`${command} exited, but its detached process group could not be stopped`));
+						else failProcessTree(processTreeTerminationError(`${command} exited, but its detached process group could not be stopped`));
 						return;
 					}
 					terminationPromise = (async () => {
@@ -16449,7 +16843,7 @@ function runCapture(command, args = [], options = {}) {
 							cleanup,
 						);
 						if (!treeExited) {
-							finish(processTreeTerminationError(`${command} exited, but its detached process group did not stop after SIGKILL`));
+							failProcessTree(processTreeTerminationError(`${command} exited, but its detached process group did not stop after SIGKILL`));
 							return;
 						}
 						if (terminationReason === "timeout") {
@@ -16461,7 +16855,7 @@ function runCapture(command, args = [], options = {}) {
 							return;
 						}
 						settleResult();
-					})();
+					})().catch((error) => failProcessTree(error));
 					return;
 				}
 			}
@@ -16614,14 +17008,7 @@ function filesystemPathIsCaseInsensitive(targetPath, platform = process.platform
 	}
 }
 
-// Codex's ACP session/list currently pages through the rollout store before it
-// applies the cwd filter. Large histories can therefore require hundreds of
-// round trips just to populate /resume. The local thread index is authoritative
-// for a local Codex backend and can answer the same picker query in one read.
-// Return undefined (rather than []) when the index cannot be queried so callers
-// can fall back to the protocol implementation.
-export function listLocalCodexSessions(cwd = process.cwd(), dbPath = codexStateDbPath(), limit = 1_000, options = {}) {
-	if (!fs.existsSync(dbPath)) return undefined;
+function localCodexSessionQuery(cwd, limit, options = {}) {
 	const safeLimit = Math.max(1, Math.min(10_000, Number.isFinite(limit) ? Math.trunc(limit) : 1_000));
 	const archived = options.archived === true ? 1 : 0;
 	const platform = options.platform ?? process.platform;
@@ -16638,7 +17025,7 @@ export function listLocalCodexSessions(cwd = process.cwd(), dbPath = codexStateD
 	const modelProvider = typeof options.modelProvider === "string" && options.modelProvider.trim()
 		? options.modelProvider.trim()
 		: undefined;
-	const sql = [
+	return [
 		"select id, cwd,",
 		"coalesce(nullif(title, ''), nullif(first_user_message, ''), nullif(preview, ''), id) as title,",
 		"updated_at, updated_at_ms",
@@ -16652,15 +17039,12 @@ export function listLocalCodexSessions(cwd = process.cwd(), dbPath = codexStateD
 		"order by coalesce(updated_at_ms, updated_at * 1000) desc, id desc",
 		`limit ${safeLimit};`,
 	].join(" ");
-	const result = spawnSync("sqlite3", ["-json", dbPath, sql], {
-		encoding: "utf8",
-		timeout: 2_000,
-		windowsHide: true,
-	});
-	if (result.error || result.status !== 0) return undefined;
+}
+
+function parseLocalCodexSessions(stdout) {
 	let rows;
 	try {
-		rows = JSON.parse(result.stdout || "[]");
+		rows = JSON.parse(String(stdout ?? "") || "[]");
 	} catch {
 		return undefined;
 	}
@@ -16680,6 +17064,79 @@ export function listLocalCodexSessions(cwd = process.cwd(), dbPath = codexStateD
 			...(timestampMs ? { updatedAt: new Date(timestampMs).toISOString() } : {}),
 		};
 	});
+}
+
+function boundedCodexSessionIndexOption(value, fallback, maximum) {
+	if (!Number.isFinite(value)) return fallback;
+	return Math.max(1, Math.min(maximum, Math.trunc(value)));
+}
+
+// Codex's ACP session/list currently pages through the rollout store before it
+// applies the cwd filter. Large histories can therefore require hundreds of
+// round trips just to populate /resume. The local thread index is authoritative
+// for a local Codex backend and can answer the same picker query in one read.
+// Return undefined (rather than []) when the index cannot be queried so callers
+// can fall back to the protocol implementation.
+//
+// Retain this synchronous API for small non-picker operations which resolve a
+// user-supplied session name before invoking one native Codex command. The TUI
+// picker uses listLocalCodexSessionsAsync so SQLite startup never blocks input,
+// rendering, or its visible loading state.
+export function listLocalCodexSessions(cwd = process.cwd(), dbPath = codexStateDbPath(), limit = 1_000, options = {}) {
+	if (!fs.existsSync(dbPath)) return undefined;
+	const sql = localCodexSessionQuery(cwd, limit, options);
+	const result = spawnSync("sqlite3", ["-json", dbPath, sql], {
+		encoding: "utf8",
+		timeout: CODEX_SESSION_INDEX_TIMEOUT_MS,
+		maxBuffer: CODEX_SESSION_INDEX_STDOUT_MAX_BYTES,
+		windowsHide: true,
+	});
+	if (result.error || result.status !== 0) return undefined;
+	return parseLocalCodexSessions(result.stdout);
+}
+
+export async function listLocalCodexSessionsAsync(
+	cwd = process.cwd(),
+	dbPath = codexStateDbPath(),
+	limit = 1_000,
+	options = {},
+) {
+	if (!fs.existsSync(dbPath)) return undefined;
+	const sql = localCodexSessionQuery(cwd, limit, options);
+	const timeoutMs = boundedCodexSessionIndexOption(
+		options.timeoutMs,
+		CODEX_SESSION_INDEX_TIMEOUT_MS,
+		CODEX_SESSION_INDEX_TIMEOUT_MS,
+	);
+	const maxStdoutBytes = boundedCodexSessionIndexOption(
+		options.maxStdoutBytes,
+		CODEX_SESSION_INDEX_STDOUT_MAX_BYTES,
+		CODEX_SESSION_INDEX_STDOUT_MAX_BYTES,
+	);
+	const maxStderrBytes = boundedCodexSessionIndexOption(
+		options.maxStderrBytes,
+		CODEX_SESSION_INDEX_STDERR_MAX_BYTES,
+		CODEX_SESSION_INDEX_STDERR_MAX_BYTES,
+	);
+	const sqliteCommand = typeof options.sqliteCommand === "string" && options.sqliteCommand
+		? options.sqliteCommand
+		: "sqlite3";
+	const sqliteCommandArgs = Array.isArray(options.sqliteCommandArgs)
+		? options.sqliteCommandArgs.slice(0, 16).map(String)
+		: [];
+	try {
+		const result = await runCapture(sqliteCommand, [...sqliteCommandArgs, "-json", dbPath, sql], {
+			timeoutMs,
+			maxStdoutBytes,
+			maxStderrBytes,
+			processTracker: options.processTracker,
+		});
+		if (result.stdoutTruncated) return undefined;
+		return parseLocalCodexSessions(result.stdout);
+	} catch (error) {
+		if (error?.code === "CC_NATIVE_PROCESS_SHUTDOWN" || isProcessTreeTerminationFailure(error)) throw error;
+		return undefined;
+	}
 }
 
 function codexRolloutStat(rolloutPath) {

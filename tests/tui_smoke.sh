@@ -14,6 +14,11 @@ CONFIG_SETTINGS_THEME_FILE="$(mktemp -t cc-tui-config-settings-theme.XXXXXX)"
 CONFIG_TOP_THEME_FILE="$(mktemp -t cc-tui-config-top-theme.XXXXXX)"
 COMMANDS_GATE="$(mktemp -t cc-tui-commands-gate.XXXXXX)"
 rm -f "$COMMANDS_GATE"
+NEW_GATE="$(mktemp -t cc-tui-new-gate.XXXXXX)"
+rm -f "$NEW_GATE"
+SESSION_LIST_GATE="$(mktemp -t cc-tui-session-list-gate.XXXXXX)"
+rm -f "$SESSION_LIST_GATE"
+START_LOG="$(mktemp -t cc-tui-start-log.XXXXXX)"
 COMMAND_CACHE="$(mktemp -t cc-tui-command-cache.XXXXXX)"
 rm -f "$COMMAND_CACHE"
 # Isolate the permission grant store so cc never reads the developer's real
@@ -29,6 +34,9 @@ PERMS_FILE_Q="$(printf "%q" "$PERMS_FILE")"
 CONFIG_SETTINGS_THEME_FILE_Q="$(printf "%q" "$CONFIG_SETTINGS_THEME_FILE")"
 CONFIG_TOP_THEME_FILE_Q="$(printf "%q" "$CONFIG_TOP_THEME_FILE")"
 COMMANDS_GATE_Q="$(printf "%q" "$COMMANDS_GATE")"
+NEW_GATE_Q="$(printf "%q" "$NEW_GATE")"
+SESSION_LIST_GATE_Q="$(printf "%q" "$SESSION_LIST_GATE")"
+START_LOG_Q="$(printf "%q" "$START_LOG")"
 COMMAND_CACHE_Q="$(printf "%q" "$COMMAND_CACHE")"
 TERM_PROGRAM_Q="$(printf "%q" "${TERM_PROGRAM:-}")"
 VSCODE_PID_Q="$(printf "%q" "${VSCODE_PID:-}")"
@@ -50,7 +58,7 @@ fi
 
 cleanup() {
 	tmux kill-session -t "$SESSION" >/dev/null 2>&1 || true
-	rm -f "$WRITE_LOG" "$SETTINGS_FILE" "$CONFIG_SETTINGS_THEME_FILE" "$CONFIG_TOP_THEME_FILE" "$COMMANDS_GATE" "$COMMAND_CACHE" "$PERMS_FILE"
+	rm -f "$WRITE_LOG" "$SETTINGS_FILE" "$CONFIG_SETTINGS_THEME_FILE" "$CONFIG_TOP_THEME_FILE" "$COMMANDS_GATE" "$NEW_GATE" "$SESSION_LIST_GATE" "$START_LOG" "$COMMAND_CACHE" "$PERMS_FILE"
 }
 trap cleanup EXIT
 
@@ -101,6 +109,20 @@ wait_for_write_log_text() {
 		sleep 0.1
 	done
 	echo "Timed out waiting for write log text: $needle" >&2
+	capture >&2
+	exit 1
+}
+
+wait_for_start_log_text() {
+	local needle="$1"
+	for _ in {1..50}; do
+		if grep -Fq "$needle" "$START_LOG"; then
+			return 0
+		fi
+		sleep 0.1
+	done
+	echo "Timed out waiting for fake ACP event: $needle" >&2
+	cat "$START_LOG" >&2
 	capture >&2
 	exit 1
 }
@@ -223,6 +245,35 @@ tmux new-session -d -s "$SESSION" -x 100 -y 30 "cd $ROOT_Q && $PANE_ENV PI_TUI_W
 wait_for_text "Space to record"
 tmux send-keys -t "$SESSION" / r
 wait_for_text "Review current changes"
+tmux kill-session -t "$SESSION"
+: > "$WRITE_LOG"
+
+# A user command that depends on a deliberately stalled cold ACP startup must
+# immediately own a visible status. A second Enter stays in the composer, the
+# original startup is reused exactly once, and the picker appears only after its
+# own session-list request completes.
+rm -f "$NEW_GATE" "$SESSION_LIST_GATE"
+: > "$START_LOG"
+tmux new-session -d -s "$SESSION" -x 100 -y 30 "cd $ROOT_Q && $PANE_ENV PI_TUI_WRITE_LOG=$WRITE_LOG_Q CC_CONFIG=tests/fake_config.json CC_SETTINGS=$SETTINGS_FILE_Q CC_BACKGROUND_CONNECT_DELAY_MS=0 FAKE_ACP_NEW_GATE=$NEW_GATE_Q FAKE_ACP_SESSION_LIST_GATE=$SESSION_LIST_GATE_Q FAKE_ACP_START_LOG=$START_LOG_Q ./src/cc fake"
+wait_for_text "Space to record"
+wait_for_start_log_text "session/new"
+tmux send-keys -t "$SESSION" / r e s u m e Enter
+wait_for_text "starting Fake ACP for /resume"
+tmux send-keys -t "$SESSION" / n e w Enter
+wait_for_text "input remains in the composer"
+wait_for_text "/new"
+: > "$NEW_GATE"
+wait_for_start_log_text "session/list"
+wait_for_text "loading sessions"
+: > "$SESSION_LIST_GATE"
+wait_for_text "Resume session"
+if [ "$(grep -c '^initialize$' "$START_LOG")" -ne 1 ] || [ "$(grep -c '^session/new$' "$START_LOG")" -ne 1 ]; then
+	echo "Cold /resume started more than one ACP lifecycle" >&2
+	cat "$START_LOG" >&2
+	exit 1
+fi
+tmux send-keys -t "$SESSION" Escape
+wait_for_text "/new"
 tmux kill-session -t "$SESSION"
 : > "$WRITE_LOG"
 

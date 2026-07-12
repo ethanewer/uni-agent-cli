@@ -9,6 +9,22 @@ next_client_request_id = 1000
 SLOW_DELAY = float(os.environ.get("FAKE_ACP_SLOW_DELAY", "0.8"))
 NEW_DELAY = float(os.environ.get("FAKE_ACP_NEW_DELAY", "0"))
 COMMANDS_GATE = os.environ.get("FAKE_ACP_COMMANDS_GATE")
+NEW_GATE = os.environ.get("FAKE_ACP_NEW_GATE")
+SESSION_LIST_GATE = os.environ.get("FAKE_ACP_SESSION_LIST_GATE")
+START_LOG = os.environ.get("FAKE_ACP_START_LOG")
+
+
+def record(event):
+    if not START_LOG:
+        return
+    with open(START_LOG, "a", encoding="utf-8") as log:
+        log.write(event + "\n")
+        log.flush()
+
+
+def wait_for_gate(gate):
+    while gate and not os.path.exists(gate):
+        time.sleep(0.01)
 
 CONFIG_OPTIONS = [
     {
@@ -131,6 +147,7 @@ def handle_message(message):
     request_id = message.get("id")
 
     if method == "initialize":
+        record("initialize")
         if os.environ.get("FAKE_ACP_EXIT_INIT") == "1":
             sys.stderr.write("fake backend crash\n")
             sys.stderr.flush()
@@ -163,6 +180,8 @@ def handle_message(message):
             }
         )
     elif method == "session/new":
+        record("session/new")
+        wait_for_gate(NEW_GATE)
         if NEW_DELAY > 0:
             poll_cancel(NEW_DELAY)
         send(
@@ -212,6 +231,8 @@ def handle_message(message):
             }
         )
     elif method == "session/list":
+        record("session/list")
+        wait_for_gate(SESSION_LIST_GATE)
         send(
             {
                 "jsonrpc": "2.0",

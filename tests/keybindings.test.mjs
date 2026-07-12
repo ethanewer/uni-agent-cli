@@ -259,6 +259,40 @@ assert.match(normalizeCcKeyStroke("hyper+k").error, /unknown modifier/);
 
 {
 	const notices = [];
+	let toggles = 0;
+	let voiceCalls = 0;
+	let sideInterrupts = 0;
+	let renders = 0;
+	const app = Object.create(HarnessApp.prototype);
+	app.foregroundOperation = {
+		commandName: "resume",
+		status: "loading sessions",
+		cancelled: false,
+	};
+	app.addNotice = (message) => notices.push(message);
+	app.ui = { requestRender: () => { renders += 1; } };
+	app.focusedThread = "btw";
+	app.btwThread = { busy: true, interrupt: () => { sideInterrupts += 1; } };
+	app.deferredLocalSlashCommands = [];
+	app.schedulePromptQueueDrain = () => {};
+	app.toggleTodosPanel = () => { toggles += 1; };
+	app.handleVoiceKey = () => { voiceCalls += 1; return true; };
+	assert.equal(app.executeCcKeybindingAction("cc.app.toggleTodos"), true);
+	assert.equal(app.executeCcKeybindingAction("cc.voice.pushToTalk", {
+		chord: "alt+v",
+		binding: { default: false },
+	}), true);
+	assert.equal(toggles, 0, "Ctrl+T must not replace a picker that is still loading");
+	assert.equal(voiceCalls, 0, "push-to-talk must not start during an exclusive operation");
+	assert.deepEqual(notices, ["/resume is still in progress. Wait or press Ctrl+C to cancel."]);
+	assert.equal(renders, 2);
+	assert.equal(app.executeCcKeybindingAction("cc.chat.cancel"), true);
+	assert.equal(app.foregroundOperation, undefined, "Ctrl+C cancels the global foreground owner");
+	assert.equal(sideInterrupts, 0, "a focused /btw turn cannot steal foreground cancellation");
+}
+
+{
+	const notices = [];
 	const stopped = [];
 	const client = {
 		capabilities: { backgroundTasks: true },

@@ -17,6 +17,7 @@ import {
 	collectEnvironmentAuthenticationVariables,
 	configureCcKeybindings,
 	copyCodexRolloutWithNewId,
+	effectiveActivityStatus,
 	findCodexRolloutPath,
 	forgetForkIds,
 	loadCodexForkDescendantIds,
@@ -981,6 +982,54 @@ await (async () => {
 	releaseMain();
 	await exiting;
 	assert.deepEqual(events.slice(-3), ["side:end", "main:end", "exit:0"]);
+})();
+
+// Shutdown owns every rejection and waits for all cleanup before reporting a
+// nonzero exit. Pending foreground UI is invalidated before terminal teardown.
+await (async () => {
+	const events = [];
+	let releaseNative;
+	const nativeGate = new Promise((resolve) => { releaseNative = resolve; });
+	const foreground = { commandName: "resume", cancelled: false };
+	const app = Object.create(HarnessApp.prototype);
+	Object.assign(app, {
+		stopping: false,
+		foregroundOperation: foreground,
+		client: {
+			async stopAndWait() {
+				events.push("main:start");
+				const error = new Error("main process tree remains live");
+				error.code = "PROCESS_TREE_TERMINATION_FAILED";
+				throw error;
+			},
+		},
+		nativeProcessTracker: {
+			async stopAndWait() {
+				events.push("native:start");
+				await nativeGate;
+				events.push("native:end");
+			},
+		},
+		btwThread: undefined,
+		btwShutdownTail: undefined,
+		agentSwitchTail: undefined,
+		spinnerTimer: undefined,
+		markdownPreloadTimer: undefined,
+		startupConnectTimer: undefined,
+		voiceController: undefined,
+		clearCancelGraceTimer() {},
+		cancelPermissionPrompts() {},
+		ui: { stop() { events.push("ui:stop"); } },
+	});
+	const exiting = app.stopAndExit({ exit: (code) => events.push(`exit:${code}`) });
+	assert.equal(foreground.cancelled, true);
+	assert.equal(app.foregroundOperation, undefined);
+	assert.deepEqual(events, ["main:start", "native:start", "ui:stop"]);
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(events.some((event) => event.startsWith("exit:")), false);
+	releaseNative();
+	await exiting;
+	assert.deepEqual(events.slice(-2), ["native:end", "exit:1"]);
 })();
 
 const config = {
@@ -5973,6 +6022,36 @@ await (async () => {
 	]);
 })();
 
+// An authentication-required startup deliberately leaves its initialized ACP
+// client alive with advertised methods. /login must reuse that client instead
+// of launching the same unauthenticated backend a second time.
+await (async () => {
+	let picker;
+	const definition = {};
+	const app = Object.create(HarnessApp.prototype);
+	Object.assign(app, {
+		activeKey: "fake",
+		transport: "acp",
+		activeAgentGeneration: 0,
+		config: { agents: { fake: definition } },
+		client: {
+			exited: false,
+			launchSpec: definition,
+			authMethods: [{ id: "browser", name: "Browser login" }],
+		},
+		ready: false,
+		busy: false,
+		sessionSwitchInProgress: false,
+		addCommandMessage() {},
+		addNotice() {},
+		ensureConnectedSingleFlight: async () => assert.fail("advertised authentication methods must be reused"),
+		openSelection(title, entries) { picker = { title, entries }; },
+	});
+	await app.openAuthenticationDialog();
+	assert.equal(picker?.title, "Authenticate");
+	assert.deepEqual(picker?.entries.map((entry) => entry.value.id), ["browser"]);
+})();
+
 // A same-harness reconnect replaces the adapter's cloned launch spec. Context
 // ownership follows the stable configured definition, so cold local commands
 // do not report failure after successfully reconnecting.
@@ -5994,6 +6073,231 @@ await (async () => {
 	assert.equal(await app.ensureConnected(), true);
 	assert.notEqual(app.client.launchSpec, definition);
 	assert.equal(app.isActiveAgentContext(app.captureActiveAgentContext({ includeClient: true })), true);
+})();
+
+// A cold command joins the exact adapter initialization already in flight. It
+// promotes a visible status immediately and never turns a failed attempt into a
+// second, implicit backend launch.
+await (async () => {
+	const definition = { label: "Fake", acp: { command: "fake", args: [] } };
+	const makeWaitingApp = () => {
+		const app = Object.create(HarnessApp.prototype);
+		Object.assign(app, {
+			activeKey: "fake",
+			transport: "acp",
+			activeAgentGeneration: 0,
+			config: { agents: { fake: definition } },
+			client: { exited: false, launchSpec: structuredClone(definition) },
+			ready: false,
+			statusState: "",
+			updateSpinner() {},
+			ui: { requestRender() {} },
+			switchAgent: async () => assert.fail("ensureConnected must join the live connection attempt"),
+		});
+		return app;
+	};
+
+	let releaseSuccessfulAttempt;
+	const successful = makeWaitingApp();
+	successful.connectionAttempt = {
+		client: successful.client,
+		promise: new Promise((resolve) => { releaseSuccessfulAttempt = resolve; }),
+	};
+	const connected = successful.ensureConnected({ statusState: "starting Fake for Resume" });
+	assert.equal(successful.statusState, "starting Fake for Resume", "the wait is visible before startup settles");
+	successful.ready = true;
+	releaseSuccessfulAttempt();
+	assert.equal(await connected, true);
+	assert.equal(successful.statusState, "", "a successful joined attempt releases its waiting status");
+
+	let releaseFailedAttempt;
+	const failed = makeWaitingApp();
+	failed.connectionAttempt = {
+		client: failed.client,
+		promise: new Promise((resolve) => { releaseFailedAttempt = resolve; }),
+	};
+	const notConnected = failed.ensureConnected();
+	releaseFailedAttempt();
+	assert.equal(await notConnected, false, "a settled failed startup is reported without an automatic retry");
+	assert.equal(failed.statusState, "", "a failed joined attempt cannot leave the footer spinning forever");
+})();
+
+// A command-specific connection must not replace a permission/elicitation menu
+// that appeared while session creation was settling.
+await (async () => {
+	const notices = [];
+	const app = Object.create(HarnessApp.prototype);
+	Object.assign(app, {
+		activeKey: "fake",
+		config: { agents: { fake: { label: "Fake" } } },
+		ready: false,
+		client: undefined,
+		foregroundOperation: undefined,
+		foregroundOperationSequence: 0,
+		deferredLocalSlashCommands: [],
+		async ensureConnectedSingleFlight() {
+			this.client = { exited: false };
+			this.ready = true;
+			this.menuHandle = { keybindingContext: "Confirmation" };
+			this.permissionPromptActive = true;
+			return true;
+		},
+		addNotice(message) { notices.push(message); },
+		updateSpinner() {},
+		schedulePromptQueueDrain() {},
+		ui: { requestRender() {} },
+	});
+	assert.equal(await app.ensureConnected({ commandName: "config" }), false);
+	assert.equal(app.menuHandle.keybindingContext, "Confirmation");
+	assert.ok(notices.some((message) => message.includes("another interaction is active")));
+})();
+
+// Shell activity is an independent footer owner. Connection progress may take
+// precedence temporarily, but clearing it reveals the still-running shell and
+// keeps the spinner alive.
+{
+	const app = Object.create(HarnessApp.prototype);
+	Object.assign(app, {
+		activeShellInputCount: 0,
+		shellInputsRunning: 0,
+		statusState: "",
+		connectionStatusOwner: undefined,
+		foregroundOperation: undefined,
+		btwThread: undefined,
+		spinnerTimer: undefined,
+		spinnerIndex: 0,
+		ui: { requestRender() {} },
+	});
+	app.setShellInputStatus(undefined, true);
+	assert.equal(effectiveActivityStatus(app), "running shell command");
+	const attempt = {};
+	app.setConnectionStatus(attempt, "connecting");
+	assert.equal(effectiveActivityStatus(app), "connecting");
+	app.clearConnectionStatus(attempt);
+	app.updateSpinner();
+	assert.equal(effectiveActivityStatus(app), "running shell command");
+	assert.ok(app.spinnerTimer, "the shell owner keeps animation active after connection cleanup");
+	app.setShellInputStatus(undefined, false);
+	assert.equal(effectiveActivityStatus(app), "");
+	assert.equal(app.spinnerTimer, undefined);
+}
+
+// switchAgent publishes lifecycle ownership before its first await. That closes
+// the pre-client race without allowing a stale generation to claim success.
+await (async () => {
+	const definition = { label: "Fake", acp: { command: "fake", args: [] } };
+	const makeWaitingApp = () => {
+		const app = Object.create(HarnessApp.prototype);
+		Object.assign(app, {
+			activeKey: "fake",
+			transport: "acp",
+			activeAgentGeneration: 0,
+			config: { agents: { fake: definition } },
+			client: undefined,
+			ready: false,
+			statusState: "",
+			updateSpinner() {},
+			ui: { requestRender() {} },
+			switchAgent: async () => assert.fail("ensureConnected must join the queued lifecycle"),
+		});
+		return app;
+	};
+	const installAttempt = (app) => {
+		let release;
+		app.agentSwitchAttempt = {
+			key: "fake",
+			transport: "acp",
+			generation: 0,
+			agentDefinition: definition,
+			promise: new Promise((resolve) => { release = resolve; }),
+		};
+		return release;
+	};
+
+	const joined = makeWaitingApp();
+	const releaseJoined = installAttempt(joined);
+	const joinedResult = joined.ensureConnected({ statusState: "connecting for /resume" });
+	assert.equal(joined.agentSwitchAttempt.statusState, "connecting for /resume");
+	assert.equal(joined.agentSwitchAttempt.connectionStatusState, "connecting for /resume");
+	joined.client = { exited: false, launchSpec: structuredClone(definition) };
+	joined.ready = true;
+	releaseJoined();
+	assert.equal(await joinedResult, true);
+
+	const stale = makeWaitingApp();
+	const releaseStale = installAttempt(stale);
+	const staleResult = stale.ensureConnected();
+	stale.activeAgentGeneration += 1;
+	stale.client = { exited: false, launchSpec: structuredClone(definition) };
+	stale.ready = true;
+	releaseStale();
+	assert.equal(await staleResult, false, "a lifecycle from an older generation cannot satisfy the caller");
+})();
+
+// Lazy background startup is still non-blocking, but the lifecycle no longer
+// presents an idle-looking status while its adapter is connecting.
+await (async () => {
+	let releaseStop;
+	let markStopStarted;
+	let releaseConnect;
+	let markConnectStarted;
+	const stopStarted = new Promise((resolve) => { markStopStarted = resolve; });
+	const stopGate = new Promise((resolve) => { releaseStop = resolve; });
+	const connectStarted = new Promise((resolve) => { markConnectStarted = resolve; });
+	const connectGate = new Promise((resolve) => { releaseConnect = resolve; });
+	const previousClient = {
+		exited: false,
+		async stopAndWait() {
+			markStopStarted();
+			await stopGate;
+		},
+	};
+	const replacementClient = {
+		exited: false,
+		authMethods: [],
+		async connect() {
+			markConnectStarted();
+			await connectGate;
+		},
+	};
+	const app = Object.create(HarnessApp.prototype);
+	Object.assign(app, {
+		activeKey: "fake",
+		transport: "acp",
+		activeAgentGeneration: 0,
+		config: { agents: { fake: { label: "Fake" } } },
+		client: previousClient,
+		ready: true,
+		busy: false,
+		btwThread: undefined,
+		statusState: "",
+		promptQueue: [],
+		deferredLocalSlashCommands: [],
+		activeToolIds: new Set(),
+		activeAnonymousToolCount: 0,
+		pendingUserEchoes: [],
+		cancelPermissionPrompts() {},
+		closeMenu() {},
+		clearLiveBackendCommands() {},
+		clearCancelGraceTimer() {},
+		closeCurrentAssistantText() {},
+		updateSpinner() {},
+		updateAutocomplete() {},
+		schedulePromptQueueDrain() {},
+		ui: { requestRender() {} },
+		createRuntimeAdapter: () => replacementClient,
+	});
+	const startup = app.switchAgent("fake", "acp", { quiet: true });
+	await stopStarted;
+	assert.equal(app.statusState, "stopping previous backend");
+	releaseStop();
+	await connectStarted;
+	assert.equal(app.statusState, "connecting", "replacement startup must not retain its teardown label");
+	assert.equal(app.ready, false);
+	releaseConnect();
+	await startup;
+	assert.equal(app.ready, true);
+	assert.equal(app.statusState, "");
 })();
 
 // Terminal auth can only add args/env to the configured agent executable. It
