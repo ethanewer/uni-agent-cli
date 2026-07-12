@@ -4372,7 +4372,10 @@ export class HarnessApp {
 			if (this.client === previousClient) this.client = undefined;
 			this.ready = false;
 			this.sessionSwitchInProgress = true;
-			this.setConnectionStatus(lifecycleAttempt, options.statusState ?? "stopping previous backend");
+			const teardownStatus = lifecycleAttempt?.connectionStatusState ?? options.statusState ?? (
+				options.quiet === true ? "" : "stopping previous backend"
+			);
+			if (teardownStatus) this.setConnectionStatus(lifecycleAttempt, teardownStatus);
 			this.updateSpinner();
 			this.ui.requestRender();
 			try {
@@ -4450,13 +4453,13 @@ export class HarnessApp {
 		this.pendingUserEchoes = [];
 		this.pendingUnsendPrompt = undefined;
 		this.codexThreadStateSnapshot = undefined;
-		// Starting the TUI remains independent of backend startup, but once the
-		// lifecycle actually begins it must never look idle. A command joining a
-		// pre-client attempt can promote this label before we reach this point.
-		this.setConnectionStatus(
-			lifecycleAttempt,
-			lifecycleAttempt?.connectionStatusState ?? options.statusState ?? "connecting",
+		// Lazy background startup stays visually quiet. If user input joins this
+		// lifecycle, ensureConnected promotes connectionStatusState and the same
+		// in-flight attempt immediately becomes visible without launching another ACP.
+		const connectionStatus = lifecycleAttempt?.connectionStatusState ?? options.statusState ?? (
+			options.quiet === true ? "" : "connecting"
 		);
+		if (connectionStatus) this.setConnectionStatus(lifecycleAttempt, connectionStatus);
 		this.updateSpinner();
 		this.updateAutocomplete();
 		if (!options.quiet) this.addCommandMessage(options.displayText ?? slashPromptDisplay("/harness", agent.label ?? key));
@@ -5688,11 +5691,19 @@ export class HarnessApp {
 				promptParts: options.promptParts,
 				sessionCommandTarget: options.sessionCommandTarget,
 			});
-			if (!this.sessionSwitchInProgress) this.statusState = "connecting";
+			if (!this.statusState && !this.foregroundOperation?.status) {
+				const lifecycleAttempt = this.agentSwitchAttempt;
+				if (lifecycleAttempt) {
+					lifecycleAttempt.connectionStatusState = "connecting";
+					this.setConnectionStatus(lifecycleAttempt, "connecting");
+				} else {
+					this.statusState = "connecting";
+				}
+			}
 			this.updateSpinner();
 			// Reconnect when there is no client or the previous one died (e.g. backend crash).
 			if (!this.sessionSwitchInProgress && (!this.client || this.client.exited)) {
-				void this.switchAgent(this.activeKey, this.transport, { quiet: true });
+				void this.switchAgent(this.activeKey, this.transport, { quiet: true, statusState: "connecting" });
 			}
 			this.ui.requestRender();
 			return;

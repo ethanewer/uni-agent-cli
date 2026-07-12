@@ -6782,8 +6782,9 @@ await (async () => {
 	assert.equal(await staleResult, false, "a lifecycle from an older generation cannot satisfy the caller");
 })();
 
-// Lazy background startup is still non-blocking, but the lifecycle no longer
-// presents an idle-looking status while its adapter is connecting.
+// Quiet background startup remains visually idle even while an old backend is
+// retired and its replacement connects. A blocked action promotes the same
+// lifecycle through ensureConnected tests above.
 await (async () => {
 	let releaseStop;
 	let markStopStarted;
@@ -6837,10 +6838,13 @@ await (async () => {
 	});
 	const startup = app.switchAgent("fake", "acp", { quiet: true });
 	await stopStarted;
-	assert.equal(app.statusState, "stopping previous backend");
+	assert.equal(app.statusState, "", "background retirement does not show an unrequested spinner");
+	await app.submitBackendPrompt("hello after startup");
+	assert.equal(app.statusState, "connecting", "a prompt blocked on the quiet lifecycle promotes its spinner");
+	assert.equal(app.promptQueue.at(-1)?.text, "hello after startup");
 	releaseStop();
 	await connectStarted;
-	assert.equal(app.statusState, "connecting", "replacement startup must not retain its teardown label");
+	assert.equal(app.statusState, "connecting", "the promoted spinner remains visible through connection");
 	assert.equal(app.ready, false);
 	releaseConnect();
 	await startup;
