@@ -23,8 +23,12 @@ import {
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "cc-claude-cwd-"));
 const first = path.join(root, "first");
 const second = path.join(root, "second directory");
+const nested = path.join(second, "nested child");
+const nestedLeaf = path.join(nested, "final leaf");
+const quotedDirectory = path.join(root, 'quoted "directory');
 fs.mkdirSync(first);
-fs.mkdirSync(second);
+fs.mkdirSync(nestedLeaf, { recursive: true });
+fs.mkdirSync(quotedDirectory);
 
 try {
 	assert.deepEqual(parseChangeWorkingDirectoryParams({ sessionId: "s1", path: first }), {
@@ -255,6 +259,23 @@ try {
 	assert.equal(completions[0].label, `second directory${path.sep}`);
 	assert.equal(completions[0].value, `"second directory${path.sep}"`);
 
+	// A completion engine normally keeps the cursor before the closing quote, but
+	// terminals may leave it after that quote. Continued text in either position
+	// must still support deeper completion, and pressing Enter without another
+	// completion must resolve the intended whitespace-containing directory.
+	const nestedCompletions = directoryCompletionMatches(`${completions[0].value}nest`, root);
+	assert.equal(nestedCompletions.length, 1);
+	assert.equal(nestedCompletions[0].value, `"second directory${path.sep}nested child${path.sep}"`);
+	const leafCompletions = directoryCompletionMatches(`${nestedCompletions[0].value}fin`, root);
+	assert.equal(leafCompletions.length, 1);
+	assert.equal(leafCompletions[0].value, `"second directory${path.sep}nested child${path.sep}final leaf${path.sep}"`);
+	assert.equal(resolveWorkingDirectoryTarget(leafCompletions[0].value, root), fs.realpathSync(nestedLeaf));
+	assert.equal(
+		resolveWorkingDirectoryTarget(`${nestedCompletions[0].value}final leaf`, root),
+		fs.realpathSync(nestedLeaf),
+	);
+	assert.equal(resolveWorkingDirectoryTarget('"quoted "directory"', root), fs.realpathSync(quotedDirectory));
+
 	// A bare home shorthand is expanded only for reading the directory. Its
 	// completion must retain `~/` so accepting it does not produce a cwd-relative
 	// path such as `.config/`. Existing separators and partial names are retained.
@@ -383,8 +404,9 @@ try {
 	assert.equal(explicitCustom.capabilities.changeWorkingDirectory, false);
 	assert.equal(explicitCustom.capabilities.fork, false);
 
-	// Local ownership follows the unified capability. Without it, a native /cd
-	// remains a backend command rather than being shadowed by a broken fallback.
+	// /cd is always a host-owned command so cold startup cannot forward it and
+	// silently diverge cc's process cwd from the backend. The live capability
+	// still decides whether the handler can perform the move.
 	const routeApp = (hasCapability, backendCommands = []) => {
 		const app = Object.create(HarnessApp.prototype);
 		const capabilities = { changeWorkingDirectory: hasCapability };
@@ -408,12 +430,48 @@ try {
 	assert.equal(localSlashCommands(local).some((entry) => entry.name === "cd"), true);
 	assert.equal(local.slashCommandRoute("cd", second), "local");
 	const nativeFallback = routeApp(false, ["cd"]);
-	assert.equal(localSlashCommands(nativeFallback).some((entry) => entry.name === "cd"), false);
-	assert.equal(nativeFallback.slashCommandRoute("cd", second), "backend");
+	assert.equal(localSlashCommands(nativeFallback).some((entry) => entry.name === "cd"), true);
+	assert.equal(nativeFallback.slashCommandRoute("cd", second), "local");
 	const unsupported = routeApp(false, []);
-	assert.equal(unsupported.slashCommandRoute("cd", second), "unknown");
+	assert.equal(unsupported.slashCommandRoute("cd", second), "local");
 	nativeFallback.focusedThread = "btw";
 	assert.equal(nativeFallback.slashCommandRoute("cd", second), "local", "side threads reject /cd locally");
+
+	// A side-pane /cd rejection belongs to the side transcript. It must not look
+	// like the main session attempted a process-global directory change.
+	{
+		const sideMessages = [];
+		const mainMessages = [];
+		const agentDefinition = {};
+		const client = { sessionId: "main-session", exited: false };
+		const sideClient = { sessionId: "side-session", exited: false };
+		const sideThread = {
+			client: sideClient,
+			sessionId: "side-session",
+			addCommandMessage: (message) => sideMessages.push(message),
+			addNotice: (message) => sideMessages.push(message),
+		};
+		const app = Object.create(HarnessApp.prototype);
+		Object.assign(app, {
+			activeKey: "fake",
+			activeAgentGeneration: 0,
+			transport: "acp",
+			config: { agents: { fake: agentDefinition } },
+			client,
+			btwThread: sideThread,
+			focusedThread: "btw",
+			addCommandMessage: (message) => mainMessages.push(message),
+			addNotice: (message) => mainMessages.push(message),
+			onThreadActivity() {},
+			ui: { requestRender() {} },
+		});
+		await app.runChangeWorkingDirectory(second, "cd", { targetThread: sideThread });
+		assert.deepEqual(sideMessages, [
+			`/cd ${second}`,
+			"Close the /btw side thread before changing directories",
+		]);
+		assert.deepEqual(mainMessages, []);
+	}
 
 	// Host cwd, cache scope, and autocomplete change only after the backend
 	// succeeds. Trust attestation echoes the exact canonical directory.

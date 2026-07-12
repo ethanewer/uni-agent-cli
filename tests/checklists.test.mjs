@@ -103,6 +103,37 @@ await client.handleCursorRequest({
 assert.equal(client.checklistSnapshot.entries[0].content, "Cursor task");
 assert.deepEqual(cursorReplies.at(-1), { jsonrpc: "2.0", id: 9, result: {} });
 
+// Cursor can publish a todo snapshot while session/load is still pending. ACK
+// immediately so the backend can finish loading, but preserve the snapshot in
+// the ordered session replay instead of applying it to the old session and then
+// erasing it at commit.
+client.getChecklistStore().replace([{ content: "Old task", status: "pending" }]);
+client.checklistSnapshot = client.getChecklistStore().list();
+client.bufferingSessionUpdates = true;
+client.bufferedSessionUpdates = [];
+await client.handleCursorRequest({
+	id: 10,
+	method: "cursor/update_todos",
+	params: { sessionId: "session-2", todos: [{ content: "Loaded task", status: "in_progress" }] },
+});
+assert.equal(cursorReplies.at(-1).id, 10, "the buffered todo request is acknowledged immediately");
+assert.equal(client.checklistSnapshot.entries[0].content, "Old task");
+assert.equal(client.bufferedSessionUpdates.length, 1);
+client.sessionId = "session-2";
+client.checklistSnapshot = client.getChecklistStore().reset();
+client.bufferingSessionUpdates = false;
+client.handleSessionUpdate(client.bufferedSessionUpdates.shift());
+assert.equal(client.checklistSnapshot.entries[0].content, "Loaded task");
+
+const loadedRevision = client.checklistSnapshot.revision;
+await client.handleCursorRequest({
+	id: 11,
+	method: "cursor/update_todos",
+	params: { sessionId: "stale-session", todos: [{ content: "Stale task", status: "pending" }] },
+});
+assert.equal(client.checklistSnapshot.revision, loadedRevision, "an explicitly stale todo snapshot is ignored");
+assert.equal(cursorReplies.at(-1).id, 11, "stale todo requests are still acknowledged");
+
 // Main and /btw retain independent generic snapshots.
 const app = Object.create(HarnessApp.prototype);
 app.activeKey = "claude";
@@ -123,7 +154,7 @@ const panelApp = {
 };
 const panel = new ChecklistPanel(panelApp, {});
 panelApp.menuHandle = panel;
-assert.match(panel.render(80).join("\n"), /Cursor task/);
+assert.match(panel.render(80).join("\n"), /Loaded task/);
 panel.handleInput("\x1b");
 assert.equal(panelApp.menuHandle, undefined);
 

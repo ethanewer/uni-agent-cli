@@ -8,6 +8,13 @@ fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SESSION="cc-tui-smoke-$$"
+TMUX_SOCKET="cc-tui-smoke-$PPID-$$"
+# Keep smoke sessions and server options isolated from the developer's active
+# tmux server. In particular, a failed smoke run must never consume panes or PTYs
+# owned by a real interactive session.
+tmux() {
+	command tmux -L "$TMUX_SOCKET" "$@"
+}
 WRITE_LOG="$(mktemp -t cc-tui-write-log.XXXXXX)"
 SETTINGS_FILE="$(mktemp -t cc-tui-settings.XXXXXX)"
 CONFIG_SETTINGS_THEME_FILE="$(mktemp -t cc-tui-config-settings-theme.XXXXXX)"
@@ -56,8 +63,79 @@ if [ -n "${VSCODE_INJECTION:-}" ]; then
 	PANE_ENV="$PANE_ENV VSCODE_INJECTION=$VSCODE_INJECTION_Q"
 fi
 
-cleanup() {
+process_identity() {
+	local pid="${1:-}"
+	if [ -z "$pid" ]; then
+		return 0
+	fi
+	# Start time distinguishes a recycled PID even if a later process happens to
+	# use the same command line as the pane we launched.
+	ps -ww -p "$pid" -o lstart= -o command= 2>/dev/null || true
+}
+
+pid_is_same_process() {
+	local pid="${1:-}"
+	local identity="${2:-}"
+	local current=""
+	if [ -z "$pid" ] || [ -z "$identity" ]; then
+		return 1
+	fi
+	current="$(process_identity "$pid")"
+	[ -n "$current" ] && [ "$current" = "$identity" ]
+}
+
+wait_for_process_exit() {
+	local pid="${1:-}"
+	local identity="${2:-}"
+	for _ in {1..100}; do
+		if ! pid_is_same_process "$pid" "$identity"; then
+			return 0
+		fi
+		sleep 0.05
+	done
+	return 1
+}
+
+force_stop_pid() {
+	local pid="${1:-}"
+	local identity="${2:-}"
+	if pid_is_same_process "$pid" "$identity"; then
+		kill -TERM "$pid" >/dev/null 2>&1 || true
+		sleep 0.1
+		if pid_is_same_process "$pid" "$identity"; then
+			kill -KILL "$pid" >/dev/null 2>&1 || true
+		fi
+	fi
+}
+
+force_stop_session() {
+	local pid=""
+	local identity=""
+	pid="$(tmux list-panes -t "$SESSION" -F '#{pane_pid}' 2>/dev/null | head -n 1 || true)"
+	identity="$(process_identity "$pid")"
 	tmux kill-session -t "$SESSION" >/dev/null 2>&1 || true
+	if ! wait_for_process_exit "$pid" "$identity"; then
+		force_stop_pid "$pid" "$identity"
+	fi
+}
+
+stop_session() {
+	local pid=""
+	local identity=""
+	pid="$(tmux list-panes -t "$SESSION" -F '#{pane_pid}' 2>/dev/null | head -n 1 || true)"
+	identity="$(process_identity "$pid")"
+	tmux kill-session -t "$SESSION"
+	if wait_for_process_exit "$pid" "$identity"; then
+		return 0
+	fi
+	force_stop_pid "$pid" "$identity"
+	echo "cc process $pid did not exit after its tmux session closed" >&2
+	return 1
+}
+
+cleanup() {
+	force_stop_session
+	tmux kill-server >/dev/null 2>&1 || true
 	rm -f "$WRITE_LOG" "$SETTINGS_FILE" "$CONFIG_SETTINGS_THEME_FILE" "$CONFIG_TOP_THEME_FILE" "$COMMANDS_GATE" "$NEW_GATE" "$SESSION_LIST_GATE" "$START_LOG" "$COMMAND_CACHE" "$PERMS_FILE"
 }
 trap cleanup EXIT
@@ -234,7 +312,7 @@ tmux send-keys -t "$SESSION" / r
 : > "$COMMANDS_GATE"
 wait_for_text "Review current changes"
 wait_for_text "/r"
-tmux kill-session -t "$SESSION"
+stop_session
 : > "$WRITE_LOG"
 
 # The first live advertisement above is now a workspace-scoped display hint.
@@ -245,7 +323,7 @@ tmux new-session -d -s "$SESSION" -x 100 -y 30 "cd $ROOT_Q && $PANE_ENV PI_TUI_W
 wait_for_text "Space to record"
 tmux send-keys -t "$SESSION" / r
 wait_for_text "Review current changes"
-tmux kill-session -t "$SESSION"
+stop_session
 : > "$WRITE_LOG"
 
 # A user command that depends on a deliberately stalled cold ACP startup must
@@ -274,7 +352,7 @@ if [ "$(grep -c '^initialize$' "$START_LOG")" -ne 1 ] || [ "$(grep -c '^session/
 fi
 tmux send-keys -t "$SESSION" Escape
 wait_for_text "/new"
-tmux kill-session -t "$SESSION"
+stop_session
 : > "$WRITE_LOG"
 
 tmux new-session -d -s "$SESSION" -x 100 -y 30 "cd $ROOT_Q && printf 'outside-before-cc\n' && $PANE_ENV PI_TUI_WRITE_LOG=$WRITE_LOG_Q CC_CONFIG=tests/fake_config.json CC_SETTINGS=$SETTINGS_FILE_Q CC_BACKGROUND_CONNECT_DELAY_MS=0 FAKE_ACP_NEW_DELAY=0.4 ./src/cc fake"
@@ -333,7 +411,7 @@ fi
 tmux send-keys -t "$SESSION" / c l e a r Enter
 wait_without_text "Unknown theme: missing"
 
-tmux kill-session -t "$SESSION"
+stop_session
 : > "$WRITE_LOG"
 tmux new-session -d -s "$SESSION" -x 110 -y 32 "cd $ROOT_Q && printf 'outside-before-cc\n' && $PANE_ENV PI_TUI_WRITE_LOG=$WRITE_LOG_Q CC_CONFIG=tests/fake_config.json CC_SETTINGS=$SETTINGS_FILE_Q CC_BACKGROUND_CONNECT_DELAY_MS=0 FAKE_ACP_NEW_DELAY=0.4 ./src/cc fake"
 wait_for_text "fake acp"
@@ -373,7 +451,7 @@ cat > "$CONFIG_SETTINGS_THEME_FILE" <<'JSON'
 }
 JSON
 printf '{}\n' > "$SETTINGS_FILE"
-tmux kill-session -t "$SESSION"
+stop_session
 : > "$WRITE_LOG"
 tmux new-session -d -s "$SESSION" -x 110 -y 32 "cd $ROOT_Q && printf 'outside-before-cc\n' && $PANE_ENV PI_TUI_WRITE_LOG=$WRITE_LOG_Q CC_CONFIG=$CONFIG_SETTINGS_THEME_FILE_Q CC_SETTINGS=$SETTINGS_FILE_Q CC_BACKGROUND_CONNECT_DELAY_MS=0 FAKE_ACP_NEW_DELAY=0.4 ./src/cc fake"
 wait_for_text "fake acp"
@@ -404,14 +482,14 @@ cat > "$CONFIG_TOP_THEME_FILE" <<'JSON'
 }
 JSON
 printf '{}\n' > "$SETTINGS_FILE"
-tmux kill-session -t "$SESSION"
+stop_session
 : > "$WRITE_LOG"
 tmux new-session -d -s "$SESSION" -x 110 -y 32 "cd $ROOT_Q && printf 'outside-before-cc\n' && $PANE_ENV PI_TUI_WRITE_LOG=$WRITE_LOG_Q CC_CONFIG=$CONFIG_TOP_THEME_FILE_Q CC_SETTINGS=$SETTINGS_FILE_Q CC_BACKGROUND_CONNECT_DELAY_MS=0 FAKE_ACP_NEW_DELAY=0.4 node src/cc.mjs fake"
 wait_for_text "fake acp"
 wait_for_ansi_text "$(printf '\033[38;2;79;143;92mfake acp')"
 assert_no_prepaint_clear
 
-tmux kill-session -t "$SESSION"
+stop_session
 : > "$WRITE_LOG"
 tmux new-session -d -s "$SESSION" -x 30 -y 12 "cd $ROOT_Q && printf 'outside-before-cc\n' && $PANE_ENV PI_TUI_WRITE_LOG=$WRITE_LOG_Q CC_CONFIG=$CONFIG_TOP_THEME_FILE_Q CC_SETTINGS=$SETTINGS_FILE_Q CC_BACKGROUND_CONNECT_DELAY_MS=0 FAKE_ACP_NEW_DELAY=0.4 ./src/cc fake"
 wait_for_text "Space to record"
@@ -780,7 +858,7 @@ tmux send-keys -t "$SESSION" / p e r m i s s i o n - e x i t Enter
 wait_for_text "backend exited"
 wait_without_text "Permission: Permission Exit"
 
-tmux kill-session -t "$SESSION"
+stop_session
 printf '{}\n' > "$SETTINGS_FILE"
 : > "$WRITE_LOG"
 tmux new-session -d -s "$SESSION" -x 100 -y 30 "cd $ROOT_Q && $PANE_ENV PI_TUI_WRITE_LOG=$WRITE_LOG_Q CC_CONFIG=tests/fake_config.json CC_SETTINGS=$SETTINGS_FILE_Q CC_BACKGROUND_CONNECT_DELAY_MS=0 ./src/cc fake"
@@ -835,7 +913,7 @@ if [ "$trace_prompt_count" != "1" ] || [ "$trace_tool_1_count" != "1" ] || [ "$t
 	exit 1
 fi
 
-tmux kill-session -t "$SESSION"
+stop_session
 printf '{}\n' > "$SETTINGS_FILE"
 tmux new-session -d -s "$SESSION" -x 100 -y 12 "cd $ROOT_Q && $PANE_ENV PI_TUI_WRITE_LOG=$WRITE_LOG_Q CC_CONFIG=tests/e2e_trace_config.json CC_SETTINGS=$SETTINGS_FILE_Q CC_BACKGROUND_CONNECT_DELAY_MS=0 ./src/cc trace"
 wait_for_text "trace acp"

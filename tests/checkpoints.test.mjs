@@ -236,11 +236,13 @@ await (async () => {
 	const rewindStarted = new Promise((resolve) => { releaseRewind = resolve; });
 	let finishRewind;
 	const rewindGate = new Promise((resolve) => { finishRewind = resolve; });
+	let rewindRequests = 0;
 	const definition = { label: "Fake" };
 	const client = {
 		sessionId: "source",
 		exited: false,
 		async rewindCheckpoint() {
+			rewindRequests += 1;
 			releaseRewind();
 			await rewindGate;
 			return { ok: true, mode: "code", filesChanged: [] };
@@ -273,6 +275,15 @@ await (async () => {
 		switchAgent: async () => assert.fail("harness replacement raced code rewind"),
 	});
 	const context = app.captureActiveAgentContext({ includeClient: true });
+	app.activeShellInputCount = 1;
+	assert.equal(
+		await app.applyCheckpointRewind(context, "source", { id: "checkpoint-1", summary: "Start" }, "code"),
+		false,
+		"code rewind is rejected while a shell command owns the working tree",
+	);
+	assert.equal(rewindRequests, 0);
+	assert.ok(notices.some((message) => /shell commands.*rewinding files/iu.test(message)));
+	app.activeShellInputCount = 0;
 	const rewinding = app.applyCheckpointRewind(context, "source", { id: "checkpoint-1", summary: "Start" }, "code");
 	await rewindStarted;
 	assert.equal(app.sessionSwitchInProgress, true);

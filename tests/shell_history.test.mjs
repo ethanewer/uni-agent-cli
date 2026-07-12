@@ -125,6 +125,21 @@ assert.deepEqual(history.suggestions("git").slice(0, 2), ["git status", "git sta
 			["notice", "Shell commands are unavailable while the working directory is changing"],
 		]);
 		app.workingDirectoryCommandTransition = undefined;
+		app.workingTreeMutationOperation = { label: "Codex Cloud is applying changes" };
+		const mutationSentinel = `${sentinel}-mutation`;
+		await app.handleSubmit(`!touch ${JSON.stringify(mutationSentinel)}`);
+		assert.equal(fs.existsSync(mutationSentinel), false, "leading-! input must not launch during a working-tree mutation");
+		assert.deepEqual(blockedMessages.slice(-2), [
+			["command", `!touch ${JSON.stringify(mutationSentinel)}`],
+			["notice", "Shell commands are unavailable while Codex Cloud is applying changes"],
+		]);
+		app.switchAgent = async () => assert.fail("a harness switch must not overlap a working-tree mutation");
+		await app.handleHarnessCommand("/harness codex");
+		assert.deepEqual(blockedMessages.slice(-2), [
+			["command", "/harness codex"],
+			["notice", "Harness switching is unavailable while Codex Cloud is applying changes"],
+		]);
+		app.workingTreeMutationOperation = undefined;
 
 		let cwdRequests = 0;
 		app.config.settings = { respondToBashCommands: false };
@@ -148,6 +163,116 @@ assert.deepEqual(history.suggestions("git").slice(0, 2), ["git status", "git sta
 		assert.equal(cwdRequests, 0, "/cd must not race a shell command that captured the old cwd");
 		await delayedShell;
 		assert.equal(app.activeShellInputCount, 0);
+
+		// Leading-! input is available before lazy ACP startup. Installing the first
+		// client for the same agent generation must not make that command look stale
+		// or discard its output.
+		app.client = undefined;
+		app.ready = false;
+		app.clientInstallSequence = 0;
+		let appendedColdOutput;
+		const coldShell = app.runShellInput(
+			`${JSON.stringify(process.execPath)} -e ${JSON.stringify("setTimeout(() => console.log('cold done'), 80)")}`,
+		);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		app.client = {
+			exited: false,
+			sessionId: "first-lazy-client",
+			capabilities: { appendContext: true },
+			async appendContext(text) { appendedColdOutput = text; },
+		};
+		app.clientInstallSequence += 1;
+		app.initialSessionIdByClient.set(app.client, app.client.sessionId);
+		app.ready = true;
+		await coldShell;
+		assert.match(appendedColdOutput, /cold done/u, "cold shell output reaches the first lazily-installed client");
+		assert.ok(
+			!blockedMessages.some(([, message]) => message.includes("its original session changed")),
+			"normal first-client startup is not reported as a session replacement",
+		);
+
+		// The startup exception is limited to that first session. A same-client
+		// resume/new/branch must not receive output launched before startup.
+		app.client = undefined;
+		app.ready = false;
+		app.clientInstallSequence = 0;
+		appendedColdOutput = undefined;
+		const staleColdShell = app.runShellInput(
+			`${JSON.stringify(process.execPath)} -e ${JSON.stringify("setTimeout(() => console.log('stale cold'), 80)")}`,
+		);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		app.client = {
+			exited: false,
+			sessionId: "initial-session",
+			capabilities: { appendContext: true },
+			async appendContext(text) { appendedColdOutput = text; },
+		};
+		app.clientInstallSequence += 1;
+		app.initialSessionIdByClient.set(app.client, app.client.sessionId);
+		app.ready = true;
+		app.client.sessionId = "replacement-session";
+		await staleColdShell;
+		assert.equal(appendedColdOutput, undefined, "cold shell output cannot cross a same-client session switch");
+		assert.ok(
+			blockedMessages.some(([, message]) => message.includes("its original session changed")),
+			"discarded cross-session output is explained",
+		);
+
+		// A resume picker can open while a concrete-session shell is running. Keep
+		// its model follow-up target-bound in the queue, then discard it if the picker
+		// commits a different session before the queue drains.
+		app.config.settings.respondToBashCommands = true;
+		let backendPrompts = 0;
+		app.client = {
+			exited: false,
+			sessionId: "queued-shell-source",
+			capabilities: {},
+			async prompt() { backendPrompts += 1; return {}; },
+		};
+		app.ready = true;
+		app.foregroundOperation = { commandName: "resume", status: "loading sessions", cancelled: false };
+		await app.runShellInput(`${JSON.stringify(process.execPath)} -e ${JSON.stringify("console.log('queue me')")}`);
+		assert.equal(app.promptQueue.length, 1);
+		assert.ok(app.promptQueue[0].sessionCommandTarget, "queued shell follow-up retains its source identity");
+		app.client.sessionId = "queued-shell-replacement";
+		app.foregroundOperation = undefined;
+		await app.flushPromptQueue();
+		assert.equal(backendPrompts, 0, "target-bound shell output cannot drain into a resumed session");
+		assert.equal(app.promptQueue.length, 0);
+
+		// If the first lazy ACP attempt fails, cold output is never left for a later
+		// reconnect. Reporting the result must not itself launch another attempt.
+		app.client = undefined;
+		app.ready = false;
+		app.clientInstallSequence = 0;
+		app.ensureConnected = async () => false;
+		await app.runShellInput(`${JSON.stringify(process.execPath)} -e ${JSON.stringify("console.log('no target')")}`);
+		assert.equal(app.promptQueue.length, 0, "failed first startup leaves no unfenced shell prompt");
+
+		// A completed failed/auth-required first install is not an in-flight attempt.
+		// Shell completion must not tear it down and launch an indistinguishable retry.
+		app.client = undefined;
+		app.ready = false;
+		app.clientInstallSequence = 0;
+		app.agentSwitchAttempt = undefined;
+		app.connectionAttempt = undefined;
+		let reconnects = 0;
+		app.ensureConnected = async () => {
+			reconnects += 1;
+			return true;
+		};
+		const settledFailureShell = app.runShellInput(
+			`${JSON.stringify(process.execPath)} -e ${JSON.stringify("setTimeout(() => console.log('settled failure'), 80)")}`,
+		);
+		await new Promise((resolve) => setTimeout(resolve, 10));
+		app.client = { exited: false, sessionId: undefined, capabilities: {} };
+		app.clientInstallSequence += 1;
+		await settledFailureShell;
+		assert.equal(reconnects, 0, "cold shell output cannot start a second ACP lifecycle after the first settled unsuccessfully");
+		assert.ok(
+			blockedMessages.some(([, message]) => message.includes("first backend connection never became ready")),
+			"the discarded cold output explains the failed first target",
+		);
 	} finally {
 		app.voiceController?.dispose();
 	}

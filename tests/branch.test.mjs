@@ -82,14 +82,54 @@ try {
 	assert.equal(await namedSuccess.app.branchCurrentSession("feature-name"), true);
 	assert.equal(requestedName, "feature-name");
 
+	// A lineage-label write happens after the backend has committed the new
+	// session. If that metadata store is unavailable, keep the live branch and
+	// report a warning instead of claiming the branch failed.
+	const validForkRegistry = process.env.CC_FORKS;
+	const unreadableForkRegistry = path.join(root, "fork-registry-is-a-directory");
+	fs.mkdirSync(unreadableForkRegistry);
+	process.env.CC_FORKS = unreadableForkRegistry;
+	try {
+		const lineageClient = {
+			exited: false,
+			sessionId: "lineage-parent",
+			capabilities: { fork: "native" },
+			async fork(_parent, options) {
+				this.sessionId = "lineage-child";
+				options.beforeReplay();
+			},
+		};
+		const lineage = appWith(lineageClient);
+		assert.equal(await lineage.app.branchCurrentSession(), true);
+		assert.equal(lineageClient.sessionId, "lineage-child");
+		assert.ok(lineage.events.some((event) => event.includes("branch is active")));
+		assert.equal(lineage.events.some((event) => event.startsWith("error:")), false);
+	} finally {
+		process.env.CC_FORKS = validForkRegistry;
+	}
+
 	const unsupported = appWith({ exited: false, sessionId: "parent", capabilities: { fork: false } });
 	assert.equal(await unsupported.app.branchCurrentSession(), false);
 	assert.ok(unsupported.events.some((event) => event.includes("does not advertise session forking")));
 
 	const side = appWith(client);
+	const sideEvents = [];
+	const sideClient = { sessionId: "side-session", exited: false };
+	const sideThread = {
+		client: sideClient,
+		sessionId: "side-session",
+		addCommandMessage: (message) => sideEvents.push(`command:${message}`),
+		addNotice: (message) => sideEvents.push(`notice:${message}`),
+	};
+	side.app.activeAgentGeneration = 0;
+	side.app.transport = "acp";
+	side.app.config = { agents: { fake: {} } };
+	side.app.btwThread = sideThread;
+	side.app.onThreadActivity = () => {};
 	side.app.focusedThread = "btw";
-	assert.equal(await side.app.branchCurrentSession(), false);
-	assert.ok(side.events.some((event) => event.includes("only from the main session")));
+	assert.equal(await side.app.branchCurrentSession("", { targetThread: sideThread }), false);
+	assert.ok(sideEvents.some((event) => event.includes("only from the main session")));
+	assert.equal(side.events.some((event) => event.includes("only from the main session")), false);
 } finally {
 	if (previousForks === undefined) delete process.env.CC_FORKS;
 	else process.env.CC_FORKS = previousForks;

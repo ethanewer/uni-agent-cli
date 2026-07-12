@@ -116,6 +116,7 @@ cancel()
 stop(): Promise                         // terminal close; signals synchronously
 stopAndWait(): Promise                  // complete process-tree teardown
 forceResolvePrompt(): boolean           // settle a cancelled prompt if needed
+async acquireSessionLoadGuard(id): release  // hold adapter-owned safety fences across loadSession
 setRuntimePermissionMode(mode?)         // host-owned in-memory policy override
 getSessionInfo(): SessionInfo        // sessionId, capabilities, configOptions, models, modes, agentInfo
 ```
@@ -180,6 +181,7 @@ reach the TUI.
 | Difference | Adapter-side home |
 | --- | --- |
 | Fork semantics | `adapter.capabilities.fork` + `adapter.fork()`; Codex implements copy-fork |
+| Session ownership | `acquireSessionLoadGuard()`; Codex rejects rollouts leased by another live cc process |
 | Prompt retraction | `snapshotRetractionState()` / `canRetract()` |
 | Command preset UI | `interceptCommand()` returns a normalized preset dialog |
 | Native config/env/args/meta | `buildLaunchSpec()` and adapter translation hooks |

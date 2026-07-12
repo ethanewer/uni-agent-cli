@@ -87,14 +87,12 @@ const DEFAULT_CC_ACTION_BINDINGS = Object.freeze([
 ]);
 
 export const CC_UNBOUND_ACTION = "cc.unbound";
+// Internal dispatcher context for components that deliberately do not expose a
+// user-remappable Claude context (for example ThemePicker and a free-text
+// elicitation field). It gives their native text/navigation handling priority
+// over Global bindings without making unsupported component actions configurable.
+export const CC_NATIVE_INPUT_CONTEXT = "cc.nativeInput";
 export const CC_KEYBINDING_CHORD_TIMEOUT_MS = 1_000;
-
-const CC_KEYBINDING_CONTEXT_IDS = Object.freeze({
-	// A null binding removes the key's existing behavior even when that behavior
-	// is a lower-level line-editing action without a public Claude action name
-	// (the documented `ctrl+u: null` example relies on this).
-	Chat: Object.freeze(Object.keys(TUI_KEYBINDINGS).filter((id) => id.startsWith("tui.editor.") || id.startsWith("tui.input."))),
-});
 
 const MODIFIER_ALIASES = Object.freeze({
 	ctrl: "ctrl",
@@ -138,6 +136,12 @@ const TERMINAL_CONFLICTS = new Map([
 	["ctrl+a", "GNU screen prefix"],
 	["ctrl+z", "terminal suspend"],
 ]);
+const NATIVE_TUI_INPUT_KEYS = Object.freeze(
+	Object.entries(TUI_KEYBINDINGS)
+		.filter(([id]) => id.startsWith("tui.editor.") || id.startsWith("tui.input.") || id.startsWith("tui.select."))
+		.flatMap(([id, definition]) => normalizedKeyList(DEFAULT_CC_KEYBINDINGS[id] ?? definition.defaultKeys)),
+);
+const NATIVE_PANEL_INPUT_KEYS = Object.freeze(["enter", "escape", "up", "down", "backspace", "ctrl+u"]);
 
 export function ccKeybindingsPath(options = {}) {
 	const environment = options.environment ?? process.env;
@@ -248,7 +252,6 @@ export function compileCcKeybindings(document) {
 			warnings.push(`bindings[${blockIndex}].bindings must be an object.`);
 			continue;
 		}
-		const contextIds = CC_KEYBINDING_CONTEXT_IDS[context] ?? [];
 		for (const [sourceKey, action] of Object.entries(block.bindings)) {
 			const normalized = normalizeCcKeyStroke(sourceKey);
 			if (!normalized.key) {
@@ -281,30 +284,15 @@ export function compileCcKeybindings(document) {
 				warnings.push(`${context} ${sourceKey}: replaces an earlier binding for ${key}.`);
 			}
 			seenClaims.set(claim, action);
-			// Pi accepts only single strokes. Chords and component/host actions are
-			// resolved by CcKeybindingDispatcher before the editor sees the input.
-			if (strokes.length === 1) {
-				for (const id of contextIds.filter((id) => id.startsWith("tui."))) {
-					const keys = resolved.get(id) ?? [];
-					const next = keys.filter((candidate) => candidate !== key);
-					if (next.length !== keys.length) {
-						resolved.set(id, next);
-						touched.add(id);
-					}
-				}
-			}
+			// Contextual bindings must not be copied into Pi's process-global editor
+			// manager. Doing so lets a Chat remap (for example Enter -> newline) alter
+			// the same raw key after Autocomplete has accepted a slash command. The
+			// dispatcher consumes Chat actions in Chat and leaves Pi's native component
+			// defaults untouched in higher-priority contexts.
 			if (action === null && strokes.length > 1) {
 				// A chord has no lower-level component behavior to suppress. Removing
 				// its claim really frees the prefix once no sibling chord remains.
 				actionClaims.delete(claim);
-			} else if (targetId?.startsWith("tui.") && strokes.length === 1 && context === "Chat") {
-				const keys = resolved.get(targetId) ?? [];
-				if (!keys.includes(key)) resolved.set(targetId, [...keys, key]);
-				touched.add(targetId);
-				// Also retain the semantic action for context-aware dispatch. This is
-				// what lets a custom Chat key coexist safely with a chord prefix and
-				// keeps an Autocomplete key scoped to an open completion menu.
-				actionClaims.set(claim, { context, key, action: targetId, default: false });
 			} else {
 				actionClaims.set(claim, {
 					context,
@@ -396,19 +384,40 @@ export class CcKeybindingDispatcher {
 			if (completed) return { consume: true, action: completed.action, chord: completed.key, binding: completed };
 		}
 
-		const active = bindingsForContexts(this.bindings, orderedContexts);
-		const prefixes = active.filter((binding) => binding.strokes.length === 2 && matchesKey(data, binding.strokes[0]));
-		if (prefixes.length > 0) {
-			const pending = { candidates: prefixes };
-			this.pending = pending;
-			this.timer = this.setTimeout(() => {
-				if (this.pending === pending) this.reset();
-			}, this.timeoutMs);
-			this.timer?.unref?.();
-			return { consume: true, pending: true };
+		// Resolve one context at a time. A custom binding in the active context may
+		// replace that component's default, and a chord prefix still beats a single
+		// binding in the same context. If neither exists, let the active component
+		// consume its native key before considering a lower Chat/Global context.
+		// This is especially important for autocomplete Enter: Pi accepts the slash
+		// completion and submits it, behavior a host-dispatched select action cannot
+		// reproduce without reaching into the editor.
+		for (const context of orderedContexts) {
+			const contextual = this.bindings.filter((binding) => binding.context === context);
+			const prefixes = contextual.filter(
+				(binding) => binding.strokes.length === 2 && matchesKey(data, binding.strokes[0]),
+			);
+			if (prefixes.length > 0) {
+				const pending = { candidates: prefixes };
+				this.pending = pending;
+				this.timer = this.setTimeout(() => {
+					if (this.pending === pending) this.reset();
+				}, this.timeoutMs);
+				this.timer?.unref?.();
+				return { consume: true, pending: true };
+			}
+			const single = contextual.find(
+				(binding) => binding.strokes.length === 1 && matchesKey(data, binding.strokes[0]),
+			);
+			if (single) return { consume: true, action: single.action, chord: single.key, binding: single };
+			if (componentOwnsInput(context, data)) {
+				// Return immediately instead of scanning lower contexts, but do not consume
+				// the raw key: the component must retain its exact native behavior. In
+				// particular, Pi's slash-autocomplete Enter accepts and submits in one turn,
+				// while the host's semantic accept helper intentionally only completes.
+				return { consume: false };
+			}
 		}
-		const single = firstMatchingBinding(active.filter((binding) => binding.strokes.length === 1), data, 0, orderedContexts);
-		return single ? { consume: true, action: single.action, chord: single.key, binding: single } : { consume: false };
+		return { consume: false };
 	}
 }
 
@@ -486,4 +495,37 @@ function bindingsForContexts(bindings, contexts) {
 function firstMatchingBinding(bindings, data, strokeIndex, contexts) {
 	const ordered = bindingsForContexts(bindings, contexts);
 	return ordered.find((binding) => matchesKey(data, binding.strokes[strokeIndex]));
+}
+
+function componentOwnsInput(context, data) {
+	if (context === "Autocomplete") {
+		// Autocomplete is still the editor: printable input extends the current
+		// prefix, and every native edit/navigation key must reach Pi unchanged.
+		// Only an explicit Autocomplete binding (checked above) may replace it;
+		// lower Chat/Global shortcuts must not steal characters or Backspace.
+		return isNativePrintableInput(data) || nativeTuiInputOwns(data);
+	}
+	if (context === CC_NATIVE_INPUT_CONTEXT) return nativePanelInputOwns(data);
+	if (context !== "Select" && context !== "Confirmation") return false;
+	const nativeKeys = context === "Select"
+		? ["enter", "escape", "up", "down", "pageUp", "pageDown", "home", "end", "backspace", "ctrl+u"]
+		: ["enter", "escape", "up", "down", "backspace", "ctrl+u"];
+	if (nativeKeys.some((key) => matchesKey(data, key))) return true;
+	// Selection menus own printable input for filtering. Explicit bindings in
+	// Select/Confirmation were checked above and still override this native path;
+	// only lower-priority Global bindings are prevented from stealing the text.
+	return isNativePrintableInput(data);
+}
+
+function nativeTuiInputOwns(data) {
+	return NATIVE_TUI_INPUT_KEYS.some((candidate) => matchesKey(data, candidate));
+}
+
+function nativePanelInputOwns(data) {
+	if (isNativePrintableInput(data)) return true;
+	return NATIVE_PANEL_INPUT_KEYS.some((key) => matchesKey(data, key));
+}
+
+function isNativePrintableInput(data) {
+	return typeof data === "string" && [...data].length === 1 && !/[\p{Cc}\p{Cf}\p{Cs}]/u.test(data);
 }

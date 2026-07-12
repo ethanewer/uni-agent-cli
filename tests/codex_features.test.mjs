@@ -2,11 +2,13 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 
 import {
 	AcpClient,
+	acquireCodexLiveSessionLease,
 	BtwThread,
+	codexLiveSessionLeaseIsActive,
 	codexStoredSessionPresence,
 	forgetForkIds,
 	HarnessApp,
@@ -25,6 +27,77 @@ const previousForkRegistry = process.env.CC_FORKS;
 const testForkRegistryRoot = fs.mkdtempSync(path.join(os.tmpdir(), "cc-codex-features-forks-"));
 process.env.CC_FORKS = path.join(testForkRegistryRoot, "forks.json");
 process.once("exit", () => fs.rmSync(testForkRegistryRoot, { recursive: true, force: true }));
+
+// A live Codex rollout has one process owner. Duplicate owners fail closed,
+// clean shutdown releases it, and a dead local PID is reaped for crash recovery.
+{
+	const liveId = "aaaaaaaa-bbbb-7ccc-8ddd-eeeeeeeeeeee";
+	const release = acquireCodexLiveSessionLease(liveId);
+	assert.equal(codexLiveSessionLeaseIsActive(liveId), true);
+	assert.throws(
+		() => acquireCodexLiveSessionLease(liveId),
+		(error) => error?.code === "CC_SESSION_LEASE_ACTIVE",
+	);
+	assert.equal(release(), true);
+	assert.equal(codexLiveSessionLeaseIsActive(liveId), false);
+
+	const staleId = "bbbbbbbb-cccc-7ddd-8eee-ffffffffffff";
+	const staleDirectory = `${process.env.CC_FORKS}.live-sessions`;
+	const staleFile = path.join(staleDirectory, `${staleId}.json`);
+	fs.mkdirSync(staleDirectory, { recursive: true });
+	fs.writeFileSync(staleFile, `${JSON.stringify({
+		sessionId: staleId,
+		pid: 999_999_999,
+		hostname: os.hostname(),
+		token: "stale-owner",
+		createdAt: new Date(0).toISOString(),
+	})}\n`);
+	const firstDeadObservation = Date.UTC(2026, 0, 1);
+	assert.equal(codexLiveSessionLeaseIsActive(staleId, {
+		processIsAlive: () => false,
+		nowMs: firstDeadObservation,
+	}), true, "a dead cc PID alone does not prove its ACP tree has stopped");
+	assert.equal(codexLiveSessionLeaseIsActive(staleId, {
+		processIsAlive: () => false,
+		nowMs: firstDeadObservation + 30_001,
+	}), false, "an owner with no recorded tree becomes recoverable after the observed orphan grace");
+	assert.equal(fs.existsSync(staleFile), false);
+
+	const survivingTreeId = "cccccccc-dddd-7eee-8fff-000000000000";
+	acquireCodexLiveSessionLease(survivingTreeId, {
+		pid: 999_999_998,
+		backendPid: 999_999_997,
+		backendProcessGroup: true,
+		backendPlatform: process.platform === "win32" ? "linux" : process.platform,
+	});
+	assert.equal(codexLiveSessionLeaseIsActive(survivingTreeId, {
+		processIsAlive: () => false,
+		processGroupIsAlive: () => true,
+	}), true, "a surviving detached ACP group retains ownership after the cc parent dies");
+	assert.equal(codexLiveSessionLeaseIsActive(survivingTreeId, {
+		processIsAlive: () => false,
+		processGroupIsAlive: () => false,
+	}), false, "the stale lease is reclaimed once the detached ACP group is confirmed gone");
+
+	const reusedPidId = "dddddddd-eeee-7fff-8000-111111111111";
+	const reusedPidFile = path.join(staleDirectory, `${reusedPidId}.json`);
+	fs.mkdirSync(staleDirectory, { recursive: true });
+	fs.writeFileSync(reusedPidFile, `${JSON.stringify({
+		sessionId: reusedPidId,
+		pid: process.pid,
+		processStartIdentity: "old-process-incarnation",
+		hostname: os.hostname(),
+		token: "reused-pid-owner",
+		backendPid: 999_999_996,
+		backendProcessGroup: true,
+		backendPlatform: process.platform === "win32" ? "linux" : process.platform,
+	})}\n`);
+	assert.equal(codexLiveSessionLeaseIsActive(reusedPidId, {
+		processIsAlive: () => true,
+		processStartIdentity: () => "new-process-incarnation",
+		processGroupIsAlive: () => false,
+	}), false, "PID reuse cannot keep a dead owner leased after its backend group is gone");
+}
 
 function appHarness(agent = {}) {
 	const notices = [];
@@ -289,9 +362,11 @@ await (async () => {
 			const { app, sideClient, sideThread, errors } = makeOwnedApp();
 			const stopStarted = deferred();
 			const releaseStop = deferred();
+			const releaseSideLease = acquireCodexLiveSessionLease(sideId);
 			sideClient.stopAndWait = async () => {
 				stopStarted.resolve();
 				await releaseStop.promise;
+				releaseSideLease();
 			};
 			app.client.stopAndWait = async () => assert.fail("archiving the side session must not stop main");
 			const operation = app.runLocalSlashCommand("archive", "", { targetThread: sideThread });
@@ -320,6 +395,7 @@ await (async () => {
 			releaseStop.resolve();
 			await operation;
 			assert.deepEqual(JSON.parse(fs.readFileSync(log, "utf8").trim()), ["delete", sideId, "--force"]);
+			assert.equal(codexLiveSessionLeaseIsActive(sideId), false, "confirmed local side shutdown releases its lease before deletion");
 			assert.deepEqual(errors, []);
 			fs.rmSync(log, { force: true });
 		}
@@ -410,6 +486,72 @@ await (async () => {
 			assert.ok(errors.some((message) => message.includes("restart cc")));
 		}
 	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+})();
+
+// A second cc process cannot permanently delete a live /btw rollout indirectly
+// through one of its registered ancestors. The delete path checks the complete
+// copy-fork closure under the shared operation lock before running Codex.
+await (async () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "cc-cross-process-lease-delete-"));
+	const codexHome = path.join(root, "codex-home");
+	const day = path.join(codexHome, "sessions", "2026", "07", "12");
+	const cli = path.join(root, "fake-codex.mjs");
+	const log = path.join(root, "delete.log");
+	const rootId = "71000000-0000-7000-8000-000000000001";
+	const leasedChildId = "72000000-0000-7000-8000-000000000002";
+	let leaseOwner;
+	try {
+		fs.mkdirSync(day, { recursive: true });
+		for (const id of [rootId, leasedChildId]) {
+			fs.writeFileSync(
+				path.join(day, `rollout-2026-07-12T12-00-00-${id}.jsonl`),
+				`${JSON.stringify({ type: "session_meta", payload: { id } })}\n`,
+			);
+		}
+		fs.writeFileSync(cli, `import fs from "node:fs"; fs.appendFileSync(process.env.CC_TEST_LOG, "delete ran\\n");\n`);
+		fs.chmodSync(cli, 0o755);
+		recordForkId(leasedChildId, rootId, { required: true });
+
+		const moduleUrl = new URL("../src/pi-harness.mjs", import.meta.url).href;
+		leaseOwner = spawn(process.execPath, ["--input-type=module", "-e", `
+import { acquireCodexLiveSessionLease } from ${JSON.stringify(moduleUrl)};
+acquireCodexLiveSessionLease(${JSON.stringify(leasedChildId)});
+process.stdout.write("ready\\n");
+setInterval(() => {}, 1000);
+`], {
+			env: { ...process.env, CC_FORKS: process.env.CC_FORKS },
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		await new Promise((resolve, reject) => {
+			let stderr = "";
+			leaseOwner.stderr.on("data", (chunk) => { stderr += chunk; });
+			leaseOwner.once("error", reject);
+			leaseOwner.once("exit", (code) => reject(new Error(`lease owner exited ${code}: ${stderr}`)));
+			leaseOwner.stdout.once("data", (chunk) => {
+				if (String(chunk).includes("ready")) resolve();
+				else reject(new Error(`unexpected lease owner output: ${chunk}`));
+			});
+		});
+
+		const harness = appHarness({
+			env: { CODEX_PATH: cli, CODEX_HOME: codexHome, PATH: "", CC_TEST_LOG: log },
+		});
+		harness.app.client.sessionId = "73000000-0000-7000-8000-000000000003";
+		harness.app.runFencedCodexAppServerRequests = async () => [{ data: [], nextCursor: null }];
+		harness.app.settleDeferredBtwPrompts = async () => {};
+		await harness.app.deleteSessionPermanently(rootId, { codex: true });
+		assert.equal(fs.existsSync(log), false, "Codex delete never runs while a descendant lease is live");
+		assert.match(harness.errors.at(-1), /open in another cc process/u);
+		assert.equal(loadForkParents().get(leasedChildId), rootId, "blocked deletion preserves lineage for retry");
+	} finally {
+		if (leaseOwner?.exitCode === null) {
+			const closed = new Promise((resolve) => leaseOwner.once("close", resolve));
+			leaseOwner.kill("SIGKILL");
+			await closed;
+		}
+		forgetForkIds(leasedChildId);
 		fs.rmSync(root, { recursive: true, force: true });
 	}
 })();
@@ -2063,25 +2205,29 @@ if (process.argv[2] === "cloud") {
 const rl = readline.createInterface({ input: process.stdin });
 let initialized = false;
 const send = (value) => process.stdout.write(JSON.stringify(value) + "\\r\\n");
+if (process.env.CC_TEST_MODE === "timeout") {
+  process.on("SIGTERM", () => {});
+  if (process.env.CC_PID_FILE) fs.writeFileSync(process.env.CC_PID_FILE, String(process.pid));
+}
+if (process.env.CC_TEST_MODE === "timeout-descendant") {
+  const descendantSource = 'const fs = require("node:fs"); process.on("SIGTERM", () => {}); fs.writeFileSync(process.env.CC_DESCENDANT_PID_FILE, String(process.pid)); setInterval(() => {}, 1_000);';
+  const descendant = spawn(process.execPath, ["-e", descendantSource], {
+    env: process.env,
+    stdio: "ignore",
+  });
+  descendant.unref();
+  process.on("SIGTERM", () => process.exit(0));
+}
 rl.on("line", (line) => {
   const message = JSON.parse(line);
   fs.appendFileSync(process.env.CC_TEST_LOG, JSON.stringify(message) + "\\n");
   if (message.method === "initialize") {
     if (process.env.CC_TEST_MODE === "exit") { process.stderr.write("app-server boom\\n"); process.exit(7); }
     if (process.env.CC_TEST_MODE === "timeout") {
-      if (process.env.CC_PID_FILE) fs.writeFileSync(process.env.CC_PID_FILE, String(process.pid));
-      process.on("SIGTERM", () => {});
       setInterval(() => {}, 1_000);
       return;
     }
     if (process.env.CC_TEST_MODE === "timeout-descendant") {
-      const descendantSource = 'const fs = require("node:fs"); fs.writeFileSync(process.env.CC_DESCENDANT_PID_FILE, String(process.pid)); process.on("SIGTERM", () => {}); setInterval(() => {}, 1_000);';
-      const descendant = spawn(process.execPath, ["-e", descendantSource], {
-        env: process.env,
-        stdio: "ignore",
-      });
-      descendant.unref();
-      process.on("SIGTERM", () => process.exit(0));
       setInterval(() => {}, 1_000);
       return;
     }
@@ -2122,6 +2268,29 @@ rl.on("line", (line) => {
 		fs.chmodSync(cli, 0o755);
 		const invocation = { command: process.execPath, args: [cli] };
 		const agent = { env: { CC_TEST_LOG: log } };
+		const startHandshakenAppServer = async (environment, readyFile) => {
+			const child = spawn(invocation.command, [...invocation.args, "app-server", "--stdio"], {
+				cwd: process.cwd(),
+				env: { ...process.env, ...environment },
+				detached: process.platform !== "win32",
+				shell: false,
+				stdio: ["pipe", "pipe", "pipe"],
+			});
+			try {
+				const deadline = Date.now() + 10_000;
+				while (!fs.existsSync(readyFile) && Date.now() < deadline) {
+					await new Promise((resolve) => setTimeout(resolve, 5));
+				}
+				assert.equal(fs.existsSync(readyFile), true, "fake app-server published its process-tree handshake");
+				return child;
+			} catch (error) {
+				try {
+					if (process.platform === "win32") child.kill("SIGKILL");
+					else if (Number.isInteger(child.pid)) process.kill(-child.pid, "SIGKILL");
+				} catch {}
+				throw error;
+			}
+		};
 		const [usage, limits] = await runCodexAppServerRequests(invocation, [
 			{ method: "account/usage/read" },
 			{ method: "account/rateLimits/read" },
@@ -2157,25 +2326,30 @@ rl.on("line", (line) => {
 			/exited 7.*app-server boom/,
 		);
 		const pidFile = path.join(root, "wedged.pid");
+		const timeoutEnvironment = { CC_TEST_LOG: log, CC_TEST_MODE: "timeout", CC_PID_FILE: pidFile };
+		const wedgedChild = await startHandshakenAppServer(timeoutEnvironment, pidFile);
 		await assert.rejects(
 			() => runCodexAppServerRequests(invocation, [{ method: "account/usage/read" }], {
-				env: { CC_TEST_LOG: log, CC_TEST_MODE: "timeout", CC_PID_FILE: pidFile },
-			}, { timeoutMs: 75 }),
+				env: timeoutEnvironment,
+			}, { timeoutMs: 75, spawnImpl: () => wedgedChild }),
 			/timed out/,
 		);
 		const wedgedPid = Number(fs.readFileSync(pidFile, "utf8"));
+		assert.equal(wedgedPid, wedgedChild.pid, "the timeout assertion observes the handshaken app-server");
 		await new Promise((resolve) => setTimeout(resolve, 1_300));
 		assert.throws(() => process.kill(wedgedPid, 0), /ESRCH/, "timed-out app-server is force-killed after its grace period");
 		if (process.platform !== "win32") {
 			const descendantPidFile = path.join(root, "wedged-descendant.pid");
+			const descendantEnvironment = {
+				CC_TEST_LOG: log,
+				CC_TEST_MODE: "timeout-descendant",
+				CC_DESCENDANT_PID_FILE: descendantPidFile,
+			};
+			const descendantWrapper = await startHandshakenAppServer(descendantEnvironment, descendantPidFile);
 			await assert.rejects(
 				() => runCodexAppServerRequests(invocation, [{ method: "account/usage/read" }], {
-					env: {
-						CC_TEST_LOG: log,
-						CC_TEST_MODE: "timeout-descendant",
-						CC_DESCENDANT_PID_FILE: descendantPidFile,
-					},
-				}, { timeoutMs: 500 }),
+					env: descendantEnvironment,
+				}, { timeoutMs: 75, spawnImpl: () => descendantWrapper }),
 				/timed out/,
 			);
 			const descendantPid = Number(fs.readFileSync(descendantPidFile, "utf8"));
@@ -2405,14 +2579,20 @@ rl.on("line", (line) => {
 		const beforeApply = fs.readFileSync(log, "utf8").split("\n").length;
 		await apply.app.runCodexCloud("apply task-123");
 		assert.equal(fs.readFileSync(log, "utf8").split("\n").length, beforeApply, "cloud apply does not run before confirmation");
-		apply.app.btwThread = { busy: true };
-		await applySelection({ value: "apply" });
-		assert.equal(fs.readFileSync(log, "utf8").split("\n").length, beforeApply, "a side turn that starts during confirmation blocks cloud apply");
-		assert.match(apply.notices.join("\n"), /cannot be applied while a turn is running/);
-		apply.app.btwThread.busy = false;
-		await apply.app.runCodexCloud("apply task-123");
-		await applySelection({ value: "apply" });
-		assert.match(apply.blocks.join("\n"), /cloud.*apply.*task-123/);
+			apply.app.btwThread = { busy: true };
+			await applySelection({ value: "apply" });
+			assert.equal(fs.readFileSync(log, "utf8").split("\n").length, beforeApply, "a side turn that starts during confirmation blocks cloud apply");
+			assert.match(apply.notices.join("\n"), /cannot be applied while a turn is running/);
+			apply.app.btwThread.busy = false;
+			await apply.app.runCodexCloud("apply task-123");
+			apply.app.activeShellInputCount = 1;
+			await applySelection({ value: "apply" });
+			assert.equal(fs.readFileSync(log, "utf8").split("\n").length, beforeApply, "a shell command that starts during confirmation blocks cloud apply");
+			assert.match(apply.notices.join("\n"), /shell commands.*applying Codex Cloud/iu);
+			apply.app.activeShellInputCount = 0;
+			await apply.app.runCodexCloud("apply task-123");
+			await applySelection({ value: "apply" });
+			assert.match(apply.blocks.join("\n"), /cloud.*apply.*task-123/);
 
 		for (const busyOwner of ["main", "side"]) {
 			const blocked = appHarness(featureAgent);
@@ -2420,8 +2600,192 @@ rl.on("line", (line) => {
 			blocked.app.btwThread = busyOwner === "side" ? { busy: true } : undefined;
 			blocked.app.openSelection = () => assert.fail(`${busyOwner} busy state must block confirmation`);
 			await blocked.app.runCodexCloud("apply task-456");
-			assert.match(blocked.notices.join("\n"), /cannot be applied while a turn is running/);
+				assert.match(blocked.notices.join("\n"), /cannot be applied while a turn is running/);
+			}
+
+			const shellBlocked = appHarness(featureAgent);
+			shellBlocked.app.activeShellInputCount = 1;
+			shellBlocked.app.openSelection = () => assert.fail("a running shell must block the cloud apply dialog");
+			await shellBlocked.app.runCodexCloud("apply task-shell");
+			assert.match(shellBlocked.notices.join("\n"), /shell commands.*applying Codex Cloud/iu);
+
+		const executionBlocked = appHarness(featureAgent);
+		executionBlocked.app.activeShellInputCount = 1;
+		executionBlocked.app.runTrackedCodexCommand = async () => assert.fail("the execution boundary must retain the shell gate");
+		await executionBlocked.app.executeCodexCloud(["apply", "task-shell"], executionBlocked.app.captureActiveAgentContext());
+		assert.match(executionBlocked.notices.join("\n"), /shell commands.*applying Codex Cloud/iu);
+
+		const sideQueued = appHarness(featureAgent);
+		sideQueued.app.onThreadActivity = () => {};
+		sideQueued.app.asyncPickerLoads = new Set();
+		sideQueued.app.beginAsyncPickerLoad = HarnessApp.prototype.beginAsyncPickerLoad;
+		sideQueued.app.endAsyncPickerLoad = HarnessApp.prototype.endAsyncPickerLoad;
+		const cloudSideClient = { exited: false, sessionId: "side-cloud-session", capabilities: {} };
+		const cloudSideThread = new BtwThread(sideQueued.app, cloudSideClient, "");
+		cloudSideThread.ready = true;
+		cloudSideThread.state = "ready";
+		const sideQueueNotices = [];
+		cloudSideThread.addNotice = (message) => sideQueueNotices.push(message);
+		let sidePrompts = 0;
+		cloudSideThread.sendPrompt = async () => { sidePrompts += 1; };
+		sideQueued.app.btwThread = cloudSideThread;
+		let finishApply;
+		sideQueued.app.runTrackedCodexCommand = () => new Promise((resolve) => { finishApply = resolve; });
+		const applying = sideQueued.app.executeCodexCloud(
+			["apply", "task-side-queue"],
+			sideQueued.app.captureActiveAgentContext(),
+		);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.ok(sideQueued.app.workingTreeMutationOperation, "cloud apply publishes its mutation gate before awaiting Codex");
+		await cloudSideThread.submit("work after apply");
+		assert.equal(sidePrompts, 0, "a side prompt cannot start while cloud apply owns the working tree");
+		assert.equal(cloudSideThread.queue.length, 1, "the side prompt remains queued in FIFO order");
+		assert.match(sideQueueNotices.at(-1), /Queued while Codex Cloud is applying changes/u);
+		let diffRuns = 0;
+		let copyRuns = 0;
+		let directoryChanges = 0;
+		let initPrompts = 0;
+		let todosRuns = 0;
+		sideQueued.app.runDiff = async () => { diffRuns += 1; };
+		sideQueued.app.runCopy = async () => { copyRuns += 1; };
+		sideQueued.app.runChangeWorkingDirectory = async () => { directoryChanges += 1; };
+		sideQueued.app.runInitCommand = async () => { initPrompts += 1; };
+		sideQueued.app.runTodosCommand = () => { todosRuns += 1; };
+		for (const name of ["diff", "copy", "cd", "init", "todos"]) {
+			await sideQueued.app.runLocalSlashCommand(name, "");
 		}
+		assert.equal(diffRuns, 0, "/diff cannot read a half-applied working tree");
+		assert.equal(copyRuns, 0, "/copy cannot open a write-capable picker during an apply");
+		assert.equal(directoryChanges, 0, "/cd joins the shared FIFO instead of reporting a misleading session race");
+		assert.equal(initPrompts, 0, "/init cannot enqueue repository edits during an apply");
+		assert.equal(todosRuns, 0, "/todos cannot open a panel bound to a transitioning session");
+		assert.deepEqual(
+			sideQueued.app.deferredLocalSlashCommands.map((entry) => entry.name),
+			["diff", "copy", "cd", "init", "todos"],
+		);
+		finishApply({ code: 0, signal: null, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) });
+		await applying;
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		assert.equal(sidePrompts, 1, "the queued side prompt drains after cloud apply releases the mutation gate");
+		assert.equal(diffRuns, 1, "/diff runs after the apply gate releases");
+		assert.equal(copyRuns, 1, "/copy runs after the apply gate releases");
+		assert.equal(directoryChanges, 1, "/cd runs after the apply gate releases");
+		assert.equal(initPrompts, 1, "/init runs after the apply gate releases");
+		assert.equal(todosRuns, 1, "/todos runs after the apply gate releases");
+
+			sideQueued.app.asyncPickerLoadCount = 1;
+			sideQueued.app.statusState = "loading sessions";
+			await cloudSideThread.submit("work after session load");
+			assert.equal(sidePrompts, 1, "a non-mutation root operation also preserves the side queue invariant");
+			assert.match(sideQueueNotices.at(-1), /Queued while loading sessions/u);
+			sideQueued.app.asyncPickerLoadCount = 0;
+			cloudSideThread.drainQueue();
+			await new Promise((resolve) => setTimeout(resolve, 0));
+			assert.equal(sidePrompts, 2);
+
+			// If apply teardown cannot confirm that the native process tree stopped,
+			// never release the working tree to prompts, side queues, shell input, or
+			// shortcuts in this cc process. A restart is the only safe recovery.
+			const terminalApply = appHarness(featureAgent);
+			terminalApply.app.onThreadActivity = () => {};
+			const terminalSideNotices = [];
+			const fencedSide = new BtwThread(
+				terminalApply.app,
+				{ exited: false, sessionId: "terminal-side", capabilities: {} },
+				"",
+			);
+			fencedSide.ready = true;
+			fencedSide.state = "ready";
+			fencedSide.addNotice = (message) => terminalSideNotices.push(message);
+			let fencedSidePrompts = 0;
+			fencedSide.sendPrompt = async () => { fencedSidePrompts += 1; };
+			terminalApply.app.btwThread = fencedSide;
+			const terminationFailure = new Error("cloud apply descendant remains live");
+			terminationFailure.code = "PROCESS_TREE_TERMINATION_FAILED";
+			terminalApply.app.runTrackedCodexCommand = async () => {
+				terminalApply.app.recordReplacementProcessFence(terminationFailure, { preserveReady: true });
+				throw terminalApply.app.replacementProcessFenceError();
+			};
+			const failedApply = terminalApply.app.executeCodexCloud(
+				["apply", "task-unconfirmed-tree"],
+				terminalApply.app.captureActiveAgentContext(),
+			);
+			const queuedSidePrompt = fencedSide.submit("queued side after apply");
+			const deferredSideCommand = fencedSide.deferLocalCommand("model", "low", {
+				reason: "Codex Cloud finishes applying changes",
+			});
+			terminalApply.app.promptQueue.push({
+				text: "queued main after apply",
+				timing: "afterTurn",
+				queuedInputOrder: 3,
+			});
+			terminalApply.app.deferredLocalSlashCommands.push({
+				name: "model",
+				argument: "high",
+				queuedInputOrder: 4,
+			});
+			await queuedSidePrompt;
+			await failedApply;
+			assert.equal(await deferredSideCommand, false);
+			const terminalFence = terminalApply.app.workingTreeMutationOperation;
+			assert.equal(terminalFence?.terminal, true);
+			assert.match(terminalFence.label, /may still be changing files.*restart cc/u);
+			assert.equal(
+				terminalApply.app.editor.getText(),
+				"queued side after apply\n/model low\nqueued main after apply\n/model high",
+			);
+			assert.deepEqual(terminalApply.app.promptQueue, []);
+			assert.deepEqual(terminalApply.app.deferredLocalSlashCommands, []);
+			assert.deepEqual(fencedSide.queue, []);
+			assert.deepEqual(fencedSide.localCommandQueue, []);
+			assert.ok(terminalSideNotices.some((message) => /returned to the composer.*restart cc/u.test(message)));
+			terminalApply.app.editor.setText("");
+			await terminalApply.app.handleSubmit("keep this draft");
+			assert.equal(terminalApply.app.editor.getText(), "keep this draft");
+			assert.ok(terminalApply.notices.some((message) => /input remains.*restart cc/u.test(message)));
+
+			const mutationSentinel = path.join(root, "must-not-run-after-unconfirmed-apply");
+			await terminalApply.app.runShellInput(`touch ${JSON.stringify(mutationSentinel)}`);
+			assert.equal(fs.existsSync(mutationSentinel), false);
+
+			await fencedSide.submit("do not send after failed apply");
+			assert.equal(fencedSidePrompts, 0);
+			assert.equal(fencedSide.queue.length, 0);
+			assert.equal(
+				terminalApply.app.editor.getText(),
+				"do not send after failed apply\nkeep this draft",
+			);
+			assert.equal(await fencedSide.deferLocalCommand("model", "late"), false);
+			assert.equal(
+				terminalApply.app.editor.getText(),
+				"/model late\ndo not send after failed apply\nkeep this draft",
+				"a side command arriving after terminal teardown returns immediately instead of joining an undrainable queue",
+			);
+			assert.deepEqual(fencedSide.localCommandQueue, []);
+			let exitRequests = 0;
+			terminalApply.app.requestUserExit = () => { exitRequests += 1; };
+			await terminalApply.app.runLocalSlashCommand("exit", "");
+			assert.equal(exitRequests, 1, "/exit remains available as the documented terminal-fence recovery path");
+
+			// A previously recorded process fence is retained with ??=. A new apply
+			// teardown failure must still keep its working-tree gate terminal instead
+			// of relying on the app-wide fence object's identity changing.
+			const alreadyFencedApply = appHarness(featureAgent);
+			const earlierFence = new Error("an earlier backend tree remains live");
+			earlierFence.code = "PROCESS_TREE_TERMINATION_FAILED";
+			alreadyFencedApply.app.replacementProcessFence = earlierFence;
+			const secondTerminationFailure = new Error("cloud apply also remains live");
+			secondTerminationFailure.code = "PROCESS_TREE_TERMINATION_FAILED";
+			alreadyFencedApply.app.runTrackedCodexCommand = async () => {
+				alreadyFencedApply.app.recordReplacementProcessFence(secondTerminationFailure, { preserveReady: true });
+				throw secondTerminationFailure;
+			};
+			await alreadyFencedApply.app.executeCodexCloud(
+				["apply", "task-second-unconfirmed-tree"],
+				alreadyFencedApply.app.captureActiveAgentContext(),
+			);
+			assert.equal(alreadyFencedApply.app.replacementProcessFence, earlierFence);
+			assert.equal(alreadyFencedApply.app.workingTreeMutationOperation?.terminal, true);
 	} finally {
 		fs.rmSync(root, { recursive: true, force: true });
 	}

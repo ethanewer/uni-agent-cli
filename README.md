@@ -67,10 +67,15 @@ and `cc2.cmd` names. The installer never runs `npm link` or changes npm's
 global prefix.
 
 Stable `cc` continues to use the normal `~/.config/cc` state. Beta `cc2` keeps
-its config, settings, permission grants, fork registry, and autocomplete cache
-under `~/.local/share/cc/channels/beta/state`, so beta experiments cannot alter
-stable wrapper state. Backend-owned Claude and Codex session stores remain
-shared.
+its config, settings, permission grants, and autocomplete cache under
+`~/.local/share/cc/channels/beta/state`, so beta experiments cannot alter stable
+wrapper preferences. Backend-owned Claude and Codex session stores remain
+shared, so their copy-fork lineage and mutation lock are shared too. An explicit
+`CC_FORKS` path is respected by both channels; otherwise cc2 uses stable's normal
+`~/.config/cc/forks.json` path. New cc2 launches consume a legacy beta-local
+`forks.json`, preserving shared entries on conflicts. A cumulative migration
+marker lets a still-running old cc2 contribute newly-created lineage later
+without re-applying already-consumed entries after a shared deletion.
 
 Each successful update records the old release as `previous`. Roll back without
 reinstalling dependencies:
@@ -78,6 +83,16 @@ reinstalling dependencies:
 ```sh
 node scripts/install-channel.mjs beta --rollback
 ```
+
+After promotion, inactive lease-aware snapshots older than `current` and
+`previous` are removed. Startup resolution and garbage collection share an
+atomic channel guard, and a per-process lease keeps any older running snapshot
+until a later update can clean it safely. Snapshots created by older installers
+cannot prove that no pre-upgrade process still uses them. The first snapshot
+exposed while replacing an older direct launcher has the same limitation, so
+that finite migration set is preserved. Interrupted recognized cleanup is
+retried on a later update; staging and unrecognized directories are never
+removed.
 
 Use `--root` and `--bin-dir` (or `CC_INSTALL_ROOT` and `CC_BIN_DIR`) to override
 the default locations.

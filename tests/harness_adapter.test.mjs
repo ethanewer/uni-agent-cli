@@ -15,15 +15,18 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
 	AcpClient,
+	acquireCodexLiveSessionLease,
 	acquireForkOperationLock,
 	applyHarnessSettings,
 	codexHome,
 	collectEnvironmentAuthenticationVariables,
+	codexLiveSessionLeaseIsActive,
 	copyCodexRolloutWithNewId,
 	findCodexRolloutPath,
 	forgetForkIds,
@@ -73,7 +76,9 @@ class FakeConnection {
 		return { agentCapabilities: this.capabilities, agentInfo: this.agentInfo, authMethods: this.authMethods };
 	}
 	async newSession() {
-		this.sessionId = this.profile.sessionId ?? "fake-session";
+		this.sessionId = typeof this.profile.sessionId === "function"
+			? this.profile.sessionId()
+			: this.profile.sessionId ?? "fake-session";
 		this.configOptions = this.profile.configOptions ?? [];
 		this.models = this.profile.models;
 		this.modes = this.profile.modes;
@@ -161,6 +166,7 @@ function factoryFor(profile) {
 const PROFILES = {
 	codex: {
 		agentInfo: { name: "@agentclientprotocol/codex-acp" },
+		sessionId: () => randomUUID(),
 		capabilities: { loadSession: true, sessionCapabilities: { list: {}, resume: {}, delete: {} }, promptCapabilities: { image: false } },
 		configOptions: [{ id: "model", category: "model" }, { id: "mode", category: "mode" }, { id: "thought_level", category: "thought_level" }],
 		modes: { currentModeId: "agent", availableModes: [{ id: "agent" }] },
@@ -226,11 +232,13 @@ function codexConfig(agent) {
 const noopHost = () => ({ onEvent() {}, requestPermission: () => ({ outcome: "cancelled" }), requestInteraction: () => undefined });
 
 const codexServices = {
+	acquireLiveSessionLease: acquireCodexLiveSessionLease,
 	acquireForkOperationLock,
 	codexHome,
 	copyCodexRolloutWithNewId,
 	findCodexRolloutPath,
 	forgetForkIds,
+	liveSessionLeaseIsActive: codexLiveSessionLeaseIsActive,
 	readCodexThreadState,
 	recordForkId,
 };
@@ -1509,14 +1517,41 @@ async function main() {
 				...CONFIGS.codex,
 				env: { ...(CONFIGS.codex.env ?? {}), CODEX_HOME: dir },
 			};
+			let confirmTreeStopped;
+			const treeStopped = new Promise((resolve) => { confirmTreeStopped = resolve; });
 			const codex = createAdapter("codex", codexConfig, noopHost(), {
 				connectionFactory: factoryFor(PROFILES.codex),
 				services: { codex: codexServices },
+				stopConnections: async (connections) => {
+					for (const connection of connections) connection?.stop?.();
+					await treeStopped;
+				},
 			});
 			assert.equal(codex.codexEnvironment().CODEX_HOME, dir, "adapter storage helpers honor configured CODEX_HOME");
 			await codex.connect({ createSession: false });
 			assert.equal(codex.capabilities.fork, "copy");
-			await codex.fork(parentId);
+			let leaseVisibleAtLoad = false;
+			let copiedLoadCount = 0;
+			const loadCopiedSession = codex.connection.loadSession.bind(codex.connection);
+			codex.connection.loadSession = async (sessionId, options) => {
+				copiedLoadCount += 1;
+				leaseVisibleAtLoad = codexLiveSessionLeaseIsActive(sessionId);
+				return await loadCopiedSession(sessionId, options);
+			};
+			// Both calls pass the pre-lock check in this turn. The post-lock check must
+			// make the serialized contender fail without overwriting the first lease.
+			const primaryFork = codex.fork(parentId, { retainSessionLease: true });
+			const competingForkOutcome = codex.fork(parentId, { retainSessionLease: true })
+				.then(() => undefined, (error) => error);
+			await primaryFork;
+			const competingForkError = await competingForkOutcome;
+			assert.match(competingForkError?.message ?? "", /source session changed before the fork could start/);
+			assert.equal(copiedLoadCount, 1, "a serialized contender never loads or replaces the live fork");
+			assert.equal(
+				leaseVisibleAtLoad,
+				true,
+				"copy-fork ownership is durable before the ACP backend can open the rollout",
+			);
 			// loadSession set the session id to the new (copied) uuid.
 			assert.notEqual(codex.sessionId, parentId);
 			assert.match(codex.sessionId, /^[0-9a-f-]{36}$/);
@@ -1543,12 +1578,171 @@ async function main() {
 				assert.equal(snapshot?.sessionId, codex.sessionId, "unsend snapshots use configured CODEX_HOME");
 				assert.equal(codex.canRetract(snapshot), true);
 			}
+			const leasedSessionId = codex.sessionId;
+			assert.equal(codexLiveSessionLeaseIsActive(leasedSessionId), true);
+			const contender = createAdapter("codex", codexConfig, noopHost(), {
+				connectionFactory: factoryFor(PROFILES.codex),
+				services: { codex: codexServices },
+			});
+			await assert.rejects(
+				() => contender.loadSession(leasedSessionId),
+				(error) => error?.code === "CC_SESSION_LEASE_ACTIVE",
+				"another adapter cannot resume a rollout owned by the live side process",
+			);
+			const stopping = codex.stop();
+			assert.equal(
+				codexLiveSessionLeaseIsActive(leasedSessionId),
+				true,
+				"session ownership remains while ACP process-tree shutdown is unconfirmed",
+			);
+			confirmTreeStopped();
+			await stopping;
+			assert.equal(codexLiveSessionLeaseIsActive(leasedSessionId), false);
 			ok("fork:codex-copy-e2e");
 		} finally {
 			if (prevHome === undefined) delete process.env.CODEX_HOME;
 			else process.env.CODEX_HOME = prevHome;
 			if (prevForks === undefined) delete process.env.CC_FORKS;
 			else process.env.CC_FORKS = prevForks;
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	}
+
+	// A failed copy-fork load must keep its lease until backend shutdown is
+	// confirmed, then release ownership before removing the unpublished branch.
+	{
+		const previousForks = process.env.CC_FORKS;
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-codex-fork-load-failure-"));
+		let codex;
+		try {
+			process.env.CC_FORKS = path.join(dir, "forks.json");
+			const parentId = "22222222-2222-2222-2222-222222222222";
+			const day = path.join(dir, "sessions", "2026", "06", "24");
+			fs.mkdirSync(day, { recursive: true });
+			const rollout = path.join(day, `rollout-2026-06-24T12-00-00-${parentId}.jsonl`);
+			fs.writeFileSync(
+				rollout,
+				`${JSON.stringify({ type: "session_meta", payload: { id: parentId, session_id: parentId } })}\n`,
+			);
+			const codexConfig = {
+				...CONFIGS.codex,
+				env: { ...(CONFIGS.codex.env ?? {}), CODEX_HOME: dir },
+			};
+			let shutdownObservedLease = false;
+			let failedSessionId;
+			let announceShutdownStarted;
+			const shutdownStarted = new Promise((resolve) => { announceShutdownStarted = resolve; });
+			let confirmShutdown;
+			const shutdownConfirmed = new Promise((resolve) => { confirmShutdown = resolve; });
+			codex = createAdapter("codex", codexConfig, noopHost(), {
+				connectionFactory: factoryFor(PROFILES.codex),
+				services: { codex: codexServices },
+				stopConnections: async (connections) => {
+					shutdownObservedLease = Boolean(
+						failedSessionId && codexLiveSessionLeaseIsActive(failedSessionId),
+					);
+					announceShutdownStarted();
+					await shutdownConfirmed;
+					for (const connection of connections) connection?.stop?.();
+				},
+			});
+			await codex.connect({ createSession: false });
+			codex.connection.loadSession = async (sessionId) => {
+				failedSessionId = sessionId;
+				assert.equal(
+					codexLiveSessionLeaseIsActive(sessionId),
+					true,
+					"the lease exists before a failing ACP session/load begins",
+				);
+				throw new Error("injected session/load failure");
+				};
+			const failedFork = codex.fork(parentId, { retainSessionLease: true });
+			await shutdownStarted;
+			assert.equal(codexLiveSessionLeaseIsActive(failedSessionId), true, "ownership remains while shutdown is unconfirmed");
+			assert.equal(
+				fs.existsSync(path.join(day, `rollout-2026-06-24T12-00-00-${failedSessionId}.jsonl`)),
+				true,
+				"the rollout remains while its ACP process may still be using it",
+			);
+			assert.equal(loadForkParents().get(failedSessionId), parentId, "lineage remains durable during shutdown");
+			confirmShutdown();
+			await assert.rejects(
+				failedFork,
+				/injected session\/load failure/,
+			);
+			assert.equal(shutdownObservedLease, true, "backend cleanup runs while ownership remains fail-closed");
+			assert.equal(codexLiveSessionLeaseIsActive(failedSessionId), false, "confirmed cleanup releases ownership");
+			assert.equal(
+				fs.existsSync(path.join(day, `rollout-2026-06-24T12-00-00-${failedSessionId}.jsonl`)),
+				false,
+				"the failed copied rollout is removed",
+			);
+			assert.equal(loadForkParents().has(failedSessionId), false, "failed fork lineage is removed");
+			ok("fork:codex-copy-load-failure-releases-lease");
+		} finally {
+			if (codex?.lifecycleState === "open") await codex.stop();
+			if (previousForks === undefined) delete process.env.CC_FORKS;
+			else process.env.CC_FORKS = previousForks;
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	}
+
+	// Main-pane Codex sessions use the same process-external ownership protocol as
+	// /btw: load acquires before ACP touches the target, swaps only after commit,
+	// and connect/new/stop publish and release the active session consistently.
+	{
+		const previousForks = process.env.CC_FORKS;
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-codex-main-lease-"));
+		const firstId = "30000000-0000-7000-8000-000000000001";
+		const secondId = "30000000-0000-7000-8000-000000000002";
+		const profile = { ...PROFILES.codex, sessionId: firstId };
+		let main;
+		let contender;
+		try {
+			process.env.CC_FORKS = path.join(dir, "forks.json");
+			main = createAdapter("codex", CONFIGS.codex, noopHost(), {
+				connectionFactory: factoryFor(profile),
+				services: { codex: codexServices },
+			});
+			await main.connect();
+			assert.equal(codexLiveSessionLeaseIsActive(firstId), true, "initial main session is leased");
+
+			contender = createAdapter("codex", CONFIGS.codex, noopHost(), {
+				connectionFactory: factoryFor(profile),
+				services: { codex: codexServices },
+			});
+			await assert.rejects(
+				() => contender.connect(),
+				(error) => error?.code === "CC_SESSION_LEASE_ACTIVE",
+				"another main adapter cannot attach to the same rollout",
+			);
+			await contender.stop();
+			contender = undefined;
+
+			const loadMainSession = main.connection.loadSession.bind(main.connection);
+			let targetOwnedAtLoad = false;
+			main.connection.loadSession = async (sessionId, options) => {
+				targetOwnedAtLoad = codexLiveSessionLeaseIsActive(sessionId);
+				assert.equal(codexLiveSessionLeaseIsActive(firstId), true, "source ownership remains during load");
+				return await loadMainSession(sessionId, options);
+			};
+			await main.loadSession(secondId);
+			assert.equal(targetOwnedAtLoad, true, "target ownership exists before session/load");
+			assert.equal(codexLiveSessionLeaseIsActive(firstId), false, "committed load releases the source");
+			assert.equal(codexLiveSessionLeaseIsActive(secondId), true, "committed target remains owned");
+
+			await main.newSession();
+			assert.equal(codexLiveSessionLeaseIsActive(secondId), false, "new session releases the prior rollout");
+			assert.equal(codexLiveSessionLeaseIsActive(firstId), true, "newly active session is retained");
+			await main.stop();
+			main = undefined;
+			assert.equal(codexLiveSessionLeaseIsActive(firstId), false, "confirmed main shutdown releases ownership");
+			ok("sessions:codex-main-live-ownership");
+		} finally {
+			if (contender?.lifecycleState === "open") await contender.stop();
+			if (main?.lifecycleState === "open") await main.stop();
+			if (previousForks === undefined) delete process.env.CC_FORKS;
+			else process.env.CC_FORKS = previousForks;
 			fs.rmSync(dir, { recursive: true, force: true });
 		}
 	}
@@ -1581,9 +1775,10 @@ async function main() {
 	{
 		const prevHome = process.env.CODEX_HOME;
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-codex-empty-"));
+		let codex;
 		try {
 			process.env.CODEX_HOME = dir;
-			const codex = createAdapter("codex", CONFIGS.codex, noopHost(), {
+			codex = createAdapter("codex", CONFIGS.codex, noopHost(), {
 				connectionFactory: factoryFor(PROFILES.codex),
 				services: { codex: codexServices },
 			});
@@ -1602,6 +1797,7 @@ async function main() {
 			assert.equal(canUnsend(claude, undefined), false);
 			ok("unsend:codex-wired-others-off");
 		} finally {
+			if (codex?.lifecycleState === "open") await codex.stop();
 			if (prevHome === undefined) delete process.env.CODEX_HOME;
 			else process.env.CODEX_HOME = prevHome;
 			fs.rmSync(dir, { recursive: true, force: true });

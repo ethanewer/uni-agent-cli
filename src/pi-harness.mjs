@@ -71,6 +71,7 @@ import { BUNDLED_ACP_ADAPTERS } from "./harness/bundled-adapters.mjs";
 import { capabilitiesFromWire } from "./harness/interface.mjs";
 import { createAdapter } from "./harness/registry.mjs";
 import {
+	CC_NATIVE_INPUT_CONTEXT,
 	CC_UNBOUND_ACTION,
 	CcKeybindingDispatcher,
 	DEFAULT_CC_KEYBINDINGS,
@@ -139,6 +140,12 @@ import {
 	ChecklistStore,
 	emptyChecklistSnapshot,
 } from "./harness/checklists.mjs";
+
+// Backend extensions that arrive while session/new/load/fork is in flight must
+// share the same ordered replay queue as ACP session/update messages. Symbols
+// keep these host-private records impossible to spoof over the JSON wire.
+const BUFFERED_BACKGROUND_TASK_UPDATE = Symbol("cc.background-task-update");
+const BUFFERED_CURSOR_TODOS_UPDATE = Symbol("cc.cursor-todos-update");
 
 const HARNESS = "/harness";
 // Commands the shared UI owns when localSlashCommands exposes them, even if a
@@ -308,10 +315,10 @@ const MAX_ACP_SESSION_LIST_ENTRIES = 1_000;
 const FORK_REGISTRY_VERSION = 2;
 const FORK_REGISTRY_LABEL_LIMIT = 500;
 const FORK_REGISTRY_LOCK_TIMEOUT_MS = 2_000;
-const FORK_REGISTRY_STALE_LOCK_MS = 30_000;
 const FORK_REGISTRY_LOCK_WAIT = new Int32Array(new SharedArrayBuffer(4));
 const FORK_OPERATION_LOCK_TIMEOUT_MS = 2_000;
-const FORK_OPERATION_LOCK_ORPHAN_GRACE_MS = 30_000;
+const FORK_OPERATION_LOCK_PROTOCOL_VERSION = 3;
+const CODEX_LIVE_SESSION_LEASE_ORPHAN_GRACE_MS = 30_000;
 const FORK_LEGACY_PREFIX_MAX_BYTES = 16 * 1024 * 1024;
 const CLIPBOARD_IMAGE_LABEL = Symbol("cc.clipboardImageLabel");
 const STREAMING_MARKDOWN_MUTABLE_TAIL_LINES = 4;
@@ -1977,13 +1984,37 @@ export class BtwThread {
 			this.app.onThreadActivity();
 			return;
 		}
-		// Queue until the fork session is established (ready), or while busy.
+		if (this.app.workingTreeMutationOperation?.terminal === true) {
+			if (options.displayText) this.addUserMessage(options.displayText);
+			else this.app.restoreQueuedTextToComposer([{ text: trimmed, promptParts }]);
+			this.addNotice("Input was not sent because Codex Cloud apply may still be changing files. Restart cc before continuing.");
+			this.app.onThreadActivity();
+			return;
+		}
+		const rootQueueReason = this.app.workingTreeMutationOperation?.label ||
+			this.app.foregroundOperation?.status || (
+			(this.app.asyncPickerLoadCount ?? 0) > 0 ||
+			(this.app.configUpdateCount ?? 0) > 0 ||
+			this.app.selectionActionInProgress
+				? oneLine(this.app.statusState) || "a main-pane operation is in progress"
+				: this.app.menuHandle
+					? "a main-pane dialog is open"
+					: undefined
+		);
+		// Queue until the fork session is established (ready), while busy, or while
+		// a root-owned interaction prevents the shared FIFO from draining.
 		if (
 			!this.ready ||
 			this.busy ||
 			this.configUpdateTail ||
 			this.localCommandDrainActive ||
-			this.localCommandQueue.length > 0
+			this.localCommandQueue.length > 0 ||
+			this.app.foregroundOperation ||
+			this.app.workingTreeMutationOperation ||
+			(this.app.asyncPickerLoadCount ?? 0) > 0 ||
+			(this.app.configUpdateCount ?? 0) > 0 ||
+			this.app.menuHandle ||
+			this.app.selectionActionInProgress
 		) {
 			this.queue.push({
 				text: trimmed,
@@ -1992,6 +2023,7 @@ export class BtwThread {
 				queuedInputOrder: options.queuedInputOrder ?? this.nextQueuedInputOrder(),
 			});
 			this.queue.sort((left, right) => left.queuedInputOrder - right.queuedInputOrder);
+			if (rootQueueReason) this.addNotice(`Queued while ${rootQueueReason}. It will send automatically afterward.`);
 			this.app.onThreadActivity();
 			return;
 		}
@@ -2011,6 +2043,38 @@ export class BtwThread {
 	}
 
 	deferLocalCommand(name, argument = "", options = {}) {
+		if (this.app.btwThread !== this || !this.client || this.client.exited) {
+			this.app.reportClosedSessionCommandTarget?.(name, argument);
+			return Promise.resolve(false);
+		}
+		if (this.app.workingTreeMutationOperation?.terminal === true) {
+			this.app.restoreQueuedTextToComposer([{
+				text: slashCommandText(name, argument),
+				promptParts: options.promptParts,
+			}]);
+			this.addNotice("The command was returned to the composer because Codex Cloud apply may still be changing files. Restart cc before continuing.");
+			this.app.onThreadActivity();
+			return Promise.resolve(false);
+		}
+		const willWait = Boolean(
+			!this.ready ||
+			this.busy ||
+			this.configUpdateTail ||
+			this.localCommandDrainActive ||
+			this.localCommandQueue.length > 0 ||
+			this.queue.length > 0 ||
+			this.app.foregroundOperation ||
+			this.app.workingTreeMutationOperation ||
+			(this.app.asyncPickerLoadCount ?? 0) > 0 ||
+			(this.app.configUpdateCount ?? 0) > 0 ||
+			this.app.menuHandle ||
+			this.app.selectionActionInProgress
+		);
+		if (willWait && options.announce !== false) {
+			const reason = oneLine(options.reason ?? "the current /btw operation finishes");
+			this.addNotice(`Queued ${slashCommandText(name, argument)} until ${reason}.`);
+			this.app.onThreadActivity();
+		}
 		return new Promise((resolve) => {
 			this.localCommandQueue.push({
 				name,
@@ -2040,6 +2104,8 @@ export class BtwThread {
 			this.busy ||
 			this.configUpdateTail ||
 			this.localCommandDrainActive ||
+			this.app.foregroundOperation ||
+			this.app.workingTreeMutationOperation ||
 			(this.app.asyncPickerLoadCount ?? 0) > 0 ||
 			(this.app.configUpdateCount ?? 0) > 0 ||
 			this.app.menuHandle ||
@@ -2699,12 +2765,13 @@ export class AcpClient {
 		if (!this.supportsBackgroundTasks()) {
 			throw new Error("This agent does not advertise background-task lifecycle support");
 		}
+		const requestSessionId = this.sessionId;
 		const params = parseBackgroundTaskListParams({
-			sessionId: this.sessionId,
+			sessionId: requestSessionId,
 			...(options.limit !== undefined ? { limit: options.limit } : {}),
 		});
 		const snapshot = normalizeBackgroundTaskListResponse(await this.request(BACKGROUND_TASKS_LIST_METHOD, params));
-		return this.applyBackgroundTaskSnapshot(this.sessionId, snapshot)
+		return this.applyBackgroundTaskSnapshot(requestSessionId, snapshot)
 			? snapshot
 			: this.backgroundTasksSnapshot;
 	}
@@ -3276,14 +3343,7 @@ export class AcpClient {
 			return;
 		}
 		if (message.method === BACKGROUND_TASKS_CHANGED_NOTIFICATION) {
-			if (!this.sessionUpdateTargetsCurrentSession(message.params)) return;
-			try {
-				const snapshot = normalizeBackgroundTaskListResponse(message.params);
-				this.onEvent({ type: "backend_activity" });
-				this.applyBackgroundTaskSnapshot(message.params?.sessionId, snapshot);
-			} catch (error) {
-				this.onEvent({ type: "error", message: `Invalid background-task update: ${error.message ?? error}` });
-			}
+			this.handleBackgroundTaskUpdate(message.params);
 			return;
 		}
 		if (message.id !== undefined && message.method?.startsWith("terminal/")) {
@@ -3356,7 +3416,16 @@ export class AcpClient {
 		const method = message.method;
 		const params = message.params ?? {};
 		if (method === "cursor/update_todos") {
-			this.applyChecklistSnapshot(this.getChecklistStore().replace(params.todos, { planId: "cursor" }));
+			if (this.bufferingSessionUpdates) {
+				// ACK immediately: some backends wait for this response before completing
+				// session/load. The snapshot itself replays only after the target session
+				// commits, in arrival order with its ordinary ACP history updates.
+				this.bufferedSessionUpdates.push({
+					[BUFFERED_CURSOR_TODOS_UPDATE]: params,
+				});
+			} else if (this.sessionUpdateTargetsCurrentSession(params)) {
+				this.applyChecklistSnapshot(this.getChecklistStore().replace(params.todos, { planId: "cursor" }));
+			}
 			this.writeSafe({ jsonrpc: "2.0", id: message.id, result: {} });
 			return;
 		}
@@ -3429,6 +3498,17 @@ export class AcpClient {
 	handleSessionUpdate(params) {
 		if (this.bufferingSessionUpdates) {
 			this.bufferedSessionUpdates.push(params);
+			return;
+		}
+		if (Object.hasOwn(params ?? {}, BUFFERED_BACKGROUND_TASK_UPDATE)) {
+			this.handleBackgroundTaskUpdate(params[BUFFERED_BACKGROUND_TASK_UPDATE]);
+			return;
+		}
+		if (Object.hasOwn(params ?? {}, BUFFERED_CURSOR_TODOS_UPDATE)) {
+			const cursorParams = params[BUFFERED_CURSOR_TODOS_UPDATE];
+			if (this.sessionUpdateTargetsCurrentSession(cursorParams)) {
+				this.applyChecklistSnapshot(this.getChecklistStore().replace(cursorParams?.todos, { planId: "cursor" }));
+			}
 			return;
 		}
 		if (!this.sessionUpdateTargetsCurrentSession(params)) return;
@@ -3510,6 +3590,26 @@ export class AcpClient {
 		}
 	}
 
+	handleBackgroundTaskUpdate(params) {
+		if (this.bufferingSessionUpdates) {
+			this.bufferedSessionUpdates.push({ [BUFFERED_BACKGROUND_TASK_UPDATE]: params });
+			return;
+		}
+		try {
+			// Unlike stable ACP session/update, this private notification has no
+			// schema layer ahead of the transport. Require an explicit owner so a
+			// malformed extension frame can never be attributed to whichever session
+			// happens to be current.
+			const { sessionId } = parseBackgroundTaskListParams(params);
+			if (!this.sessionUpdateTargetsCurrentSession({ sessionId })) return;
+			const snapshot = normalizeBackgroundTaskListResponse(params);
+			this.onEvent({ type: "backend_activity" });
+			this.applyBackgroundTaskSnapshot(sessionId, snapshot);
+		} catch (error) {
+			this.onEvent({ type: "error", message: `Invalid background-task update: ${error.message ?? error}` });
+		}
+	}
+
 	sessionUpdateTargetsCurrentSession(params) {
 		const sessionId = params?.sessionId ?? params?.session?.sessionId ?? params?.session?.id;
 		return !(sessionId && this.sessionId && sessionId !== this.sessionId);
@@ -3527,10 +3627,12 @@ function harnessAdapterServices() {
 	return {
 		codex: {
 			acquireForkOperationLock,
+			acquireLiveSessionLease: acquireCodexLiveSessionLease,
 			codexHome,
 			copyCodexRolloutWithNewId,
 			findCodexRolloutPath,
 			forgetForkIds,
+			liveSessionLeaseIsActive: codexLiveSessionLeaseIsActive,
 			readCodexThreadState,
 			recordForkId,
 		},
@@ -3712,6 +3814,10 @@ export class HarnessApp {
 		// nor forwards it.
 		this.shellCommandHistory = options.shellCommandHistory ?? new ShellCommandHistory();
 		this.activeShellInputCount = 0;
+		// Host-owned file mutations such as Codex Cloud apply exclude leading-!
+		// shell commands for their full lifetime. Session rewinds use the stronger
+		// sessionSwitchInProgress gate, but still check active shells before starting.
+		this.workingTreeMutationOperation = undefined;
 		this.keybindingsOptions = options.keybindingsOptions ?? {};
 		this.keybindingsResult = loadCcKeybindings(this.keybindingsOptions);
 		this.inputKeybindings = configureCcKeybindings(this.keybindingsResult.userBindings);
@@ -3728,6 +3834,12 @@ export class HarnessApp {
 		this.ready = false;
 		this.busy = false;
 		this.client = undefined;
+		this.clientInstallSequence = 0;
+		// A leading-! command may start before lazy ACP startup installs a client.
+		// Remember the first ready session on each client so that command can accept
+		// normal startup without following a later /new, /resume, or /branch on the
+		// same adapter instance.
+		this.initialSessionIdByClient = new WeakMap();
 		this.connectionAttempt = undefined;
 		this.connectionStatusOwner = undefined;
 		this.agentSwitchTail = undefined;
@@ -3846,7 +3958,16 @@ export class HarnessApp {
 			const btwFocused = this.focusedThread === "btw" && this.btwThread;
 			// A root operation blocks submissions in every pane, so its progress must
 			// remain visible even when the /btw pane currently owns editor focus.
-			const state = this.foregroundOperation?.status || effectiveActivityStatus(
+			const rootOperationState = this.foregroundOperation?.status ||
+				this.workingTreeMutationOperation?.label || (
+					(this.asyncPickerLoadCount ?? 0) > 0 ||
+					(this.configUpdateCount ?? 0) > 0 ||
+					this.selectionActionInProgress
+						? this.statusState || "main-pane operation"
+						: ""
+				);
+			const state = rootOperationState ||
+				effectiveActivityStatus(
 				btwFocused ? this.btwThread : this,
 			);
 			return {
@@ -4351,6 +4472,7 @@ export class HarnessApp {
 			onEvent: (event) => this.handleBackendEvent(event),
 		});
 		this.client = client;
+		this.clientInstallSequence = (this.clientInstallSequence ?? 0) + 1;
 		let settleConnectionAttempt;
 		const connectionAttempt = {
 			client,
@@ -4374,6 +4496,10 @@ export class HarnessApp {
 			if (this.client !== client) {
 				await this.retireSupersededClient(client);
 				return;
+			}
+			this.initialSessionIdByClient ??= new WeakMap();
+			if (client.sessionId !== undefined && !this.initialSessionIdByClient.has(client)) {
+				this.initialSessionIdByClient.set(client, client.sessionId);
 			}
 			this.ready = true;
 			this.clearConnectionStatus(lifecycleAttempt);
@@ -4415,7 +4541,13 @@ export class HarnessApp {
 	activeCcKeybindingContexts() {
 		if (this.menuHandle) {
 			const menuContexts = this.menuHandle.activeKeybindingContexts?.() ?? [this.menuHandle.keybindingContext ?? "Select"];
-			return [...menuContexts, "Global"];
+			// Some native panels intentionally expose no remappable Claude context.
+			// Keep their text/navigation behavior above Global without pretending that
+			// unsupported ThemePicker or free-text actions are configurable.
+			return [
+				...(menuContexts.length > 0 ? menuContexts : [CC_NATIVE_INPUT_CONTEXT]),
+				"Global",
+			];
 		}
 		const contexts = [];
 		if (this.editor?.autocompleteState) contexts.push("Autocomplete");
@@ -4444,8 +4576,11 @@ export class HarnessApp {
 			this.forceFullRepaint({ immediate: true });
 			return true;
 		}
+		const terminalMutation = this.workingTreeMutationOperation?.terminal === true
+			? this.workingTreeMutationOperation
+			: undefined;
 		if (
-			this.foregroundOperation &&
+			(this.foregroundOperation || terminalMutation) &&
 			[
 				"cc.app.toggleTodos",
 				"cc.chat.killAgents",
@@ -4457,10 +4592,12 @@ export class HarnessApp {
 				"cc.voice.pushToTalk",
 			].includes(action)
 		) {
-			const operation = this.foregroundOperation;
+			const operation = this.foregroundOperation ?? terminalMutation;
 			if (!operation.blockedSubmissionNoticeShown) {
 				operation.blockedSubmissionNoticeShown = true;
-				this.addNotice(`/${operation.commandName} is still in progress. Wait or press Ctrl+C to cancel.`);
+				this.addNotice(this.foregroundOperation
+					? `/${operation.commandName} is still in progress. Wait or press Ctrl+C to cancel.`
+					: "Codex Cloud apply could not be confirmed stopped. Restart cc before using this shortcut.");
 			}
 			this.ui.requestRender();
 			return true;
@@ -5218,6 +5355,21 @@ export class HarnessApp {
 			this.editorTargetThread = undefined;
 			return;
 		}
+		const terminalMutation = this.workingTreeMutationOperation?.terminal === true
+			? this.workingTreeMutationOperation
+			: undefined;
+		if (terminalMutation && !/^\/(?:exit|quit)(?:\s|$)/u.test(text)) {
+			this.editor.setText(rawText);
+			this.lastKnownEditorText = rawText;
+			if (!terminalMutation.blockedSubmissionNoticeShown) {
+				terminalMutation.blockedSubmissionNoticeShown = true;
+				this.addNotice(
+					"Codex Cloud apply could not be confirmed stopped. Your input remains in the composer; restart cc before continuing.",
+				);
+			}
+			this.ui.requestRender();
+			return;
+		}
 		// The editor is intentionally usable while a slow backend starts, so typing
 		// and autocomplete stay instantaneous. Enter must not launch a competing
 		// action, though: restore the submitted draft and leave the foreground
@@ -5354,11 +5506,17 @@ export class HarnessApp {
 			}
 			return;
 		}
-		if (this.sessionSwitchInProgress || this.workingDirectoryCommandTransition) {
+		if (
+			this.sessionSwitchInProgress ||
+			this.workingDirectoryCommandTransition ||
+			this.workingTreeMutationOperation
+		) {
 			const displayText = `!${command}`;
 			const message = this.sessionSwitchInProgress
 				? "Shell commands are unavailable while a session transition is in progress"
-				: "Shell commands are unavailable while the working directory is changing";
+				: this.workingDirectoryCommandTransition
+					? "Shell commands are unavailable while the working directory is changing"
+					: `Shell commands are unavailable while ${this.workingTreeMutationOperation.label ?? "the working tree is changing"}`;
 			if (targetThread && this.btwThread === targetThread) {
 				targetThread.addCommandMessage(displayText);
 				targetThread.addNotice(message);
@@ -5374,7 +5532,49 @@ export class HarnessApp {
 		// delivery target and response policy at launch so output from session A can
 		// never be appended or submitted to a replacement session B.
 		const target = this.captureSessionCommandTarget(targetThread);
+		// A shell command is intentionally usable during the 250 ms lazy-start
+		// window. In that one pre-client state, the first client installed for the
+		// same immutable agent context is the command's delivery target; once any
+		// concrete client/session existed, exact identity fencing remains mandatory.
+		if (!targetThread && !target.client && target.sessionId === undefined) {
+			target.allowInitialClient = true;
+			target.initialClientInstallSequence = this.clientInstallSequence ?? 0;
+		}
 		const modelResponseEnabled = this.shellModelResponseEnabled(target.agentContext.key);
+		const settleLazyTarget = async () => {
+			if (!target.allowInitialClient) return true;
+			const installedSinceLaunch = (this.clientInstallSequence ?? 0) -
+				(target.initialClientInstallSequence ?? 0);
+			// Do not enqueue cold shell output against a half-initialized adapter. Join
+			// exactly the first lazy connection, then validate its recorded first session.
+			// Once that first installed client has settled unsuccessfully, never start a
+			// replacement merely because an unrelated shell command finished.
+			if (!this.ready || !this.client || this.client.exited) {
+				const exactFirstAttemptInFlight = installedSinceLaunch === 1 && Boolean(
+					(this.connectionAttempt && this.connectionAttempt.client === this.client) ||
+					this.agentSwitchAttempt,
+				);
+				if (installedSinceLaunch !== 0 && !exactFirstAttemptInFlight) return false;
+				const connected = await this.ensureConnected({ statusState: "connecting" });
+				if (!connected) return false;
+			}
+			return this.isSessionCommandTargetActive(target);
+		};
+		const targetRemainsSafe = () => Boolean(
+			!this.sessionSwitchInProgress && this.isSessionCommandTargetActive(target)
+		);
+		const reportStaleTarget = (result = undefined) => {
+			const firstConnectionNeverReady = target.allowInitialClient === true &&
+				!this.initialSessionIdByClient?.get(this.client);
+			const owner = targetThread ? "its /btw thread closed or changed" : "its original session changed";
+			const suffix = result ? ` (${result.signal ?? result.code ?? "unknown"})` : "";
+			this.addNotice(
+				firstConnectionNeverReady
+					? `Shell command finished, but the first backend connection never became ready; its output was not sent${suffix}`
+					: `Shell command finished after ${owner}; its output was not sent to the replacement session${suffix}`,
+			);
+			this.ui.requestRender();
+		};
 
 		this.setShellInputStatus(targetThread, true);
 		try {
@@ -5388,21 +5588,17 @@ export class HarnessApp {
 			}));
 			const result = normalizeShellResult(command, captured);
 			const displayText = formatShellTranscript(result);
-			if (!this.isSessionCommandTargetActive(target)) {
-				const owner = targetThread ? "its /btw thread closed" : "its original session changed";
-				this.addNotice(
-					`Shell command finished after ${owner}; its output was not sent to the replacement session ` +
-					`(${result.signal ?? result.code ?? "unknown"})`,
-				);
-				this.ui.requestRender();
+			const lazyTargetReady = await settleLazyTarget();
+			if (!lazyTargetReady || !targetRemainsSafe()) {
+				reportStaleTarget(result);
 				return;
 			}
 			if (modelResponseEnabled) {
 				const prompt = formatShellFollowup(result);
 				if (targetThread) await targetThread.submit(prompt, undefined, { displayText });
-				else await this.submitBackendPrompt(prompt, { displayText });
+				else await this.submitBackendPrompt(prompt, { displayText, sessionCommandTarget: target });
 			} else {
-				const client = target.client;
+				const client = target.allowInitialClient ? this.client : target.client;
 				if (targetThread) {
 					targetThread.addUserMessage(displayText);
 					this.onThreadActivity();
@@ -5433,7 +5629,8 @@ export class HarnessApp {
 			}
 		} catch (error) {
 			const message = error?.message ?? String(error);
-			if (!this.isSessionCommandTargetActive(target)) {
+			const lazyTargetReady = await settleLazyTarget();
+			if (!lazyTargetReady || !targetRemainsSafe()) {
 				this.addNotice("Shell command failed after its original session changed; its error was not attached to the replacement session");
 				this.ui.requestRender();
 				return;
@@ -5452,9 +5649,45 @@ export class HarnessApp {
 
 	async submitBackendPrompt(text, options = {}) {
 		const displayText = options.displayText ?? text;
+		if (this.workingTreeMutationOperation?.terminal === true) {
+			if (options.sessionCommandTarget) {
+				this.addNotice("Shell output was not sent because Codex Cloud apply may still be changing files");
+			} else {
+				this.restoreQueuedTextToComposer([{ text, promptParts: options.promptParts }]);
+				this.addNotice("Input was returned to the composer because Codex Cloud apply may still be changing files. Restart cc before continuing.");
+			}
+			this.ui.requestRender();
+			return;
+		}
 		if (!this.ready || !this.client || this.client.exited) {
 			if (this.client?.exited) this.ready = false;
-			this.enqueuePrompt(text, "afterTurn", { displayText, compactCommand: options.compactCommand, promptParts: options.promptParts });
+			if (this.replacementProcessFence) {
+				// A fenced process tree cannot reconnect in this cc process. Do not put
+				// fresh input into a queue that can only be discarded by the required
+				// restart, and do not animate a false "connecting" state. Return every
+				// pending command/prompt to the composer in its original order instead.
+				this.promptQueue.push({
+					text,
+					timing: "afterTurn",
+					displayText,
+					compactCommand: options.compactCommand,
+					promptParts: options.promptParts,
+					queuedInputOrder: this.nextQueuedInputOrder(),
+				});
+				this.restoreFailedSessionSwitchInput();
+				this.connectionStatusOwner = undefined;
+				this.statusState = "";
+				this.updateSpinner();
+				this.reportReplacementProcessFence();
+				this.ui.requestRender();
+				return;
+			}
+			this.enqueuePrompt(text, "afterTurn", {
+				displayText,
+				compactCommand: options.compactCommand,
+				promptParts: options.promptParts,
+				sessionCommandTarget: options.sessionCommandTarget,
+			});
 			if (!this.sessionSwitchInProgress) this.statusState = "connecting";
 			this.updateSpinner();
 			// Reconnect when there is no client or the previous one died (e.g. backend crash).
@@ -5467,6 +5700,7 @@ export class HarnessApp {
 		if (
 			this.busy ||
 			this.foregroundOperation ||
+			this.workingTreeMutationOperation ||
 			this.sessionSwitchInProgress ||
 			this.flushingDeferredLocalSlashCommands ||
 			this.selectionActionInProgress ||
@@ -5481,6 +5715,7 @@ export class HarnessApp {
 				displayText,
 				compactCommand: options.compactCommand,
 				promptParts: options.promptParts,
+				sessionCommandTarget: options.sessionCommandTarget,
 			});
 			return;
 		}
@@ -5855,6 +6090,18 @@ export class HarnessApp {
 	isSessionCommandTargetActive(target) {
 		if (!target || !this.isActiveAgentContext(target.agentContext)) return false;
 		if (!target.targetThread) {
+			if (target.allowInitialClient === true && !target.client && target.sessionId === undefined) {
+				const installedSinceLaunch = (this.clientInstallSequence ?? 0) -
+					(target.initialClientInstallSequence ?? 0);
+				if (installedSinceLaunch === 0) return !this.client;
+				if (installedSinceLaunch !== 1 || !this.client || this.client.exited) return false;
+				// Cold shell delivery explicitly waits for connect to settle. Never treat a
+				// merely spawned adapter as a valid target: authentication/init failure must
+				// not leave output queued for a later reconnect.
+				if (!this.ready) return false;
+				const initialSessionId = this.initialSessionIdByClient?.get(this.client);
+				return initialSessionId !== undefined && sameSessionId(this.client.sessionId, initialSessionId);
+			}
 			if (this.client !== target.client || target.client?.exited) return false;
 			return target.sessionId === undefined || sameSessionId(target.client?.sessionId, target.sessionId);
 		}
@@ -6000,6 +6247,7 @@ export class HarnessApp {
 			!this.ready ||
 			this.busy ||
 			this.foregroundOperation ||
+			this.workingTreeMutationOperation ||
 			this.sessionSwitchInProgress ||
 			this.flushingDeferredLocalSlashCommands ||
 			this.selectionActionInProgress ||
@@ -6015,6 +6263,7 @@ export class HarnessApp {
 				this.ready &&
 				!this.busy &&
 				!this.foregroundOperation &&
+				!this.workingTreeMutationOperation &&
 				!this.sessionSwitchInProgress &&
 				!this.flushingDeferredLocalSlashCommands &&
 				!this.selectionActionInProgress &&
@@ -6025,6 +6274,14 @@ export class HarnessApp {
 				this.promptQueue.length > 0
 			) {
 				const prompt = this.promptQueue.shift();
+				if (
+					prompt.sessionCommandTarget &&
+					!this.isSessionCommandTargetActive(prompt.sessionCommandTarget)
+				) {
+					this.addNotice("Queued shell output was not sent because its original session changed");
+					this.ui.requestRender();
+					continue;
+				}
 				const pendingUserEcho = this.trackPendingUserEcho(prompt.text);
 				const transcriptEntry = this.addUserMessage(prompt.displayText ?? prompt.text, { compactCommand: prompt.compactCommand });
 				this.armPendingUnsendPrompt({
@@ -6054,6 +6311,7 @@ export class HarnessApp {
 			displayText: options.displayText,
 			compactCommand: options.compactCommand,
 			promptParts: options.promptParts,
+			...(options.sessionCommandTarget ? { sessionCommandTarget: options.sessionCommandTarget } : {}),
 			queuedInputOrder: this.nextQueuedInputOrder(),
 		});
 		this.updateSpinner();
@@ -6069,6 +6327,7 @@ export class HarnessApp {
 		if (this.stopping || !Array.isArray(this.promptQueue) || this.promptQueue.length === 0) return;
 		if (
 			this.foregroundOperation ||
+			this.workingTreeMutationOperation ||
 			this.sessionSwitchInProgress ||
 			this.flushingDeferredLocalSlashCommands ||
 			this.selectionActionInProgress ||
@@ -6213,6 +6472,13 @@ export class HarnessApp {
 		if (this.sessionSwitchInProgress) {
 			this.addCommandMessage(command);
 			this.addNotice("Harness switching is unavailable while a session transition is in progress");
+			return;
+		}
+		if (this.workingTreeMutationOperation) {
+			this.addCommandMessage(command);
+			this.addNotice(
+				`Harness switching is unavailable while ${this.workingTreeMutationOperation.label ?? "the working tree is changing"}`,
+			);
 			return;
 		}
 		if (parts.length === 1) {
@@ -6393,32 +6659,84 @@ export class HarnessApp {
 		const promptBearingParts = (name === "plan" || name === "btw" || name === "side") && argument
 			? (Object.hasOwn(options, "promptParts") ? options.promptParts : this.consumeImagePromptParts(argument))
 			: undefined;
+		if (
+			this.workingTreeMutationOperation?.terminal === true &&
+			name !== "exit" &&
+			name !== "quit"
+		) {
+			this.restoreQueuedTextToComposer([{
+				text: slashCommandText(name, argument),
+				promptParts: promptBearingParts,
+			}]);
+			const notice = `/${name} was returned to the composer because Codex Cloud apply may still be changing files. Restart cc before continuing.`;
+			if (options.targetThread && this.btwThread === options.targetThread) {
+				options.targetThread.addNotice(notice);
+				this.onThreadActivity();
+			} else {
+				this.addNotice(notice);
+				this.ui.requestRender();
+			}
+			return;
+		}
 		if (this.sessionSwitchInProgress && shouldDeferLocalSlashCommand(name)) {
-			this.deferLocalSlashCommand(name, argument, { promptParts: promptBearingParts, targetThread: options.targetThread });
+			this.deferLocalSlashCommand(name, argument, {
+				promptParts: promptBearingParts,
+				targetThread: options.targetThread,
+				reason: "the current session transition finishes",
+			});
 			return;
 		}
 		const sideTarget = options.targetThread;
 		if (sideTarget && !options.fromSideCommandQueue && shouldDeferBusySideConfigCommand(name)) {
-			await sideTarget.deferLocalCommand(name, argument, { promptParts: promptBearingParts });
+			await sideTarget.deferLocalCommand(name, argument, {
+				promptParts: promptBearingParts,
+				reason: sideTarget.busy
+					? "the current /btw turn finishes"
+					: sideTarget.ready === false
+						? "the /btw backend finishes starting"
+					: (this.asyncPickerLoadCount ?? 0) > 0
+							? "the current main-pane operation finishes"
+							: (this.configUpdateCount ?? 0) > 0
+								? "the current configuration update finishes"
+								: "earlier /btw input finishes",
+			});
 			return;
 		}
 		if (!sideTarget && this.busy && shouldDeferBusyConfigCommand(name)) {
-			this.deferLocalSlashCommand(name, argument, { promptParts: promptBearingParts, targetThread: options.targetThread });
+			this.deferLocalSlashCommand(name, argument, {
+				promptParts: promptBearingParts,
+				targetThread: options.targetThread,
+				reason: "the current turn finishes",
+			});
 			return;
 		}
 		if ((this.asyncPickerLoadCount ?? 0) > 0 && shouldDeferDuringLocalOperation(name)) {
 			if (sideTarget && shouldDeferBusySideConfigCommand(name)) {
-				await sideTarget.deferLocalCommand(name, argument, { promptParts: promptBearingParts });
+				await sideTarget.deferLocalCommand(name, argument, {
+					promptParts: promptBearingParts,
+					reason: "the current main-pane operation finishes",
+				});
 			} else {
-				this.deferLocalSlashCommand(name, argument, { promptParts: promptBearingParts, targetThread: options.targetThread });
+				this.deferLocalSlashCommand(name, argument, {
+					promptParts: promptBearingParts,
+					targetThread: options.targetThread,
+					reason: "the current local operation finishes",
+				});
 			}
 			return;
 		}
 		if ((this.configUpdateCount ?? 0) > 0 && shouldDeferDuringLocalOperation(name)) {
 			if (sideTarget && shouldDeferBusySideConfigCommand(name)) {
-				await sideTarget.deferLocalCommand(name, argument, { promptParts: promptBearingParts });
+				await sideTarget.deferLocalCommand(name, argument, {
+					promptParts: promptBearingParts,
+					reason: "the current configuration update finishes",
+				});
 			} else {
-				this.deferLocalSlashCommand(name, argument, { promptParts: promptBearingParts, targetThread: options.targetThread });
+				this.deferLocalSlashCommand(name, argument, {
+					promptParts: promptBearingParts,
+					targetThread: options.targetThread,
+					reason: "the current configuration update finishes",
+				});
 			}
 			return;
 		}
@@ -6464,7 +6782,7 @@ export class HarnessApp {
 			return;
 		}
 		if (name === "copy") {
-			await this.runCopy(argument);
+			await this.runCopy(argument, { targetThread: options.targetThread });
 			return;
 		}
 		if (name === "color") {
@@ -6568,7 +6886,7 @@ export class HarnessApp {
 			return;
 		}
 		if (name === "init") {
-			await this.runInitCommand(name);
+			await this.runInitCommand(name, { targetThread: options.targetThread });
 			return;
 		}
 		if (name === "rename") {
@@ -6721,12 +7039,17 @@ export class HarnessApp {
 		}
 		if (
 			this.busy ||
+			(this.activeShellInputCount ?? 0) > 0 ||
 			this.sessionSwitchInProgress ||
 			this.selectionActionInProgress ||
 			(this.asyncPickerLoadCount ?? 0) > 0 ||
 			(this.configUpdateCount ?? 0) > 0
 		) {
-			this.addNotice(this.busy ? "A session cannot be rewound while a turn is running" : "Another session operation is active");
+			this.addNotice(this.busy
+				? "A session cannot be rewound while a turn is running"
+				: (this.activeShellInputCount ?? 0) > 0
+					? "Wait for running shell commands to finish before rewinding"
+					: "Another session operation is active");
 			return false;
 		}
 		if (!this.client || !this.ready || this.client.exited) {
@@ -6831,6 +7154,10 @@ export class HarnessApp {
 
 	async applyCheckpointRewind(context, sourceSessionId, checkpoint, mode, displayText = "/rewind") {
 		if (!this.isCheckpointContextActive(context, sourceSessionId)) return false;
+		if ((mode === "code" || mode === "both") && (this.activeShellInputCount ?? 0) > 0) {
+			this.addNotice("Wait for running shell commands to finish before rewinding files");
+			return false;
+		}
 		if (this.busy || this.sessionSwitchInProgress || this.btwThread) {
 			this.addNotice("The session changed while the rewind choice was open; run /rewind again");
 			return false;
@@ -7087,10 +7414,24 @@ export class HarnessApp {
 	}
 
 	async runChangeWorkingDirectory(argument, commandName = "cd", options = {}) {
+		const targetThread = options.targetThread ?? (
+			this.focusedThread === "btw" && this.btwThread ? this.btwThread : undefined
+		);
+		if (targetThread) {
+			const target = this.captureSessionCommandTarget(targetThread);
+			if (this.isSessionCommandTargetActive(target)) {
+				this.addSessionTargetCommand(target, slashCommandText(commandName, argument));
+				this.addSessionTargetNotice(target, "Close the /btw side thread before changing directories");
+			} else {
+				this.reportClosedSessionCommandTarget(commandName, argument);
+			}
+			this.ui.requestRender();
+			return;
+		}
 		this.addCommandMessage(slashCommandText(commandName, argument));
 		// cwd is process-global in cc. A live side session would retain its old
 		// backend cwd and make the footer and path completion ambiguous.
-		if (options.targetThread || this.focusedThread === "btw" || this.btwThread) {
+		if (this.btwThread) {
 			this.addNotice("Close the /btw side thread before changing directories");
 			return;
 		}
@@ -7107,20 +7448,36 @@ export class HarnessApp {
 			this.addNotice("The working directory can change only while the session is idle");
 			return;
 		}
-		const client = this.client;
-		if (!this.ready || !client || client.exited) {
-			this.addNotice("The active session is not ready to change directories");
-			return;
-		}
-		if (client.capabilities?.changeWorkingDirectory !== true) {
-			this.addNotice("This agent does not advertise live working-directory changes");
-			return;
-		}
 		let targetPath;
 		try {
 			targetPath = resolveWorkingDirectoryTarget(argument, process.cwd());
 		} catch (error) {
 			this.addNotice(error.message ?? String(error));
+			return;
+		}
+		if (!this.ready || !this.client || this.client.exited) {
+			const connected = await this.ensureConnected({ commandName });
+			if (!connected) return;
+		}
+		// Startup can settle behind another interaction or session mutation. Re-run
+		// every process-global gate before using the newly advertised capability.
+		if (
+			this.btwThread ||
+			this.busy ||
+			(this.activeShellInputCount ?? 0) > 0 ||
+			(this.shellInputsRunning ?? 0) > 0 ||
+			(this.btwThread?.shellInputsRunning ?? 0) > 0 ||
+			this.sessionSwitchInProgress ||
+			this.selectionActionInProgress ||
+			(this.configUpdateCount ?? 0) > 0 ||
+			(this.asyncPickerLoadCount ?? 0) > 0
+		) {
+			this.addNotice("The session changed while /cd was waiting for the backend; run /cd again");
+			return;
+		}
+		const client = this.client;
+		if (client?.capabilities?.changeWorkingDirectory !== true) {
+			this.addNotice("This agent does not advertise live working-directory changes");
 			return;
 		}
 		const context = this.captureActiveAgentContext({ includeClient: true });
@@ -7145,7 +7502,7 @@ export class HarnessApp {
 				{
 					value: "trust",
 					label: "Yes, move here",
-					description: "Claude will be able to read, edit, and execute files in this directory",
+					description: `${this.workingDirectoryAgentLabel(context)} will be able to read, edit, and execute files in this directory`,
 				},
 			], async (entry) => {
 				this.closeMenu();
@@ -7302,7 +7659,7 @@ export class HarnessApp {
 			this.clearLiveBackendCommands(this.activeKey);
 			this.disconnectDivergedWorkingDirectorySession(context);
 			this.addError(
-				`Claude moved the session to ${response.cwd}, but cc could not follow: ${error.message ?? error}. ` +
+				`${this.workingDirectoryAgentLabel(context)} moved the session to ${response.cwd}, but cc could not follow: ${error.message ?? error}. ` +
 				"The mismatched session was disconnected; restart cc in that directory to continue there.",
 			);
 			return false;
@@ -7326,10 +7683,15 @@ export class HarnessApp {
 		} else if (Array.isArray(destinationCommands)) this.applyBackendCommandUpdate(destinationCommands);
 		this.addNotice(response.changed ? `Working directory: ${cwd}` : `Already using ${cwd}`);
 		if (response.transcript_relocated === false) {
-			this.addNotice("The session moved, but Claude could not relocate its transcript; cwd-based resume may not find it");
+			this.addNotice(`The session moved, but ${this.workingDirectoryAgentLabel(context)} could not relocate its transcript; cwd-based resume may not find it`);
 		}
 		this.ui.requestRender();
 		return true;
+	}
+
+	workingDirectoryAgentLabel(context = undefined) {
+		const key = context?.key ?? this.activeKey;
+		return oneLine(this.config?.agents?.[key]?.label ?? key).slice(0, 80) || "The agent";
 	}
 
 	// Flip the active harness's permission mode at runtime, harness-agnostically.
@@ -7485,6 +7847,16 @@ export class HarnessApp {
 			...(options.targetThread ? { targetThread: options.targetThread } : {}),
 			queuedInputOrder: this.nextQueuedInputOrder(),
 		});
+		if (options.announce !== false) {
+			const reason = oneLine(options.reason ?? "the current operation finishes");
+			const notice = `Queued ${slashCommandText(name, argument)} until ${reason}.`;
+			if (options.targetThread && this.btwThread === options.targetThread) {
+				options.targetThread.addNotice(notice);
+				this.onThreadActivity();
+			} else {
+				this.addNotice?.(notice);
+			}
+		}
 		this.updateSpinner();
 		this.ui.requestRender();
 	}
@@ -7494,8 +7866,27 @@ export class HarnessApp {
 		return this.queuedInputOrder;
 	}
 
-	restoreFailedSessionSwitchInput() {
-		const queued = Array.isArray(this.promptQueue) ? this.promptQueue.splice(0) : [];
+	restoreFailedSessionSwitchInput(options = {}) {
+		const queuedEntries = Array.isArray(this.promptQueue) ? this.promptQueue.splice(0) : [];
+		const queued = [];
+		let retainedTargetBoundPrompt = false;
+		for (const entry of queuedEntries) {
+			if (!entry.sessionCommandTarget) {
+				queued.push(entry);
+				continue;
+			}
+			if (
+				options.retainSessionCommandTargets !== false &&
+				this.isSessionCommandTargetActive(entry.sessionCommandTarget)
+			) {
+				this.promptQueue.push(entry);
+				retainedTargetBoundPrompt = true;
+			} else {
+				this.addNotice?.(options.retainSessionCommandTargets === false
+					? "Queued shell output was not sent because the working-tree operation could not be confirmed stopped"
+					: "Queued shell output was not sent because its original session changed");
+			}
+		}
 		const deferredCommands = Array.isArray(this.deferredLocalSlashCommands)
 			? this.deferredLocalSlashCommands.splice(0)
 			: [];
@@ -7505,12 +7896,43 @@ export class HarnessApp {
 			promptParts: command.promptParts,
 			queuedInputOrder: command.queuedInputOrder,
 		}));
-		const entries = [...queued, ...deferred].sort(
+		const additionalEntries = Array.isArray(options.additionalEntries) ? options.additionalEntries : [];
+		const entries = [...queued, ...deferred, ...additionalEntries].sort(
 			(a, b) => (a.queuedInputOrder ?? Number.MAX_SAFE_INTEGER) - (b.queuedInputOrder ?? Number.MAX_SAFE_INTEGER),
 		);
-		if (entries.length === 0) return;
-		this.pendingPromptDisplay = undefined;
-		this.restoreQueuedTextToComposer(entries);
+		if (entries.length > 0) {
+			this.pendingPromptDisplay = undefined;
+			this.restoreQueuedTextToComposer(entries);
+		}
+		if (retainedTargetBoundPrompt) {
+			// Transition owners clear their gate immediately after this helper returns.
+			// Re-arm the drain on the next microtask without exposing an internal shell
+			// follow-up in the user's composer.
+			queueMicrotask(() => this.schedulePromptQueueDrain());
+		}
+	}
+
+	takeTerminalMutationSideInput() {
+		const thread = this.btwThread;
+		if (!thread) return [];
+		const prompts = Array.isArray(thread.queue) ? thread.queue.splice(0) : [];
+		const commands = Array.isArray(thread.localCommandQueue) ? thread.localCommandQueue.splice(0) : [];
+		const entries = [
+			...prompts,
+			...commands.map((command) => ({
+				text: slashCommandText(command.name, command.argument),
+				promptParts: command.promptParts,
+				queuedInputOrder: command.queuedInputOrder,
+			})),
+		];
+		for (const command of commands) command.resolve(false);
+		if (entries.length > 0) {
+			thread.addNotice(
+				"Codex Cloud apply could not be confirmed stopped. Queued side input was returned to the composer; restart cc before continuing.",
+			);
+			this.onThreadActivity();
+		}
+		return entries;
 	}
 
 	async flushDeferredLocalSlashCommands() {
@@ -7524,6 +7946,7 @@ export class HarnessApp {
 			while (
 				!this.stopping &&
 				!this.foregroundOperation &&
+				!this.workingTreeMutationOperation &&
 				!this.sessionSwitchInProgress &&
 				!this.menuHandle &&
 				this.deferredLocalSlashCommands.length > 0
@@ -7621,21 +8044,24 @@ export class HarnessApp {
 		// Let the caller resume from its await and install the next picker/config
 		// gate before considering older queued work. Running that work inline here
 		// would recreate the exact connect->late-menu race this coordinator prevents.
-		if ((this.deferredLocalSlashCommands?.length ?? 0) > 0) {
-			const timer = setTimeout(() => {
-				if (
-					!this.stopping &&
-					!this.foregroundOperation &&
-					!this.flushingDeferredLocalSlashCommands &&
-					!this.sessionSwitchInProgress &&
-					!this.selectionActionInProgress &&
-					!this.menuHandle
-				) void this.flushDeferredLocalSlashCommands();
-			}, 0);
-			timer.unref?.();
-			return;
-		}
-		if (!this.stopping) this.schedulePromptQueueDrain();
+		const timer = setTimeout(() => {
+			if (this.stopping) return;
+			this.btwThread?.drainQueue?.();
+			if (
+				!this.foregroundOperation &&
+				!this.workingTreeMutationOperation &&
+				!this.flushingDeferredLocalSlashCommands &&
+				!this.sessionSwitchInProgress &&
+				!this.selectionActionInProgress &&
+				!this.menuHandle &&
+				(this.deferredLocalSlashCommands?.length ?? 0) > 0
+			) {
+				void this.flushDeferredLocalSlashCommands();
+				return;
+			}
+			this.schedulePromptQueueDrain();
+		}, 0);
+		timer.unref?.();
 	}
 
 	endForegroundOperation(token) {
@@ -7696,6 +8122,7 @@ export class HarnessApp {
 		if (this.asyncPickerLoadCount === 0) this.btwThread?.drainQueue?.();
 		if (
 			this.asyncPickerLoadCount === 0 &&
+			!this.workingTreeMutationOperation &&
 			!this.flushingDeferredLocalSlashCommands &&
 			!this.sessionSwitchInProgress &&
 			!this.selectionActionInProgress &&
@@ -7711,6 +8138,7 @@ export class HarnessApp {
 	canOpenAsyncPicker() {
 		return (
 			!this.busy &&
+			!this.workingTreeMutationOperation &&
 			!this.sessionSwitchInProgress &&
 			!this.selectionActionInProgress &&
 			(this.configUpdateCount ?? 0) === 0 &&
@@ -7734,6 +8162,7 @@ export class HarnessApp {
 		if (this.configUpdateCount === 0) this.btwThread?.drainQueue?.();
 		if (
 			this.configUpdateCount === 0 &&
+			!this.workingTreeMutationOperation &&
 			!this.flushingDeferredLocalSlashCommands &&
 			!this.sessionSwitchInProgress &&
 			!this.selectionActionInProgress &&
@@ -8321,7 +8750,23 @@ export class HarnessApp {
 						}
 						deletingMain = owners.deletingMain;
 						deletingSide = owners.deletingSide;
-						const liveSideThread = owners.sideThread;
+							const liveSideThread = owners.sideThread;
+							const liveSideSessionId = liveSideThread?.sessionId ?? liveSideThread?.client?.sessionId;
+							const liveMainSessionId = operationClient?.sessionId;
+						const leasedDeletionIds = () => owners.deletionIds.filter(
+							(id) => isUuid(id) && codexLiveSessionLeaseIsActive(id),
+						);
+						const externallyLeasedIds = leasedDeletionIds().filter(
+								(id) =>
+									!(deletingSide && liveSideSessionId && sameSessionId(id, liveSideSessionId)) &&
+									!(deletingMain && liveMainSessionId && sameSessionId(id, liveMainSessionId)),
+							);
+							if (externallyLeasedIds.length > 0) {
+								throw new Error(
+									`session ${externallyLeasedIds[0]} is open in another cc process; ` +
+									"close that session before deleting it or one of its ancestors",
+							);
+						}
 						// Every live owner in the native/copy deletion closure has its own ACP
 						// process. Detach and prove those trees gone before touching any rollout.
 						if (liveSideThread && (deletingMain || deletingSide)) {
@@ -8334,6 +8779,13 @@ export class HarnessApp {
 							stoppedSessionId = operationClient?.sessionId;
 							mainStopStarted = true;
 							await stopClientForNativeMutation(operationClient);
+						}
+						const remainingLeasedIds = leasedDeletionIds();
+						if (remainingLeasedIds.length > 0) {
+							throw new Error(
+									`session ${remainingLeasedIds[0]} is still owned by a live Codex backend; ` +
+								"its rollout was left untouched",
+							);
 						}
 						// Copy-forks are standalone Codex threads. Remove the complete registered
 						// subtree deepest-first, then the requested root; a child failure leaves
@@ -8677,7 +9129,9 @@ export class HarnessApp {
 			if (startupOperation.cancelled || this.stopping || this.activeKey !== requestedKey) return;
 		}
 		if (this.sessionSwitchInProgress) {
-			this.deferLocalSlashCommand(commandName, argument);
+			this.deferLocalSlashCommand(commandName, argument, {
+				reason: "the current session transition finishes",
+			});
 			return;
 		}
 		// A failed session creation may intentionally leave authentication methods
@@ -10503,11 +10957,18 @@ export class HarnessApp {
 		}
 	}
 
-	async runInitCommand(commandName = "init") {
-		await this.submitBackendPrompt(
-			"Create or improve an AGENTS.md file in the current directory. Capture durable repository conventions, important commands, verification steps, and review expectations. Inspect the repository first, keep the guidance concise and accurate, and do not overwrite useful existing instructions.",
-			{ displayText: `/${commandName}`, compactCommand: true },
-		);
+	async runInitCommand(commandName = "init", options = {}) {
+		const prompt = "Create or improve an AGENTS.md file in the current directory. Capture durable repository conventions, important commands, verification steps, and review expectations. Inspect the repository first, keep the guidance concise and accurate, and do not overwrite useful existing instructions.";
+		const targetThread = options.targetThread;
+		if (targetThread) {
+			if (this.btwThread !== targetThread || targetThread.client?.exited) {
+				this.reportClosedSessionCommandTarget(commandName);
+				return;
+			}
+			await targetThread.submit(prompt, undefined, { displayText: `/${commandName}` });
+			return;
+		}
+		await this.submitBackendPrompt(prompt, { displayText: `/${commandName}`, compactCommand: true });
 	}
 
 	async renameCodexSession(argument = "", commandName = "rename", options = {}) {
@@ -10743,6 +11204,10 @@ export class HarnessApp {
 			this.addNotice("Codex Cloud changes cannot be applied while a turn is running");
 			return;
 		}
+		if (subcommand === "apply" && (this.activeShellInputCount ?? 0) > 0) {
+			this.addNotice("Wait for running shell commands to finish before applying Codex Cloud changes");
+			return;
+		}
 		const context = this.captureActiveAgentContext();
 		if (subcommand === "apply") {
 			this.openSelection("Apply this Codex Cloud task diff to the working tree?", [
@@ -10753,6 +11218,10 @@ export class HarnessApp {
 				if (entry?.value !== "apply" || !this.isActiveAgentContext(context)) return;
 				if (this.busy || this.btwThread?.busy) {
 					this.addNotice("Codex Cloud changes cannot be applied while a turn is running");
+					return;
+				}
+				if ((this.activeShellInputCount ?? 0) > 0) {
+					this.addNotice("Wait for running shell commands to finish before applying Codex Cloud changes");
 					return;
 				}
 				await this.executeCodexCloud(args, context);
@@ -10770,12 +11239,23 @@ export class HarnessApp {
 			this.addNotice("Codex Cloud changes cannot be applied while a turn is running");
 			return;
 		}
+		if (args[0] === "apply" && (this.activeShellInputCount ?? 0) > 0) {
+			this.addNotice("Wait for running shell commands to finish before applying Codex Cloud changes");
+			return;
+		}
+		if (args[0] === "apply" && this.workingTreeMutationOperation) {
+			this.addNotice("Another working-tree mutation is already running");
+			return;
+		}
 		const invocation = resolveCodexInvocation(context.agent);
 		if (!invocation) {
 			this.addError("A compatible Codex CLI is required for Codex Cloud");
 			return;
 		}
 		const operation = this.beginAsyncPickerLoad();
+		const mutationToken = args[0] === "apply" ? { label: "Codex Cloud is applying changes" } : undefined;
+		let terminalMutationFence = false;
+		if (mutationToken) this.workingTreeMutationOperation = mutationToken;
 		this.statusState = `${args[0]} cloud task`;
 		this.updateSpinner();
 		this.ui.requestRender();
@@ -10800,8 +11280,30 @@ export class HarnessApp {
 				this.addNotice(`Additional Codex Cloud ${streams} was omitted because the output safety limit was reached.`);
 			}
 		} catch (error) {
+			if (mutationToken && isProcessTreeTerminationFailure(error)) {
+				// A timed-out apply whose process tree cannot be confirmed stopped may
+				// still be changing files. Key this decision to the failure from this
+				// exact apply, not to whether recordReplacementProcessFence replaced its
+				// app-wide object: a prior fence is retained with ??= and must not hide a
+				// second unconfirmed tree. Fail closed for the rest of this cc process.
+				terminalMutationFence = true;
+				mutationToken.terminal = true;
+				mutationToken.label = "Codex Cloud apply may still be changing files; restart cc";
+			}
 			if (this.isActiveAgentContext(context)) this.addError(`Codex Cloud failed: ${error.message ?? error}`);
 		} finally {
+			if (!terminalMutationFence && this.workingTreeMutationOperation === mutationToken) {
+				this.workingTreeMutationOperation = undefined;
+			}
+			if (terminalMutationFence) {
+				// This process cannot safely execute anything that was committed behind
+				// the apply. Hand user-authored prompts/commands back to the composer and
+				// discard internal shell follow-ups rather than stranding hidden work.
+				this.restoreFailedSessionSwitchInput({
+					retainSessionCommandTargets: false,
+					additionalEntries: this.takeTerminalMutationSideInput(),
+				});
+			}
 			if (this.isActiveAgentContext(context) && !this.busy && !this.sessionSwitchInProgress) {
 				this.statusState = "";
 				this.updateSpinner();
@@ -10947,6 +11449,7 @@ export class HarnessApp {
 				throw new Error("another turn or local operation started before the fork could be loaded");
 			}
 			await client.loadSession(forked.sessionId, {
+				_ccForkOperationLockHeld: true,
 				beforeReplay: () => {
 					if (!this.isActiveAgentContext(context)) return;
 					// Preserve the old main and its /btw page until ACP confirms the
@@ -10997,6 +11500,11 @@ export class HarnessApp {
 
 	async openResumeDialog(commandName = "resume") {
 		const requestedKey = this.activeKey;
+		if (this.replacementProcessFence) {
+			this.addCommandMessage(`/${commandName}`);
+			this.reportReplacementProcessFence();
+			return;
+		}
 		if (this.busy || this.foregroundOperation || (this.asyncPickerLoadCount ?? 0) > 0) {
 			this.addCommandMessage(`/${commandName}`);
 			this.addNotice(this.busy
@@ -11015,6 +11523,15 @@ export class HarnessApp {
 			if (pickerLoad) this.endAsyncPickerLoad(pickerLoad);
 		};
 		try {
+			if (this.btwShutdownTail) {
+				this.updateForegroundOperation(operation, "waiting for the previous /btw backend to close");
+				await this.btwShutdownTail;
+				if (!this.isForegroundOperationActive(operation)) return;
+				if (this.replacementProcessFence) {
+					this.reportReplacementProcessFence();
+					return;
+				}
+			}
 			if (!this.client || !this.ready || this.client.exited) {
 				const connected = await this.ensureConnected({
 					// The lifecycle retains a generic state if the user cancels this UI
@@ -11068,17 +11585,28 @@ export class HarnessApp {
 			// otherwise large global histories make an empty picker needlessly slow.
 			const sessions = localCodexSessions !== undefined ? localCodexSessions : await client.listSessions();
 			if (!this.isActiveAgentContext(context) || !this.isForegroundOperationActive(operation)) return;
+			if (this.replacementProcessFence) {
+				this.reportReplacementProcessFence();
+				return;
+			}
 			const forkIds = loadForkIds();
+			const liveSideSessionId = this.btwThread?.sessionId ?? this.btwThread?.client?.sessionId;
 			const entries = sessions.map((session) => {
 				const title = singleLineMenuText(session.title) || singleLineMenuText(session.sessionId) || "unknown session";
+				const openInBtw = Boolean(
+					liveSideSessionId && sameSessionId(session.sessionId, liveSideSessionId),
+				);
+				const sessionDescription = singleLineMenuText(
+					session.updatedAt ? `${compactDate(session.updatedAt)} · ${compactPath(session.cwd)}` : compactPath(session.cwd),
+				);
 				return {
 					value: session.sessionId,
 					// /btw forks inherit the parent's title; mark them so a resume list
 					// of a parent + its fork(s) is distinguishable.
 					label: forkIds.has(session.sessionId) ? `(fork) ${title}` : title,
-					description: singleLineMenuText(
-						session.updatedAt ? `${compactDate(session.updatedAt)} · ${compactPath(session.cwd)}` : compactPath(session.cwd),
-					),
+					description: [openInBtw ? "Open in /btw; close it before resuming" : "", sessionDescription]
+						.filter(Boolean)
+						.join(" · ") || undefined,
 					active: session.sessionId === client.sessionId,
 					session,
 					};
@@ -11107,9 +11635,20 @@ export class HarnessApp {
 	}
 
 	async resumeSelectedSession(session, options = {}) {
-		if (!this.client) return;
 		const title = singleLineMenuText(session.title) || singleLineMenuText(session.sessionId) || "unknown session";
 		const displayText = options.displayText ?? slashPromptDisplay("/resume", title);
+		if (this.replacementProcessFence) {
+			this.addCommandMessage(displayText);
+			this.reportReplacementProcessFence();
+			return;
+		}
+		if (!this.client) return;
+		const liveSideSessionId = this.btwThread?.sessionId ?? this.btwThread?.client?.sessionId;
+		if (liveSideSessionId && sameSessionId(session.sessionId, liveSideSessionId)) {
+			this.addCommandMessage(displayText);
+			this.addNotice("That session is currently open in /btw. Close the side thread before resuming it in the main pane.");
+			return;
+		}
 		if (this.busy) {
 			this.addCommandMessage(displayText);
 			this.addNotice("A session cannot be resumed while a turn is running");
@@ -11129,8 +11668,18 @@ export class HarnessApp {
 		this.updateSpinner();
 		this.ui.requestRender();
 		const client = this.client;
+		let releaseSessionLoadGuard;
 		let switched = false;
 		try {
+			releaseSessionLoadGuard = typeof client.acquireSessionLoadGuard === "function"
+				? await client.acquireSessionLoadGuard(session.sessionId)
+				: () => true;
+			if (this.client !== client) return;
+			if (this.replacementProcessFence) {
+				this.addCommandMessage(displayText);
+				this.reportReplacementProcessFence();
+				return;
+			}
 			await client.loadSession(session.sessionId, {
 				beforeReplay: () => {
 					if (this.client !== client) return;
@@ -11151,8 +11700,18 @@ export class HarnessApp {
 		} catch (error) {
 			if (this.client !== client) return;
 			if (client.exited) this.ready = false;
-			this.addError(error.message ?? String(error));
+			if (error?.code === "CC_SESSION_LEASE_ACTIVE") {
+				this.addCommandMessage(displayText);
+				this.addNotice(error.message ?? "That session is open in another cc process");
+			} else {
+				this.addError(error.message ?? String(error));
+			}
 		} finally {
+			try {
+				releaseSessionLoadGuard?.();
+			} catch (error) {
+				this.addError(`Could not release the session-load guard: ${error.message ?? error}`);
+			}
 			if (this.client !== client) return;
 			await this.settleDeferredBtwPrompts();
 			if (client.exited) this.ready = false;
@@ -11175,14 +11734,18 @@ export class HarnessApp {
 		const commandName = "branch";
 		const name = oneLine(argument).trim();
 		const displayText = slashCommandText(commandName, argument);
-		if (options.targetThread || this.focusedThread === "btw") {
-			this.addCommandMessage(displayText);
-			this.addNotice("/branch is available only from the main session");
-			return false;
-		}
-		if (name && this.client?.capabilities?.namedFork !== true) {
-			this.addCommandMessage(displayText);
-			this.addNotice("This harness does not advertise named branches. Run /branch without a name.");
+		const targetThread = options.targetThread ?? (
+			this.focusedThread === "btw" && this.btwThread ? this.btwThread : undefined
+		);
+		if (targetThread) {
+			const target = this.captureSessionCommandTarget(targetThread);
+			if (this.isSessionCommandTargetActive(target)) {
+				this.addSessionTargetCommand(target, displayText);
+				this.addSessionTargetNotice(target, "/branch is available only from the main session");
+			} else {
+				this.reportClosedSessionCommandTarget(commandName, argument);
+			}
+			this.ui.requestRender();
 			return false;
 		}
 		if (this.btwThread) {
@@ -11200,6 +11763,35 @@ export class HarnessApp {
 			this.addNotice("A session transition is already in progress");
 			return false;
 		}
+		if (
+			this.workingTreeMutationOperation ||
+			this.selectionActionInProgress ||
+			(this.asyncPickerLoadCount ?? 0) > 0 ||
+			(this.configUpdateCount ?? 0) > 0
+		) {
+			this.addCommandMessage(displayText);
+			this.addNotice("Another local operation is active; run /branch again when it finishes");
+			return false;
+		}
+		if (!this.ready || !this.client || this.client.exited) {
+			const connected = await this.ensureConnected({ commandName });
+			if (!connected) return false;
+		}
+		// The foreground startup lease prevents user submissions, but capability
+		// negotiation itself may surface an interaction or invalidate the session.
+		if (
+			this.btwThread ||
+			this.busy ||
+			this.sessionSwitchInProgress ||
+			this.workingTreeMutationOperation ||
+			this.selectionActionInProgress ||
+			(this.asyncPickerLoadCount ?? 0) > 0 ||
+			(this.configUpdateCount ?? 0) > 0
+		) {
+			this.addCommandMessage(displayText);
+			this.addNotice("The session changed while /branch was waiting for the backend; run /branch again");
+			return false;
+		}
 		const client = this.client;
 		const parentSessionId = client?.sessionId;
 		if (!this.ready || !client || client.exited || !parentSessionId) {
@@ -11210,6 +11802,11 @@ export class HarnessApp {
 		if (!client.capabilities?.fork || typeof client.fork !== "function") {
 			this.addCommandMessage(displayText);
 			this.addNotice("This harness does not advertise session forking");
+			return false;
+		}
+		if (name && client.capabilities?.namedFork !== true) {
+			this.addCommandMessage(displayText);
+			this.addNotice("This harness does not advertise named branches. Run /branch without a name.");
 			return false;
 		}
 
@@ -11242,7 +11839,16 @@ export class HarnessApp {
 			// Some adapters have no replay callback. Commit the UI only after their
 			// fork RPC has returned a distinct live session.
 			commitView();
-			recordForkId(client.sessionId, parentSessionId);
+			try {
+				recordForkId(client.sessionId, parentSessionId);
+			} catch (error) {
+				// The backend has already committed and loaded the branch. Registry
+				// metadata only labels lineage, so report that degradation without
+				// falsely telling the user their successful branch failed.
+				this.addNotice(
+					`The branch is active, but cc could not record its parent relation: ${error.message ?? error}`,
+				);
+			}
 			if (name && forkResult?._meta?.cc?.branchNameApplied !== true) {
 				this.addNotice(
 					`Created the branch, but could not name it ${name}: ` +
@@ -11854,52 +12460,107 @@ export class HarnessApp {
 	async runBtw(question, options = {}) {
 		const trimmed = (question ?? "").trim();
 		const commandName = options.commandName === "side" ? "side" : "btw";
+		const commandText = slashCommandText(commandName, trimmed);
 		const promptParts = Object.hasOwn(options, "promptParts")
 			? options.promptParts
 			: (trimmed ? this.consumeImagePromptParts(trimmed) : undefined);
+		let intentRestored = false;
+		const restoreFullIntent = () => {
+			if (intentRestored) return;
+			intentRestored = true;
+			this.restoreQueuedTextToComposer([{ text: commandText, promptParts }]);
+			this.ui.requestRender();
+		};
 		const restorePromptAttachments = () => {
 			if (!Array.isArray(promptParts)) return;
 			this.restoreQueuedTextToComposer([{
-				text: slashCommandText(commandName, trimmed),
+				text: commandText,
 				promptParts,
 			}]);
 		};
 		if (this.busy) {
-			this.deferLocalSlashCommand(commandName, trimmed, { promptParts });
+			this.deferLocalSlashCommand(commandName, trimmed, {
+				promptParts,
+				reason: "the current turn finishes",
+			});
 			return;
 		}
-		this.addCommandMessage(trimmed ? slashCommandText(commandName, trimmed) : `/${commandName}`);
 		if (this.replacementProcessFence) {
+			this.addCommandMessage(commandText);
 			this.reportReplacementProcessFence();
 			restorePromptAttachments();
 			return;
 		}
 		if (this.btwThread) {
+			this.addCommandMessage(commandText);
 			this.addNotice("A /btw thread is already open — shift+tab to focus it, esc (when focused) to close.");
 			restorePromptAttachments();
 			this.ui.requestRender();
 			return;
 		}
-		// A closed side pane may still be reaping its detached ACP tree. Do not let a
-		// new fork (or its credentials/session files) overlap that retirement.
-		if (this.btwShutdownTail) await this.btwShutdownTail;
+		const requestedContext = this.captureActiveAgentContext();
+		const needsStartup = Boolean(
+			this.btwShutdownTail || !this.ready || !this.client || this.client.exited,
+		);
+		let startupOperation;
+		let prerequisitesReady = true;
+		if (needsStartup) {
+			const agentLabel = oneLine(this.config?.agents?.[this.activeKey]?.label ?? this.activeKey).slice(0, 80) || "backend";
+			startupOperation = this.beginForegroundOperation({
+				commandName,
+				status: `starting ${agentLabel} for /${commandName}`,
+			});
+			if (!startupOperation) {
+				restoreFullIntent();
+				return;
+			}
+			startupOperation.onCancel = restoreFullIntent;
+			try {
+				// A closed side pane may still be reaping its detached ACP tree. Keep the
+				// submitted intent visible and cancellable while that ownership fence settles.
+				if (this.btwShutdownTail) {
+					this.updateForegroundOperation(startupOperation, "waiting for the previous /btw backend to close");
+					await this.btwShutdownTail;
+				}
+				if (!this.isForegroundOperationActive(startupOperation) || !this.isActiveAgentContext(requestedContext)) {
+					prerequisitesReady = false;
+				} else if (!this.ready || !this.client || this.client.exited) {
+					this.updateForegroundOperation(startupOperation, `starting ${agentLabel} for /${commandName}`);
+					prerequisitesReady = await this.ensureConnected({
+						commandName,
+						statusState: "connecting",
+						foregroundOperation: startupOperation,
+					});
+				}
+			} finally {
+				this.endForegroundOperation(startupOperation);
+			}
+			if (!prerequisitesReady || startupOperation.cancelled) {
+				restoreFullIntent();
+				return;
+			}
+		}
 		if (this.replacementProcessFence) {
+			this.addCommandMessage(commandText);
 			this.reportReplacementProcessFence();
 			restorePromptAttachments();
 			return;
 		}
 		if (this.btwThread) {
+			this.addCommandMessage(commandText);
 			this.addNotice("A /btw thread is already open — shift+tab to focus it, esc (when focused) to close.");
 			restorePromptAttachments();
 			this.ui.requestRender();
 			return;
 		}
 		if (!this.ready || !this.client?.sessionId) {
-			this.addNotice("/btw needs an active session — try again once connected.");
+			this.addCommandMessage(commandText);
+			this.addNotice("/btw needs an active session.");
 			restorePromptAttachments();
 			this.ui.requestRender();
 			return;
 		}
+		this.addCommandMessage(commandText);
 		if (!this.client.capabilities.fork) {
 			this.addNotice("/btw is not supported by this harness (it does not advertise session forking).");
 			restorePromptAttachments();
@@ -11936,7 +12597,7 @@ export class HarnessApp {
 			if (!btwClient.capabilities.fork) {
 				throw new Error("this agent does not support session forking");
 			}
-			await btwClient.fork(parentSessionId);
+			await btwClient.fork(parentSessionId, { retainSessionLease: true });
 			recordForkId(btwClient.sessionId, parentSessionId);
 			thread.sessionId = btwClient.sessionId;
 			this.syncRuntimePermissionModeForSideClient(btwClient, btwClient.getSessionInfo(), { onlyIfChanged: true });
@@ -11976,10 +12637,10 @@ export class HarnessApp {
 		tracked = Promise.resolve(combined)
 			.catch((error) => {
 				if (this.recordReplacementProcessFence(error, { preserveReady: true })) {
-					this.reportReplacementProcessFence();
+					if (!this.stopping) this.reportReplacementProcessFence();
 				} else {
 					this.addError(`Could not stop the /btw backend: ${error.message ?? error}`);
-					this.ui.requestRender();
+					if (!this.stopping) this.ui.requestRender();
 				}
 			})
 			.finally(() => {
@@ -11993,13 +12654,21 @@ export class HarnessApp {
 
 	closeBtw(options = {}) {
 		const thread = this.btwThread;
-		if (this.menuHandle instanceof ChecklistPanel && this.menuHandle.target?.targetThread === thread) {
+		const skipUi = options.skipUi === true;
+		if (!skipUi && this.menuHandle instanceof ChecklistPanel && this.menuHandle.target?.targetThread === thread) {
 			this.closeMenu();
 		}
-		this.clearEditorSideThreadBinding(thread);
+		if (skipUi) {
+			// The process is exiting, so discard editor ownership without calling into
+			// the focused component after its terminal has been revoked.
+			if (this.editorTargetThread === thread) this.editorTargetThread = undefined;
+			this.pendingPromptDisplay = undefined;
+		} else {
+			this.clearEditorSideThreadBinding(thread);
+		}
 		this.btwThread = undefined;
 		this.focusedThread = "main";
-		this.updateAutocomplete();
+		if (!skipUi) this.updateAutocomplete();
 		this.mainView.stick = true;
 		if (thread) {
 			thread.settleReadyWaiters?.(false);
@@ -12012,12 +12681,16 @@ export class HarnessApp {
 				this.trackBtwShutdown(thread.client);
 			}
 		}
-		this.updateSpinner();
-		// Leaving the fixed-height page view back to natural flow: restore the normal
-		// buffer, then hard repaint so main includes anything that arrived while the
-		// fork page was open.
-		this.ui.terminal.exitAlternateScreen?.();
-		this.forceFullRepaint({ immediate: options.immediateRender === true });
+		if (!skipUi) {
+			this.updateSpinner();
+			// Leaving the fixed-height page view back to natural flow: restore the normal
+			// buffer, then hard repaint so main includes anything that arrived while the
+			// fork page was open. A revoked terminal skips every UI operation here; even
+			// closing an active side checklist can otherwise write or block before the
+			// backend process trees have been signalled.
+			this.ui.terminal.exitAlternateScreen?.();
+			this.forceFullRepaint({ immediate: options.immediateRender === true });
+		}
 		return this.btwShutdownTail ?? Promise.resolve();
 	}
 
@@ -12280,36 +12953,44 @@ export class HarnessApp {
 		}
 	}
 
-	async runCopy(argument = "") {
+	async runCopy(argument = "", options = {}) {
 		const requested = argument.trim();
-		this.addCommandMessage(slashCommandText("copy", requested));
-		if (["picker", "reset"].includes(requested.toLowerCase())) {
-			if (this.setCopyAlwaysFullResponse(false)) {
-				this.addNotice("The response picker will be shown again for responses with fenced code.");
-			}
-			this.ui.requestRender();
+		const targetThread = options.targetThread ?? (
+			this.focusedThread === "btw" && this.btwThread ? this.btwThread : undefined
+		);
+		const target = targetThread ? this.captureSessionCommandTarget(targetThread) : undefined;
+		if (targetThread && !this.isSessionCommandTargetActive(target)) {
+			this.reportClosedSessionCommandTarget("copy", requested);
 			return;
 		}
+		if (target) this.addSessionTargetCommand(target, slashCommandText("copy", requested));
+		else this.addCommandMessage(slashCommandText("copy", requested));
+		const forcePicker = ["picker", "reset"].includes(requested.toLowerCase());
+		if (forcePicker) this.setCopyAlwaysFullResponse(false);
 		const index = requested ? Number(requested) : 1;
-		if (!Number.isSafeInteger(index) || index < 1) {
-			this.addNotice("usage: /copy [positive-response-index|picker]");
+		const responseIndex = forcePicker ? 1 : index;
+		if (!Number.isSafeInteger(responseIndex) || responseIndex < 1) {
+			this.addCopyTargetNotice(target, "usage: /copy [positive-response-index|picker]");
 			this.ui.requestRender();
 			return;
 		}
 		// Copy the focused thread's Nth-latest complete assistant response. Assistant
 		// text separated by tool calls remains one response; host-rendered markdown
 		// such as /diff is deliberately not included.
-		const targetChat = this.focusedThread === "btw" && this.btwThread ? this.btwThread.chat : this.chat;
+		const targetChat = targetThread?.chat ?? this.chat;
 		const responses = assistantResponseTexts(targetChat);
-		const text = responses.at(-index)?.trim();
+		const text = responses.at(-responseIndex)?.trim();
 		if (!text) {
-			this.addNotice(index === 1 ? "Nothing to copy yet." : `There are only ${responses.length} assistant responses to copy.`);
+			this.addCopyTargetNotice(
+				target,
+				responseIndex === 1 ? "Nothing to copy yet." : `There are only ${responses.length} assistant responses to copy.`,
+			);
 			this.ui.requestRender();
 			return;
 		}
 		const choices = copyResponseChoices(text);
-		if (choices.length <= 1 || this.copyAlwaysFullResponse()) {
-			await this.copyResponseChoice(choices[0], index);
+		if (choices.length <= 1 || (!forcePicker && this.copyAlwaysFullResponse())) {
+			await this.copyResponseChoice(choices[0], responseIndex, target);
 			return;
 		}
 		const alwaysFullChoice = {
@@ -12327,11 +13008,11 @@ export class HarnessApp {
 			this.closeMenu();
 			if (!entry) return;
 			if (entry.value.kind === "always-full") this.setCopyAlwaysFullResponse(true);
-			await this.copyResponseChoice(entry.value.kind === "always-full" ? choices[0] : entry.value, index);
+			await this.copyResponseChoice(entry.value.kind === "always-full" ? choices[0] : entry.value, responseIndex, target);
 		}, {
 			onWrite: (entry) => {
 				this.closeMenu();
-				if (entry) this.openCopyWriteForm(entry.value.kind === "always-full" ? choices[0] : entry.value, index);
+				if (entry) this.openCopyWriteForm(entry.value.kind === "always-full" ? choices[0] : entry.value, responseIndex, target);
 			},
 			writeHint: "w write selection",
 		});
@@ -12356,21 +13037,21 @@ export class HarnessApp {
 		return true;
 	}
 
-	async copyResponseChoice(choice, responseIndex = 1) {
+	async copyResponseChoice(choice, responseIndex = 1, target = undefined) {
 		if (!choice?.text) return;
 		try {
 			await writeClipboardText(choice.text);
 			const responseLabel = responseIndex === 1 ? "the last response" : `response ${responseIndex}`;
-			this.addNotice(choice.kind === "full"
+			this.addCopyTargetNotice(target, choice.kind === "full"
 				? `Copied ${responseLabel} to the clipboard.`
 				: `Copied ${choice.label.toLowerCase()} from ${responseLabel} to the clipboard.`);
 		} catch (error) {
-			this.addError(`Could not copy: ${error.message ?? error}`);
+			this.addCopyTargetError(target, `Could not copy: ${error.message ?? error}`);
 		}
 		this.ui.requestRender();
 	}
 
-	openCopyWriteForm(choice, responseIndex = 1) {
+	openCopyWriteForm(choice, responseIndex = 1, target = undefined) {
 		if (!choice?.text) return;
 		this.openElicitationForm({
 			title: `Write ${choice.label.toLowerCase()} to a file`,
@@ -12387,7 +13068,7 @@ export class HarnessApp {
 		}, (result) => {
 			this.closeMenu();
 			if (result?.action !== "accept") return;
-			this.writeCopyChoice(result.content?.path, choice, responseIndex);
+			this.writeCopyChoice(result.content?.path, choice, responseIndex, { target });
 		});
 	}
 
@@ -12403,17 +13084,42 @@ export class HarnessApp {
 					{ value: "cancel", label: "Cancel" },
 				], (entry) => {
 					this.closeMenu();
-					if (entry?.value === "overwrite") this.writeCopyChoice(destination, choice, responseIndex, { overwrite: true });
+					if (entry?.value === "overwrite") {
+						this.writeCopyChoice(destination, choice, responseIndex, { overwrite: true, target: options.target });
+					}
 				}, { wrapTitle: true });
 				return;
 			}
-			this.addError(`Could not write selection: ${error.message ?? error}`);
+			this.addCopyTargetError(options.target, `Could not write selection: ${error.message ?? error}`);
 			this.ui.requestRender();
 			return;
 		}
 		const responseLabel = responseIndex === 1 ? "last response" : `response ${responseIndex}`;
-		this.addNotice(`Wrote ${choice.kind === "full" ? responseLabel : choice.label.toLowerCase()} to ${destination}.`);
+		this.addCopyTargetNotice(
+			options.target,
+			`Wrote ${choice.kind === "full" ? responseLabel : choice.label.toLowerCase()} to ${destination}.`,
+		);
 		this.ui.requestRender();
+	}
+
+	addCopyTargetNotice(target, message) {
+		if (!target?.targetThread) {
+			this.addNotice(message);
+			return true;
+		}
+		if (this.addSessionTargetNotice(target, message)) return true;
+		this.addNotice(`Copy action completed after its /btw thread closed: ${message}`);
+		return false;
+	}
+
+	addCopyTargetError(target, message) {
+		if (!target?.targetThread) {
+			this.addError(message);
+			return true;
+		}
+		if (this.addSessionTargetError(target, message)) return true;
+		this.addError(`Copy action failed after its /btw thread closed: ${message}`);
+		return false;
 	}
 
 	runPromptColor(argument = "") {
@@ -12928,14 +13634,27 @@ export class HarnessApp {
 		}
 	}
 
-	cancelPermissionPrompts() {
+	cancelPermissionPrompts(options = {}) {
 		const queued = this.permissionQueue.splice(0);
 		for (const request of queued) request.resolve(this.cancelledInteractiveResult(request));
 		if (!this.permissionPromptActive) return;
+		if (options.skipUi === true) {
+			const active = this.activeInteractiveRequest;
+			this.activeInteractiveRequest = undefined;
+			this.permissionPromptActive = false;
+			active?.resolve?.(this.cancelledInteractiveResult(active));
+			this.commandPanel?.clear?.();
+			this.menuHandle = undefined;
+			this.menuEditorText = undefined;
+			return;
+		}
 		this.closeMenu({ cancelSelection: true });
 	}
 
 	handleBackendEvent(event) {
+		// Teardown has already invalidated UI ownership and is waiting only for
+		// process trees. Late ACP frames must not repaint a revoked terminal.
+		if (this.stopping) return;
 		if (event.type === "backend_activity") {
 			this.disarmPendingUnsendPrompt();
 		} else if (event.type === "text") {
@@ -13051,6 +13770,7 @@ export class HarnessApp {
 	updateSpinner() {
 		if (
 			!this.foregroundOperation?.status &&
+			!this.workingTreeMutationOperation?.label &&
 			!effectiveActivityStatus(this) &&
 			!effectiveActivityStatus(this.btwThread)
 		) {
@@ -13237,9 +13957,9 @@ export class HarnessApp {
 		return spacer;
 	}
 
-	stop() {
+	stop(options = {}) {
 		if (this.stopPromise) return this.stopPromise;
-		this.stopPromise = this.stopAndExit();
+		this.stopPromise = this.stopAndExit(options);
 		return this.stopPromise;
 	}
 
@@ -13264,14 +13984,17 @@ export class HarnessApp {
 		if (this.markdownPreloadTimer) clearTimeout(this.markdownPreloadTimer);
 		if (this.startupConnectTimer) clearTimeout(this.startupConnectTimer);
 		this.clearCancelGraceTimer();
-		this.cancelPermissionPrompts();
+		this.cancelPermissionPrompts({ skipUi: options.skipUiStop === true });
 		this.voiceController?.dispose();
 		let sideShutdown = this.btwShutdownTail;
 		if (this.btwThread) {
 			// TUI.stop() positions its final cursor relative to the current buffer.
 			// Leave /btw's alternate screen and render main synchronously first so
 			// the shell prompt lands after the restored normal transcript.
-			sideShutdown = this.closeBtw({ immediateRender: true });
+			sideShutdown = this.closeBtw({
+				immediateRender: options.skipUiStop !== true,
+				skipUi: options.skipUiStop === true,
+			});
 		}
 		// Starting the awaitable stop installs close tracking before the TUI teardown
 		// or process exit can advance. Both main and side trees get bounded TERM/KILL
@@ -13287,14 +14010,25 @@ export class HarnessApp {
 		// that was registered before shutdown. No later native helper can spawn, and
 		// process.exit remains behind the bounded TERM/KILL tree waiters.
 		const nativeShutdown = this.nativeProcessTracker?.stopAndWait?.() ?? Promise.resolve();
-		this.ui.stop();
+		let uiStopFailure;
+		if (!options.skipUiStop) {
+			try {
+				this.ui.stop();
+			} catch (error) {
+				// Terminal restoration must never strand cc after the backend tree has
+				// already been signalled for shutdown. SIGHUP skips this call entirely
+				// because opening a revoked controlling TTY can block in the kernel.
+				uiStopFailure = error;
+			}
+		}
 		const shutdownResults = await Promise.allSettled(
 			[sideShutdown, mainShutdown, agentSwitchShutdown, nativeShutdown].filter(Boolean),
 		);
+		if (uiStopFailure) shutdownResults.push({ status: "rejected", reason: uiStopFailure });
 		const failure = shutdownResults.find((result) => result.status === "rejected");
 		if (failure) {
 			const message = oneLine(failure.reason?.message ?? failure.reason ?? "unknown shutdown error");
-			if (!options.exit) process.stderr.write(`cc: shutdown failed: ${message}\n`);
+			if (!options.exit && !options.suppressShutdownError) process.stderr.write(`cc: shutdown failed: ${message}\n`);
 			(options.exit ?? process.exit)(1);
 			return;
 		}
@@ -14652,25 +15386,29 @@ export function localSlashCommands(app) {
 	const capabilities = focusedClient?.capabilities ?? state?.capabilities;
 	if (agentSupportsLogout(capabilities)) addIfMissing({ name: "logout", description: "Sign out of the active ACP agent" });
 	const supportsWorkingDirectoryChange = capabilities?.changeWorkingDirectory === true;
-	if (supportsWorkingDirectoryChange) {
-		addIfMissing({
-			name: "cd",
-			description: "Move this session to another working directory",
-			argumentHint: "<path>",
-			getArgumentCompletions: (prefix) => directoryCompletionMatches(prefix, process.cwd()),
-		});
-	}
-	if (capabilities?.backgroundTasks === true) {
-		addIfMissing({
-			name: "tasks",
-			description: "List, stop, or background harness tasks",
-			argumentHint: "[stop <task-id>|background [tool-use-id]]",
-			getArgumentCompletions: (prefix) => [
-				{ value: "stop ", label: "stop", description: "Stop a task by task id" },
-				{ value: "background", label: "background", description: "Background all foreground tasks" },
-			].filter((entry) => entry.value.startsWith(prefix.toLowerCase())),
-		});
-	}
+	// These are shared host commands even before the lazy ACP connection has
+	// advertised capabilities. Keep their autocomplete and routing local on the
+	// first frame; the handlers join startup and then report unsupported features
+	// using the live adapter instead of forwarding a misleading backend slash prompt.
+	addIfMissing({
+		name: "cd",
+		description: supportsWorkingDirectoryChange
+			? "Move this session to another working directory"
+			: "Move this session when the harness supports live directory changes",
+		argumentHint: "<path>",
+		getArgumentCompletions: (prefix) => directoryCompletionMatches(prefix, process.cwd()),
+	});
+	addIfMissing({
+		name: "tasks",
+		description: capabilities?.backgroundTasks === true
+			? "List, stop, or background harness tasks"
+			: "Manage tasks when the harness supports background-task lifecycle controls",
+		argumentHint: "[stop <task-id>|background [tool-use-id]]",
+		getArgumentCompletions: (prefix) => [
+			{ value: "stop ", label: "stop", description: "Stop a task by task id" },
+			{ value: "background", label: "background", description: "Background all foreground tasks" },
+		].filter((entry) => entry.value.startsWith(prefix.toLowerCase())),
+	});
 	const rewindDescription = focusedSideThread
 		? "Rewinding is available only from the main session"
 		: capabilities?.checkpoints === true
@@ -14704,8 +15442,14 @@ export function localSlashCommands(app) {
 	addIfMissing({ name: "new", description: "Start a new ACP session" });
 	if (focusedSideThread) {
 		addIfMissing({ name: "branch", description: "Branching is available only from the main session", argumentHint: "[name]" });
-	} else if (focusedClient?.capabilities?.fork) {
-		addIfMissing({ name: "branch", description: "Fork this session and continue on the new branch", argumentHint: "[name]" });
+	} else {
+		addIfMissing({
+			name: "branch",
+			description: focusedClient?.capabilities?.fork
+				? "Fork this session and continue on the new branch"
+				: "Branch this session when the harness supports session forking",
+			argumentHint: "[name]",
+		});
 	}
 	addIfMissing({ name: "model", description: "Change model" });
 	addIfMissing({ name: "mode", description: "Change agent mode" });
@@ -14800,7 +15544,7 @@ function codexFeedbackSlashCommand() {
 }
 
 function shouldDeferLocalSlashCommand(name) {
-	return ["resume", "fork", "model", "mode", "effort", "reasoning", "thinking", "plan", "config", "fast", "permissions", "delete", "archive", "unarchive", "login", "logout", "btw", "side", "theme", "plugins", "hooks", "app", "apps", "feedback", "import", "memories", "debug-config", "mcp", "doctor", "experimental", "rename", "usage", "cloud", "goal", "tasks", "rewind", "checkpoint", "undo", "remote-control", "rc"].includes(name);
+	return ["resume", "fork", "branch", "model", "mode", "effort", "reasoning", "thinking", "plan", "config", "fast", "permissions", "delete", "archive", "unarchive", "login", "logout", "btw", "side", "diff", "copy", "theme", "plugins", "hooks", "app", "apps", "feedback", "import", "memories", "debug-config", "mcp", "doctor", "experimental", "init", "rename", "usage", "cloud", "goal", "cd", "tasks", "todos", "rewind", "checkpoint", "undo", "remote-control", "rc"].includes(name);
 }
 
 function shouldDeferBusyConfigCommand(name) {
@@ -18397,7 +19141,7 @@ function normalizeForkRegistry(data) {
 }
 
 function readForkRegistry(options = {}) {
-	const file = forksPath();
+	const file = options.file ?? forksPath();
 	try {
 		return normalizeForkRegistry(JSON.parse(fs.readFileSync(file, "utf8")));
 	} catch (error) {
@@ -18407,8 +19151,8 @@ function readForkRegistry(options = {}) {
 	}
 }
 
-function writeForkRegistry(registry) {
-	const file = forksPath();
+function writeForkRegistry(registry, options = {}) {
+	const file = options.file ?? forksPath();
 	const normalized = normalizeForkRegistry(registry);
 	const relationshipIds = new Set(Object.keys(normalized.parents));
 	const labelOnly = normalized.forks.filter((id) => !relationshipIds.has(id)).slice(-FORK_REGISTRY_LABEL_LIMIT);
@@ -18443,37 +19187,584 @@ function processIsAlive(pid) {
 	}
 }
 
-function reclaimAbandonedForkOperationLock(lockPath) {
-	let stat;
+function processStartIdentity(pid, platform = process.platform) {
+	if (!Number.isInteger(pid) || pid <= 0) return undefined;
 	try {
-		stat = fs.statSync(lockPath);
-	} catch (error) {
-		if (error?.code === "ENOENT") return true;
+		if (platform === "linux") {
+			const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+			const close = stat.lastIndexOf(")");
+			if (close < 0) return undefined;
+			// Fields after the command start at process state (field 3); starttime is
+			// field 22. Include boot_id so a reboot cannot make tick counts collide.
+			const startTicks = stat.slice(close + 1).trim().split(/\s+/u)[19];
+			if (!startTicks) return undefined;
+			let bootId = "";
+			try { bootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim(); } catch {}
+			return `linux:${bootId}:${startTicks}`;
+		}
+		if (platform === "darwin" || platform === "freebsd") {
+			const result = spawnSync("ps", ["-p", String(pid), "-o", "lstart="], {
+				encoding: "utf8",
+				timeout: 1_000,
+			});
+			const started = result.status === 0 ? String(result.stdout ?? "").trim() : "";
+			return started ? `${platform}:${started}` : undefined;
+		}
+	} catch {}
+	return undefined;
+}
+
+function codexLiveSessionLeaseLocation(sessionId) {
+	const canonicalSessionId = String(sessionId ?? "").toLowerCase();
+	if (!isUuid(canonicalSessionId)) {
+		throw new Error("Codex live-session ownership requires a UUID session id");
+	}
+	const directory = `${forksPath()}.live-sessions`;
+	return {
+		canonicalSessionId,
+		directory,
+		file: path.join(directory, `${canonicalSessionId}.json`),
+	};
+}
+
+function removeCodexLiveSessionLeaseFile(file, directory) {
+	try {
+		fs.rmSync(file, { force: true });
+	} catch {
 		return false;
 	}
+	try {
+		fs.rmdirSync(directory);
+	} catch {}
+	return true;
+}
+
+function markCodexLiveSessionOwnerDead(location, owner, nowMs) {
+	const temporary = path.join(
+		location.directory,
+		`.${path.basename(location.file)}.${process.pid}.${randomUUID()}.tmp`,
+	);
+	try {
+		fs.writeFileSync(
+			temporary,
+			`${JSON.stringify({ ...owner, ownerDeadObservedAt: new Date(nowMs).toISOString() })}\n`,
+			{ flag: "wx", mode: 0o600 },
+		);
+		fs.renameSync(temporary, location.file);
+		return true;
+	} catch {
+		return false;
+	} finally {
+		try { fs.rmSync(temporary, { force: true }); } catch {}
+	}
+}
+
+function inspectCodexLiveSessionLease(sessionId, options = {}) {
+	const location = codexLiveSessionLeaseLocation(sessionId);
+	let stat;
+	try {
+		stat = fs.lstatSync(location.file);
+	} catch (error) {
+		if (error?.code === "ENOENT") return { active: false, ...location };
+		throw new Error(`could not inspect Codex session ownership: ${error.message ?? error}`);
+	}
+	// Never follow a substituted symlink or silently discard an unexpected node.
+	if (!stat.isFile()) return { active: true, ...location };
+
+	let owner;
+	try {
+		owner = JSON.parse(fs.readFileSync(location.file, "utf8"));
+	} catch {
+		const nowMs = Number.isFinite(options.nowMs) ? options.nowMs : Date.now();
+		const graceMs = Number.isFinite(options.graceMs)
+			? Math.max(0, options.graceMs)
+			: CODEX_LIVE_SESSION_LEASE_ORPHAN_GRACE_MS;
+		if (nowMs - stat.mtimeMs < graceMs) return { active: true, ...location };
+		return {
+			active: !removeCodexLiveSessionLeaseFile(location.file, location.directory),
+			...location,
+		};
+	}
+
+	if (owner?.released === true) {
+		removeCodexLiveSessionLeaseFile(location.file, location.directory);
+		return { active: false, owner, ...location };
+	}
+	const validOwner =
+		owner &&
+		typeof owner === "object" &&
+		String(owner.sessionId ?? "").toLowerCase() === location.canonicalSessionId &&
+		Number.isInteger(owner.pid) &&
+		owner.pid > 0 &&
+		typeof owner.hostname === "string" &&
+		owner.hostname.length > 0 &&
+		typeof owner.token === "string" &&
+		owner.token.length > 0;
+	if (!validOwner) {
+		const nowMs = Number.isFinite(options.nowMs) ? options.nowMs : Date.now();
+		const graceMs = Number.isFinite(options.graceMs)
+			? Math.max(0, options.graceMs)
+			: CODEX_LIVE_SESSION_LEASE_ORPHAN_GRACE_MS;
+		if (nowMs - stat.mtimeMs < graceMs) return { active: true, owner, ...location };
+		return {
+			active: !removeCodexLiveSessionLeaseFile(location.file, location.directory),
+			owner,
+			...location,
+		};
+	}
+
+	const hostname = options.hostname ?? os.hostname();
+	if (owner.hostname !== hostname) return { active: true, owner, ...location };
+	const probe = typeof options.processIsAlive === "function" ? options.processIsAlive : processIsAlive;
+	const ownerAlive = probe(owner.pid);
+	if (typeof owner.processStartIdentity === "string" && owner.processStartIdentity) {
+		const identityProbe = typeof options.processStartIdentity === "function"
+			? options.processStartIdentity
+			: processStartIdentity;
+		const currentIdentity = identityProbe(owner.pid, owner.backendPlatform ?? process.platform);
+		if (currentIdentity === owner.processStartIdentity) return { active: true, owner, ...location };
+		// An unavailable identity cannot disprove a live owner. A different identity,
+		// however, proves PID reuse and must fall through to the recorded backend tree.
+		if (currentIdentity === undefined && ownerAlive !== false) return { active: true, owner, ...location };
+	} else if (ownerAlive !== false) {
+		// Legacy leases lack a birth identity and retain the conservative PID rule.
+		return { active: true, owner, ...location };
+	}
+
+	// A crashed cc parent does not prove its detached ACP tree stopped. Prefer the
+	// process-group identity captured by the adapter; on POSIX, group absence is a
+	// conclusive quiescence check even if descendants outlived the ACP root.
+	if (Number.isInteger(owner.backendPid) && owner.backendPid > 0) {
+		if (owner.backendProcessGroup === true && owner.backendPlatform !== "win32") {
+			const groupProbe = typeof options.processGroupIsAlive === "function"
+				? options.processGroupIsAlive
+				: (pid) => posixProcessGroupExists(pid, owner.backendPlatform);
+			if (groupProbe(owner.backendPid) !== false) return { active: true, owner, ...location };
+			return {
+				active: !removeCodexLiveSessionLeaseFile(location.file, location.directory),
+				owner,
+				...location,
+			};
+		}
+		if (probe(owner.backendPid) !== false) return { active: true, owner, ...location };
+	}
+
+	// Without a conclusive process-tree check (notably Windows, or a lease written
+	// before backend identity was available), start the orphan grace period when a
+	// successor first observes the dead owner. Lease age alone is insufficient: a
+	// long-running owner may have died only milliseconds ago while its child exits.
+	const nowMs = Number.isFinite(options.nowMs) ? options.nowMs : Date.now();
+	const graceMs = Number.isFinite(options.graceMs)
+		? Math.max(0, options.graceMs)
+		: CODEX_LIVE_SESSION_LEASE_ORPHAN_GRACE_MS;
+	const deadObservedAt = Date.parse(owner.ownerDeadObservedAt ?? "");
+	if (!Number.isFinite(deadObservedAt)) {
+		markCodexLiveSessionOwnerDead(location, owner, nowMs);
+		return { active: true, owner, ...location };
+	}
+	if (nowMs - deadObservedAt < graceMs) return { active: true, owner, ...location };
+	return {
+		active: !removeCodexLiveSessionLeaseFile(location.file, location.directory),
+		owner,
+		...location,
+	};
+}
+
+// Callers coordinate this check with acquireForkOperationLock(). A dead local
+// owner is reaped only after its recorded ACP group is gone, or after an
+// observation-based orphan grace when no conclusive tree identity is available.
+export function codexLiveSessionLeaseIsActive(sessionId, options = {}) {
+	return inspectCodexLiveSessionLease(sessionId, options).active;
+}
+
+export function acquireCodexLiveSessionLease(sessionId, options = {}) {
+	const location = codexLiveSessionLeaseLocation(sessionId);
+	const token = options.token ?? randomUUID();
+	const ownerPid = Number.isInteger(options.pid) ? options.pid : process.pid;
+	const ownerProcessStartIdentity = processStartIdentity(ownerPid, options.platform ?? process.platform);
+	const owner = {
+		sessionId: location.canonicalSessionId,
+		pid: ownerPid,
+		hostname: options.hostname ?? os.hostname(),
+		token,
+		createdAt: options.createdAt ?? new Date().toISOString(),
+		...(ownerProcessStartIdentity ? { processStartIdentity: ownerProcessStartIdentity } : {}),
+		...(Number.isInteger(options.backendPid) && options.backendPid > 0
+			? {
+				backendPid: options.backendPid,
+				backendProcessGroup: options.backendProcessGroup === true,
+				backendPlatform: options.backendPlatform ?? process.platform,
+			}
+			: {}),
+	};
+	fs.mkdirSync(location.directory, { recursive: true, mode: 0o700 });
+	while (true) {
+		try {
+			fs.writeFileSync(location.file, `${JSON.stringify(owner)}\n`, { flag: "wx", mode: 0o600 });
+			break;
+		} catch (error) {
+			if (error?.code !== "EEXIST") {
+				throw new Error(`could not retain Codex session ownership: ${error.message ?? error}`);
+			}
+			if (!codexLiveSessionLeaseIsActive(sessionId, options)) continue;
+			const activeError = new Error("the Codex session is already open in another cc process");
+			activeError.code = "CC_SESSION_LEASE_ACTIVE";
+			throw activeError;
+		}
+	}
+
+	let released = false;
+	return () => {
+		if (released) return true;
+		let current;
+		try {
+			current = JSON.parse(fs.readFileSync(location.file, "utf8"));
+		} catch (error) {
+			if (error?.code === "ENOENT") {
+				released = true;
+				return true;
+			}
+			throw new Error(`could not release Codex session ownership: ${error.message ?? error}`);
+		}
+		if (current?.token !== token) {
+			throw new Error("could not release Codex session ownership because its owner changed");
+		}
+		if (!removeCodexLiveSessionLeaseFile(location.file, location.directory)) {
+			throw new Error("could not remove the Codex session ownership lease");
+		}
+		released = true;
+		return true;
+	};
+}
+
+function forkOperationMutationGuardPath(lockPath) {
+	return `${lockPath}.mutation`;
+}
+
+function restoreDisplacedForkMutationMarker(markerPath, quarantinePath) {
+	try {
+		fs.linkSync(quarantinePath, markerPath);
+		fs.rmSync(quarantinePath, { force: true });
+		return true;
+	} catch {
+		// Never overwrite a newer canonical marker. Leaving the displaced file at
+		// its unique quarantine name is fail-safe and does not grant another owner
+		// permission to enter the canonical mutation section.
+		return false;
+	}
+}
+
+function reclaimAbandonedForkOperationMutation(lockPath, options = {}) {
+	const markerPath = forkOperationMutationGuardPath(lockPath);
+	const state = readForkOperationOwner(markerPath);
+	if (!state) return true;
+	const owner = state.owner;
+	// Unknown/corrupt markers and markers from another host are deliberately
+	// fail-closed. Only a current-protocol marker whose local owner is definitely
+	// gone (or explicitly released) is safe to reclaim.
+	if (
+		state.invalid ||
+		!state.stat?.isFile() ||
+		owner?.protocolVersion !== FORK_OPERATION_LOCK_PROTOCOL_VERSION
+	) return false;
+	if (owner.released !== true) {
+		if (!owner.hostname || owner.hostname !== os.hostname()) return false;
+		if (processIsAlive(Number(owner.pid)) !== false) return false;
+	}
+	const expectedToken = owner.token;
+	if (typeof expectedToken !== "string" || !expectedToken) return false;
+	options._testBeforeMutationReclaimRename?.({ markerPath, expectedToken });
+	const current = readForkOperationOwner(markerPath);
+	if (
+		current?.owner?.protocolVersion !== FORK_OPERATION_LOCK_PROTOCOL_VERSION ||
+		current.owner.token !== expectedToken ||
+		!sameFileIdentity(current.stat, state.stat)
+	) return false;
+	const quarantinePath = `${markerPath}.reclaimed-${randomUUID()}`;
+	try {
+		fs.renameSync(markerPath, quarantinePath);
+	} catch (error) {
+		return error?.code === "ENOENT";
+	}
+	const movedOwner = readForkOperationOwner(quarantinePath)?.owner;
+	if (
+		movedOwner?.protocolVersion !== FORK_OPERATION_LOCK_PROTOCOL_VERSION ||
+		movedOwner?.token !== expectedToken
+	) {
+		// The canonical marker changed after our stale read. Put that successor
+		// back rather than deleting it; its owner may already be inside the
+		// protected mutation section.
+		restoreDisplacedForkMutationMarker(markerPath, quarantinePath);
+		return false;
+	}
+	return removeForkLockStorage(quarantinePath, "file");
+}
+
+function releaseForkOperationMutation(markerPath, token) {
+	const state = readForkOperationOwner(markerPath);
+	if (state?.owner?.token !== token || !state.stat?.isFile()) return !state;
+	const quarantinePath = `${markerPath}.released-${randomUUID()}`;
+	try {
+		fs.renameSync(markerPath, quarantinePath);
+	} catch (error) {
+		if (error?.code === "ENOENT") return true;
+		// Directory permissions can forbid unlink/rename while the owner can still
+		// update its own file. Publish an explicit release in that case so a later
+		// process can reclaim the marker even while this PID remains alive.
+		let descriptor;
+		try {
+			descriptor = fs.openSync(
+				markerPath,
+				fs.constants.O_RDWR | (fs.constants.O_NOFOLLOW ?? 0),
+			);
+			const descriptorStat = fs.fstatSync(descriptor);
+			if (!sameFileIdentity(descriptorStat, state.stat)) return false;
+			const currentOwner = JSON.parse(fs.readFileSync(descriptor, "utf8"));
+			if (currentOwner?.token !== token) return false;
+			const releasedOwner = `${JSON.stringify({
+				...currentOwner,
+				released: true,
+				releasedAt: new Date().toISOString(),
+			})}\n`;
+			fs.ftruncateSync(descriptor, 0);
+			fs.writeSync(descriptor, releasedOwner, 0, "utf8");
+			fs.fsyncSync(descriptor);
+			return true;
+		} catch {
+			return false;
+		} finally {
+			if (descriptor !== undefined) {
+				try { fs.closeSync(descriptor); } catch {}
+			}
+		}
+	}
+	const moved = readForkOperationOwner(quarantinePath)?.owner;
+	if (
+		moved?.protocolVersion !== FORK_OPERATION_LOCK_PROTOCOL_VERSION ||
+		moved?.token !== token
+	) {
+		restoreDisplacedForkMutationMarker(markerPath, quarantinePath);
+		return false;
+	}
+	// Canonical ownership ended at the atomic rename. Failure to remove this
+	// uniquely named quarantine cannot block a successor mutation.
+	removeForkLockStorage(quarantinePath, "file");
+	return true;
+}
+
+function forkOperationMutationInProgress(lockPath, options = {}) {
+	try {
+		fs.lstatSync(forkOperationMutationGuardPath(lockPath));
+	} catch (error) {
+		if (error?.code === "ENOENT") return false;
+		return true;
+	}
+	return !reclaimAbandonedForkOperationMutation(lockPath, options);
+}
+
+function beginForkOperationMutation(lockPath, timeoutMs = FORK_OPERATION_LOCK_TIMEOUT_MS, options = {}) {
+	const deadline = Date.now() + timeoutMs;
+	while (true) {
+		const token = randomUUID();
+		const markerPath = forkOperationMutationGuardPath(lockPath);
+		const candidatePath = `${markerPath}.candidate-${token}`;
+		const marker = {
+			protocolVersion: FORK_OPERATION_LOCK_PROTOCOL_VERSION,
+			pid: process.pid,
+			hostname: os.hostname(),
+			token,
+			createdAt: new Date().toISOString(),
+		};
+		try {
+			fs.writeFileSync(candidatePath, `${JSON.stringify(marker)}\n`, { flag: "wx", mode: 0o600 });
+			fs.linkSync(candidatePath, markerPath);
+			fs.rmSync(candidatePath, { force: true });
+		} catch (error) {
+			try { fs.rmSync(candidatePath, { force: true }); } catch {}
+			if (error?.code !== "EEXIST") return undefined;
+			if (reclaimAbandonedForkOperationMutation(lockPath, options)) continue;
+			if (Date.now() >= deadline) return undefined;
+			Atomics.wait(FORK_REGISTRY_LOCK_WAIT, 0, 0, 10);
+			continue;
+		}
+		// A stale-marker reclaimer can have observed its predecessor before this
+		// publication, then move our marker while validating the old token. Do not
+		// enter the mutation section unless our token still owns the canonical path.
+		options._testAfterMutationPublish?.({ markerPath, token });
+		if (readForkOperationOwner(markerPath)?.owner?.token !== token) continue;
+		return () => {
+			return releaseForkOperationMutation(markerPath, token);
+		};
+	}
+}
+
+function readForkOperationOwner(lockPath) {
+	let stat;
+	try {
+		stat = fs.lstatSync(lockPath);
+	} catch (error) {
+		if (error?.code === "ENOENT") return undefined;
+		return { invalid: true };
+	}
+	if (stat.isSymbolicLink() || (!stat.isFile() && !stat.isDirectory())) return { invalid: true, stat };
+	try {
+		return {
+			owner: JSON.parse(fs.readFileSync(stat.isFile() ? lockPath : forkOperationOwnerPath(lockPath), "utf8")),
+			stat,
+		};
+	} catch {
+		return { invalid: true, stat };
+	}
+}
+
+function forkLockStateMatchesKind(state, lockKind) {
+	return lockKind === "directory" ? state?.stat?.isDirectory() === true : state?.stat?.isFile() === true;
+}
+
+function removeForkLockStorage(file, lockKind) {
+	try {
+		fs.rmSync(file, { recursive: lockKind === "directory", force: true });
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function sameFileIdentity(left, right) {
+	return Boolean(
+		left &&
+		right &&
+		left.dev === right.dev &&
+		left.ino === right.ino &&
+		left.birthtimeMs === right.birthtimeMs,
+	);
+}
+
+function removeOwnedForkOperationDirectory(lockPath, claimStat, token) {
+	let currentStat;
+	try {
+		currentStat = fs.lstatSync(lockPath);
+	} catch (error) {
+		return error?.code === "ENOENT";
+	}
+	if (!currentStat.isDirectory() || !sameFileIdentity(currentStat, claimStat)) return false;
 	let owner;
 	try {
 		owner = JSON.parse(fs.readFileSync(forkOperationOwnerPath(lockPath), "utf8"));
-	} catch {
-		if (Date.now() - stat.mtimeMs < FORK_OPERATION_LOCK_ORPHAN_GRACE_MS) return false;
-	}
-	if (owner?.released === true) {
+	} catch (error) {
+		if (error?.code !== "ENOENT") return false;
 		try {
-			fs.rmSync(lockPath, { recursive: true, force: true });
+			if (fs.readdirSync(lockPath).length !== 0) return false;
+		} catch {
+			return false;
+		}
+	}
+	if (owner && owner.token !== token) return false;
+	return removeForkLockStorage(lockPath, "directory");
+}
+
+function restoreDisplacedForkOperationLock(lockPath, quarantinePath, lockKind) {
+	try {
+		fs.lstatSync(lockPath);
+	} catch (error) {
+		if (error?.code !== "ENOENT") return false;
+		try {
+			if (lockKind === "directory") fs.renameSync(quarantinePath, lockPath);
+			else {
+				fs.linkSync(quarantinePath, lockPath);
+				fs.rmSync(quarantinePath, { force: true });
+			}
 			return true;
 		} catch {
 			return false;
 		}
 	}
-	if (owner?.hostname && owner.hostname !== os.hostname()) return false;
-	const alive = processIsAlive(Number(owner?.pid));
-	if (alive === true) return false;
-	if (alive === undefined && Date.now() - stat.mtimeMs < FORK_OPERATION_LOCK_ORPHAN_GRACE_MS) return false;
+	// A current-protocol contender publishes fully before it checks the mutation
+	// marker, and cannot return ownership until that marker disappears. If another
+	// contender already occupies the canonical path, the displaced contender will
+	// observe the token mismatch and retry, so its quarantined candidate is safe to
+	// discard. Legacy owners are preserved fail-closed instead.
+	const displacedState = readForkOperationOwner(quarantinePath);
+	const displaced = displacedState?.owner;
+	if (
+		!forkLockStateMatchesKind(displacedState, lockKind) ||
+		displaced?.protocolVersion !== FORK_OPERATION_LOCK_PROTOCOL_VERSION
+	) return false;
+	return removeForkLockStorage(quarantinePath, lockKind);
+}
+
+function reclaimAbandonedForkOperationLock(lockPath, options = {}) {
+	const lockKind = options.lockKind === "directory" ? "directory" : "file";
+	const mutationTimeoutMs = Number.isFinite(options.timeoutMs)
+		? Math.max(0, Math.trunc(options.timeoutMs))
+		: FORK_OPERATION_LOCK_TIMEOUT_MS;
+	const releaseMutation = beginForkOperationMutation(lockPath, mutationTimeoutMs, options);
+	if (!releaseMutation) return false;
 	try {
-		fs.rmSync(lockPath, { recursive: true, force: true });
+		const state = readForkOperationOwner(lockPath);
+		if (!state) return true;
+		const owner = state.owner;
+		// Current operation locks publish a complete candidate directory atomically,
+		// while registry locks publish a complete file by hard link. Never reap
+		// an ownerless/legacy directory: an older creator could still be between
+		// mkdir and owner.json and would otherwise delete a successor in its cleanup.
+		if (
+			state.invalid ||
+			!forkLockStateMatchesKind(state, lockKind) ||
+			owner?.protocolVersion !== FORK_OPERATION_LOCK_PROTOCOL_VERSION
+		) return false;
+		if (owner.released !== true) {
+			if (!owner.hostname || owner.hostname !== os.hostname()) return false;
+			if (processIsAlive(Number(owner.pid)) !== false) return false;
+		}
+		const expectedToken = owner.token;
+		if (typeof expectedToken !== "string" || !expectedToken) return false;
+		options._testBeforeReclaimRename?.({ lockPath, expectedToken });
+		const quarantinePath = `${lockPath}.reclaimed-${randomUUID()}`;
+		try {
+			fs.renameSync(lockPath, quarantinePath);
+		} catch (error) {
+			if (error?.code === "ENOENT") return true;
+			return false;
+		}
+		const movedOwner = readForkOperationOwner(quarantinePath)?.owner;
+		if (
+			movedOwner?.protocolVersion !== FORK_OPERATION_LOCK_PROTOCOL_VERSION ||
+			movedOwner?.token !== expectedToken
+		) {
+			restoreDisplacedForkOperationLock(lockPath, quarantinePath, lockKind);
+			return false;
+		}
+		return removeForkLockStorage(quarantinePath, lockKind);
+	} finally {
+		releaseMutation();
+	}
+}
+
+function releaseForkOperationLock(lockPath, token, lockKind = "file") {
+	const releaseMutation = beginForkOperationMutation(lockPath);
+	if (!releaseMutation) return false;
+	try {
+		const quarantinePath = `${lockPath}.released-${randomUUID()}`;
+		try {
+			fs.renameSync(lockPath, quarantinePath);
+		} catch (error) {
+			return error?.code === "ENOENT";
+		}
+		const movedOwner = readForkOperationOwner(quarantinePath)?.owner;
+		if (
+			movedOwner?.protocolVersion !== FORK_OPERATION_LOCK_PROTOCOL_VERSION ||
+			movedOwner?.token !== token
+		) {
+			restoreDisplacedForkOperationLock(lockPath, quarantinePath, lockKind);
+			return false;
+		}
+		// Canonical ownership ended at the atomic rename. A failed best-effort
+		// quarantine cleanup cannot block or delete a successor lock.
+		removeForkLockStorage(quarantinePath, lockKind);
 		return true;
-	} catch {
-		return false;
+	} finally {
+		releaseMutation();
 	}
 }
 
@@ -18485,6 +19776,7 @@ export async function acquireForkOperationLock(options = {}) {
 	const deadline = Date.now() + timeoutMs;
 	const token = randomUUID();
 	const owner = {
+		protocolVersion: FORK_OPERATION_LOCK_PROTOCOL_VERSION,
 		pid: process.pid,
 		hostname: os.hostname(),
 		token,
@@ -18493,47 +19785,62 @@ export async function acquireForkOperationLock(options = {}) {
 	};
 	fs.mkdirSync(path.dirname(lockPath), { recursive: true });
 	while (true) {
+		if (forkOperationMutationInProgress(lockPath, options)) {
+			if (Date.now() >= deadline) {
+				throw new Error("another cc process is changing Codex fork storage; try again after it finishes");
+			}
+			await new Promise((resolve) => setTimeout(resolve, 25));
+			continue;
+		}
+		const candidatePath = `${lockPath}.candidate-${token}-${randomUUID()}`;
 		try {
-			fs.mkdirSync(lockPath);
+			let claimStat;
 			try {
-				fs.writeFileSync(forkOperationOwnerPath(lockPath), `${JSON.stringify(owner)}\n`, { flag: "wx", mode: 0o600 });
+				fs.mkdirSync(candidatePath, { mode: 0o700 });
+				fs.writeFileSync(forkOperationOwnerPath(candidatePath), `${JSON.stringify(owner)}\n`, {
+					flag: "wx",
+					mode: 0o600,
+				});
+				// mkdir is the atomic no-replace claim. Link a fully written owner into
+				// that exact directory so older stable cc can read <lock>/owner.json and
+				// will never age a live beta operation into false staleness.
+				options._testBeforeOperationPublish?.({ lockPath });
+				fs.mkdirSync(lockPath, { mode: 0o700 });
+				claimStat = fs.lstatSync(lockPath);
+				options._testAfterOperationMkdirBeforeOwner?.({ lockPath });
+				const candidateOwnerPath = forkOperationOwnerPath(candidatePath);
+				const ownerPath = forkOperationOwnerPath(lockPath);
+				try {
+					fs.linkSync(candidateOwnerPath, ownerPath);
+				} catch (error) {
+					if (!["EACCES", "EPERM", "EXDEV", "ENOTSUP"].includes(error?.code)) throw error;
+					fs.copyFileSync(candidateOwnerPath, ownerPath, fs.constants.COPYFILE_EXCL);
+				}
 			} catch (error) {
-				fs.rmSync(lockPath, { recursive: true, force: true });
+				if (claimStat) removeOwnedForkOperationDirectory(lockPath, claimStat, token);
+				fs.rmSync(candidatePath, { recursive: true, force: true });
 				throw error;
 			}
+			try { fs.rmSync(candidatePath, { recursive: true, force: true }); } catch {}
+			// A reclaimer can publish its mutation marker after our pre-check. Do not
+			// return ownership until it has either preserved this token or moved it out
+			// of the canonical path and completed its token verification.
+			while (forkOperationMutationInProgress(lockPath, options)) {
+				await new Promise((resolve) => setTimeout(resolve, 25));
+			}
+			if (readForkOperationOwner(lockPath)?.owner?.token !== token) continue;
 			let released = false;
 			return () => {
 				if (released) return true;
-				let current;
-				try {
-					current = JSON.parse(fs.readFileSync(forkOperationOwnerPath(lockPath), "utf8"));
-				} catch {
-					return false;
-				}
-				if (current?.token !== token) {
-					released = true;
-					return false;
-				}
-				try {
-					fs.rmSync(lockPath, { recursive: true, force: true });
-					released = true;
-					return true;
-				} catch {
-					try {
-						fs.writeFileSync(
-							forkOperationOwnerPath(lockPath),
-							`${JSON.stringify({ ...current, released: true, releasedAt: new Date().toISOString() })}\n`,
-							{ mode: 0o600 },
-						);
-					} catch {}
-					return false;
-				}
+				const result = releaseForkOperationLock(lockPath, token, "directory");
+				if (result) released = true;
+				return result;
 			};
 		} catch (error) {
-			if (error?.code !== "EEXIST") {
+			if (!["EEXIST", "ENOTEMPTY"].includes(error?.code)) {
 				throw new Error(`could not acquire the fork operation lock: ${error.message ?? error}`);
 			}
-			if (reclaimAbandonedForkOperationLock(lockPath)) continue;
+			if (reclaimAbandonedForkOperationLock(lockPath, { ...options, lockKind: "directory" })) continue;
 			if (Date.now() >= deadline) {
 				throw new Error("another cc process is changing Codex fork storage; try again after it finishes");
 			}
@@ -18542,41 +19849,245 @@ export async function acquireForkOperationLock(options = {}) {
 	}
 }
 
-function updateForkRegistry(mutator, options = {}) {
-	const file = forksPath();
-	const lock = `${file}.lock`;
-	const deadline = Date.now() + FORK_REGISTRY_LOCK_TIMEOUT_MS;
-	let locked = false;
-	try {
-		fs.mkdirSync(path.dirname(file), { recursive: true });
-		while (!locked) {
+function acquireForkRegistryLock(lockPath, options = {}) {
+	// Registry writes are synchronous and bounded to this critical section, so a
+	// file-shaped no-replace lock is safe with the previous release's 30-second
+	// stale policy. Long-lived operation locks use the old-readable directory shape
+	// instead because stable cc and beta cc2 can share them during ACP shutdown.
+	const timeoutMs = Number.isFinite(options.timeoutMs)
+		? Math.max(0, Math.trunc(options.timeoutMs))
+		: FORK_REGISTRY_LOCK_TIMEOUT_MS;
+	const deadline = Date.now() + timeoutMs;
+	const token = randomUUID();
+	const owner = {
+		protocolVersion: FORK_OPERATION_LOCK_PROTOCOL_VERSION,
+		pid: process.pid,
+		hostname: os.hostname(),
+		token,
+		createdAt: new Date().toISOString(),
+		operation: "fork registry update",
+	};
+	fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+	while (true) {
+		if (forkOperationMutationInProgress(lockPath, options)) {
+			if (Date.now() >= deadline) throw new Error("timed out waiting for the fork registry lock");
+			Atomics.wait(FORK_REGISTRY_LOCK_WAIT, 0, 0, 10);
+			continue;
+		}
+		const candidatePath = `${lockPath}.candidate-${token}-${randomUUID()}`;
+		try {
+			fs.writeFileSync(candidatePath, `${JSON.stringify(owner)}\n`, { flag: "wx", mode: 0o600 });
 			try {
-				fs.mkdirSync(lock);
-				locked = true;
-			} catch (error) {
-				if (error?.code !== "EEXIST") throw error;
-				try {
-					if (Date.now() - fs.statSync(lock).mtimeMs > FORK_REGISTRY_STALE_LOCK_MS) {
-						fs.rmSync(lock, { recursive: true, force: true });
-						continue;
-					}
-				} catch (statError) {
-					if (statError?.code === "ENOENT") continue;
-					throw statError;
-				}
-				if (Date.now() >= deadline) throw new Error("timed out waiting for the fork registry lock");
+				fs.linkSync(candidatePath, lockPath);
+			} finally {
+				fs.rmSync(candidatePath, { force: true });
+			}
+			while (forkOperationMutationInProgress(lockPath, options)) {
 				Atomics.wait(FORK_REGISTRY_LOCK_WAIT, 0, 0, 10);
 			}
+			if (readForkOperationOwner(lockPath)?.owner?.token !== token) continue;
+			let released = false;
+			return () => {
+				if (released) return true;
+				const result = releaseForkOperationLock(lockPath, token);
+				if (result) released = true;
+				return result;
+			};
+		} catch (error) {
+			try { fs.rmSync(candidatePath, { force: true }); } catch {}
+			if (!["EEXIST", "ENOTEMPTY"].includes(error?.code)) throw error;
+			if (reclaimAbandonedForkOperationLock(lockPath, options)) continue;
+			if (Date.now() >= deadline) throw new Error("timed out waiting for the fork registry lock");
+			Atomics.wait(FORK_REGISTRY_LOCK_WAIT, 0, 0, 10);
 		}
-		const registry = readForkRegistry({ strict: true });
+	}
+}
+
+function updateForkRegistry(mutator, options = {}) {
+	const file = options.file ?? forksPath();
+	const lock = `${file}.lock`;
+	let releaseLock;
+	try {
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		releaseLock = acquireForkRegistryLock(lock, options);
+		const registry = readForkRegistry({ strict: true, file });
 		const changed = mutator(registry) !== false;
-		if (changed) writeForkRegistry(registry);
+		if (changed) writeForkRegistry(registry, { file });
 		return true;
 	} catch (error) {
 		if (options.required) throw new Error(`could not update the fork registry: ${error.message ?? error}`);
 		return false;
 	} finally {
-		if (locked) fs.rmSync(lock, { recursive: true, force: true });
+		releaseLock?.();
+	}
+}
+
+function legacyForkRegistryMigrationMarkerPath(sourcePath) {
+	return `${sourcePath}.migration-complete`;
+}
+
+function readLegacyForkRegistryMigrationMarker(sourcePath, targetPath) {
+	const markerPath = legacyForkRegistryMigrationMarkerPath(sourcePath);
+	let stat;
+	try {
+		stat = fs.lstatSync(markerPath);
+	} catch (error) {
+		if (error?.code === "ENOENT") return undefined;
+		throw new Error(`could not inspect the legacy fork migration marker: ${error.message ?? error}`);
+	}
+	if (stat.isSymbolicLink() || !stat.isFile()) {
+		throw new Error("the legacy fork migration marker is not a regular file");
+	}
+	let marker;
+	try {
+		marker = JSON.parse(fs.readFileSync(markerPath, "utf8"));
+	} catch (error) {
+		throw new Error(`could not read the legacy fork migration marker: ${error.message ?? error}`);
+	}
+	if (![1, 2].includes(marker?.version) || path.resolve(String(marker.target ?? "")) !== targetPath) {
+		throw new Error("the legacy fork migration marker does not match the active shared registry");
+	}
+	if (marker.version === 1) {
+		// Version 1 recorded only that a snapshot had been consumed. Import a
+		// recreated source once before upgrading it: this may conservatively restore
+		// an old label, but it must not permanently strand lineage created by a
+		// pre-upgrade process after the v1 marker was published.
+		return { version: 1, consumedForks: new Set(), consumedParentRelations: new Set() };
+	}
+	if (!Array.isArray(marker.consumedForks) || !Array.isArray(marker.consumedParentRelations)) {
+		throw new Error("the legacy fork migration marker has invalid consumed lineage");
+	}
+	const consumedForks = new Set();
+	for (const id of marker.consumedForks) {
+		if (typeof id !== "string" || !id) {
+			throw new Error("the legacy fork migration marker has invalid consumed lineage");
+		}
+		consumedForks.add(id);
+	}
+	const consumedParentRelations = new Set();
+	for (const relation of marker.consumedParentRelations) {
+		if (
+			!Array.isArray(relation) ||
+			relation.length !== 2 ||
+			typeof relation[0] !== "string" ||
+			!relation[0] ||
+			typeof relation[1] !== "string" ||
+			!relation[1] ||
+			relation[0] === relation[1]
+		) {
+			throw new Error("the legacy fork migration marker has invalid consumed lineage");
+		}
+		consumedParentRelations.add(JSON.stringify(relation));
+	}
+	return { version: 2, consumedForks, consumedParentRelations };
+}
+
+function writeLegacyForkRegistryMigrationMarker(sourcePath, targetPath, consumedForks, consumedParentRelations) {
+	const markerPath = legacyForkRegistryMigrationMarkerPath(sourcePath);
+	const temporary = path.join(
+		path.dirname(markerPath),
+		`.${path.basename(markerPath)}.${process.pid}.${randomUUID()}.tmp`,
+	);
+	try {
+		fs.writeFileSync(
+			temporary,
+			`${JSON.stringify({
+				version: 2,
+				target: targetPath,
+				completedAt: new Date().toISOString(),
+				consumedForks: [...consumedForks],
+				consumedParentRelations: [...consumedParentRelations].map((relation) => JSON.parse(relation)),
+			})}\n`,
+			{ flag: "wx", mode: 0o600 },
+		);
+		fs.renameSync(temporary, markerPath);
+	} finally {
+		try { fs.rmSync(temporary, { force: true }); } catch {}
+	}
+}
+
+export async function migrateLegacyForkRegistry(options = {}) {
+	const requestedSource = options.sourcePath ?? process.env.CC_FORKS_MIGRATE_FROM;
+	if (typeof requestedSource !== "string" || !requestedSource.trim()) return false;
+	const sourcePath = path.resolve(requestedSource);
+	const targetPath = path.resolve(options.targetPath ?? forksPath());
+	if (sourcePath === targetPath) return false;
+
+	let sourceStat;
+	try {
+		sourceStat = fs.lstatSync(sourcePath);
+	} catch (error) {
+		if (error?.code === "ENOENT") return false;
+		throw new Error(`could not inspect the legacy fork registry: ${error.message ?? error}`);
+	}
+	if (sourceStat.isSymbolicLink() || !sourceStat.isFile()) {
+		throw new Error("the legacy fork registry is not a regular file");
+	}
+
+	const releaseOperation = await acquireForkOperationLock({ operation: "migrate legacy beta fork registry" });
+	let releaseSourceLock;
+	try {
+		// Old beta processes use this same registry lock for their atomic writes.
+		// Holding it across read, marker publication, and source removal prevents us
+		// from deleting a newer snapshot that appeared after the one we consumed.
+		releaseSourceLock = acquireForkRegistryLock(`${sourcePath}.lock`, options);
+		let legacyRegistry;
+		try {
+			const currentSourceStat = fs.lstatSync(sourcePath);
+			if (currentSourceStat.isSymbolicLink() || !currentSourceStat.isFile()) {
+				throw new Error("the legacy fork registry is not a regular file");
+			}
+			legacyRegistry = normalizeForkRegistry(JSON.parse(fs.readFileSync(sourcePath, "utf8")));
+		} catch (error) {
+			if (error?.code === "ENOENT") return false;
+			throw new Error(`could not read the legacy fork registry: ${error.message ?? error}`);
+		}
+		const marker = readLegacyForkRegistryMigrationMarker(sourcePath, targetPath);
+		const consumedForks = marker?.consumedForks ?? new Set();
+		const consumedParentRelations = marker?.consumedParentRelations ?? new Set();
+		const newForks = legacyRegistry.forks.filter((id) => !consumedForks.has(id));
+		const newParentRelations = Object.entries(legacyRegistry.parents).filter(
+			([child, parent]) => !consumedParentRelations.has(JSON.stringify([child, parent])),
+		);
+		updateForkRegistry((registry) => {
+			let changed = false;
+			for (const id of newForks) {
+				if (registry.forks.includes(id)) continue;
+				registry.forks.push(id);
+				changed = true;
+			}
+			for (const [child, parent] of newParentRelations) {
+				// Shared state is already authoritative if both channels recorded a
+				// relation for the same child. Import only missing lineage.
+				if (registry.parents[child] !== undefined) continue;
+				registry.parents[child] = parent;
+				changed = true;
+			}
+			return changed;
+		}, { required: true, file: targetPath });
+		for (const id of legacyRegistry.forks) consumedForks.add(id);
+		for (const relation of Object.entries(legacyRegistry.parents)) {
+			consumedParentRelations.add(JSON.stringify(relation));
+		}
+		writeLegacyForkRegistryMigrationMarker(
+			sourcePath,
+			targetPath,
+			consumedForks,
+			consumedParentRelations,
+		);
+		// A still-running old process can recreate this file after releasing the
+		// lock. A later launch will consume only lineage absent from the cumulative
+		// marker, so stale snapshots cannot resurrect shared deletions. Marker
+		// publication is the durable commit; an unlink permission failure must not
+		// make every future cc startup fail.
+		try {
+			options._testBeforeLegacySourceRemoval?.({ sourcePath });
+			fs.rmSync(sourcePath, { force: true });
+		} catch {}
+		return newForks.length > 0 || newParentRelations.length > 0;
+	} finally {
+		releaseSourceLock?.();
+		releaseOperation();
 	}
 }
 
@@ -18601,7 +20112,7 @@ export function recordForkId(sessionId, parentSessionId = undefined, options = {
 			changed = true;
 		}
 		return changed;
-	}, { required: options.required === true || Boolean(parentSessionId) });
+	}, { ...options, required: options.required === true || Boolean(parentSessionId) });
 }
 
 export function forgetForkIds(sessionIds, options = {}) {
@@ -18904,6 +20415,7 @@ export async function runCli(args = process.argv.slice(2)) {
 		process.exit(0);
 	}
 
+	await migrateLegacyForkRegistry();
 	const config = loadConfig();
 	if (args.includes("--list")) {
 		for (const [key, agent] of Object.entries(config.agents)) {
@@ -18920,9 +20432,47 @@ export async function runCli(args = process.argv.slice(2)) {
 		cachePath: backendCommandCachePath(),
 	});
 	const app = new HarnessApp(config, initialAgent, undefined, { backendCommandCatalog });
+	const stopAfterTerminalLoss = (exitCode = 0) => {
+		void app.stop({
+			skipUiStop: true,
+			suppressShutdownError: true,
+			exit: (shutdownCode) => process.exit(Math.max(exitCode, shutdownCode)),
+		}).catch(() => process.exit(1));
+	};
+	// stdout/stderr are TTY streams and emit EIO when their terminal disappears.
+	// Register while the terminal is still valid so Node never tries to construct a
+	// replacement TTY wrapper while reporting an unhandled stream error after HUP.
+	for (const stream of [process.stdout, process.stderr]) {
+		stream.on("error", (error) => {
+			if (["EIO", "EPIPE", "ENXIO", "ERR_STREAM_DESTROYED"].includes(error?.code)) {
+				stopAfterTerminalLoss();
+				return;
+			}
+			// An unexpected asynchronous stream error cannot be routed through runCli's
+			// promise rejection handler. Throwing here would bypass backend teardown and
+			// can orphan an ACP process tree, so fail nonzero through the same safe stop.
+			stopAfterTerminalLoss(1);
+		});
+	}
 	process.on("SIGINT", () => app.handleInterrupt("signal"));
 	for (const signal of ["SIGTERM", "SIGHUP"]) {
-		process.once(signal, () => app.stop());
+		process.once(signal, () => {
+			const terminalLost = signal === "SIGHUP";
+			void app.stop({ skipUiStop: terminalLost, suppressShutdownError: terminalLost }).catch((error) => {
+				// stopAndExit normally owns process.exit. This is the last-resort path
+				// for an unexpected teardown exception, where leaving a live TUI process
+				// behind is worse than returning a nonzero status immediately.
+				if (terminalLost) {
+					process.exit(1);
+					return;
+				}
+				try {
+					process.stderr.write(`cc: shutdown failed: ${oneLine(error?.message ?? error)}\n`);
+				} finally {
+					process.exit(1);
+				}
+			});
+		});
 	}
 	await app.start();
 }

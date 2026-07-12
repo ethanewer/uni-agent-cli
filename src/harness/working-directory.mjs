@@ -107,12 +107,8 @@ export function normalizeChangeWorkingDirectoryResponse(value) {
 
 /** Resolve a user-facing /cd argument and validate it before contacting ACP. */
 export function resolveWorkingDirectoryTarget(argument, cwd = process.cwd()) {
-	let value = String(argument ?? "").trim();
+	let value = normalizeWorkingDirectoryArgument(String(argument ?? "").trim());
 	if (!value) throw new Error("usage: /cd <path>");
-	if (
-		(value.startsWith('"') && value.endsWith('"')) ||
-		(value.startsWith("'") && value.endsWith("'"))
-	) value = value.slice(1, -1);
 	if (!value || value.length > WORKING_DIRECTORY_PATH_MAX_CHARS || containsUnsafeProtocolText(value)) {
 		throw new Error("The directory path is empty, too long, or contains control characters");
 	}
@@ -146,7 +142,14 @@ export function directoryCompletionMatches(prefix, cwd = process.cwd(), options 
 	let typed = String(prefix ?? "");
 	const quoted = typed.startsWith('"');
 	if (quoted) typed = typed.slice(1);
-	if (typed.endsWith('"')) typed = typed.slice(0, -1);
+	const hasOuterClosingQuote = quoted && typed.endsWith('"');
+	if (hasOuterClosingQuote) typed = typed.slice(0, -1);
+	// Pi normally leaves the cursor just before a completed directory's closing
+	// quote. Some terminals/editors instead place it after the quote, so continued
+	// typing produces `"parent dir/"child`. Treat that one completion-generated
+	// quote as a path boundary; subsequent completion and direct Enter then behave
+	// exactly like the cursor-before-quote form.
+	if (quoted && !hasOuterClosingQuote) typed = removeCompletedDirectoryQuote(typed);
 	if (typed.length > WORKING_DIRECTORY_PATH_MAX_CHARS || containsUnsafeProtocolText(typed)) return [];
 
 	const homePrefix = typed === "~" || /^~[\\/]/u.test(typed);
@@ -194,6 +197,24 @@ export function directoryCompletionMatches(prefix, cwd = process.cwd(), options 
 		if (results.length >= limit) break;
 	}
 	return results;
+}
+
+function normalizeWorkingDirectoryArgument(value) {
+	if (value.startsWith("'") && value.endsWith("'")) return value.slice(1, -1);
+	if (!value.startsWith('"')) return value;
+	const hasOuterClosingQuote = value.length > 1 && value.endsWith('"');
+	const body = value.slice(1, hasOuterClosingQuote ? -1 : undefined);
+	if (hasOuterClosingQuote) return body;
+	const continued = removeCompletedDirectoryQuote(body);
+	// Preserve an unmatched user-authored quote so normal path validation reports
+	// it faithfully. Only a balanced quoted argument or the recognizable
+	// completion-generated `/<quote>suffix` form is unwrapped.
+	return continued !== body ? continued : value;
+}
+
+function removeCompletedDirectoryQuote(value) {
+	const continued = /^([\s\S]*[\\/])"([^"\r\n]*)$/u.exec(value);
+	return continued ? `${continued[1]}${continued[2]}` : value;
 }
 
 function safeAbsoluteResponsePath(value, field) {

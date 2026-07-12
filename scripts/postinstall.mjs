@@ -36,6 +36,138 @@ function packageDirectory(nodeModules, packageName) {
 	return path.join(nodeModules, ...packageName.split("/"));
 }
 
+function installedDependencyDirectory(nodeModules, packageName, owners = []) {
+	const candidates = [
+		packageDirectory(nodeModules, packageName),
+		...owners.filter(Boolean).map((owner) => packageDirectory(path.join(owner, "node_modules"), packageName)),
+	];
+	return candidates.find((candidate) => Boolean(readJson(path.join(candidate, "package.json"))));
+}
+
+function nativePlatformPackageNames(options = {}) {
+	const platform = options.platform ?? process.platform;
+	const arch = options.arch ?? process.arch;
+	if (!["x64", "arm64"].includes(arch) || !["darwin", "linux", "win32"].includes(platform)) {
+		return { error: `unsupported native backend platform ${platform}-${arch}` };
+	}
+	let libc = options.libc;
+	if (platform === "linux" && !libc) {
+		libc = process.report?.getReport?.()?.header?.glibcVersionRuntime ? "glibc" : "musl";
+	}
+	const claudeSuffix = platform === "linux" && libc === "musl"
+		? `${platform}-${arch}-musl`
+		: `${platform}-${arch}`;
+	return {
+		platform,
+		claude: `@anthropic-ai/claude-agent-sdk-${claudeSuffix}`,
+		codex: `@openai/codex-${platform}-${arch}`,
+	};
+}
+
+function nativeFailure(key, packageName, reason) {
+	return { key, kind: "native-payload", packageName, ok: false, reason };
+}
+
+function executableFile(file, platform) {
+	try {
+		if (!fs.statSync(file).isFile()) return false;
+		fs.accessSync(file, platform === "win32" ? fs.constants.F_OK : fs.constants.X_OK);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function expectedOptionalPackage(aliasName, specification) {
+	if (typeof specification !== "string" || !specification.trim()) return undefined;
+	if (!specification.startsWith("npm:")) return { name: aliasName, version: specification };
+	const target = specification.slice(4);
+	const separator = target.lastIndexOf("@");
+	if (separator <= 0 || separator === target.length - 1) return undefined;
+	return { name: target.slice(0, separator), version: target.slice(separator + 1) };
+}
+
+function nativePackageMismatch(packageDir, aliasName, specification) {
+	const expected = expectedOptionalPackage(aliasName, specification);
+	const manifest = packageDir && readJson(path.join(packageDir, "package.json"));
+	if (!expected) return `the parent package declares an unsupported optional dependency specifier: ${specification}`;
+	if (!manifest) return "optional native package is missing or has no readable manifest";
+	if (manifest.name !== expected.name || manifest.version !== expected.version) {
+		return `optional native package identity/version mismatch (expected ${expected.name}@${expected.version}, found ${manifest.name ?? "unknown"}@${manifest.version ?? "unknown"})`;
+	}
+	return undefined;
+}
+
+/** Verify the optional platform packages required by the pinned JS adapters. */
+export function inspectLocalNativePayloads(nodeModules = LOCAL_NODE_MODULES, options = {}) {
+	const names = nativePlatformPackageNames(options);
+	if (names.error) {
+		return [
+			nativeFailure("claude", "@anthropic-ai/claude-agent-sdk", names.error),
+			nativeFailure("codex", "@openai/codex", names.error),
+		];
+	}
+	const claudeAdapter = packageDirectory(nodeModules, BUNDLED_ACP_ADAPTERS.claude.packageName);
+	const codexAdapter = packageDirectory(nodeModules, BUNDLED_ACP_ADAPTERS.codex.packageName);
+	const claudeSdk = installedDependencyDirectory(
+		nodeModules,
+		"@anthropic-ai/claude-agent-sdk",
+		[claudeAdapter],
+	);
+	const codexCli = installedDependencyDirectory(nodeModules, "@openai/codex", [codexAdapter]);
+	const results = [];
+
+	if (!claudeSdk) {
+		results.push(nativeFailure("claude", names.claude, "@anthropic-ai/claude-agent-sdk is missing"));
+	} else {
+		const manifest = readJson(path.join(claudeSdk, "package.json"));
+		if (!Object.hasOwn(manifest?.optionalDependencies ?? {}, names.claude)) {
+			results.push(nativeFailure("claude", names.claude, "the Claude Agent SDK does not declare this platform payload"));
+		} else {
+			const packageDir = installedDependencyDirectory(nodeModules, names.claude, [claudeSdk]);
+			const mismatch = nativePackageMismatch(
+				packageDir,
+				names.claude,
+				manifest.optionalDependencies[names.claude],
+			);
+			const binary = packageDir && path.join(packageDir, names.platform === "win32" ? "claude.exe" : "claude");
+			results.push(!mismatch && binary && executableFile(binary, names.platform)
+				? { key: "claude", kind: "native-payload", packageName: names.claude, ok: true, packageDir, binary }
+				: nativeFailure("claude", names.claude, mismatch ?? "optional native package or executable is missing"));
+		}
+	}
+
+	if (!codexCli) {
+		results.push(nativeFailure("codex", names.codex, "@openai/codex is missing"));
+	} else {
+		const manifest = readJson(path.join(codexCli, "package.json"));
+		if (!Object.hasOwn(manifest?.optionalDependencies ?? {}, names.codex)) {
+			results.push(nativeFailure("codex", names.codex, "the Codex CLI does not declare this platform payload"));
+		} else {
+			const packageDir = installedDependencyDirectory(nodeModules, names.codex, [codexCli]);
+			const mismatch = nativePackageMismatch(
+				packageDir,
+				names.codex,
+				manifest.optionalDependencies[names.codex],
+			);
+			let binary;
+			try {
+				if (mismatch) throw new Error(mismatch);
+				const vendor = packageDir && path.join(packageDir, "vendor");
+				const binaryName = names.platform === "win32" ? "codex.exe" : "codex";
+				binary = fs.readdirSync(vendor, { withFileTypes: true })
+					.filter((entry) => entry.isDirectory())
+					.map((entry) => path.join(vendor, entry.name, "bin", binaryName))
+					.find((candidate) => executableFile(candidate, names.platform));
+			} catch {}
+			results.push(!mismatch && binary
+				? { key: "codex", kind: "native-payload", packageName: names.codex, ok: true, packageDir, binary }
+				: nativeFailure("codex", names.codex, mismatch ?? "optional native package or executable is missing"));
+		}
+	}
+	return results;
+}
+
 /**
  * Verify package identity, exact version, and its declared binary entrypoint.
  * This function is read-only and accepts a node_modules root for tests and
@@ -84,15 +216,26 @@ function disabled(env = process.env) {
 
 export function verifyPostinstall(options = {}) {
 	if (disabled(options.env)) return [];
-	const results = inspectLocalAdapters(options.nodeModules, options.adapters);
+	const environment = options.env ?? process.env;
+	const nodeModules = options.nodeModules ?? LOCAL_NODE_MODULES;
+	const results = [
+		...inspectLocalAdapters(nodeModules, options.adapters),
+		...(options.inspectNative === false ? [] : inspectLocalNativePayloads(nodeModules, options.nativeOptions)),
+	];
 	const failed = results.filter((result) => !result.ok);
 	if (failed.length > 0 && options.report !== false) {
 		const details = failed
-			.map((result) => `  - ${result.packageName}@${result.version}: ${result.reason}`)
+			.map((result) => `  - ${result.packageName}${result.version ? `@${result.version}` : ""}: ${result.reason}`)
 			.join("\n");
+		const globalValue = String(environment.npm_config_global ?? environment.NPM_CONFIG_GLOBAL ?? "").toLowerCase();
+		const globalInstall = globalValue === "true" || globalValue === "1";
+		const reinstall = globalInstall
+			? "Re-run the original global cc install command with `--include=optional` (for a registry install, `npm install -g cc --include=optional`). "
+			: "From the cc package/project directory, run `npm install --include=optional`, or re-run the original install command with that flag. ";
 		console.warn(
-			`cc: this installation is missing a pinned package-local ACP adapter:\n${details}\n` +
-			"Reinstall cc with npm. No global packages were changed.",
+			`cc: this installation is missing a required package-local ACP component:\n${details}\n` +
+			reinstall +
+			"If npm's omit config contains `optional`, remove it first. No global packages were changed.",
 		);
 	}
 	return results;

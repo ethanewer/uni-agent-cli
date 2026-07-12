@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+	CC_NATIVE_INPUT_CONTEXT,
 	CC_UNBOUND_ACTION,
 	CcKeybindingDispatcher,
 	ccKeybindingsPath,
@@ -46,6 +47,13 @@ assert.match(normalizeCcKeyStroke("hyper+k").error, /unknown modifier/);
 	assert.ok(result.actionBindings.some((binding) =>
 		binding.context === "Global" && binding.key === "ctrl+t" && binding.action === "cc.app.toggleTodos" && binding.default));
 	assert.deepEqual(result.warnings, []);
+	const dispatcher = new CcKeybindingDispatcher(result);
+	assert.deepEqual(
+		dispatcher.handle("\r", ["Autocomplete", "Chat", "Global"]),
+		{ consume: false },
+		"without a lower collision, native autocomplete keeps Pi's exact accept-and-submit behavior",
+	);
+	dispatcher.dispose();
 }
 
 {
@@ -70,10 +78,10 @@ assert.match(normalizeCcKeyStroke("hyper+k").error, /unknown modifier/);
 			},
 		],
 	});
-	assert.deepEqual(result.userBindings["tui.input.newLine"], ["alt+enter", "enter", "ctrl+k"]);
-	assert.deepEqual(result.userBindings["tui.input.submit"], ["ctrl+q"]);
-	assert.deepEqual(result.userBindings["tui.editor.deleteToLineStart"], []);
-	assert.deepEqual(result.userBindings["tui.editor.deleteToLineEnd"], []);
+	assert.deepEqual(result.userBindings["tui.input.newLine"], ["shift+enter", "alt+enter"]);
+	assert.equal(result.userBindings["tui.input.submit"], undefined);
+	assert.equal(result.userBindings["tui.editor.deleteToLineStart"], undefined);
+	assert.equal(result.userBindings["tui.editor.deleteToLineEnd"], undefined);
 	assert.ok(result.actionBindings.some((binding) =>
 		binding.context === "Autocomplete" && binding.key === "ctrl+n" && binding.action === "tui.select.down"));
 	assert.ok(result.actionBindings.some((binding) =>
@@ -107,7 +115,7 @@ assert.match(normalizeCcKeyStroke("hyper+k").error, /unknown modifier/);
 	assert.ok(result.warnings.some((warning) => /chat:clearScreen.*not supported/.test(warning)));
 	assert.ok(result.warnings.some((warning) => /task:kill.*not supported/.test(warning)));
 	assert.ok(result.warnings.some((warning) => /not supported/.test(warning)));
-	assert.ok(result.userBindings["tui.input.newLine"].includes("ctrl+b"));
+	assert.equal(result.userBindings["tui.input.newLine"].includes("ctrl+b"), false);
 }
 
 {
@@ -163,6 +171,89 @@ assert.match(normalizeCcKeyStroke("hyper+k").error, /unknown modifier/);
 }
 
 {
+	// Active components retain their native keys ahead of lower Chat/Global
+	// bindings. In particular, Pi's autocomplete Enter both completes and submits
+	// slash commands, so it must pass through rather than becoming host newline.
+	const result = compileCcKeybindings({
+		bindings: [
+			{ context: "Global", bindings: { enter: "app:redraw", j: "app:toggleTodos", x: "app:redraw" } },
+			{ context: "Chat", bindings: { enter: "chat:newline", backspace: "chat:fastMode", "tab x": "chat:submit" } },
+		],
+	});
+	const dispatcher = new CcKeybindingDispatcher(result);
+	assert.deepEqual(dispatcher.handle("\r", ["Autocomplete", "Chat", "Global"]), { consume: false });
+	assert.deepEqual(dispatcher.handle("\t", ["Autocomplete", "Chat", "Global"]), { consume: false });
+	assert.deepEqual(dispatcher.handle("j", ["Autocomplete", "Chat", "Global"]), { consume: false });
+	assert.deepEqual(dispatcher.handle("x", ["Autocomplete", "Chat", "Global"]), { consume: false });
+	assert.deepEqual(dispatcher.handle("\x7f", ["Autocomplete", "Chat", "Global"]), { consume: false });
+	assert.equal(dispatcher.handle("\r", ["Chat", "Global"]).action, "tui.input.newLine");
+	assert.deepEqual(dispatcher.handle("\r", ["Select", "Global"]), { consume: false });
+	assert.deepEqual(dispatcher.handle("j", ["Select", "Global"]), { consume: false });
+	assert.deepEqual(dispatcher.handle("\x1b[6~", ["Select", "Global"]), { consume: false });
+	assert.deepEqual(dispatcher.handle("x", [CC_NATIVE_INPUT_CONTEXT, "Global"]), { consume: false });
+	assert.deepEqual(dispatcher.handle("\x7f", [CC_NATIVE_INPUT_CONTEXT, "Global"]), { consume: false });
+	dispatcher.dispose();
+}
+
+{
+	// A binding in the higher component context still replaces its default, and
+	// its chord keeps normal prefix/completion semantics.
+	const result = compileCcKeybindings({
+		bindings: [
+			{ context: "Autocomplete", bindings: { enter: "autocomplete:next", "tab x": "autocomplete:accept" } },
+			{ context: "Chat", bindings: { enter: "chat:newline", tab: "chat:submit" } },
+			{ context: "Select", bindings: { j: "select:next" } },
+		],
+	});
+	const dispatcher = new CcKeybindingDispatcher(result);
+	assert.equal(dispatcher.handle("\r", ["Autocomplete", "Chat", "Global"]).action, "tui.select.down");
+	assert.deepEqual(dispatcher.handle("\t", ["Autocomplete", "Chat", "Global"]), { consume: true, pending: true });
+	assert.equal(dispatcher.handle("x", ["Autocomplete", "Chat", "Global"]).action, "tui.select.confirm");
+	assert.equal(dispatcher.handle("j", ["Select", "Global"]).action, "cc.select.next");
+	dispatcher.dispose();
+}
+
+{
+	// Integration with Pi's real editor: a lower Chat Enter remap must not remain
+	// in the process-global key manager after slash autocomplete accepts a command.
+	const temporary = fs.mkdtempSync(path.join(os.tmpdir(), "cc-keybinding-autocomplete-integration-"));
+	try {
+		const file = path.join(temporary, "keybindings.json");
+		fs.writeFileSync(file, JSON.stringify({
+			bindings: [{ context: "Chat", bindings: { enter: "chat:newline" } }],
+		}));
+		const config = {
+			defaultAgent: "codex",
+			agents: { codex: { label: "Codex", transport: "acp", acp: { command: "codex-acp", args: [] } } },
+		};
+		const app = new HarnessApp(config, "codex", "acp", { keybindingsOptions: { file } });
+		try {
+			app.editor.setText("/r");
+			app.editor.autocompleteState = "regular";
+			app.editor.autocompletePrefix = "/r";
+			app.editor.autocompleteList = { getSelectedItem: () => ({ value: "/resume", label: "resume" }) };
+			app.editor.autocompleteProvider = {
+				applyCompletion: () => ({ lines: ["/resume"], cursorLine: 0, cursorCol: 7 }),
+			};
+			let submitted;
+			app.editor.onSubmit = (text) => { submitted = text; };
+			assert.deepEqual(
+				app.keybindingDispatcher.handle("\r", ["Autocomplete", "Chat", "Global"]),
+				{ consume: false },
+			);
+			app.editor.handleInput("\r");
+			assert.equal(submitted, "/resume");
+			assert.equal(app.editor.getText(), "", "autocomplete Enter submits instead of inserting a Chat newline");
+		} finally {
+			app.keybindingDispatcher.dispose();
+			app.voiceController?.dispose();
+		}
+	} finally {
+		fs.rmSync(temporary, { recursive: true, force: true });
+	}
+}
+
+{
 	const result = compileCcKeybindings({
 		bindings: [{
 			context: "Chat",
@@ -189,7 +280,11 @@ assert.match(normalizeCcKeyStroke("hyper+k").error, /unknown modifier/);
 	app.menuHandle = { keybindingContext: "Confirmation" };
 	assert.deepEqual(app.activeCcKeybindingContexts(), ["Confirmation", "Global"]);
 	app.menuHandle = { activeKeybindingContexts: () => [] };
-	assert.deepEqual(app.activeCcKeybindingContexts(), ["Global"], "free-text forms must not treat y/n as confirmation keys");
+	assert.deepEqual(
+		app.activeCcKeybindingContexts(),
+		[CC_NATIVE_INPUT_CONTEXT, "Global"],
+		"free-text forms keep native input priority without treating y/n as confirmation actions",
+	);
 }
 
 {
@@ -289,6 +384,13 @@ assert.match(normalizeCcKeyStroke("hyper+k").error, /unknown modifier/);
 	assert.equal(app.executeCcKeybindingAction("cc.chat.cancel"), true);
 	assert.equal(app.foregroundOperation, undefined, "Ctrl+C cancels the global foreground owner");
 	assert.equal(sideInterrupts, 0, "a focused /btw turn cannot steal foreground cancellation");
+	app.workingTreeMutationOperation = {
+		terminal: true,
+		label: "Codex Cloud apply may still be changing files; restart cc",
+	};
+	assert.equal(app.executeCcKeybindingAction("cc.app.toggleTodos"), true);
+	assert.equal(toggles, 0, "host shortcuts stay blocked after an unconfirmed Cloud apply");
+	assert.ok(notices.some((message) => /Restart cc before using this shortcut/u.test(message)));
 }
 
 {
@@ -391,7 +493,9 @@ try {
 	}));
 	const loaded = loadCcKeybindings({ file });
 	assert.equal(loaded.exists, true);
-	assert.ok(loaded.userBindings["tui.input.submit"].includes("ctrl+j"));
+	assert.equal(loaded.userBindings["tui.input.submit"], undefined);
+	assert.ok(loaded.actionBindings.some((binding) =>
+		binding.context === "Chat" && binding.key === "ctrl+j" && binding.action === "tui.input.submit"));
 	assert.match(formatCcKeybindingsStatus(loaded), /Chat ctrl\+j -> chat:submit/);
 
 	fs.writeFileSync(file, "{ nope");

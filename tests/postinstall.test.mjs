@@ -7,6 +7,7 @@ import {
 	REQUIRED_LOCAL_ADAPTERS,
 	inspectLocalAdapter,
 	inspectLocalAdapters,
+	inspectLocalNativePayloads,
 	verifyPostinstall,
 } from "../scripts/postinstall.mjs";
 
@@ -33,6 +34,10 @@ assert.match(launcher, /requires Node\.js 22 or newer/u);
 const installed = inspectLocalAdapters();
 assert.equal(installed.length, 2);
 assert.ok(installed.every((result) => result.ok), JSON.stringify(installed));
+const installedNative = inspectLocalNativePayloads();
+assert.equal(installedNative.length, 2);
+assert.ok(installedNative.every((result) => result.ok), JSON.stringify(installedNative));
+assert.ok(verifyPostinstall({ report: false }).every((result) => result.ok));
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "cc-postinstall-local-"));
 try {
@@ -81,7 +86,114 @@ try {
 	fs.rmSync(root, { recursive: true, force: true });
 }
 
+// Omitting npm optional dependencies leaves both JS adapters present but strips
+// the native executables they need. Verify that postinstall detects that exact
+// partial-install state and tells the user how to repair it.
+{
+	const nodeModules = fs.mkdtempSync(path.join(os.tmpdir(), "cc-postinstall-native-"));
+	const nativeOptions = { platform: "linux", arch: "x64", libc: "glibc" };
+	const claudeNativeName = "@anthropic-ai/claude-agent-sdk-linux-x64";
+	const codexNativeName = "@openai/codex-linux-x64";
+	const writePackage = (name, metadata) => {
+		const directory = path.join(nodeModules, ...name.split("/"));
+		fs.mkdirSync(directory, { recursive: true });
+		fs.writeFileSync(path.join(directory, "package.json"), JSON.stringify({ name, ...metadata }));
+		return directory;
+	};
+	try {
+		writePackage("@anthropic-ai/claude-agent-sdk", {
+			optionalDependencies: { [claudeNativeName]: "1.0.0" },
+		});
+		const claudeNative = writePackage(claudeNativeName, { version: "1.0.0" });
+		fs.writeFileSync(path.join(claudeNative, "claude"), "native\n", { mode: 0o755 });
+		fs.chmodSync(path.join(claudeNative, "claude"), 0o755);
+
+		writePackage("@openai/codex", {
+			optionalDependencies: { [codexNativeName]: "npm:@openai/codex@1.0.0-linux-x64" },
+		});
+		const codexNative = writePackage(codexNativeName, { name: "@openai/codex", version: "1.0.0-linux-x64" });
+		const codexBinary = path.join(codexNative, "vendor", "test-target", "bin", "codex");
+		fs.mkdirSync(path.dirname(codexBinary), { recursive: true });
+		fs.writeFileSync(codexBinary, "native\n", { mode: 0o755 });
+		fs.chmodSync(codexBinary, 0o755);
+
+		const complete = inspectLocalNativePayloads(nodeModules, nativeOptions);
+		assert.equal(complete.length, 2);
+		assert.ok(complete.every((result) => result.ok), JSON.stringify(complete));
+
+		fs.writeFileSync(path.join(claudeNative, "package.json"), JSON.stringify({
+			name: claudeNativeName,
+			version: "0.9.0",
+		}));
+		const staleClaude = inspectLocalNativePayloads(nodeModules, nativeOptions)
+			.find((result) => result.key === "claude");
+		assert.equal(staleClaude?.ok, false);
+		assert.match(staleClaude?.reason, /expected .*@1\.0\.0, found .*@0\.9\.0/u);
+		fs.writeFileSync(path.join(claudeNative, "package.json"), JSON.stringify({
+			name: claudeNativeName,
+			version: "1.0.0",
+		}));
+
+		fs.writeFileSync(path.join(codexNative, "package.json"), JSON.stringify({
+			name: "@openai/codex",
+			version: "1.0.0-linux-arm64",
+		}));
+		const staleCodex = inspectLocalNativePayloads(nodeModules, nativeOptions)
+			.find((result) => result.key === "codex");
+		assert.equal(staleCodex?.ok, false);
+		assert.match(staleCodex?.reason, /expected @openai\/codex@1\.0\.0-linux-x64/u);
+		fs.writeFileSync(path.join(codexNative, "package.json"), JSON.stringify({
+			name: "@openai/codex",
+			version: "1.0.0-linux-x64",
+		}));
+
+		fs.rmSync(claudeNative, { recursive: true, force: true });
+		const omitted = inspectLocalNativePayloads(nodeModules, nativeOptions);
+		assert.equal(omitted.find((result) => result.key === "claude")?.ok, false);
+		assert.match(omitted.find((result) => result.key === "claude")?.reason, /optional native package/u);
+		assert.equal(omitted.find((result) => result.key === "codex")?.ok, true);
+		fs.rmSync(codexNative, { recursive: true, force: true });
+		assert.ok(inspectLocalNativePayloads(nodeModules, nativeOptions).every((result) => !result.ok));
+
+		let warning = "";
+		const originalWarn = console.warn;
+		console.warn = (message) => { warning += String(message); };
+		try {
+			const results = verifyPostinstall({
+				nodeModules,
+				adapters: [],
+				nativeOptions,
+			});
+			assert.equal(results.some((result) => !result.ok), true);
+		} finally {
+			console.warn = originalWarn;
+		}
+		assert.match(warning, /npm install --include=optional/u);
+		assert.match(warning, /omit config contains `optional`/u);
+		assert.match(warning, /@anthropic-ai\/claude-agent-sdk-linux-x64/u);
+		assert.match(warning, /@openai\/codex-linux-x64/u);
+
+		let globalWarning = "";
+		console.warn = (message) => { globalWarning += String(message); };
+		try {
+			verifyPostinstall({
+				nodeModules,
+				adapters: [],
+				nativeOptions,
+				env: { npm_config_global: "true" },
+			});
+		} finally {
+			console.warn = originalWarn;
+		}
+		assert.match(globalWarning, /original global cc install command/u);
+		assert.match(globalWarning, /npm install -g cc --include=optional/u);
+		assert.doesNotMatch(globalWarning, /From the cc package\/project directory/u);
+	} finally {
+		fs.rmSync(nodeModules, { recursive: true, force: true });
+	}
+}
+
 const source = fs.readFileSync(new URL("../scripts/postinstall.mjs", import.meta.url), "utf8");
-assert.doesNotMatch(source, /npm\s+(?:install|uninstall)|spawnSync|execSync|@zed-industries/u);
+assert.doesNotMatch(source, /spawnSync|execSync|@zed-industries/u);
 
 console.log("postinstall: package-local verification only; no global migration");

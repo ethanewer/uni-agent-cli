@@ -24,6 +24,7 @@ import {
 	loadForkDescendantIds,
 	loadForkIds,
 	loadForkParents,
+	migrateLegacyForkRegistry,
 	mergeEnvironments,
 	recordForkId,
 	findConfigValue,
@@ -1031,6 +1032,109 @@ await (async () => {
 	await exiting;
 	assert.deepEqual(events.slice(-2), ["native:end", "exit:1"]);
 })();
+
+// Losing the controlling terminal can make the renderer's final restoration
+// throw during SIGHUP. Shutdown must still reap the backend and return instead
+// of leaving an orphaned cc process holding the revoked PTY open.
+await (async () => {
+	const events = [];
+	let releaseMain;
+	const mainGate = new Promise((resolve) => { releaseMain = resolve; });
+	const app = Object.create(HarnessApp.prototype);
+	Object.assign(app, {
+		client: {
+			async stopAndWait() {
+				events.push("main:start");
+				await mainGate;
+				events.push("main:end");
+			},
+		},
+		btwThread: undefined,
+		btwShutdownTail: undefined,
+		agentSwitchTail: undefined,
+		spinnerTimer: undefined,
+		markdownPreloadTimer: undefined,
+		startupConnectTimer: undefined,
+		voiceController: undefined,
+		clearCancelGraceTimer() {},
+		cancelPermissionPrompts() {},
+		ui: {
+			stop() {
+				events.push("ui:stop");
+				throw new Error("controlling terminal is gone");
+			},
+		},
+	});
+	const exiting = app.stopAndExit({ exit: (code) => events.push(`exit:${code}`) });
+	assert.deepEqual(events, ["main:start", "ui:stop"]);
+	releaseMain();
+	await exiting;
+	assert.deepEqual(events, ["main:start", "ui:stop", "main:end", "exit:1"]);
+})();
+
+// SIGHUP means the controlling terminal is already being revoked. Its shutdown
+// path skips terminal restoration (which can block inside open(2)) while still
+// waiting for backend ownership to settle before exiting.
+await (async () => {
+	const events = [];
+	const app = Object.create(HarnessApp.prototype);
+	Object.assign(app, {
+		client: { async stopAndWait() { events.push("main:stop"); } },
+		btwThread: { client: {} },
+		btwShutdownTail: undefined,
+		agentSwitchTail: undefined,
+		spinnerTimer: undefined,
+		markdownPreloadTimer: undefined,
+		startupConnectTimer: undefined,
+		voiceController: undefined,
+		clearCancelGraceTimer() {},
+		cancelPermissionPrompts(options) {
+			events.push(`permissions:cancel:${options.skipUi === true ? "no-ui" : "ui"}`);
+		},
+		closeBtw(options) {
+			events.push(`side:close:${options.skipUi === true ? "no-ui" : "ui"}`);
+			this.btwThread = undefined;
+			return Promise.resolve();
+		},
+		ui: { stop() { events.push("ui:stop"); } },
+	});
+	await app.stopAndExit({ skipUiStop: true, exit: (code) => events.push(`exit:${code}`) });
+	assert.deepEqual(events, ["permissions:cancel:no-ui", "side:close:no-ui", "main:stop", "exit:0"]);
+})();
+
+// Terminal-loss cancellation resolves every interactive request without asking
+// the revoked TUI to close or refocus its modal component.
+{
+	const outcomes = [];
+	const active = {
+		kind: "permission",
+		resolve: (outcome) => outcomes.push(["active", outcome]),
+	};
+	const queued = {
+		kind: "cursor",
+		method: "cursor/ask_question",
+		resolve: (outcome) => outcomes.push(["queued", outcome]),
+	};
+	const app = Object.create(HarnessApp.prototype);
+	Object.assign(app, {
+		permissionQueue: [queued],
+		permissionPromptActive: true,
+		activeInteractiveRequest: active,
+		menuHandle: {},
+		menuEditorText: "private input",
+		commandPanel: { clear() {} },
+		closeMenu: () => assert.fail("terminal-loss cancellation must not call the TUI"),
+	});
+	app.cancelPermissionPrompts({ skipUi: true });
+	assert.deepEqual(outcomes, [
+		["queued", { outcome: { outcome: "cancelled" } }],
+		["active", { outcome: "cancelled" }],
+	]);
+	assert.equal(app.permissionPromptActive, false);
+	assert.equal(app.activeInteractiveRequest, undefined);
+	assert.equal(app.menuHandle, undefined);
+	assert.equal(app.menuEditorText, undefined);
+}
 
 const config = {
 	defaultAgent: "codex",
@@ -2319,6 +2423,7 @@ await (async () => {
 		asyncPickerLoadCount: 0,
 		configUpdateCount: 0,
 		promptQueue: [],
+		addNotice() {},
 		updateSpinner() {},
 		schedulePromptQueueDrain() {},
 		ui: { requestRender() {} },
@@ -2387,10 +2492,19 @@ await (async () => {
 		app.promptQueue = [];
 		app.promptQueueDrainScheduled = false;
 		app.deferredLocalSlashCommands = [];
+		app.queuedInputOrder = 0;
 		app.activeToolIds = new Set();
 		app.activeAnonymousToolCount = 0;
 		app.pendingUserEchoes = [];
 		app.statusState = "";
+		app.connectionStatusOwner = undefined;
+		app.clipboardImages = [];
+		app.lastKnownEditorText = "";
+		app.editor = {
+			text: "",
+			getText() { return this.text; },
+			setText(text) { this.text = text; },
+		};
 		app.cancelPermissionPrompts = () => {};
 		app.closeMenu = () => {};
 		app.clearCancelGraceTimer = () => {};
@@ -2550,7 +2664,9 @@ await (async () => {
 		const fencedPromptSwitch = fatal.agentSwitchTail;
 		if (fencedPromptSwitch) await fencedPromptSwitch;
 		assert.equal(replacementInitializations, replacementInitializationsBeforeFatal, "queued prompts cannot bypass the fatal replacement fence");
-		assert.equal(fatal.promptQueue.at(-1).text, "must remain queued behind the fatal fence");
+		assert.deepEqual(fatal.promptQueue, [], "a fenced reconnect has no deliverable queue");
+		assert.equal(fatal.editor.getText(), "must remain queued behind the fatal fence");
+		assert.equal(fatal.statusState, "", "a blocked restart must not spin as connecting");
 		assert.ok(fatalErrors.some((message) => message.includes("restart cc")));
 
 		// A second switch arriving while the first is reaping must wait for the full
@@ -5068,38 +5184,470 @@ await (async () => {
 		const releaseAgain = await acquireForkOperationLock({ operation: "test reacquire", timeoutMs: 100 });
 		releaseAgain();
 
+		// Stable cc and beta cc2 share this lock. Its directory/owner.json shape must
+		// remain readable by the previous stable reaper even after the mtime exceeds
+		// that version's 30-second stale threshold.
+		const releaseCrossVersion = await acquireForkOperationLock({ operation: "test old stable compatibility" });
+		const crossVersionLock = `${process.env.CC_FORKS}.operation-lock`;
+		fs.utimesSync(crossVersionLock, new Date(0), new Date(0));
+		const oldReader = spawnSync(process.execPath, ["-e", `
+const fs = require("node:fs");
+const lock = process.argv[1];
+const hostname = process.argv[2];
+const stat = fs.statSync(lock);
+let owner;
+try { owner = JSON.parse(fs.readFileSync(lock + "/owner.json", "utf8")); } catch {}
+let alive;
+try { process.kill(Number(owner?.pid), 0); alive = true; }
+catch (error) { alive = error?.code === "EPERM" ? true : error?.code === "ESRCH" ? false : undefined; }
+const wouldReap = owner?.released === true || !(
+  owner?.hostname === hostname && alive === true
+) && !(alive === undefined && Date.now() - stat.mtimeMs < 30000);
+process.stdout.write(wouldReap ? "reap" : "keep");
+`, crossVersionLock, os.hostname()], { encoding: "utf8" });
+		assert.equal(oldReader.status, 0, oldReader.stderr);
+		assert.equal(oldReader.stdout, "keep", "the previous stable cc recognizes the new live owner PID");
+		releaseCrossVersion();
+
 		// A lock whose same-host owner is definitely gone is reclaimed immediately,
 		// rather than poisoning fork/delete operations for the rest of the process.
 		const abandonedLock = `${process.env.CC_FORKS}.operation-lock`;
 		const exitedOwner = spawnSync(process.execPath, ["-e", ""]);
-		fs.mkdirSync(abandonedLock);
-		fs.writeFileSync(path.join(abandonedLock, "owner.json"), `${JSON.stringify({
+		const writeOperationLockOwner = (owner) => {
+			fs.mkdirSync(abandonedLock);
+			fs.writeFileSync(path.join(abandonedLock, "owner.json"), `${JSON.stringify(owner)}\n`);
+		};
+		writeOperationLockOwner({
+			protocolVersion: 3,
 			pid: exitedOwner.pid,
 			hostname: os.hostname(),
 			token: "abandoned",
-		})}\n`);
+		});
 		const releaseRecovered = await acquireForkOperationLock({ operation: "test stale recovery", timeoutMs: 100 });
 		releaseRecovered();
 		assert.equal(fs.existsSync(abandonedLock), false);
 
-		// A holder that could not unlink its directory marks it released. That
+		// A holder that could not unlink its lock marks it released. That
 		// explicit handoff is reclaimable even if the hostname changed meanwhile.
-		fs.mkdirSync(abandonedLock);
-		fs.writeFileSync(path.join(abandonedLock, "owner.json"), `${JSON.stringify({
+		writeOperationLockOwner({
+			protocolVersion: 3,
 			pid: process.pid,
 			hostname: "previous-hostname",
 			token: "released",
 			released: true,
-		})}\n`);
+		});
 		const releaseMarked = await acquireForkOperationLock({ operation: "test released recovery", timeoutMs: 100 });
 		releaseMarked();
 		assert.equal(fs.existsSync(abandonedLock), false);
+
+		// The fixed mutation guard is exclusive. A second stale-lock reclaimer
+		// started from inside the first one's deterministic pre-rename hook must not
+		// enter its own mutation section before the first finishes.
+		writeOperationLockOwner({
+			protocolVersion: 3,
+			pid: exitedOwner.pid,
+			hostname: os.hostname(),
+			token: "stale-for-overlap",
+		});
+		let overlappingReclaim;
+		let overlapEnteredMutation = false;
+		const releaseAfterOverlap = await acquireForkOperationLock({
+			operation: "test exclusive mutation owner",
+			timeoutMs: 100,
+			_testBeforeReclaimRename({ lockPath }) {
+				assert.equal(fs.existsSync(`${lockPath}.mutation`), true);
+				overlappingReclaim ??= acquireForkOperationLock({
+					operation: "test overlapping reclaimer",
+					timeoutMs: 25,
+					_testBeforeReclaimRename() { overlapEnteredMutation = true; },
+				});
+			},
+		});
+		await assert.rejects(overlappingReclaim, /another cc process is changing Codex fork storage/);
+		assert.equal(overlapEnteredMutation, false);
+		releaseAfterOverlap();
+		assert.equal(fs.existsSync(`${abandonedLock}.mutation`), false);
+
+		// A process can die after publishing the mutation guard but before removing
+		// it. The recorded local PID makes that abandoned marker reclaimable instead
+		// of permanently poisoning every later operation.
+		const mutationMarker = `${abandonedLock}.mutation`;
+		const writeMutationMarker = (owner) => {
+			fs.writeFileSync(mutationMarker, `${JSON.stringify(owner)}\n`, { flag: "wx" });
+		};
+		writeMutationMarker({
+			protocolVersion: 3,
+			pid: exitedOwner.pid,
+			hostname: os.hostname(),
+			token: "abandoned-mutation",
+		});
+		const releaseAfterMutationCrash = await acquireForkOperationLock({
+			operation: "test abandoned mutation recovery",
+			timeoutMs: 100,
+		});
+		assert.equal(fs.existsSync(mutationMarker), false);
+		releaseAfterMutationCrash();
+
+		// Reclamation verifies the marker token after its atomic move. If a live
+		// successor replaces the stale marker between observation and rename, that
+		// successor is restored and the contender remains blocked.
+		writeMutationMarker({
+			protocolVersion: 3,
+			pid: exitedOwner.pid,
+			hostname: os.hostname(),
+			token: "stale-mutation-before-aba",
+		});
+		let mutationMarkerReplaced = false;
+		await assert.rejects(
+			acquireForkOperationLock({
+				operation: "test mutation marker ABA",
+				timeoutMs: 50,
+				_testBeforeMutationReclaimRename({ markerPath }) {
+					if (mutationMarkerReplaced) return;
+					mutationMarkerReplaced = true;
+					fs.rmSync(markerPath, { force: true });
+					fs.writeFileSync(markerPath, `${JSON.stringify({
+						protocolVersion: 3,
+						pid: process.pid,
+						hostname: os.hostname(),
+						token: "live-mutation-successor",
+					})}\n`, { flag: "wx" });
+				},
+			}),
+			/another cc process is changing Codex fork storage/,
+		);
+		assert.equal(mutationMarkerReplaced, true);
+		assert.equal(JSON.parse(fs.readFileSync(mutationMarker, "utf8")).token, "live-mutation-successor");
+		fs.rmSync(mutationMarker, { force: true });
+
+		// A mutation claimant also verifies its canonical token after publication.
+		// If a stale-marker reclaimer moves/replaces that publication, it never
+		// proceeds to rename the operation lock under lost ownership.
+		writeOperationLockOwner({
+			protocolVersion: 3,
+			pid: exitedOwner.pid,
+			hostname: os.hostname(),
+			token: "stale-lock-under-mutation-publication",
+		});
+		let mutationPublicationReplaced = false;
+		await assert.rejects(
+			acquireForkOperationLock({
+				operation: "test mutation publication ownership",
+				timeoutMs: 25,
+				_testAfterMutationPublish({ markerPath }) {
+					if (mutationPublicationReplaced) return;
+					mutationPublicationReplaced = true;
+					fs.rmSync(markerPath, { force: true });
+					fs.writeFileSync(markerPath, `${JSON.stringify({
+						protocolVersion: 3,
+						pid: process.pid,
+						hostname: os.hostname(),
+						token: "live-after-mutation-publication",
+					})}\n`, { flag: "wx" });
+				},
+			}),
+			/another cc process is changing Codex fork storage/,
+		);
+		assert.equal(mutationPublicationReplaced, true);
+		assert.equal(
+			JSON.parse(fs.readFileSync(path.join(abandonedLock, "owner.json"), "utf8")).token,
+			"stale-lock-under-mutation-publication",
+		);
+		assert.equal(JSON.parse(fs.readFileSync(mutationMarker, "utf8")).token, "live-after-mutation-publication");
+		fs.rmSync(mutationMarker, { force: true });
+		fs.rmSync(abandonedLock, { recursive: true, force: true });
+
+		// Ambiguous mutation owners remain fail-closed: a malformed marker, a
+		// foreign-host marker, or a live local owner cannot be stolen.
+		for (const marker of [
+			"not json\n",
+			`${JSON.stringify({ protocolVersion: 3, pid: exitedOwner.pid, hostname: "other-host", token: "foreign" })}\n`,
+			`${JSON.stringify({ protocolVersion: 3, pid: process.pid, hostname: os.hostname(), token: "live" })}\n`,
+		]) {
+			fs.writeFileSync(mutationMarker, marker, { flag: "wx" });
+			await assert.rejects(
+				acquireForkOperationLock({ operation: "test fail-closed mutation marker", timeoutMs: 25 }),
+				/another cc process is changing Codex fork storage/,
+			);
+			assert.equal(fs.readFileSync(mutationMarker, "utf8"), marker);
+			fs.rmSync(mutationMarker, { force: true });
+		}
+
+		// Reclamation verifies the token after atomically moving the lock. A
+		// successor that appears between the stale read and rename is restored, not
+		// deleted by the old owner's reaper (the classic ABA race).
+		writeOperationLockOwner({
+			protocolVersion: 3,
+			pid: exitedOwner.pid,
+			hostname: os.hostname(),
+			token: "stale-before-aba",
+		});
+		let replacedDuringReclaim = false;
+		await assert.rejects(
+			acquireForkOperationLock({
+				operation: "test ABA contender",
+				timeoutMs: 50,
+				_testBeforeReclaimRename({ lockPath }) {
+					if (replacedDuringReclaim) return;
+					replacedDuringReclaim = true;
+					fs.rmSync(lockPath, { recursive: true, force: true });
+					fs.mkdirSync(lockPath);
+					fs.writeFileSync(path.join(lockPath, "owner.json"), `${JSON.stringify({
+						protocolVersion: 3,
+						pid: process.pid,
+						hostname: os.hostname(),
+						token: "live-successor",
+					})}\n`);
+				},
+			}),
+			/another cc process is changing Codex fork storage/,
+		);
+		assert.equal(replacedDuringReclaim, true);
+		assert.equal(
+			JSON.parse(fs.readFileSync(path.join(abandonedLock, "owner.json"), "utf8")).token,
+			"live-successor",
+		);
+		fs.rmSync(abandonedLock, { recursive: true, force: true });
+
+		// Legacy mkdir-then-owner publication can be paused while owner.json is
+		// absent. Current reclaimers leave that ambiguous directory fail-closed.
+		fs.mkdirSync(abandonedLock);
+		await assert.rejects(
+			acquireForkOperationLock({ operation: "test ownerless legacy lock", timeoutMs: 25 }),
+			/another cc process is changing Codex fork storage/,
+		);
+		assert.equal(fs.existsSync(abandonedLock), true);
+		fs.rmSync(abandonedLock, { recursive: true, force: true });
+
+		// Deterministically pause an old stable publisher after its canonical mkdir.
+		// The new publisher's atomic mkdir loses with EEXIST and must preserve that
+		// ownerless old claim rather than replacing it with a candidate directory.
+		let oldOwnerlessInterleaved = false;
+		await assert.rejects(
+			acquireForkOperationLock({
+				operation: "test old ownerless publication interleave",
+				timeoutMs: 25,
+				_testBeforeOperationPublish({ lockPath }) {
+					if (oldOwnerlessInterleaved) return;
+					oldOwnerlessInterleaved = true;
+					fs.mkdirSync(lockPath);
+				},
+			}),
+			/another cc process is changing Codex fork storage/,
+		);
+		assert.equal(oldOwnerlessInterleaved, true);
+		assert.equal(fs.statSync(abandonedLock).isDirectory(), true);
+		assert.equal(fs.existsSync(path.join(abandonedLock, "owner.json")), false);
+		fs.rmSync(abandonedLock, { recursive: true, force: true });
+
+		// If the just-created directory is externally replaced before owner publish,
+		// failed cleanup validates dev/ino and token and leaves the successor intact.
+		let publicationClaimReplaced = false;
+		await assert.rejects(
+			acquireForkOperationLock({
+				operation: "test publication cleanup identity",
+				timeoutMs: 50,
+				_testAfterOperationMkdirBeforeOwner({ lockPath }) {
+					if (publicationClaimReplaced) return;
+					publicationClaimReplaced = true;
+					fs.rmSync(lockPath, { recursive: true, force: true });
+					fs.mkdirSync(lockPath);
+					fs.writeFileSync(path.join(lockPath, "owner.json"), `${JSON.stringify({
+						protocolVersion: 3,
+						pid: process.pid,
+						hostname: os.hostname(),
+						token: "publication-successor",
+					})}\n`);
+				},
+			}),
+			/another cc process is changing Codex fork storage/,
+		);
+		assert.equal(publicationClaimReplaced, true);
+		assert.equal(
+			JSON.parse(fs.readFileSync(path.join(abandonedLock, "owner.json"), "utf8")).token,
+			"publication-successor",
+		);
+		fs.rmSync(abandonedLock, { recursive: true, force: true });
+
+		// Registry writes use the same token-verified protocol, rather than the old
+		// mtime+rm lock that could delete a live successor after an ABA replacement.
+		const registryLock = `${process.env.CC_FORKS}.lock`;
+		fs.writeFileSync(registryLock, `${JSON.stringify({
+			protocolVersion: 3,
+			pid: exitedOwner.pid,
+			hostname: os.hostname(),
+			token: "stale-registry-owner",
+		})}\n`);
+		recordForkId("registry-lock-recovered", undefined, { required: true, timeoutMs: 100 });
+		assert.equal(loadForkIds().has("registry-lock-recovered"), true);
+		assert.equal(fs.existsSync(registryLock), false);
+
+		fs.writeFileSync(registryLock, `${JSON.stringify({
+			protocolVersion: 3,
+			pid: exitedOwner.pid,
+			hostname: os.hostname(),
+			token: "stale-registry-before-aba",
+		})}\n`);
+		let registryReplacedDuringReclaim = false;
+		assert.throws(
+			() => recordForkId("registry-write-must-not-run", undefined, {
+				required: true,
+				timeoutMs: 50,
+				_testBeforeReclaimRename({ lockPath }) {
+					if (registryReplacedDuringReclaim) return;
+					registryReplacedDuringReclaim = true;
+					fs.rmSync(lockPath, { force: true });
+					fs.writeFileSync(lockPath, `${JSON.stringify({
+						protocolVersion: 3,
+						pid: process.pid,
+						hostname: os.hostname(),
+						token: "live-registry-successor",
+					})}\n`);
+				},
+			}),
+			/could not update the fork registry.*timed out waiting for the fork registry lock/,
+		);
+		assert.equal(registryReplacedDuringReclaim, true);
+		assert.equal(JSON.parse(fs.readFileSync(registryLock, "utf8")).token, "live-registry-successor");
+		assert.equal(loadForkIds().has("registry-write-must-not-run"), false);
+		fs.rmSync(registryLock, { force: true });
 	} finally {
 		if (prev === undefined) delete process.env.CC_FORKS;
 		else process.env.CC_FORKS = prev;
 		fs.rmSync(dir, { recursive: true, force: true });
 	}
 }
+
+// The new beta launcher shares Codex fork lineage with stable. Import the old
+// isolated cc2 registry, preserve already-authoritative shared relations, and
+// consume cumulative deltas from old processes without reviving deleted forks.
+await (async () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "cc-beta-fork-migration-"));
+	const target = path.join(root, "shared", "forks.json");
+	const source = path.join(root, "channels", "beta", "state", "config", "forks.json");
+	const previousForks = process.env.CC_FORKS;
+	const previousMigrationSource = process.env.CC_FORKS_MIGRATE_FROM;
+	process.env.CC_FORKS = target;
+	process.env.CC_FORKS_MIGRATE_FROM = source;
+	try {
+		fs.mkdirSync(path.dirname(target), { recursive: true });
+		fs.mkdirSync(path.dirname(source), { recursive: true });
+		fs.writeFileSync(target, `${JSON.stringify({
+			version: 2,
+			forks: ["shared-only", "conflict-child"],
+			parents: { "conflict-child": "shared-parent" },
+		})}\n`);
+		const legacyContents = `${JSON.stringify({
+			version: 2,
+			forks: ["beta-only", "conflict-child", "beta-child", "late-lineage-child"],
+			parents: {
+				"conflict-child": "beta-parent",
+				"beta-child": "beta-root",
+			},
+		})}\n`;
+		fs.writeFileSync(source, legacyContents);
+
+		let removalAttempted = false;
+		assert.equal(await migrateLegacyForkRegistry({
+			_testBeforeLegacySourceRemoval() {
+				removalAttempted = true;
+				throw Object.assign(new Error("simulated unlink denial"), { code: "EACCES" });
+			},
+		}), true);
+		assert.equal(removalAttempted, true);
+		assert.equal(fs.existsSync(source), true, "source cleanup failure does not undo the durable marker");
+		assert.equal(fs.existsSync(`${source}.migration-complete`), true);
+		assert.equal(await migrateLegacyForkRegistry(), false, "the marked snapshot is not imported twice");
+		assert.equal(fs.existsSync(source), false, "the imported legacy registry is consumed");
+		assert.deepEqual(
+			new Set(loadForkIds()),
+			new Set(["shared-only", "conflict-child", "beta-only", "beta-child", "late-lineage-child"]),
+		);
+		assert.equal(loadForkParents().get("conflict-child"), "shared-parent");
+		assert.equal(loadForkParents().get("beta-child"), "beta-root");
+
+		forgetForkIds("beta-only", { required: true });
+		fs.writeFileSync(source, `${JSON.stringify({
+			version: 2,
+			forks: ["beta-only", "conflict-child", "beta-child", "late-lineage-child", "late-a"],
+			parents: {
+				"conflict-child": "beta-parent",
+				"beta-child": "beta-root",
+				"late-lineage-child": "late-root",
+				"late-a": "beta-child",
+			},
+		})}\n`);
+		fs.writeFileSync(`${source}.lock`, `${JSON.stringify({
+			protocolVersion: 3,
+			pid: process.pid,
+			hostname: os.hostname(),
+			token: "live-legacy-writer",
+		})}\n`);
+		await assert.rejects(
+			migrateLegacyForkRegistry({ timeoutMs: 25 }),
+			/timed out waiting for the fork registry lock/,
+		);
+		assert.equal(fs.existsSync(source), true, "migration never consumes a snapshot while an old writer owns it");
+		fs.rmSync(`${source}.lock`, { force: true });
+		assert.equal(await migrateLegacyForkRegistry(), true, "a late writer contributes new IDs and lineage");
+		assert.equal(loadForkIds().has("beta-only"), false, "a deleted fork is not re-added from a stale snapshot");
+		assert.equal(loadForkParents().get("late-lineage-child"), "late-root");
+		assert.equal(loadForkParents().get("late-a"), "beta-child");
+
+		forgetForkIds(["late-a", "late-lineage-child"], { required: true });
+		fs.writeFileSync(source, `${JSON.stringify({
+			version: 2,
+			forks: ["beta-only", "conflict-child", "beta-child", "late-lineage-child", "late-a", "late-b"],
+			parents: {
+				"conflict-child": "beta-parent",
+				"beta-child": "beta-root",
+				"late-lineage-child": "late-root",
+				"late-a": "beta-child",
+				"late-b": "late-root",
+			},
+		})}\n`);
+		assert.equal(await migrateLegacyForkRegistry(), true, "a second late writer contributes only unseen lineage");
+		assert.equal(loadForkIds().has("beta-only"), false);
+		assert.equal(loadForkIds().has("late-a"), false);
+		assert.equal(loadForkIds().has("late-lineage-child"), false);
+		assert.equal(loadForkParents().get("late-b"), "late-root");
+
+		// Replaying an entirely consumed snapshot is harmless and is consumed again.
+		fs.writeFileSync(source, legacyContents);
+		assert.equal(await migrateLegacyForkRegistry(), false);
+		assert.equal(fs.existsSync(source), false);
+		const marker = JSON.parse(fs.readFileSync(`${source}.migration-complete`, "utf8"));
+		assert.equal(marker.version, 2);
+		assert.equal(marker.consumedForks.includes("late-a"), true);
+		assert.equal(marker.consumedForks.includes("late-b"), true);
+		assert.equal(
+			marker.consumedParentRelations.some(([child, parent]) => child === "late-lineage-child" && parent === "late-root"),
+			true,
+		);
+
+		// Builds that already wrote the one-shot v1 marker still import the first
+		// recreated snapshot, then upgrade to cumulative tracking.
+		fs.writeFileSync(`${source}.migration-complete`, `${JSON.stringify({
+			version: 1,
+			target,
+			completedAt: new Date().toISOString(),
+		})}\n`);
+		fs.writeFileSync(source, `${JSON.stringify({
+			version: 2,
+			forks: ["v1-late-child"],
+			parents: { "v1-late-child": "v1-late-parent" },
+		})}\n`);
+		assert.equal(await migrateLegacyForkRegistry(), true);
+		assert.equal(loadForkParents().get("v1-late-child"), "v1-late-parent");
+		assert.equal(JSON.parse(fs.readFileSync(`${source}.migration-complete`, "utf8")).version, 2);
+	} finally {
+		if (previousForks === undefined) delete process.env.CC_FORKS;
+		else process.env.CC_FORKS = previousForks;
+		if (previousMigrationSource === undefined) delete process.env.CC_FORKS_MIGRATE_FROM;
+		else process.env.CC_FORKS_MIGRATE_FROM = previousMigrationSource;
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+})();
 
 // ACP feature negotiation: boolean config, URL elicitation, and client-run
 // terminal auth must be declared up front or agents omit those features.

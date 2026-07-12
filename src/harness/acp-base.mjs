@@ -301,6 +301,7 @@ export class BaseAcpAdapter {
 			// If stop() ran while initialize was pending it already retired this
 			// connection. Do not let the interrupted connect appear successful.
 			this.#assertLifecycleOpen();
+			await this.afterConnectionInitialized(connection, initialized, options);
 			return initialized;
 		} finally {
 			// Authentication methods arrive in the initialize response before a first
@@ -313,6 +314,14 @@ export class BaseAcpAdapter {
 	async newSession(options = {}) {
 		return this.connection.newSession(options);
 	}
+
+	// Harnesses with process-external session ownership can bind the session that
+	// initialize/session-new created without leaking storage details into the TUI.
+	async afterConnectionInitialized() {}
+
+	// Authentication reconnects retire a backend outside stop(). Give adapters a
+	// matching post-quiescence hook before a replacement process can be launched.
+	async afterConnectionsRetired() {}
 
 	async prompt(parts) {
 		return this.connection.prompt(parts);
@@ -423,6 +432,13 @@ export class BaseAcpAdapter {
 
 	async loadSession(sessionId, options = {}) {
 		return this.connection.loadSession(sessionId, options);
+	}
+
+	// Adapters with process-external session ownership can hold a guard across a
+	// load. The base is deliberately a no-op so the host keeps one interface and
+	// does not need harness-specific storage knowledge.
+	async acquireSessionLoadGuard() {
+		return () => true;
 	}
 
 	async deleteSession(sessionId) {
@@ -578,7 +594,7 @@ export class BaseAcpAdapter {
 		// reject the initial session/new until authenticate succeeds. Complete that
 		// interrupted startup here so a successful /login leaves the adapter ready to
 		// accept prompts instead of retaining an authenticated, sessionless connection.
-		if (this.connection === connection && !connection.sessionId) await connection.newSession();
+		if (this.connection === connection && !connection.sessionId) await this.newSession();
 		return result;
 	}
 
@@ -703,16 +719,17 @@ export class BaseAcpAdapter {
 				// Environment credentials are inherited at spawn time. Do not launch the
 				// replacement until every old connection has either exited gracefully or
 				// been force-killed with its complete process tree confirmed gone.
-				try {
-					await this.stopConnections([connectionToRetire, currentConnection]);
+					try {
+						await this.stopConnections([connectionToRetire, currentConnection]);
 				} catch (error) {
 					if (error?.code === "PROCESS_TREE_TERMINATION_FAILED") {
 						this.replacementProcessFence ??= error;
 						throw this.#replacementProcessFenceError();
 					}
-					throw error;
-				}
-				// stop() may have run while the retired process tree was settling. It
+						throw error;
+					}
+					await this.afterConnectionsRetired([connectionToRetire, currentConnection]);
+					// stop() may have run while the retired process tree was settling. It
 				// owns shutdown from that point onward, so neither credentials nor a new
 				// connection may be installed by this lifecycle turn.
 				this.#assertLifecycleOpen();

@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { HarnessApp } from "../src/pi-harness.mjs";
+import { BtwThread, HarnessApp, localSlashCommands } from "../src/pi-harness.mjs";
 
 function deferred() {
 	let resolve;
@@ -16,7 +16,7 @@ function deferred() {
 }
 
 async function waitFor(predicate, message) {
-	for (let attempt = 0; attempt < 100; attempt += 1) {
+	for (let attempt = 0; attempt < 300; attempt += 1) {
 		if (predicate()) return;
 		await new Promise((resolve) => setTimeout(resolve, 5));
 	}
@@ -67,6 +67,67 @@ function resumeFixture() {
 		openSelection(title, entries, onSelect) { selections.push({ title, entries, onSelect }); },
 	});
 	return { app, definition, notices, errors, selections };
+}
+
+function coldCommandFixture() {
+	const notices = [];
+	const commands = [];
+	const definition = { label: "Slow Fake", transport: "acp", acp: { command: "fake", args: [] } };
+	const app = Object.create(HarnessApp.prototype);
+	Object.assign(app, {
+		activeKey: "fake",
+		transport: "acp",
+		activeAgentGeneration: 0,
+		config: { agents: { fake: definition } },
+		client: undefined,
+		ready: false,
+		busy: false,
+		focusedThread: "main",
+		btwThread: undefined,
+		btwShutdownTail: undefined,
+		replacementProcessFence: undefined,
+		foregroundOperation: undefined,
+		foregroundOperationSequence: 0,
+		connectionStatusOwner: undefined,
+		sessionSwitchInProgress: false,
+		selectionActionInProgress: false,
+		permissionPromptActive: false,
+		menuHandle: undefined,
+		configUpdateTokens: new Set(),
+		configUpdateCount: 0,
+		asyncPickerLoads: new Set(),
+		asyncPickerLoadCount: 0,
+		promptQueue: [],
+		deferredLocalSlashCommands: [],
+		flushingDeferredLocalSlashCommands: false,
+		queuedInputOrder: 0,
+		statusState: "",
+		activeShellInputCount: 0,
+		shellInputsRunning: 0,
+		clipboardImages: [],
+		lastKnownEditorText: "",
+		editor: {
+			text: "",
+			getText() { return this.text; },
+			setText(text) { this.text = text; },
+		},
+		sessionStates: new Map([["fake", {}]]),
+		availableCommands: new Map(),
+		commandsLoaded: new Set(),
+		themeName: "system",
+		ui: { requestRender() {} },
+		updateSpinner() {},
+		updateAutocomplete() {},
+		clearLiveBackendCommands() {},
+		resetConversationView() {},
+		clearConfigUpdates() {},
+		schedulePromptQueueDrain() {},
+		flushDeferredLocalSlashCommands: async () => {},
+		addCommandMessage(message) { commands.push(message); },
+		addNotice(message) { notices.push(message); },
+		addError(message) { notices.push(`error:${message}`); },
+	});
+	return { app, definition, notices, commands };
 }
 
 // /resume owns one visible operation continuously across a cold connection and
@@ -288,6 +349,267 @@ await (async () => {
 	app.foregroundOperation = newer;
 	assert.equal(app.endForegroundOperation(old), false);
 	assert.equal(app.foregroundOperation, newer);
+})();
+
+// Host capability commands remain local before ACP advertisements arrive. Each
+// handler joins the cold connection and validates the live capability instead
+// of forwarding a same-named slash prompt to an uninitialized backend.
+await (async () => {
+	const routed = coldCommandFixture();
+	const coldNames = new Set(localSlashCommands(routed.app).map((command) => command.name));
+	for (const name of ["cd", "branch", "tasks"]) {
+		assert.equal(coldNames.has(name), true, `/${name} should autocomplete before ACP startup`);
+		assert.equal(routed.app.slashCommandRoute(name), "local", `/${name} should retain host routing while cold`);
+	}
+
+	const cd = coldCommandFixture();
+	const cdConnections = [];
+	cd.app.ensureConnected = async (options) => {
+		cdConnections.push(options.commandName);
+		cd.app.client = {
+			exited: false,
+			sessionId: "cwd-session",
+			capabilities: { changeWorkingDirectory: true },
+		};
+		cd.app.ready = true;
+		return true;
+	};
+	cd.app.requestWorkingDirectoryChange = async () => ({ status: "rejected", message: "move rejected" });
+	await cd.app.runChangeWorkingDirectory(".");
+	assert.deepEqual(cdConnections, ["cd"]);
+	assert.ok(cd.notices.includes("move rejected"));
+
+	const tasks = coldCommandFixture();
+	const taskConnections = [];
+	tasks.app.ensureConnected = async (options) => {
+		taskConnections.push(options.commandName);
+		tasks.app.client = {
+			exited: false,
+			sessionId: "task-session",
+			capabilities: { backgroundTasks: true },
+			async listBackgroundTasks() { return { revision: 0, tasks: [], total: 0 }; },
+		};
+		tasks.app.ready = true;
+		return true;
+	};
+	await tasks.app.runBackgroundTasksCommand("");
+	assert.deepEqual(taskConnections, ["tasks"]);
+	assert.ok(tasks.notices.some((message) => message.includes("No background tasks")));
+
+	const branch = coldCommandFixture();
+	const branchConnections = [];
+	branch.app.ensureConnected = async (options) => {
+		branchConnections.push(options.commandName);
+		branch.app.client = {
+			exited: false,
+			sessionId: "branch-session",
+			capabilities: { fork: false },
+		};
+		branch.app.ready = true;
+		return true;
+	};
+	assert.equal(await branch.app.branchCurrentSession(), false);
+	assert.deepEqual(branchConnections, ["branch"]);
+	assert.ok(branch.notices.some((message) => message.includes("does not advertise session forking")));
+})();
+
+// A cold /btw owns the same visible startup lease as other capability commands.
+// Cancellation restores its original intent immediately and late connection
+// completion cannot open a side thread.
+await (async () => {
+	const fixture = coldCommandFixture();
+	const connect = deferred();
+	let connectOptions;
+	fixture.app.ensureConnected = async (options) => {
+		connectOptions = options;
+		await connect.promise;
+		fixture.app.client = {
+			exited: false,
+			sessionId: "main-session",
+			capabilities: { fork: true },
+		};
+		fixture.app.ready = true;
+		return true;
+	};
+	fixture.app.createRuntimeAdapter = () => assert.fail("cancelled /btw must not create a side adapter");
+	const opening = fixture.app.runBtw("inspect startup");
+	assert.equal(fixture.app.foregroundOperation?.commandName, "btw");
+	assert.equal(connectOptions.foregroundOperation, fixture.app.foregroundOperation);
+	fixture.app.editor.setText("newer draft");
+	fixture.app.lastKnownEditorText = "newer draft";
+	fixture.app.handleInterrupt("input");
+	assert.equal(fixture.app.editor.getText(), "/btw inspect startup\nnewer draft");
+	connect.resolve();
+	await opening;
+	assert.equal(fixture.app.btwThread, undefined);
+	assert.equal(fixture.commands.length, 0);
+})();
+
+// The main process must never load the exact session currently owned by the
+// live /btw ACP process.
+await (async () => {
+	const fixture = coldCommandFixture();
+	let loads = 0;
+	fixture.app.client = {
+		exited: false,
+		sessionId: "main-session",
+		async loadSession() { loads += 1; },
+	};
+	fixture.app.ready = true;
+	fixture.app.btwThread = { sessionId: "live-side-session", client: { sessionId: "live-side-session" } };
+	await fixture.app.resumeSelectedSession({ sessionId: "live-side-session", title: "Side" });
+	assert.equal(loads, 0);
+	assert.ok(fixture.notices.some((message) => message.includes("currently open in /btw")));
+})();
+
+// Adapter-owned cross-process guards reject a live Codex side rollout before
+// session/load, while still unwinding the host's transition gate cleanly.
+await (async () => {
+	const fixture = coldCommandFixture();
+	let loads = 0;
+	const leaseError = new Error(
+		"That Codex session is open in another cc process. Close its /btw side thread before resuming it here.",
+	);
+	leaseError.code = "CC_SESSION_LEASE_ACTIVE";
+	fixture.app.client = {
+		exited: false,
+		sessionId: "main-session",
+		async acquireSessionLoadGuard() { throw leaseError; },
+		async loadSession() { loads += 1; },
+	};
+	fixture.app.ready = true;
+	fixture.app.settleDeferredBtwPrompts = async () => {};
+	fixture.app.restoreFailedSessionSwitchInput = () => {};
+	await fixture.app.resumeSelectedSession({ sessionId: "cross-process-side", title: "Side elsewhere" });
+	assert.equal(loads, 0);
+	assert.equal(fixture.app.sessionSwitchInProgress, false);
+	assert.ok(fixture.notices.some((message) => message.includes("another cc process")));
+})();
+
+// Deferral is explicit in the transcript, so a picker that opens after a slow
+// session transition cannot look like an unrelated surprise.
+await (async () => {
+	const fixture = coldCommandFixture();
+	fixture.app.sessionSwitchInProgress = true;
+	await fixture.app.runLocalSlashCommand("resume", "");
+	assert.deepEqual(fixture.app.deferredLocalSlashCommands.map((entry) => entry.name), ["resume"]);
+	assert.ok(fixture.notices.some((message) => message === "Queued /resume until the current session transition finishes."));
+
+	const sideNotices = [];
+	const side = { addNotice(message) { sideNotices.push(message); } };
+	fixture.app.btwThread = side;
+	fixture.app.onThreadActivity = () => {};
+	fixture.app.deferLocalSlashCommand("model", "fast", {
+		targetThread: side,
+		reason: "the main transition finishes",
+	});
+	assert.deepEqual(sideNotices, ["Queued /model fast until the main transition finishes."]);
+	assert.equal(
+		fixture.notices.includes("Queued /model fast until the main transition finishes."),
+		false,
+		"a focused side deferral is explained in the visible side transcript",
+	);
+})();
+
+// A terminal replacement fence is checked even after a prior /btw shutdown
+// promise has settled and cleared. Neither listing nor direct loading may revive
+// a session that an unconfirmed side process could still own.
+await (async () => {
+	const fixture = coldCommandFixture();
+	const fence = new Error("old side process is still live");
+	fence.code = "PROCESS_TREE_TERMINATION_FAILED";
+	fixture.app.replacementProcessFence = fence;
+	let loads = 0;
+	fixture.app.client = {
+		exited: false,
+		sessionId: "main-session",
+		capabilities: { sessionList: true },
+		async listSessions() { assert.fail("a fenced /resume must not list sessions"); },
+		async loadSession() { loads += 1; },
+	};
+	fixture.app.ready = true;
+	await fixture.app.openResumeDialog();
+	await fixture.app.resumeSelectedSession({ sessionId: "orphaned-side", title: "Side" });
+	assert.equal(loads, 0);
+	assert.equal(fixture.app.foregroundOperation, undefined);
+	assert.ok(fixture.commands.includes("/resume"));
+	assert.ok(fixture.notices.some((message) => /restart cc/u.test(message)));
+})();
+
+// Side-local commands are visibly queued, and a target that closed between the
+// app FIFO and side FIFO resolves immediately instead of hanging a /resume
+// selection action forever.
+await (async () => {
+	const fixture = coldCommandFixture();
+	fixture.app.onThreadActivity = () => {};
+	const client = { exited: false, sessionId: "side-session", capabilities: {} };
+	const side = new BtwThread(fixture.app, client, "");
+	side.ready = true;
+	side.state = "ready";
+	side.busy = true;
+	const sideNotices = [];
+	side.addNotice = (message) => sideNotices.push(message);
+	fixture.app.btwThread = side;
+	const queued = side.deferLocalCommand("model", "fast", {
+		reason: "the current /btw turn finishes",
+	});
+	assert.deepEqual(sideNotices, ["Queued /model fast until the current /btw turn finishes."]);
+	side.cancelDeferredLocalCommands();
+	assert.equal(await queued, false);
+
+	fixture.app.btwThread = undefined;
+	assert.equal(await side.deferLocalCommand("model", "high"), false);
+	assert.ok(fixture.notices.some((message) => /targeted \/btw thread is no longer open/u.test(message)));
+
+	let deferralOptions;
+	fixture.app.btwThread = side;
+	side.busy = true;
+	side.deferLocalCommand = async (_name, _argument, options) => {
+		deferralOptions = options;
+		return false;
+	};
+	await fixture.app.runLocalSlashCommand("model", "fast", { targetThread: side });
+	assert.equal(deferralOptions.reason, "the current /btw turn finishes");
+})();
+
+// A foreground main-pane operation is one continuous submission lease for both
+// panes. Side input queues with an explanation and drains when that exact owner
+// releases, rather than starting behind a slow /resume.
+await (async () => {
+	const fixture = coldCommandFixture();
+	fixture.app.onThreadActivity = () => {};
+	const client = { exited: false, sessionId: "side-session", capabilities: {} };
+	const side = new BtwThread(fixture.app, client, "");
+	side.ready = true;
+	side.state = "ready";
+	const notices = [];
+	side.addNotice = (message) => notices.push(message);
+	let prompts = 0;
+	side.sendPrompt = async () => { prompts += 1; };
+	fixture.app.btwThread = side;
+	const operation = fixture.app.beginForegroundOperation({ commandName: "resume", status: "loading sessions" });
+	await side.submit("wait for resume");
+	assert.equal(prompts, 0);
+	assert.equal(side.queue.length, 1);
+	assert.deepEqual(notices, ["Queued while loading sessions. It will send automatically afterward."]);
+	fixture.app.endForegroundOperation(operation);
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	assert.equal(prompts, 1);
+})();
+
+// Prompt-expanding local commands retain their side target when the shared FIFO
+// drains after a root operation instead of leaking the expanded prompt to main.
+await (async () => {
+	const fixture = coldCommandFixture();
+	let submitted;
+	const side = {
+		client: { exited: false },
+		async submit(text, _parts, options) { submitted = { text, displayText: options.displayText }; },
+	};
+	fixture.app.btwThread = side;
+	await fixture.app.runInitCommand("init", { targetThread: side });
+	assert.match(submitted.text, /Create or improve an AGENTS\.md/u);
+	assert.equal(submitted.displayText, "/init");
 })();
 
 console.log("slow startup UX tests passed");

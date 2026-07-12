@@ -77,6 +77,7 @@ export const REQUIRED_METHODS = [
 	"stopAndWait",
 	"forceResolvePrompt",
 	"getSessionInfo",
+	"acquireSessionLoadGuard",
 	"setRuntimePermissionMode",
 ];
 

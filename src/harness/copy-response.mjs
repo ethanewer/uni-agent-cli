@@ -20,7 +20,11 @@ export function copyResponseChoices(response) {
 		description: previewText(text),
 		text,
 	}];
-	for (const [index, block] of fencedCodeBlocks(text).slice(0, COPY_RESPONSE_MAX_CHOICES - 1).entries()) {
+	// Empty fenced blocks are valid Markdown, but they are not useful copy/write
+	// targets. Omitting them avoids a selectable row that would otherwise close
+	// the picker without copying anything or opening the write form.
+	const blocks = fencedCodeBlocks(text).filter((block) => block.text.trim().length > 0);
+	for (const [index, block] of blocks.slice(0, COPY_RESPONSE_MAX_CHOICES - 1).entries()) {
 		choices.push({
 			kind: "code",
 			label: `Code block ${index + 1}${block.language ? ` (${block.language})` : ""}`,

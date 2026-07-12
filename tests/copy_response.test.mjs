@@ -33,6 +33,11 @@ assert.equal(choices[0].kind, "full", "full response is always the first choice"
 assert.equal(choices[1].text, "console.log(`ok`);");
 assert.equal(choices[2].text, "hello\n~~~");
 assert.deepEqual(copyResponseChoices("plain response").map((choice) => choice.kind), ["full"]);
+assert.deepEqual(
+	copyResponseChoices("Nothing inside:\n\n```js\n  \n```").map((choice) => choice.kind),
+	["full"],
+	"empty fenced blocks are not offered as copy/write targets",
+);
 
 let writeSelection;
 let enterSelection;
@@ -84,18 +89,42 @@ function responseChat(text) {
 {
 	const app = Object.create(HarnessApp.prototype);
 	let copied;
+	const sideCommands = [];
+	const sideNotices = [];
+	const mainCommands = [];
+	const sideThread = {
+		chat: responseChat("side response"),
+		client: { sessionId: "side-session" },
+		sessionId: "side-session",
+		addCommandMessage: (message) => sideCommands.push(message),
+		addNotice: (message) => sideNotices.push(message),
+	};
 	Object.assign(app, {
-		btwThread: { chat: responseChat("side response") },
+		activeKey: "claude",
+		btwThread: sideThread,
 		chat: responseChat("main response"),
-		config: { settings: {} },
+		config: { agents: { claude: {} }, settings: {} },
 		focusedThread: "btw",
-		addCommandMessage() {},
+		activeAgentLaunchSpec: () => undefined,
+		addCommandMessage: (message) => mainCommands.push(message),
 		addNotice: (message) => assert.fail(message),
+		onThreadActivity() {},
 		ui: { requestRender() {} },
 		copyResponseChoice: async (choice) => { copied = choice.text; },
 	});
 	await app.runCopy();
 	assert.equal(copied, "side response");
+	assert.deepEqual(sideCommands, ["/copy"]);
+	assert.deepEqual(mainCommands, [], "a side-pane /copy command stays in the side transcript");
+	app.focusedThread = "main";
+	copied = undefined;
+	await app.runCopy("", { targetThread: app.btwThread });
+	assert.equal(copied, "side response", "a deferred /copy retains its original side-pane target after focus changes");
+	assert.deepEqual(sideCommands, ["/copy", "/copy"]);
+	sideThread.chat = responseChat("");
+	await app.runCopy("", { targetThread: sideThread });
+	assert.equal(sideNotices.at(-1), "Nothing to copy yet.");
+	assert.deepEqual(mainCommands, [], "side-pane copy feedback stays out of the main transcript");
 }
 
 // Fenced responses retain Full response as the first entry, include code
@@ -133,6 +162,7 @@ function responseChat(text) {
 	const app = Object.create(HarnessApp.prototype);
 	let copied;
 	let reset;
+	let picker;
 	Object.assign(app, {
 		btwThread: undefined,
 		chat: responseChat("Full\n\n```text\ncode\n```"),
@@ -141,14 +171,21 @@ function responseChat(text) {
 		addCommandMessage() {},
 		addNotice() {},
 		ui: { requestRender() {} },
-		openSelection: () => assert.fail("the saved full-response preference must skip the picker"),
+		openSelection: (...args) => { picker = args; },
 		copyResponseChoice: async (choice) => { copied = choice.text; },
 		setCopyAlwaysFullResponse: (enabled) => { reset = enabled; return true; },
 	});
 	await app.runCopy();
 	assert.match(copied, /^Full/u);
+	assert.equal(picker, undefined, "the saved full-response preference skips the ordinary picker");
 	await app.runCopy("picker");
 	assert.equal(reset, false, "/copy picker disables the saved preference");
+	assert.equal(picker?.[0], "Copy response", "/copy picker immediately reopens the current response picker");
+	assert.deepEqual(picker?.[1].map((entry) => entry.label), [
+		"Full response",
+		"Code block 1 (text)",
+		"Always copy full response",
+	]);
 }
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "cc-copy-response-"));

@@ -280,6 +280,8 @@ extensionClient.request = async (method, params) => {
 	return { ok: true };
 };
 await extensionClient.listBackgroundTasks({ limit: 12 });
+assert.equal(extensionClient.backgroundTasksSnapshot.revision, 1, "a current-session list response is applied");
+assert.ok(extensionEvents.some((event) => event.type === "background_tasks" && event.snapshot.revision === 1));
 await extensionClient.stopBackgroundTask("task-transport");
 await extensionClient.backgroundTasks("tool-transport");
 assert.deepEqual(extensionRequests.map(([method]) => method), [
@@ -298,6 +300,64 @@ extensionClient.handleLine(JSON.stringify({
 }));
 assert.equal(extensionClient.backgroundTasksSnapshot.tasks[0].id, "live");
 assert.ok(extensionEvents.some((event) => event.type === "background_tasks"));
+
+// A target-session notification can arrive before session/load returns. Keep it
+// in the same ordered replay buffer as session/update rather than comparing it
+// against the still-current source session and dropping it.
+extensionClient.sessionId = "source-session";
+extensionClient.backgroundTasksSnapshot = { revision: 0, tasks: [], total: 0 };
+extensionClient.bufferingSessionUpdates = true;
+extensionClient.bufferedSessionUpdates = [];
+extensionClient.handleLine(JSON.stringify({
+	jsonrpc: "2.0",
+	method: "cc/session/tasks/changed",
+	params: {
+		sessionId: "loaded-session",
+		revision: 3,
+		tasks: [{ id: "loaded-task", status: "running", isBackgrounded: true }],
+	},
+}));
+assert.deepEqual(extensionClient.backgroundTasksSnapshot, { revision: 0, tasks: [], total: 0 });
+assert.equal(extensionClient.bufferedSessionUpdates.length, 1);
+extensionClient.sessionId = "loaded-session";
+extensionClient.bufferingSessionUpdates = false;
+extensionClient.handleSessionUpdate(extensionClient.bufferedSessionUpdates.shift());
+assert.equal(extensionClient.backgroundTasksSnapshot.tasks[0].id, "loaded-task");
+
+const snapshotBeforeOwnerlessUpdate = extensionClient.backgroundTasksSnapshot;
+extensionClient.handleLine(JSON.stringify({
+	jsonrpc: "2.0",
+	method: "cc/session/tasks/changed",
+	params: {
+		revision: 100,
+		tasks: [{ id: "ownerless", status: "running", isBackgrounded: true }],
+	},
+}));
+assert.equal(extensionClient.backgroundTasksSnapshot, snapshotBeforeOwnerlessUpdate);
+assert.match(extensionEvents.at(-1).message, /sessionId/u, "an ownerless extension notification is rejected");
+
+// A list response belongs to the session captured before its RPC. If a session
+// replacement commits while that request is pending, discard the old snapshot
+// without emitting it into the new session's normalized state.
+let settleStaleList;
+extensionClient.request = async (method, params) => {
+	extensionRequests.push([method, params]);
+	return await new Promise((resolve) => { settleStaleList = resolve; });
+};
+extensionClient.sessionId = "old-transport-session";
+const staleList = extensionClient.listBackgroundTasks();
+assert.equal(extensionRequests.at(-1)[1].sessionId, "old-transport-session");
+extensionClient.sessionId = "new-transport-session";
+extensionClient.backgroundTasksSnapshot = { revision: 0, tasks: [], total: 0 };
+const eventsBeforeStaleResponse = extensionEvents.length;
+settleStaleList({
+	revision: 99,
+	tasks: [{ id: "stale", status: "running", isBackgrounded: true }],
+	total: 1,
+});
+assert.deepEqual(await staleList, { revision: 0, tasks: [], total: 0 });
+assert.deepEqual(extensionClient.backgroundTasksSnapshot, { revision: 0, tasks: [], total: 0 });
+assert.equal(extensionEvents.length, eventsBeforeStaleResponse, "a stale response emits no background-task event");
 
 const commandClient = {
 	capabilities: { backgroundTasks: true },
