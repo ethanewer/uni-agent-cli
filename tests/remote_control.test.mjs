@@ -86,6 +86,22 @@ assert.equal(
 	"claude acp · permissions deny · remote error · /tmp/project",
 	"the persistent footer reports state without exposing the pairing URL",
 );
+assert.equal(
+	statusLineText({
+		agent: "codex",
+		transport: "acp",
+		model: "gpt-5.6-sol",
+		effort: "medium",
+		permissionMode: "auto",
+	}, "/tmp/project"),
+	"codex · gpt-5.6-sol medium · permissions auto · /tmp/project",
+	"model-aware harnesses replace the transport label with their live model and effort",
+);
+assert.equal(
+	statusLineText({ agent: "cursor", transport: "acp", model: "composer-2" }, "/tmp/project"),
+	"cursor · composer-2 · /tmp/project",
+	"a harness may expose a model without a reasoning-effort option",
+);
 
 const remoteCalls = [];
 const liveSession = {

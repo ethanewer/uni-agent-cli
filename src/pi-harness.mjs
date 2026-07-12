@@ -987,8 +987,11 @@ let activeThemeName = "system";
 
 export function statusLineText(status = {}, cwd = process.cwd()) {
 	const state = status.state ? `${status.spinner ? `${status.spinner} ` : ""}${status.state} · ` : "";
+	const modelDetails = [status.model, status.effort].filter(Boolean).join(" ");
 	const parts = [
-		`${status.agent ?? "?"} ${status.transport ?? "acp"}`,
+		modelDetails
+			? `${status.agent ?? "?"} · ${modelDetails}`
+			: `${status.agent ?? "?"} ${status.transport ?? "acp"}`,
 		status.permissionMode ? `${status.permissionMode === "ask" ? "⏸ " : ""}permissions ${status.permissionMode}` : undefined,
 		status.remoteControl?.error ? "remote error" : status.remoteControl?.enabled ? "remote on" : status.remoteControl ? "remote off" : undefined,
 		compactCwd(cwd),
@@ -3979,6 +3982,7 @@ export class HarnessApp {
 				state,
 				spinner: state ? AGENT_WORK_FRAMES[this.spinnerIndex % AGENT_WORK_FRAMES.length] : "",
 				transport: this.transport,
+				...this.modelAndEffortForStatus(),
 				permissionMode: this.permissionModeForStatus(),
 				remoteControl: this.remoteControlStateForActiveSession(),
 			};
@@ -7285,6 +7289,25 @@ export class HarnessApp {
 		const sourceClient = sideThread?.client ?? this.client;
 		const agent = sourceClient?.launchSpec ?? this.config?.agents?.[this.activeKey];
 		return this.permissionPolicyFor(this.activeKey, agent, { sourceClient }).mode;
+	}
+
+	modelAndEffortForStatus() {
+		const sideThread = this.focusedThread === "btw" ? this.btwThread : undefined;
+		const sourceClient = sideThread?.client ?? this.client;
+		let liveState;
+		try {
+			liveState = sourceClient?.getSessionInfo?.();
+		} catch {
+			liveState = undefined;
+		}
+		const cachedState = sideThread ? undefined : this.sessionStates?.get?.(this.activeKey);
+		const state = liveState ?? cachedState ?? {};
+		const model = currentConfigValue(findConfigOption(state, "model")) ?? state.models?.currentModelId;
+		const effort = currentConfigValue(findConfigOption(state, "thought_level"));
+		return {
+			...(model ? { model: String(model) } : {}),
+			...(effort ? { effort: String(effort) } : {}),
+		};
 	}
 
 	remoteControlStateForSession(client = this.client, sessionId = client?.sessionId) {
@@ -19145,6 +19168,11 @@ function currentConfigLabel(option) {
 	if (option?.currentValue === undefined || option?.currentValue === null) return undefined;
 	const value = flattenConfigOptions(option).find((entry) => entry.value === option.currentValue);
 	return value?.name ?? option.currentValue;
+}
+
+function currentConfigValue(option) {
+	if (option?.currentValue === undefined || option?.currentValue === null) return undefined;
+	return option.currentValue;
 }
 
 function compactDate(value) {
