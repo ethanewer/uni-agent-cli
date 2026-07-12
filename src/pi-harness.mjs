@@ -3833,6 +3833,10 @@ export class HarnessApp {
 		this.activeAgentGeneration = 0;
 		this.ready = false;
 		this.busy = false;
+		// A freshly-created ACP session is only an implementation detail until a
+		// prompt (or replayed history) establishes a conversation. Before then /cd
+		// may safely replace that session even when the harness has no live-cwd RPC.
+		this.conversationStarted = false;
 		this.client = undefined;
 		this.clientInstallSequence = 0;
 		// A leading-! command may start before lazy ACP startup installs a client.
@@ -5731,6 +5735,7 @@ export class HarnessApp {
 			return;
 		}
 		const pendingUserEcho = this.trackPendingUserEcho(text);
+		this.conversationStarted = true;
 		const transcriptEntry = this.addUserMessage(displayText, { compactCommand: options.compactCommand });
 		this.armPendingUnsendPrompt({
 			text,
@@ -6294,6 +6299,7 @@ export class HarnessApp {
 					continue;
 				}
 				const pendingUserEcho = this.trackPendingUserEcho(prompt.text);
+				this.conversationStarted = true;
 				const transcriptEntry = this.addUserMessage(prompt.displayText ?? prompt.text, { compactCommand: prompt.compactCommand });
 				this.armPendingUnsendPrompt({
 					text: prompt.text,
@@ -7451,7 +7457,8 @@ export class HarnessApp {
 			(this.activeShellInputCount ?? 0) > 0 ||
 			(this.shellInputsRunning ?? 0) > 0 ||
 			(this.btwThread?.shellInputsRunning ?? 0) > 0 ||
-			this.sessionSwitchInProgress ||
+			(this.promptQueue?.length ?? 0) > 0 ||
+			(this.sessionSwitchInProgress && this.conversationStarted !== false) ||
 			this.selectionActionInProgress ||
 			(this.configUpdateCount ?? 0) > 0 ||
 			(this.asyncPickerLoadCount ?? 0) > 0
@@ -7464,6 +7471,44 @@ export class HarnessApp {
 			targetPath = resolveWorkingDirectoryTarget(argument, process.cwd());
 		} catch (error) {
 			this.addNotice(error.message ?? String(error));
+			return;
+		}
+		if (this.conversationStarted === false) {
+			// Background startup may already be creating an empty session in the old
+			// directory. Let it settle, then discard it after moving the host cwd. This
+			// keeps /cd intuitive without requiring live-cwd support or leaving a hidden
+			// backend whose cwd disagrees with the footer.
+			try {
+				await this.agentSwitchTail;
+			} catch {
+				// A failed optional startup cannot prevent a local pre-session /cd.
+			}
+			if (this.conversationStarted) {
+				this.addNotice("A conversation started while /cd was waiting; run /cd again");
+				return;
+			}
+			if (
+				this.btwThread ||
+				this.busy ||
+				(this.activeShellInputCount ?? 0) > 0 ||
+				(this.shellInputsRunning ?? 0) > 0 ||
+				(this.btwThread?.shellInputsRunning ?? 0) > 0 ||
+				(this.promptQueue?.length ?? 0) > 0 ||
+				this.sessionSwitchInProgress ||
+				this.selectionActionInProgress ||
+				(this.configUpdateCount ?? 0) > 0 ||
+				(this.asyncPickerLoadCount ?? 0) > 0
+			) {
+				this.addNotice("The session changed while /cd was waiting; run /cd again");
+				return;
+			}
+			if (!this.commitLocalWorkingDirectoryChange(targetPath)) return;
+			if (this.client && !this.client.exited) {
+				this.disconnectDivergedWorkingDirectorySession(
+					this.captureActiveAgentContext({ includeClient: true }),
+					{ quiet: true },
+				);
+			}
 			return;
 		}
 		if (!this.ready || !this.client || this.client.exited) {
@@ -7549,6 +7594,34 @@ export class HarnessApp {
 		}
 	}
 
+	commitLocalWorkingDirectoryChange(targetPath) {
+		const previous = process.cwd();
+		try {
+			process.chdir(targetPath);
+		} catch (error) {
+			this.addNotice(`Could not change directories: ${error.message ?? error}`);
+			return false;
+		}
+		const cwd = process.cwd();
+		process.env.PWD = cwd;
+		if (cwd !== previous) {
+			const pendingPersist = this.backendCommandCacheTimers?.get(this.activeKey);
+			if (pendingPersist) {
+				clearTimeout(pendingPersist);
+				this.backendCommandCacheTimers.delete(this.activeKey);
+			}
+			this.backendCommandCatalog?.persist?.(this.activeKey);
+			this.backendCommandCatalog?.setCwd?.(cwd);
+			this.clearLiveBackendCommands(this.activeKey);
+			this.editor?.autocompleteProvider?.setBasePath?.(cwd);
+			this.lastAutocompleteKey = undefined;
+			this.updateAutocomplete();
+		}
+		this.addNotice(cwd === previous ? `Already using ${cwd}` : `Working directory: ${cwd}`);
+		this.ui.requestRender();
+		return true;
+	}
+
 	async requestWorkingDirectoryChange(context, targetPath, options = {}) {
 		if (!this.isActiveAgentContext(context)) return undefined;
 		const transition = { context, commands: undefined };
@@ -7608,12 +7681,12 @@ export class HarnessApp {
 		})) this.scheduleBackendCommandCatalogPersist(this.activeKey);
 	}
 
-	disconnectDivergedWorkingDirectorySession(context) {
+	disconnectDivergedWorkingDirectorySession(context, options = {}) {
 		if (!context?.client || !this.isActiveAgentContext(context)) return false;
 		const client = context.client;
 		this.ready = false;
 		this.sessionSwitchInProgress = true;
-		this.statusState = "disconnecting mismatched session";
+		if (options.quiet !== true) this.statusState = "disconnecting mismatched session";
 		this.cancelPermissionPrompts();
 		this.clearCancelGraceTimer();
 		this.updateSpinner();
@@ -8192,6 +8265,7 @@ export class HarnessApp {
 	}
 
 	resetConversationView() {
+		this.conversationStarted = false;
 		this.chat.clear();
 		this.currentAssistantText = undefined;
 		this.currentToolSummary = undefined;
@@ -13675,6 +13749,7 @@ export class HarnessApp {
 			this.disarmPendingUnsendPrompt();
 			this.addNotice(event.text);
 		} else if (event.type === "user_text") {
+			this.conversationStarted = true;
 			this.disarmPendingUnsendPrompt();
 			const text = this.consumePendingUserEcho(event.text);
 			if (text) this.appendUserText(text);

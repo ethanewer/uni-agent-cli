@@ -437,6 +437,46 @@ try {
 	nativeFallback.focusedThread = "btw";
 	assert.equal(nativeFallback.slashCommandRoute("cd", second), "local", "side threads reject /cd locally");
 
+	// An empty session is not a conversation yet. /cd remains a host operation
+	// even when the selected harness cannot change a live session's cwd.
+	{
+		const originalCwd = process.cwd();
+		try {
+			process.chdir(first);
+			const notices = [];
+			const app = Object.create(HarnessApp.prototype);
+			Object.assign(app, {
+				activeKey: "fake",
+				activeAgentGeneration: 0,
+				transport: "acp",
+				config: { agents: { fake: {} } },
+				conversationStarted: false,
+				client: { exited: true, capabilities: { changeWorkingDirectory: false } },
+				ready: false,
+				busy: false,
+				focusedThread: "main",
+				btwThread: undefined,
+				sessionSwitchInProgress: false,
+				selectionActionInProgress: false,
+				configUpdateCount: 0,
+				asyncPickerLoadCount: 0,
+				backendCommandCacheTimers: new Map(),
+				backendCommandCatalog: { persist() {}, setCwd() {} },
+				editor: { autocompleteProvider: { setBasePath() {} } },
+				clearLiveBackendCommands() {},
+				updateAutocomplete() {},
+				addCommandMessage() {},
+				addNotice: (message) => notices.push(message),
+				ui: { requestRender() {} },
+			});
+			await app.runChangeWorkingDirectory(second);
+			assert.equal(process.cwd(), fs.realpathSync(second));
+			assert.deepEqual(notices, [`Working directory: ${fs.realpathSync(second)}`]);
+		} finally {
+			process.chdir(originalCwd);
+		}
+	}
+
 	// A side-pane /cd rejection belongs to the side transcript. It must not look
 	// like the main session attempted a process-global directory change.
 	{
