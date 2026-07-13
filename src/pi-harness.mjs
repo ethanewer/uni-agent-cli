@@ -2539,6 +2539,7 @@ export class AcpClient {
 		this.bufferingSessionUpdates = false;
 		this.bufferedSessionUpdates = [];
 		this.pendingStartupConfigDefaults = undefined;
+		this.startupRequestedModel = undefined;
 		this.startupConfigDefaultsPromise = undefined;
 		this.startupConfigDefaultWaiters = new Set();
 		this.terminals = new Map();
@@ -2972,6 +2973,9 @@ export class AcpClient {
 			throw new Error("ACP session/new did not return a session id");
 		}
 		this.sessionId = sessionId;
+		this.startupRequestedModel = method === "session/new" && typeof this.agent?._sessionDefaults?.model === "string"
+			? this.agent._sessionDefaults.model
+			: undefined;
 		this.pendingStartupConfigDefaults = method === "session/new" && isPlainObject(this.agent?._sessionDefaults)
 			? { sessionId, values: { ...this.agent._sessionDefaults } }
 			: undefined;
@@ -3158,6 +3162,7 @@ export class AcpClient {
 			agentInfo: this.agentInfo,
 			authMethods: this.authMethods,
 			configOptions: this.configOptions,
+			...(this.startupRequestedModel ? { _ccStartupRequestedModel: this.startupRequestedModel } : {}),
 			models: this.models,
 			modes: this.modes,
 			backgroundTasks: this.backgroundTasksSnapshot,
@@ -7409,15 +7414,23 @@ export class HarnessApp {
 		if (!persisted.model) return false;
 		const option = findConfigOption(state, "model");
 		const value = currentConfigValue(option);
-		if (value !== persisted.model) return false;
 		const label = currentConfigLabel(option);
-		if (!label || label === value || label === persisted.modelDisplay) return false;
-		const token = `${key}\0${value}\0${label}`;
+		if (!value || !label) return false;
+		const exactId = value === persisted.model;
+		const savedIdIsAdvertised = flattenConfigOptions(option).some((entry) => entry.value === persisted.model);
+		const legacyAlias = !exactId && !savedIdIsAdvertised && state?._ccStartupRequestedModel === persisted.model && (
+			modelNamesShareTerminalAlias(persisted.model, label) ||
+			String(persisted.modelDisplay ?? "").trim().toLowerCase() === String(label).trim().toLowerCase()
+		);
+		if (!exactId && !legacyAlias) return false;
+		const modelDisplay = label === value ? persisted.modelDisplay : label;
+		if (value === persisted.model && modelDisplay === persisted.modelDisplay) return false;
+		const token = `${key}\0${value}\0${modelDisplay ?? ""}`;
 		this.modelDisplayAlignmentAttempts ??= new Set();
 		if (this.modelDisplayAlignmentAttempts.has(token)) return false;
 		this.modelDisplayAlignmentAttempts.add(token);
 		try {
-			return this.persistModelPreference(key, "model", value, { modelDisplay: label });
+			return this.persistModelPreference(key, "model", value, { modelDisplay });
 		} catch (error) {
 			this.addNotice?.(`cc could not save the model name ${label}: ${error.message ?? error}`);
 			return false;
@@ -19334,6 +19347,17 @@ function currentConfigLabel(option) {
 function currentConfigValue(option) {
 	if (option?.currentValue === undefined || option?.currentValue === null) return undefined;
 	return option.currentValue;
+}
+
+function modelNamesShareTerminalAlias(savedName, liveName) {
+	const tokens = (value) => String(value ?? "")
+		.trim()
+		.toLowerCase()
+		.split(/[^a-z0-9]+/u)
+		.filter(Boolean);
+	const saved = tokens(savedName);
+	const live = tokens(liveName);
+	return saved.length === 1 && live.length > 1 && saved[0] === live.at(-1);
 }
 
 function compactDate(value) {

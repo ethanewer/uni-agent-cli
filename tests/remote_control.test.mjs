@@ -106,31 +106,81 @@ assert.equal(
 	const app = Object.create(HarnessApp.prototype);
 	app.activeKey = "codex";
 	app.focusedThread = "main";
-	app.config = { settings: { agents: { codex: { sessionDefaults: { model: "gpt-saved", effort: "high" } } } } };
+	app.config = {
+		settings: { agents: { codex: { sessionDefaults: { model: "gpt-saved", effort: "high" } } } },
+	};
 	app.sessionStates = new Map();
 	assert.deepEqual(app.modelAndEffortForStatus(), { model: "gpt-saved", effort: "high" });
 }
 {
 	const app = Object.create(HarnessApp.prototype);
 	app.activeKey = "codex";
-	app.config = { settings: { agents: { codex: { sessionDefaults: { model: "sol", effort: "high" } } } } };
+	app.config = {
+		settings: {
+			agents: {
+				codex: { sessionDefaults: { model: "sol", modelDisplay: "GPT-5.6-Sol", effort: "high" } },
+			},
+		},
+	};
 	const persisted = [];
 	app.persistModelPreference = (...args) => {
 		persisted.push(args);
+		app.config.settings.agents.codex.sessionDefaults.model = args[2];
 		app.config.settings.agents.codex.sessionDefaults.modelDisplay = args[3].modelDisplay;
 		return true;
 	};
 	const sessionInfo = {
+		_ccStartupRequestedModel: "sol",
 		configOptions: [{
 			id: "model",
 			category: "model",
-			currentValue: "sol",
-			options: [{ value: "sol", name: "GPT-5.6-Sol" }],
+			currentValue: "gpt-5.6-sol",
+			options: [{ value: "gpt-5.6-sol", name: "GPT-5.6-Sol" }],
 		}],
 	};
 	assert.equal(app.alignPersistedModelDisplay("codex", sessionInfo), true);
-	assert.deepEqual(persisted, [["codex", "model", "sol", { modelDisplay: "GPT-5.6-Sol" }]]);
+	assert.deepEqual(persisted, [["codex", "model", "gpt-5.6-sol", { modelDisplay: "GPT-5.6-Sol" }]]);
 	assert.equal(app.alignPersistedModelDisplay("codex", sessionInfo), false, "an aligned label is not rewritten");
+}
+{
+	const app = Object.create(HarnessApp.prototype);
+	app.config = {
+		settings: { agents: { codex: { sessionDefaults: { model: "sol", modelDisplay: "Sol" } } } },
+	};
+	const persisted = [];
+	app.persistModelPreference = (...args) => {
+		persisted.push(args);
+		return true;
+	};
+	assert.equal(app.alignPersistedModelDisplay("codex", {
+		_ccStartupRequestedModel: "sol",
+		configOptions: [{ id: "model", category: "model", currentValue: "gpt-5.6-sol" }],
+	}), true);
+	assert.deepEqual(
+		persisted,
+		[["codex", "model", "gpt-5.6-sol", { modelDisplay: "Sol" }]],
+		"canonical ID migration preserves a friendly label when choices are sparse",
+	);
+	assert.equal(app.alignPersistedModelDisplay("codex", {
+		configOptions: [{
+			id: "model",
+			category: "model",
+			currentValue: "gpt-5.1-codex-mini",
+			options: [{ value: "gpt-5.1-codex-mini", name: "GPT-5.1-Codex-Mini" }],
+		}],
+	}), false, "a resumed session cannot migrate the saved default by name similarity");
+	assert.equal(app.alignPersistedModelDisplay("codex", {
+		_ccStartupRequestedModel: "sol",
+		configOptions: [{
+			id: "model",
+			category: "model",
+			currentValue: "gpt-5.6-sol",
+			options: [
+				{ value: "sol", name: "Sol" },
+				{ value: "gpt-5.6-sol", name: "GPT-5.6-Sol" },
+			],
+		}],
+	}), false, "a valid short model ID is not mistaken for a canonical alias");
 }
 
 const remoteCalls = [];
