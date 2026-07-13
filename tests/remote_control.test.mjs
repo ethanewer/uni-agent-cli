@@ -110,6 +110,28 @@ assert.equal(
 	app.sessionStates = new Map();
 	assert.deepEqual(app.modelAndEffortForStatus(), { model: "gpt-saved", effort: "high" });
 }
+{
+	const app = Object.create(HarnessApp.prototype);
+	app.activeKey = "codex";
+	app.config = { settings: { agents: { codex: { sessionDefaults: { model: "sol", effort: "high" } } } } };
+	const persisted = [];
+	app.persistModelPreference = (...args) => {
+		persisted.push(args);
+		app.config.settings.agents.codex.sessionDefaults.modelDisplay = args[3].modelDisplay;
+		return true;
+	};
+	const sessionInfo = {
+		configOptions: [{
+			id: "model",
+			category: "model",
+			currentValue: "sol",
+			options: [{ value: "sol", name: "GPT-5.6-Sol" }],
+		}],
+	};
+	assert.equal(app.alignPersistedModelDisplay("codex", sessionInfo), true);
+	assert.deepEqual(persisted, [["codex", "model", "sol", { modelDisplay: "GPT-5.6-Sol" }]]);
+	assert.equal(app.alignPersistedModelDisplay("codex", sessionInfo), false, "an aligned label is not rewritten");
+}
 
 const remoteCalls = [];
 const liveSession = {

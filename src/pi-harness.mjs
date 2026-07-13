@@ -7404,6 +7404,26 @@ export class HarnessApp {
 		};
 	}
 
+	alignPersistedModelDisplay(key, state) {
+		const persisted = this.persistedModelPreferences(key);
+		if (!persisted.model) return false;
+		const option = findConfigOption(state, "model");
+		const value = currentConfigValue(option);
+		if (value !== persisted.model) return false;
+		const label = currentConfigLabel(option);
+		if (!label || label === value || label === persisted.modelDisplay) return false;
+		const token = `${key}\0${value}\0${label}`;
+		this.modelDisplayAlignmentAttempts ??= new Set();
+		if (this.modelDisplayAlignmentAttempts.has(token)) return false;
+		this.modelDisplayAlignmentAttempts.add(token);
+		try {
+			return this.persistModelPreference(key, "model", value, { modelDisplay: label });
+		} catch (error) {
+			this.addNotice?.(`cc could not save the model name ${label}: ${error.message ?? error}`);
+			return false;
+		}
+	}
+
 	persistModelPreference(key, category, value, options = {}) {
 		const field = category === "model" ? "model" : category === "thought_level" ? "effort" : undefined;
 		if (!field || typeof value !== "string" || !value) return false;
@@ -13950,6 +13970,7 @@ export class HarnessApp {
 			}
 		} else if (event.type === "session_info") {
 			this.sessionStates.set(this.activeKey, event.sessionInfo);
+			this.alignPersistedModelDisplay(this.activeKey, event.sessionInfo);
 			this.syncRuntimePermissionModeFromSessionInfo(event.sessionInfo);
 			this.refreshCodexThreadStateSnapshot(event.sessionInfo);
 			this.backendCommandCatalog?.validateIdentity?.(this.activeKey, event.sessionInfo?.agentInfo);

@@ -414,10 +414,10 @@ wait_without_text "Unknown theme: missing"
 stop_session
 : > "$WRITE_LOG"
 tmux new-session -d -s "$SESSION" -x 110 -y 32 "cd $ROOT_Q && printf 'outside-before-cc\n' && $PANE_ENV PI_TUI_WRITE_LOG=$WRITE_LOG_Q CC_CONFIG=tests/fake_config.json CC_SETTINGS=$SETTINGS_FILE_Q CC_BACKGROUND_CONNECT_DELAY_MS=0 FAKE_ACP_NEW_DELAY=0.4 ./src/cc fake"
-wait_for_text "fake · fast high"
-wait_for_ansi_text "$(printf '\033[38;2;79;143;92mfake · fast high')"
+wait_for_text "fake · Fast high"
+wait_for_ansi_text "$(printf '\033[38;2;79;143;92mfake · Fast high')"
 assert_no_prepaint_clear
-if capture_ansi | grep -Fq "$(printf '\033[2mfake · fast high')"; then
+if capture_ansi | grep -Fq "$(printf '\033[2mfake · Fast high')"; then
 	echo "Persisted non-system theme should not start with a system-colored prepaint" >&2
 	capture_ansi >&2
 	exit 1
