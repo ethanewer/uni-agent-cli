@@ -91,6 +91,7 @@ export class BaseAcpAdapter {
 		this.lifecycleState = "open";
 		this.stopPromise = undefined;
 		this.clientAuthenticationOperations = new Set();
+		this.retiringConnections = new Set();
 
 		// The fully-resolved spawn spec, with native settings translated. This is
 		// what cc would spawn and what carries _sessionMeta / _startupMode /
@@ -341,7 +342,7 @@ export class BaseAcpAdapter {
 		this.connection?.cancel?.();
 	}
 
-	stop() {
+	stop(options = {}) {
 		if (this.stopPromise) return this.stopPromise;
 		// Closing is observable synchronously. Authentication may currently be
 		// waiting on terminal/UI credential collection outside the lifecycle queue;
@@ -357,19 +358,21 @@ export class BaseAcpAdapter {
 			rejectStop = reject;
 		});
 		const connection = this.connection;
+		this.retiringConnection = connection;
+		if (connection) this.retiringConnections.add(connection);
 		this.connection = undefined;
 		const lifecycleTail = this.lifecycleTail ?? Promise.resolve();
 		// Client-side authentication runs before the serialized reconnect turn. Abort
 		// it now and retain an awaitable for both the credential collector and any
 		// terminal process tree it registered.
 		const authenticationShutdowns = [...this.clientAuthenticationOperations]
-			.map((operation) => operation.stopAndWait());
+			.map((operation) => operation.stopAndWait(options.timeoutMs));
 		let connectionShutdown;
 		try {
 			// Production AcpClient instances need their complete process tree reaped,
 			// not merely signalled. The helper retains the synchronous stop fallback for
 			// lightweight injected connections used by other adapters and tests.
-			connectionShutdown = this.stopConnections([connection]);
+			connectionShutdown = this.stopConnections([connection], options);
 		} catch (error) {
 			connectionShutdown = Promise.reject(error);
 		}
@@ -383,7 +386,10 @@ export class BaseAcpAdapter {
 			const failure = results.find((result) => result.status === "rejected");
 			if (failure) throw failure.reason;
 			return results[0].value;
-		})().then(resolveStop, rejectStop);
+		})().finally(() => {
+			if (this.retiringConnection === connection) this.retiringConnection = undefined;
+			if (connection) this.retiringConnections.delete(connection);
+		}).then(resolveStop, rejectStop);
 		return this.stopPromise;
 	}
 
@@ -425,8 +431,19 @@ export class BaseAcpAdapter {
 
 	// The host's process-tree fence uses this name to distinguish production
 	// clients from lightweight synchronous test doubles.
-	stopAndWait() {
-		return this.stop();
+	stopAndWait(timeoutMs = undefined) {
+		return this.stop({ timeoutMs });
+	}
+
+	forceStop() {
+		const connections = new Set([
+			this.connection,
+			this.retiringConnection,
+			...this.retiringConnections,
+		].filter(Boolean));
+		const results = [...connections].map((connection) => connection.forceStop?.());
+		for (const operation of this.clientAuthenticationOperations) results.push(operation.forceStop?.());
+		return results;
 	}
 
 	// Settle a backend that acknowledged cancel but omitted the prompt response.
@@ -626,15 +643,20 @@ export class BaseAcpAdapter {
 			stoppers,
 			rawPromise: undefined,
 			stopPromise: undefined,
-			stopAndWait: () => {
+			requestedStopTimeoutMs: undefined,
+			forceStop: () => {
+				for (const stopper of stoppers) stopper.force?.();
+			},
+			stopAndWait: (timeoutMs = undefined) => {
 				if (entry.stopPromise) return entry.stopPromise;
+				entry.requestedStopTimeoutMs = timeoutMs;
 				controller.abort(this.#lifecycleStoppedError());
 				// Invoke every registered tree stop in this synchronous shutdown phase.
 				// A helper that registers after the abort observes it in register() below.
-				for (const stopper of stoppers) void stopper.start().catch(() => {});
+				for (const stopper of stoppers) void stopper.start(timeoutMs).catch(() => {});
 				entry.stopPromise = (async () => {
 					const operationResult = await Promise.allSettled([entry.rawPromise]);
-					const stopResults = await Promise.allSettled([...stoppers].map((stopper) => stopper.start()));
+					const stopResults = await Promise.allSettled([...stoppers].map((stopper) => stopper.start(timeoutMs)));
 					const stopFailure = stopResults.find((result) => result.status === "rejected");
 					if (stopFailure) throw stopFailure.reason;
 					const operationFailure = operationResult.find(
@@ -649,13 +671,14 @@ export class BaseAcpAdapter {
 			assertOpen: () => {
 				if (controller.signal.aborted || this.lifecycleState !== "open") throw this.#lifecycleStoppedError();
 			},
-			register: (stopAndWait) => {
+			register: (stopAndWait, forceStop = undefined) => {
 				const stopper = {
 					promise: undefined,
-					start: () => {
+					force: () => forceStop?.(),
+					start: (timeoutMs = undefined) => {
 						if (stopper.promise) return stopper.promise;
 						try {
-							stopper.promise = Promise.resolve(stopAndWait());
+						stopper.promise = Promise.resolve(stopAndWait(timeoutMs));
 						} catch (error) {
 							stopper.promise = Promise.reject(error);
 						}
@@ -663,7 +686,7 @@ export class BaseAcpAdapter {
 					},
 				};
 				stoppers.add(stopper);
-				if (controller.signal.aborted) void stopper.start().catch(() => {});
+				if (controller.signal.aborted) void stopper.start(entry.requestedStopTimeoutMs).catch(() => {});
 				return () => {
 					// Retain the registration until this authentication operation settles so
 					// shutdown can await a stop that raced natural process completion.
@@ -731,6 +754,8 @@ export class BaseAcpAdapter {
 			const savedConnectOptions = { ...this.connectOptions };
 			const connectOptions = { ...savedConnectOptions, ...optionOverrides };
 			const currentConnection = this.connection;
+			const retiringConnections = [...new Set([connectionToRetire, currentConnection].filter(Boolean))];
+			for (const connection of retiringConnections) this.retiringConnections.add(connection);
 			// Detach first so synchronous stop/exit callbacks from either retired
 			// connection are treated as stale and cannot reach the host.
 			this.connection = undefined;
@@ -739,7 +764,7 @@ export class BaseAcpAdapter {
 				// replacement until every old connection has either exited gracefully or
 				// been force-killed with its complete process tree confirmed gone.
 					try {
-						await this.stopConnections([connectionToRetire, currentConnection]);
+						await this.stopConnections(retiringConnections);
 				} catch (error) {
 					if (error?.code === "PROCESS_TREE_TERMINATION_FAILED") {
 						this.replacementProcessFence ??= error;
@@ -747,7 +772,7 @@ export class BaseAcpAdapter {
 					}
 						throw error;
 					}
-					await this.afterConnectionsRetired([connectionToRetire, currentConnection]);
+					await this.afterConnectionsRetired(retiringConnections);
 					// stop() may have run while the retired process tree was settling. It
 				// owns shutdown from that point onward, so neither credentials nor a new
 				// connection may be installed by this lifecycle turn.
@@ -761,6 +786,7 @@ export class BaseAcpAdapter {
 				if (authenticationEnvironment !== undefined) delete this.launchSpec._signedOutAuthEnvNames;
 				return initialized;
 			} finally {
+				for (const connection of retiringConnections) this.retiringConnections.delete(connection);
 				// Internal lifecycle reconnects must not redefine how callers requested a
 				// normal connection. In particular, the logout-only createSession:false
 				// must not suppress session creation after the next successful /login.

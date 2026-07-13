@@ -309,8 +309,8 @@ export class CodexAdapter extends BaseAcpAdapter {
 		return () => true;
 	}
 
-	stop() {
-		const stopped = super.stop();
+	stop(options = {}) {
+		const stopped = super.stop(options);
 		if (!this.liveSessionLeaseStopPromise) {
 			// A rejected stop means cc could not prove the process tree is gone. Keep
 			// ownership fail-closed; a later process can reclaim it after this PID dies.

@@ -44,7 +44,7 @@ export function mergeEnvironments(sources, platform = process.platform) {
 // A replacement may continue after a confirmed force-kill, but never after an
 // unconfirmed process-tree shutdown. Injected test connections may retain the
 // original synchronous stop() contract.
-export async function stopConnectionsForReplacement(connections) {
+export async function stopConnectionsForReplacement(connections, options = {}) {
 	const unique = [...new Set((Array.isArray(connections) ? connections : [connections]).filter(Boolean))];
 	const results = await Promise.allSettled(unique.map(async (connection) => {
 		if (typeof connection.stopAndWait !== "function") {
@@ -52,7 +52,7 @@ export async function stopConnectionsForReplacement(connections) {
 			return;
 		}
 		try {
-			await connection.stopAndWait();
+			await connection.stopAndWait(options.timeoutMs);
 		} catch (error) {
 			if (error?.code === "PROCESS_TREE_FORCE_KILLED") return;
 			throw error;

@@ -287,6 +287,7 @@ const CODEX_THREAD_SOURCE_KINDS = [
 ];
 const PROCESS_TERMINATION_GRACE_MS = 1_000;
 const PROCESS_FORCE_KILL_WAIT_MS = 5_000;
+const FINAL_SHUTDOWN_GRACE_MS = 25;
 const PROCESS_TREE_POLL_INTERVAL_MS = 10;
 const WINDOWS_PROCESS_TREE_SETTLE_MS = 25;
 const CODEX_PLUGIN_COMMAND_TIMEOUT_MS = 5 * 60_000;
@@ -3236,11 +3237,35 @@ export class AcpClient {
 		return termination;
 	}
 
+	forceStop() {
+		const childExited = !this.child || this.childClosed || this.childExitObserved ||
+			this.child.exitCode !== null && this.child.exitCode !== undefined || Boolean(this.child.signalCode);
+		if (childExited) {
+			const ownsSurvivingPosixGroup = process.platform !== "win32" &&
+				(this.stopWaiterCount ?? 0) > 0 && !this.processGroupConfirmedGone;
+			if (!ownsSurvivingPosixGroup) return emptyTerminationResult();
+			const termination = terminateChild(this.child, "SIGKILL", { includeExitedGroup: true });
+			this.exitedProcessGroupForceSignalled ||= termination.forceSignalled;
+			return termination;
+		}
+		this.stopping = true;
+		this.exited = true;
+		for (const terminal of this.terminals.values()) terminal.kill();
+		this.terminals.clear();
+		this.rejectPending(new Error("backend stopped"));
+		const termination = terminateChild(this.child, "SIGKILL");
+		if (this.activeStopTermination) Object.assign(this.activeStopTermination, mergeTerminationResults(this.activeStopTermination, termination));
+		if (process.platform === "win32" && termination.treeSignalled) this.processGroupConfirmedGone = true;
+		this.exitedProcessGroupForceSignalled ||= termination.forceSignalled;
+		return termination;
+	}
+
 	stopAndWait(timeoutMs = 5_000) {
 		if (this.stopAndWaitPromise) return this.stopAndWaitPromise;
 		this.stopWaiterCount = (this.stopWaiterCount ?? 0) + 1;
 		let operation;
 		operation = this.stopAndWaitOwned(timeoutMs).finally(() => {
+			this.activeStopTermination = undefined;
 			this.stopWaiterCount = Math.max(0, (this.stopWaiterCount ?? 1) - 1);
 			if (this.stopAndWaitPromise === operation) this.stopAndWaitPromise = undefined;
 		});
@@ -3268,6 +3293,7 @@ export class AcpClient {
 			platform,
 			...(options.runWindowsTaskkill ? { runWindowsTaskkill: options.runWindowsTaskkill } : {}),
 		});
+		this.activeStopTermination = termination;
 		if (!child) return;
 
 		// When a POSIX root exited before this call, its exit handler made the only
@@ -4467,8 +4493,11 @@ export class HarnessApp {
 			if (teardownStatus) this.setConnectionStatus(lifecycleAttempt, teardownStatus);
 			this.updateSpinner();
 			this.ui.requestRender();
+			const retiringClients = [previousClient, previousBtwClient].filter(Boolean);
+			this.activeAgentShutdownClients ??= new Set();
+			for (const client of retiringClients) this.activeAgentShutdownClients.add(client);
 			try {
-				await stopClientsForReplacement([previousClient, previousBtwClient]);
+				await stopClientsForReplacement(retiringClients);
 			} catch (error) {
 				this.sessionSwitchInProgress = transitionWasInProgress;
 				this.clearConnectionStatus(lifecycleAttempt);
@@ -4478,8 +4507,10 @@ export class HarnessApp {
 					this.addError(`Could not stop the previous backend: ${error.message ?? error}`);
 					this.ui.requestRender();
 				}
-					return;
-				}
+				return;
+			} finally {
+				for (const client of retiringClients) this.activeAgentShutdownClients.delete(client);
+			}
 			// The old trees are now confirmed gone, but shutdown may have begun while
 			// that bounded wait was in flight. Leave the app detached instead of
 			// starting a replacement that stopAndExit did not get a chance to snapshot.
@@ -12936,15 +12967,17 @@ export class HarnessApp {
 		}
 	}
 
-	trackBtwShutdown(client) {
+	trackBtwShutdown(client, options = {}) {
 		if (!client) return this.btwShutdownTail ?? Promise.resolve();
 		this.btwShutdownClients ??= new WeakMap();
+		this.activeBtwShutdownClients ??= new Set();
 		const existing = this.btwShutdownClients.get(client);
 		if (existing) return existing;
 		// stopClientsForReplacement enters stopAndWait synchronously before its first
 		// await, so close tracking is installed before any signal can make the root
 		// disappear. Combine with an older retirement without delaying this one.
-		const directShutdown = stopClientsForReplacement([client]);
+		const directShutdown = stopClientsForReplacement([client], options);
+		this.activeBtwShutdownClients.add(client);
 		const previousShutdown = this.btwShutdownTail;
 		const combined = previousShutdown
 			? Promise.all([previousShutdown, directShutdown])
@@ -12960,6 +12993,7 @@ export class HarnessApp {
 				}
 			})
 			.finally(() => {
+				this.activeBtwShutdownClients?.delete(client);
 				if (this.btwShutdownClients?.get(client) === tracked) this.btwShutdownClients.delete(client);
 				if (this.btwShutdownTail === tracked) this.btwShutdownTail = undefined;
 			});
@@ -12994,7 +13028,7 @@ export class HarnessApp {
 			thread.clearCancelGraceTimer?.();
 			if (options.stop !== false) {
 				thread.client?.cancel?.();
-				this.trackBtwShutdown(thread.client);
+				this.trackBtwShutdown(thread.client, { timeoutMs: options.timeoutMs });
 			}
 		}
 		if (!skipUi) {
@@ -14305,6 +14339,7 @@ export class HarnessApp {
 		this.cancelPermissionPrompts({ skipUi: options.skipUiStop === true });
 		this.voiceController?.dispose();
 		let sideShutdown = this.btwShutdownTail;
+		for (const client of this.activeBtwShutdownClients ?? []) client.forceStop?.();
 		if (this.btwThread) {
 			// TUI.stop() positions its final cursor relative to the current buffer.
 			// Leave /btw's alternate screen and render main synchronously first so
@@ -14312,12 +14347,18 @@ export class HarnessApp {
 			sideShutdown = this.closeBtw({
 				immediateRender: options.skipUiStop !== true,
 				skipUi: options.skipUiStop === true,
+				timeoutMs: FINAL_SHUTDOWN_GRACE_MS,
 			});
 		}
 		// Starting the awaitable stop installs close tracking before the TUI teardown
 		// or process exit can advance. Both main and side trees get bounded TERM/KILL
 		// escalation, and process.exit happens only after those waiters settle.
-		const mainShutdown = this.client ? stopClientsForReplacement([this.client]) : Promise.resolve();
+		const mainWasStopping = this.client?.stopping === true;
+		const mainShutdown = this.client
+			? stopClientsForReplacement([this.client], { timeoutMs: FINAL_SHUTDOWN_GRACE_MS })
+			: Promise.resolve();
+		if (mainWasStopping) this.client?.forceStop?.();
+		for (const client of this.activeAgentShutdownClients ?? []) client.forceStop?.();
 		// A replacement may have detached `this.client` before waiting for its old
 		// process tree. Its lifecycle tail owns that tree until the wait completes.
 		// `stopping` makes every queued/reawakened switch return without spawning;
@@ -15266,7 +15307,7 @@ async function stopClientForNativeMutation(client) {
 // Replacements have a different contract from native mutations: a confirmed
 // force-kill is safe to proceed from, while an unconfirmed process tree is not.
 // Test doubles and non-ACP adapters retain the original synchronous fallback.
-export async function stopClientsForReplacement(clients) {
+export async function stopClientsForReplacement(clients, options = {}) {
 	const unique = [...new Set((Array.isArray(clients) ? clients : [clients]).filter(Boolean))];
 	const results = await Promise.allSettled(unique.map(async (client) => {
 		if (typeof client.stopAndWait !== "function") {
@@ -15274,7 +15315,7 @@ export async function stopClientsForReplacement(clients) {
 			return;
 		}
 		try {
-			await client.stopAndWait();
+			await client.stopAndWait(options.timeoutMs);
 		} catch (error) {
 			if (error?.code === "PROCESS_TREE_FORCE_KILLED") return;
 			throw error;
@@ -17206,6 +17247,7 @@ export async function runTerminalAuthentication(agent, method, options = {}) {
 		let settled = false;
 		let terminating = false;
 		let terminationPromise;
+		let activeTermination;
 		let directChildClosed = false;
 		let unregister = () => {};
 		const finish = (error) => {
@@ -17215,24 +17257,25 @@ export async function runTerminalAuthentication(agent, method, options = {}) {
 			if (error) reject(error);
 			else resolve();
 		};
-		const terminateProcessTree = () => {
+		const terminateProcessTree = (timeoutMs = undefined) => {
 			if (settled) return Promise.resolve();
 			if (terminationPromise) return terminationPromise;
 			terminating = true;
 			terminationPromise = (async () => {
 				const initialSignal = process.platform === "win32" ? "SIGKILL" : "SIGTERM";
 				let termination = terminateChild(child, initialSignal);
+				activeTermination = termination;
 				let treeExited = await waitForProcessTreeExit(
 					child,
 					() => directChildClosed,
-					options.terminationGraceMs ?? PROCESS_TERMINATION_GRACE_MS,
+					timeoutMs ?? options.terminationGraceMs ?? PROCESS_TERMINATION_GRACE_MS,
 					termination,
 				);
 				if (!treeExited) {
-					termination = mergeTerminationResults(
+					Object.assign(termination, mergeTerminationResults(
 						termination,
 						terminateChild(child, "SIGKILL", { includeExitedGroup: true }),
-					);
+					));
 					treeExited = await waitForProcessTreeExit(
 						child,
 						() => directChildClosed,
@@ -17250,7 +17293,17 @@ export async function runTerminalAuthentication(agent, method, options = {}) {
 			})();
 			return terminationPromise;
 		};
-		unregister = options.processTracker?.register(terminateProcessTree) ?? unregister;
+		const forceProcessTree = () => {
+			if (settled) return emptyTerminationResult();
+			const childExited = directChildClosed || child.exitCode !== null && child.exitCode !== undefined || Boolean(child.signalCode);
+			const ownsSurvivingPosixGroup = childExited && platform !== "win32" && Boolean(terminationPromise) &&
+				posixProcessGroupExists(Number(child.pid), platform);
+			if (childExited && !ownsSurvivingPosixGroup) return emptyTerminationResult();
+			const forced = terminateChild(child, "SIGKILL", { includeExitedGroup: ownsSurvivingPosixGroup });
+			if (activeTermination) Object.assign(activeTermination, mergeTerminationResults(activeTermination, forced));
+			return forced;
+		};
+		unregister = options.processTracker?.register(terminateProcessTree, forceProcessTree) ?? unregister;
 		child.once("error", (error) => {
 			if (!terminating) finish(error);
 		});
