@@ -19,6 +19,11 @@ assert.deepEqual(
 	parseShellHistory("- cmd: git status\n  when: 1\n- cmd: printf foo\\nbar\n", "/tmp/fish_history"),
 	["git status", "printf foo bar"],
 );
+assert.deepEqual(
+	parseShellHistory("- cmd: printf 'a\\\\nb'\n", "/tmp/fish_history"),
+	["printf 'a\\nb'"],
+	"an escaped backslash before n decodes to a literal backslash-n, not a newline",
+);
 assert.equal(normalizeHistoryCommand("  printf\t'ok'\u001b[2J  "), "printf 'ok'");
 assert.equal(normalizeHistoryCommand("bad\0command"), undefined);
 assert.deepEqual(shellHistoryFiles({ HISTFILE: "~/custom", SHELL: "/bin/zsh" }, "/home/test"), [

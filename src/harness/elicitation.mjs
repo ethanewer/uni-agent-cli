@@ -441,6 +441,9 @@ export function validateElicitationFieldValue(field, rawValue) {
 	}
 	if (field.type === "number" || field.type === "integer") {
 		if (rawValue === "" && !field.required) return { ok: true, omit: true };
+		if (typeof rawValue !== "number" && typeof rawValue !== "string") {
+			return { ok: false, error: `${label} must be ${field.type === "integer" ? "a safe integer" : "a number"}` };
+		}
 		if (typeof rawValue === "string") {
 			const syntax = field.type === "integer"
 				? /^-?(?:0|[1-9]\d*)$/u

@@ -17,6 +17,7 @@
 // The module is pure except for the grant-store helpers, which take an explicit
 // file path (defaulting to ~/.config/cc/permissions.json) so tests stay hermetic.
 
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -250,7 +251,10 @@ export function pickAllowOption(options = [], { broad = false } = {}) {
 export function pickDenyOption(options = []) {
 	const deny = options.filter((option) => classifyOption(option) === "deny");
 	if (deny.length === 0) return undefined;
-	return deny.find((option) => optionScope(option) === "once") ?? deny[0];
+	const byScope = (scope) => deny.find((option) => optionScope(option) === scope);
+	// Narrowest first, mirroring pickAllowOption: a default "n" keypress must
+	// never persist a permanent denial while a session-scoped one is offered.
+	return byScope("once") ?? byScope("session") ?? deny[0];
 }
 
 /**
@@ -509,12 +513,68 @@ export function permissionsStorePath() {
 }
 
 export function loadGrants(file = permissionsStorePath()) {
+	let raw;
 	try {
-		if (!fs.existsSync(file)) return [];
-		const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
-		return normalizeRules(parsed?.grants ?? parsed);
+		raw = fs.readFileSync(file, "utf8");
 	} catch {
 		return [];
+	}
+	try {
+		const parsed = JSON.parse(raw);
+		return normalizeRules(parsed?.grants ?? parsed);
+	} catch {
+		// The store exists but did not parse (e.g. a torn write from an old
+		// version or a full disk). Don't silently equate that with "no grants":
+		// quarantine the file so the next saveGrants can't overwrite the user's
+		// remembered allow/deny-always rules for good. Quarantine the symlink
+		// TARGET (dotfile managers commonly link the store) so the link itself
+		// survives, and claim it by atomic rename BEFORE judging it — only one
+		// process wins the rename and the claimed copy is immutable, so a healthy
+		// replacement written by another cc between the read and the claim is
+		// recognized and put back rather than quarantined.
+		let target = file;
+		for (let hops = 0; hops < 8; hops += 1) {
+			let link;
+			try {
+				link = fs.readlinkSync(target);
+			} catch {
+				break;
+			}
+			target = path.resolve(path.dirname(target), link);
+		}
+		const quarantined = `${target}.corrupt-${Date.now()}`;
+		try {
+			fs.renameSync(target, quarantined);
+		} catch {
+			// Another process already claimed or replaced it; nothing to quarantine.
+			console.error(`cc: permissions store ${file} is corrupt; ignoring it and continuing with no remembered grants.`);
+			return [];
+		}
+		try {
+			const parsed = JSON.parse(fs.readFileSync(quarantined, "utf8"));
+			const rules = normalizeRules(parsed?.grants ?? parsed);
+			// The claim captured a store repaired since the corrupt read. Publish it
+			// back without replacing anything newer that appeared meanwhile.
+			try {
+				fs.copyFileSync(quarantined, target, fs.constants.COPYFILE_EXCL);
+				fs.rmSync(quarantined, { force: true });
+			} catch {
+				// A newer store appeared; keep it, leave the healthy claim behind,
+				// and answer from the newer store — the displaced rules may include
+				// an allow that was just revoked. If the newer store cannot be read,
+				// fail closed rather than resurrect possibly-revoked grants.
+				try {
+					const parsed = JSON.parse(fs.readFileSync(target, "utf8"));
+					return normalizeRules(parsed?.grants ?? parsed);
+				} catch {
+					return [];
+				}
+			}
+			return rules;
+		} catch {
+			console.error(`cc: permissions store ${file} is corrupt; moved it to ${quarantined} and continuing with no remembered grants.`);
+			return [];
+		}
 	}
 }
 
@@ -526,7 +586,43 @@ export function saveGrants(grants, file = permissionsStorePath()) {
 	for (const rule of normalized) byScope.set(grantScopeKey(rule), rule);
 	const deduped = [...byScope.values()];
 	fs.mkdirSync(path.dirname(file), { recursive: true });
-	fs.writeFileSync(file, `${JSON.stringify({ grants: deduped }, null, 2)}\n`);
+	// Dotfile managers commonly symlink the store; replace-by-rename must land on
+	// the real target — created if absent — so the managed file is updated and
+	// the link survives. Links are followed manually because realpath rejects a
+	// dangling link, whose target the first save must create.
+	for (let hops = 0; hops < 8; hops += 1) {
+		let link;
+		try {
+			link = fs.readlinkSync(file);
+		} catch {
+			break;
+		}
+		file = path.resolve(path.dirname(file), link);
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+	}
+	// Atomic replace (temp + rename): a crash or ENOSPC mid-write must never leave
+	// a truncated store behind, or every remembered allow/deny rule would be lost.
+	const temporary = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${randomUUID()}.tmp`);
+	try {
+		fs.writeFileSync(temporary, `${JSON.stringify({ grants: deduped }, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+		try {
+			fs.renameSync(temporary, file);
+		} catch (error) {
+			// Windows rename does not replace an existing file. Keep the normal path
+			// atomic everywhere else, and use the narrow remove+rename fallback only
+			// for a non-directory destination on Windows.
+			if (process.platform !== "win32" || !["EEXIST", "EPERM"].includes(error?.code)) throw error;
+			try {
+				if (fs.lstatSync(file).isDirectory()) throw error;
+			} catch (statError) {
+				if (statError?.code !== "ENOENT") throw statError;
+			}
+			fs.rmSync(file, { force: true });
+			fs.renameSync(temporary, file);
+		}
+	} finally {
+		fs.rmSync(temporary, { force: true });
+	}
 	return deduped;
 }
 

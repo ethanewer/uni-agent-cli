@@ -27,7 +27,10 @@ export function shellInvocation(command, options = {}) {
 	}
 	const configured = String(environment.SHELL ?? "").trim();
 	const executable = configured && path.isAbsolute(configured) ? configured : "/bin/sh";
-	return { command: executable, args: ["-lc", command] };
+	// csh/tcsh reject combined flags (and only accept -l alone), so login mode is
+	// unavailable there; plain -c still runs the command.
+	const cshFamily = ["csh", "tcsh"].includes(path.basename(executable));
+	return { command: executable, args: cshFamily ? ["-c", command] : ["-lc", command] };
 }
 
 export function sanitizeShellOutput(value) {

@@ -36,12 +36,34 @@ function packageDirectory(nodeModules, packageName) {
 	return path.join(nodeModules, ...packageName.split("/"));
 }
 
+// Project-local and npx installs hoist cc's dependencies into an ancestor
+// node_modules instead of nesting them under the package, so verification must
+// mirror Node's ancestor traversal before declaring a component missing.
+function hoistedPackageDirectory(nodeModules, packageName) {
+	let directory = path.dirname(nodeModules);
+	for (;;) {
+		const parent = path.dirname(directory);
+		if (parent === directory) return undefined;
+		directory = parent;
+		if (path.basename(directory) === "node_modules") continue;
+		const candidate = packageDirectory(path.join(directory, "node_modules"), packageName);
+		if (readJson(path.join(candidate, "package.json"))) return candidate;
+	}
+}
+
+function resolvePackageDirectory(nodeModules, packageName) {
+	const local = packageDirectory(nodeModules, packageName);
+	if (readJson(path.join(local, "package.json"))) return local;
+	return hoistedPackageDirectory(nodeModules, packageName);
+}
+
 function installedDependencyDirectory(nodeModules, packageName, owners = []) {
 	const candidates = [
 		packageDirectory(nodeModules, packageName),
 		...owners.filter(Boolean).map((owner) => packageDirectory(path.join(owner, "node_modules"), packageName)),
 	];
-	return candidates.find((candidate) => Boolean(readJson(path.join(candidate, "package.json"))));
+	return candidates.find((candidate) => Boolean(readJson(path.join(candidate, "package.json"))))
+		?? hoistedPackageDirectory(nodeModules, packageName);
 }
 
 function nativePlatformPackageNames(options = {}) {
@@ -107,8 +129,8 @@ export function inspectLocalNativePayloads(nodeModules = LOCAL_NODE_MODULES, opt
 			nativeFailure("codex", "@openai/codex", names.error),
 		];
 	}
-	const claudeAdapter = packageDirectory(nodeModules, BUNDLED_ACP_ADAPTERS.claude.packageName);
-	const codexAdapter = packageDirectory(nodeModules, BUNDLED_ACP_ADAPTERS.codex.packageName);
+	const claudeAdapter = resolvePackageDirectory(nodeModules, BUNDLED_ACP_ADAPTERS.claude.packageName);
+	const codexAdapter = resolvePackageDirectory(nodeModules, BUNDLED_ACP_ADAPTERS.codex.packageName);
 	const claudeSdk = installedDependencyDirectory(
 		nodeModules,
 		"@anthropic-ai/claude-agent-sdk",
@@ -174,7 +196,8 @@ export function inspectLocalNativePayloads(nodeModules = LOCAL_NODE_MODULES, opt
  * channel-installer verification.
  */
 export function inspectLocalAdapter(adapter, nodeModules = LOCAL_NODE_MODULES) {
-	const packageDir = packageDirectory(nodeModules, adapter.packageName);
+	const packageDir = resolvePackageDirectory(nodeModules, adapter.packageName)
+		?? packageDirectory(nodeModules, adapter.packageName);
 	const manifestPath = path.join(packageDir, "package.json");
 	const manifest = readJson(manifestPath);
 	if (!manifest) {

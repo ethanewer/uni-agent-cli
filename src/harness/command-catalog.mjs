@@ -534,14 +534,26 @@ function writeCache(file, cache, changes = {}) {
 	if (!release) return false;
 	try {
 		const current = readCacheUnlocked(file);
-		const next = { version: CACHE_VERSION, entries: { ...current.entries, ...(changes.updates ?? {}) } };
-		for (const scope of changes.removed ?? []) delete next.entries[scope];
-		const removedOwners = new Set(changes.removedOwners ?? []);
+		const next = { version: CACHE_VERSION, entries: { ...current.entries } };
+		// Removals may carry a cutoff ([scope|owner, invalidatedAt]): entries
+		// written after the invalidation — by this or another process — are newer
+		// authority and survive a stale (lock-deferred) ride-along removal.
+		const newerThan = (entry, cutoff) =>
+			cutoff !== undefined && typeof entry?.updatedAt === "string" && entry.updatedAt > cutoff;
+		for (const removedEntry of changes.removed ?? []) {
+			const [scope, cutoff] = Array.isArray(removedEntry) ? removedEntry : [removedEntry, undefined];
+			if (!newerThan(next.entries[scope], cutoff)) delete next.entries[scope];
+		}
+		const removedOwners = new Map(
+			(changes.removedOwners ?? []).map((entry) => (Array.isArray(entry) ? entry : [entry, undefined])),
+		);
 		if (removedOwners.size > 0) {
 			for (const [scope, entry] of Object.entries(next.entries)) {
-				if (removedOwners.has(entry.owner)) delete next.entries[scope];
+				if (!removedOwners.has(entry.owner)) continue;
+				if (!newerThan(entry, removedOwners.get(entry.owner))) delete next.entries[scope];
 			}
 		}
+		Object.assign(next.entries, changes.updates ?? {});
 		pruneCache(next);
 		cache.entries = next.entries;
 		fs.writeFileSync(temporary, `${JSON.stringify(cache)}\n`, { flag: "wx", mode: 0o600 });
@@ -572,12 +584,42 @@ function writeCache(file, cache, changes = {}) {
 }
 
 export class BackendCommandCatalog {
+	#pendingRemovals = new Map(); // scope -> invalidatedAt ISO cutoff
+	#pendingRemovedOwners = new Map(); // owner -> invalidatedAt ISO cutoff
+
 	constructor(agents = {}, options = {}) {
 		this.agents = agents;
 		this.cwd = path.resolve(options.cwd ?? process.cwd());
 		this.environment = options.environment ?? process.env;
 		this.cachePath = options.cachePath;
 		this.cache = readCache(this.cachePath);
+	}
+
+	// Failed removals stay pending and ride along on every later write, so a
+	// contended lock during invalidation cannot let the next successful write
+	// resurrect the removed entries from the stale disk snapshot. Updates are
+	// applied after removals, so a scope re-remembered later still wins, and
+	// owner removals carry their invalidation time so entries written after it
+	// (by any process) are never deleted by a stale ride-along removal.
+	#write(changes = {}) {
+		const now = new Date().toISOString();
+		const removed = new Map(this.#pendingRemovals);
+		for (const scope of changes.removed ?? []) {
+			if (!removed.has(scope)) removed.set(scope, now);
+		}
+		const removedOwners = new Map(this.#pendingRemovedOwners);
+		for (const owner of changes.removedOwners ?? []) {
+			if (!removedOwners.has(owner)) removedOwners.set(owner, now);
+		}
+		const persisted = writeCache(this.cachePath, this.cache, { ...changes, removed: [...removed], removedOwners: [...removedOwners] });
+		if (persisted) {
+			this.#pendingRemovals.clear();
+			this.#pendingRemovedOwners.clear();
+		} else {
+			this.#pendingRemovals = removed;
+			this.#pendingRemovedOwners = removedOwners;
+		}
+		return persisted;
 	}
 
 	setCwd(cwd) {
@@ -617,15 +659,20 @@ export class BackendCommandCatalog {
 				: {}),
 		};
 		this.cache.entries[scope] = entry;
+		// A scope that is legitimately re-remembered cancels any removal still
+		// pending from a lock-contended invalidation: otherwise an unrelated
+		// scope's write would carry that stale removal and delete this fresh
+		// entry from memory and disk before its deferred persist runs.
+		this.#pendingRemovals.delete(scope);
 		if (options.persist === false) return true;
-		return writeCache(this.cachePath, this.cache, { updates: { [scope]: entry } });
+		return this.#write({ updates: { [scope]: entry } });
 	}
 
 	persist(key) {
 		const scope = this.scopeFor(key);
 		const entry = this.cache.entries[scope];
 		if (!entry) return false;
-		return writeCache(this.cachePath, this.cache, { updates: { [scope]: entry } });
+		return this.#write({ updates: { [scope]: entry } });
 	}
 
 	validateIdentity(key, agentInfo) {
@@ -638,7 +685,7 @@ export class BackendCommandCatalog {
 		const actualVersion = boundedText(agentInfo.version, 128);
 		if ((!expectedName || expectedName === actualName) && (!expectedVersion || expectedVersion === actualVersion)) return true;
 		delete this.cache.entries[scope];
-		writeCache(this.cachePath, this.cache, { removed: [scope] });
+		this.#write({ removed: [scope] });
 		return false;
 	}
 
@@ -649,7 +696,7 @@ export class BackendCommandCatalog {
 			.filter(([scope, entry]) => scope === currentScope || entry.owner === owner)
 			.map(([scope]) => scope);
 		for (const scope of removed) delete this.cache.entries[scope];
-		const persisted = writeCache(this.cachePath, this.cache, { removed, removedOwners: [owner] });
+		const persisted = this.#write({ removed, removedOwners: [owner] });
 		return removed.length > 0 || persisted;
 	}
 }

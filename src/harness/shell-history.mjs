@@ -96,7 +96,8 @@ export function parseShellHistory(value, file = "") {
 		if (fish) {
 			const match = /^\s*- cmd:\s?(.*)$/u.exec(line);
 			if (!match) continue;
-			line = match[1].replaceAll("\\n", "\n").replaceAll("\\\\", "\\");
+			// Single pass so an escaped backslash never merges with a following `n`.
+			line = match[1].replace(/\\(n|\\)/gu, (_, escaped) => (escaped === "n" ? "\n" : "\\"));
 		} else {
 			// zsh EXTENDED_HISTORY: `: <epoch>:<duration>;<command>`.
 			line = line.replace(/^:\s+\d+:\d+;/u, "");

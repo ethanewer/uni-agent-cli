@@ -61,6 +61,9 @@ export function fencedCodeBlocks(value) {
 		}
 		open.lines.push(line);
 	}
+	// CommonMark treats an unclosed fence as running to the end of the document,
+	// which also matches how the transcript renders a truncated response.
+	if (open) blocks.push({ language: open.language, text: open.lines.join("\n") });
 	return blocks;
 }
 

@@ -331,7 +331,10 @@ if (process.platform !== "win32") {
 			lease: true,
 			path: path.join(fs.realpathSync(release), "node_modules", ".bin"),
 		});
-		assert.equal(fs.existsSync(path.join(leases, releaseId)), false);
+		// Exit removes only the lease file; the lease directory is left for
+		// guard-holding GC so an exiting runner can never rmdir between a starting
+		// runner's mkdir and its lease write.
+		assert.deepEqual(fs.readdirSync(path.join(leases, releaseId)), []);
 	} finally {
 		fs.rmSync(temporary, { recursive: true, force: true });
 	}

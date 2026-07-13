@@ -5,6 +5,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import * as zlib from "node:zlib";
+import { setKittyProtocolActive } from "@mariozechner/pi-tui/dist/keys.js";
+import { ProcessTerminal } from "@mariozechner/pi-tui/dist/terminal.js";
 import {
 	AcpClient,
 	acquireForkOperationLock,
@@ -17,6 +19,7 @@ import {
 	collectEnvironmentAuthenticationVariables,
 	configureCcKeybindings,
 	copyCodexRolloutWithNewId,
+	createHarnessTerminal,
 	effectiveActivityStatus,
 	findCodexRolloutPath,
 	forgetForkIds,
@@ -93,6 +96,38 @@ assert.equal(singleLineMenuText("\x1b[31msession\nidentifier\x1b[0m"), "session 
 	assert.equal(keybindings.matches("\r", "tui.input.newLine"), false, "plain Return must not insert a newline");
 	assert.equal(keybindings.matches("\r", "tui.input.submit"), true, "plain Return still submits");
 	assert.deepEqual(keybindings.getConflicts(), []);
+}
+{
+	// A lone LF is only normalized to CR (Enter) in legacy mode. With the Kitty
+	// protocol active, "\n" is a shift+enter text mapping (e.g. Ghostty's
+	// `shift+enter=text:\n`) and must reach the TUI unchanged so it inserts a
+	// newline instead of submitting the prompt.
+	const originalStart = ProcessTerminal.prototype.start;
+	const originalStop = ProcessTerminal.prototype.stop;
+	const originalWrite = ProcessTerminal.prototype.write;
+	let handleInput;
+	ProcessTerminal.prototype.start = function (onInput) {
+		handleInput = onInput;
+	};
+	ProcessTerminal.prototype.stop = () => {};
+	ProcessTerminal.prototype.write = () => {};
+	try {
+		const received = [];
+		const terminal = createHarnessTerminal();
+		terminal.start((data) => received.push(data), () => {});
+		setKittyProtocolActive(false);
+		handleInput("\n");
+		handleInput("pasted\n");
+		setKittyProtocolActive(true);
+		handleInput("\n");
+		terminal.stop();
+		assert.deepEqual(received, ["\r", "pasted\n", "\n"]);
+	} finally {
+		setKittyProtocolActive(false);
+		ProcessTerminal.prototype.start = originalStart;
+		ProcessTerminal.prototype.stop = originalStop;
+		ProcessTerminal.prototype.write = originalWrite;
+	}
 }
 {
 	const panel = new SelectionPanel("Resume\nsession", [{ label: "first\nsecond", description: "date\npath" }], () => {});
@@ -1929,23 +1964,26 @@ await (async () => {
 
 // User-requested exits cannot tear down cc while a session mutation still owns
 // the transition gate (notably while code-only rewind is changing the worktree).
+// A repeated exit request shortly after a blocked one force-quits anyway, so a
+// hung transition can never make exit permanently unavailable.
 await (async () => {
 	const calls = [];
+	let stops = 0;
 	const app = Object.create(HarnessApp.prototype);
 	app.sessionSwitchInProgress = true;
 	app.config = { agents: { codex: {} } };
-	app.stop = () => assert.fail("exit must not stop cc during a session transition");
+	app.stop = () => { stops += 1; };
 	app.addCommandMessage = (message) => calls.push(["command", message]);
 	app.addNotice = (message) => calls.push(["notice", message]);
 	app.ui = { requestRender() {} };
 	await app.runLocalSlashCommand("exit", "");
-	await app.handleHarnessCommand("/harness exit");
+	assert.equal(stops, 0, "the first exit request during a transition is blocked");
 	assert.deepEqual(calls, [
 		["command", "/exit"],
 		["notice", "Exit is unavailable while a session transition is in progress"],
-		["command", "/harness exit"],
-		["notice", "Exit is unavailable while a session transition is in progress"],
 	]);
+	await app.handleHarnessCommand("/harness exit");
+	assert.equal(stops, 1, "a repeated exit request forces the bounded stop");
 })();
 
 // Selecting the already-active harness is an explicit replacement, not an
@@ -3653,6 +3691,34 @@ for (const key of ["claude", "codex"]) {
 assert.match(defaultConfig.agents["terminus-2"].acp.args[0], /terminus_2\/bridge\.py$/);
 assert.match(defaultConfig.agents["mini-swe-agent"].acp.args[0], /mini_swe_agent\/bridge\.py$/);
 
+// loadConfig must never hand out the module-level default agent objects: the
+// app writes session state (auth env, session defaults) onto
+// config.agents.<key> in place, and a shared reference would leak one
+// session's credentials and signed-out state into every later load in the
+// same process.
+{
+	const prevConfig = process.env.CC_CONFIG;
+	const prevSettings = process.env.CC_SETTINGS;
+	process.env.CC_CONFIG = path.join(os.tmpdir(), `cc-clone-config-${process.pid}.json`);
+	process.env.CC_SETTINGS = path.join(os.tmpdir(), `cc-clone-settings-${process.pid}.json`);
+	try {
+		const first = loadConfig();
+		first.agents.claude._sessionAuthEnv = { ANTHROPIC_API_KEY: "session-secret" };
+		first.agents.claude._signedOutAuthEnvNames = ["ANTHROPIC_API_KEY"];
+		first.agents.codex._sessionDefaults = { model: "gpt-session" };
+		const second = loadConfig();
+		assert.notStrictEqual(second.agents.claude, first.agents.claude, "agent definitions are not shared across loads");
+		assert.equal(second.agents.claude._sessionAuthEnv, undefined, "session credentials never leak into a fresh load");
+		assert.equal(second.agents.claude._signedOutAuthEnvNames, undefined);
+		assert.equal(second.agents.codex._sessionDefaults, undefined);
+	} finally {
+		if (prevConfig === undefined) delete process.env.CC_CONFIG;
+		else process.env.CC_CONFIG = prevConfig;
+		if (prevSettings === undefined) delete process.env.CC_SETTINGS;
+		else process.env.CC_SETTINGS = prevSettings;
+	}
+}
+
 assert.ok(themeNames().includes("tokyonight"));
 assert.ok(themeNames().includes("matrix"));
 assert.ok(themeNames().includes("cursor-dark"));
@@ -3758,6 +3824,56 @@ try {
 		// applyHarnessSettings ignores a key with no matching agent.
 		assert.equal(applyHarnessSettings(config, { agents: {}, defaultAgent: "claude" }).defaultAgent, "claude");
 		assert.equal(applyHarnessSettings(config, { agents: {}, defaultAgent: "nope" }).defaultAgent, config.defaultAgent);
+	} finally {
+		if (prevSettings === undefined) delete process.env.CC_SETTINGS;
+		else process.env.CC_SETTINGS = prevSettings;
+		if (prevConfig === undefined) delete process.env.CC_CONFIG;
+		else process.env.CC_CONFIG = prevConfig;
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+}
+
+// Settings persistence never materializes a theme the user did not choose (a
+// config.json theme stays authoritative and unknown stored names survive
+// unrelated saves verbatim), and a torn settings.json degrades to defaults
+// instead of failing every subsequent launch.
+{
+	const prevSettings = process.env.CC_SETTINGS;
+	const prevConfig = process.env.CC_CONFIG;
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-settings-durability-"));
+	try {
+		const settingsFile = path.join(dir, "settings.json");
+		const configFile = path.join(dir, "config.json");
+		fs.writeFileSync(configFile, `${JSON.stringify({ ...config, theme: "matrix" }, null, 2)}\n`);
+		process.env.CC_SETTINGS = settingsFile;
+		process.env.CC_CONFIG = configFile;
+
+		const saved = saveSettingsPatch({ defaultAgent: "cursor" });
+		assert.equal(Object.prototype.hasOwnProperty.call(saved, "theme"), false);
+		assert.equal(
+			Object.prototype.hasOwnProperty.call(JSON.parse(fs.readFileSync(settingsFile, "utf8")), "theme"),
+			false,
+			"a theme-less save does not materialize a theme override",
+		);
+		assert.equal(loadConfig().theme, "matrix", "the config.json theme stays authoritative");
+
+		// A stored theme from a newer release is not rewritten by unrelated saves.
+		fs.writeFileSync(settingsFile, `${JSON.stringify({ theme: "future-theme" }, null, 2)}\n`);
+		saveSettingsPatch({ defaultAgent: "cursor" });
+		assert.equal(JSON.parse(fs.readFileSync(settingsFile, "utf8")).theme, "future-theme");
+
+		// A torn write (crash/ENOSPC mid-save) falls back to defaults on load and
+		// self-heals on the next save.
+		fs.writeFileSync(settingsFile, "{\"defaultAgent\": \"cu");
+		assert.equal(loadConfig().defaultAgent, config.defaultAgent);
+		assert.equal(saveSettingsPatch({ defaultAgent: "cursor" }).defaultAgent, "cursor");
+		assert.equal(loadConfig().defaultAgent, "cursor");
+
+		// A stale settings lock left by a crashed process never blocks saving.
+		fs.mkdirSync(`${settingsFile}.lock`);
+		fs.utimesSync(`${settingsFile}.lock`, new Date(0), new Date(0));
+		assert.equal(saveSettingsPatch({ copyAlwaysFullResponse: true }).copyAlwaysFullResponse, true);
+		assert.equal(fs.existsSync(`${settingsFile}.lock`), false, "the stale lock is reclaimed and released");
 	} finally {
 		if (prevSettings === undefined) delete process.env.CC_SETTINGS;
 		else process.env.CC_SETTINGS = prevSettings;
@@ -5517,6 +5633,75 @@ process.stdout.write(wouldReap ? "reap" : "keep");
 		assert.equal(JSON.parse(fs.readFileSync(registryLock, "utf8")).token, "live-registry-successor");
 		assert.equal(loadForkIds().has("registry-write-must-not-run"), false);
 		fs.rmSync(registryLock, { force: true });
+
+		// A pre-protocol stable cc that crashed while holding the operation lock
+		// (owner.json without protocolVersion) is reclaimed with the previous
+		// release's dead-PID rule instead of blocking session operations forever.
+		writeOperationLockOwner({
+			pid: exitedOwner.pid,
+			hostname: os.hostname(),
+			token: "legacy-owner",
+		});
+		const releaseLegacyRecovered = await acquireForkOperationLock({ operation: "test legacy stale recovery", timeoutMs: 100 });
+		releaseLegacyRecovered();
+		assert.equal(fs.existsSync(abandonedLock), false);
+
+		// A leftover legacy mkdir-style registry lock ages out on mtime as before.
+		fs.mkdirSync(registryLock);
+		fs.utimesSync(registryLock, new Date(0), new Date(0));
+		recordForkId("legacy-registry-lock-recovered", undefined, { required: true, timeoutMs: 100 });
+		assert.equal(loadForkIds().has("legacy-registry-lock-recovered"), true);
+		assert.equal(fs.existsSync(registryLock), false);
+
+		// A mutation marker that becomes stuck after a contender has published its
+		// registry lock times out instead of blocking the event loop forever, and
+		// the timed-out contender unpublishes its own lock.
+		let stuckRegistryMarkerPlanted = false;
+		assert.throws(
+			() => recordForkId("registry-stuck-mutation", undefined, {
+				required: true,
+				timeoutMs: 50,
+				_testBeforeRegistryPublish({ lockPath }) {
+					if (stuckRegistryMarkerPlanted) return;
+					stuckRegistryMarkerPlanted = true;
+					fs.writeFileSync(`${lockPath}.mutation`, `${JSON.stringify({
+						protocolVersion: 3,
+						pid: process.pid,
+						hostname: os.hostname(),
+						token: "stuck-live-mutation",
+					})}\n`, { flag: "wx" });
+				},
+			}),
+			/could not update the fork registry.*timed out waiting for the fork registry lock/,
+		);
+		assert.equal(stuckRegistryMarkerPlanted, true);
+		assert.equal(fs.existsSync(registryLock), false, "the timed-out contender unpublishes its lock");
+		fs.rmSync(`${registryLock}.mutation`, { force: true });
+		recordForkId("registry-after-stuck-mutation", undefined, { required: true, timeoutMs: 100 });
+		assert.equal(loadForkIds().has("registry-after-stuck-mutation"), true);
+
+		// Same deadline for the async operation-lock variant.
+		let stuckOperationMarkerPlanted = false;
+		await assert.rejects(
+			acquireForkOperationLock({
+				operation: "test stuck mutation deadline",
+				timeoutMs: 50,
+				_testBeforeOperationPublish({ lockPath }) {
+					if (stuckOperationMarkerPlanted) return;
+					stuckOperationMarkerPlanted = true;
+					fs.writeFileSync(`${lockPath}.mutation`, `${JSON.stringify({
+						protocolVersion: 3,
+						pid: process.pid,
+						hostname: os.hostname(),
+						token: "stuck-live-operation-mutation",
+					})}\n`, { flag: "wx" });
+				},
+			}),
+			/another cc process is changing Codex fork storage/,
+		);
+		assert.equal(stuckOperationMarkerPlanted, true);
+		assert.equal(fs.existsSync(abandonedLock), false, "the timed-out contender unpublishes its lock");
+		fs.rmSync(`${abandonedLock}.mutation`, { force: true });
 	} finally {
 		if (prev === undefined) delete process.env.CC_FORKS;
 		else process.env.CC_FORKS = prev;
@@ -5763,6 +5948,187 @@ await (async () => {
 	await promptPromise;
 	assert.equal(lateRequests.at(-1).method, "session/prompt", "the prompt runs after late defaults settle");
 })();
+
+// A harness that reports its model only through the ACP models snapshot has no
+// settable model option: a saved default the snapshot proves is already current
+// must not stall the first prompt behind the startup-defaults deadline or emit
+// a session/set_config_option request. (A default the snapshot does NOT prove
+// current may still be satisfied by a config option that arrives late, and
+// keeps waiting until the deadline — covered by the late-defaults test above.)
+await (async () => {
+	const requests = [];
+	const client = new AcpClient({ command: "fake", _sessionDefaults: { model: "provider/model-id" } }, () => {});
+	client.start = () => {};
+	client.request = async (method, params) => {
+		requests.push({ method, params });
+		if (method === "initialize") return { agentCapabilities: {}, agentInfo: {}, authMethods: [] };
+		if (method === "session/new") {
+			return {
+				sessionId: "models-only",
+				models: {
+					currentModelId: "provider/model-id",
+					availableModels: [{ modelId: "provider/model-id", name: "Friendly Model" }],
+				},
+			};
+		}
+		return {};
+	};
+	await client.initialize();
+	assert.equal(client.pendingStartupConfigDefaults, undefined, "models-snapshot sessions consume saved defaults immediately");
+	const started = Date.now();
+	await client.prompt("hello");
+	assert.ok(Date.now() - started < 1_000, "the first prompt is not gated on unappliable startup defaults");
+	assert.equal(requests.some((entry) => entry.method === "session/set_config_option"), false);
+	assert.equal(requests.at(-1).method, "session/prompt");
+})();
+
+// _ccStartupRequestedModel is published only after the saved model default is
+// actually applied, so a rejected startup request cannot feed the legacy-alias
+// migration with the agent's own fallback model.
+await (async () => {
+	const rejecting = new AcpClient({ command: "fake", _sessionDefaults: { model: "sol" } }, () => {});
+	rejecting.start = () => {};
+	rejecting.request = async (method) => {
+		if (method === "initialize") return { agentCapabilities: {}, agentInfo: {}, authMethods: [] };
+		if (method === "session/new") {
+			return {
+				sessionId: "reject-model",
+				configOptions: [{ id: "model", category: "model", currentValue: "gpt-5.7-sol", options: [] }],
+			};
+		}
+		if (method === "session/set_config_option") throw new Error("model retired");
+		return {};
+	};
+	await rejecting.initialize();
+	assert.equal(
+		rejecting.getSessionInfo()._ccStartupRequestedModel,
+		undefined,
+		"a rejected startup model is not advertised as requested",
+	);
+
+	const applying = new AcpClient({ command: "fake", _sessionDefaults: { model: "sol" } }, () => {});
+	applying.start = () => {};
+	applying.request = async (method, params) => {
+		if (method === "initialize") return { agentCapabilities: {}, agentInfo: {}, authMethods: [] };
+		if (method === "session/new") {
+			return {
+				sessionId: "apply-model",
+				configOptions: [{ id: "model", category: "model", currentValue: "gpt-5.7-sol", options: [] }],
+			};
+		}
+		if (method === "session/set_config_option") {
+			return { configOptions: [{ id: "model", category: "model", currentValue: params.value, options: [] }] };
+		}
+		return {};
+	};
+	await applying.initialize();
+	assert.equal(
+		applying.getSessionInfo()._ccStartupRequestedModel,
+		"sol",
+		"an applied startup model is advertised for the alias migration",
+	);
+})();
+
+// The footer resolves models-snapshot ids to friendly names, applies the
+// persisted display, and keeps the persisted effort for harnesses without a
+// thought_level option.
+{
+	const app = Object.create(HarnessApp.prototype);
+	app.activeKey = "pi";
+	app.focusedThread = "main";
+	app.config = {
+		settings: {
+			agents: { pi: { sessionDefaults: { model: "provider/model-id", modelDisplay: "Friendly Model", effort: "high" } } },
+		},
+	};
+	app.sessionStates = new Map();
+	app.client = {
+		sessionId: "live",
+		getSessionInfo: () => ({
+			models: {
+				currentModelId: "provider/model-id",
+				availableModels: [{ modelId: "provider/model-id", name: "Provider Name" }],
+			},
+		}),
+	};
+	assert.deepEqual(
+		app.modelAndEffortForStatus(),
+		{ model: "Friendly Model", effort: "high" },
+		"a live models snapshot keeps the persisted display name and effort",
+	);
+	app.client.getSessionInfo = () => ({
+		models: {
+			currentModelId: "provider/other-model",
+			availableModels: [{ modelId: "provider/other-model", name: "Other Model" }],
+		},
+	});
+	assert.deepEqual(
+		app.modelAndEffortForStatus(),
+		{ model: "Other Model", effort: "high" },
+		"an unrelated live model resolves to its snapshot name instead of the raw id",
+	);
+}
+
+// A saved model id the agent still advertises through the models snapshot must
+// not be rewritten by the legacy-alias migration.
+{
+	const app = Object.create(HarnessApp.prototype);
+	app.config = { settings: { agents: { pi: { sessionDefaults: { model: "sol", modelDisplay: "Sol" } } } } };
+	const persisted = [];
+	app.persistModelPreference = (...args) => {
+		persisted.push(args);
+		return true;
+	};
+	assert.equal(app.alignPersistedModelDisplay("pi", {
+		_ccStartupRequestedModel: "sol",
+		models: {
+			currentModelId: "gpt-5.6-sol",
+			availableModels: [
+				{ modelId: "sol", name: "Sol" },
+				{ modelId: "gpt-5.6-sol", name: "GPT-5.6-Sol" },
+			],
+		},
+	}), false, "a models-snapshot agent's advertised saved id is not mistaken for an alias");
+	assert.deepEqual(persisted, []);
+}
+
+// Auto-captured backend defaults stabilize the footer but land under captured*
+// keys, so they are never replayed as session/new startup requests.
+{
+	const previousCapturedSettings = process.env.CC_SETTINGS;
+	const capturedSettingsDir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-captured-defaults-"));
+	process.env.CC_SETTINGS = path.join(capturedSettingsDir, "settings.json");
+	try {
+		const app = Object.create(HarnessApp.prototype);
+		app.activeKey = "pi";
+		app.config = { theme: "system", settings: { agents: {} }, agents: { pi: {} } };
+		assert.equal(app.alignPersistedModelDisplay("pi", {
+			_ccCreatedSession: true,
+			models: {
+				currentModelId: "provider/model-id",
+				availableModels: [{ modelId: "provider/model-id", name: "Friendly Model" }],
+			},
+		}), true);
+		assert.deepEqual(app.config.settings.agents.pi.sessionDefaults, {
+			capturedModel: "provider/model-id",
+			capturedModelDisplay: "Friendly Model",
+		});
+		assert.deepEqual(app.config.agents.pi._sessionDefaults, {}, "captured defaults are not replayed on session/new");
+		const reloaded = applyHarnessSettings(
+			{ agents: { pi: {} } },
+			JSON.parse(fs.readFileSync(process.env.CC_SETTINGS, "utf8")),
+		);
+		assert.deepEqual(
+			reloaded.agents.pi._sessionDefaults ?? {},
+			{},
+			"captured defaults never materialize startup session defaults",
+		);
+	} finally {
+		if (previousCapturedSettings === undefined) delete process.env.CC_SETTINGS;
+		else process.env.CC_SETTINGS = previousCapturedSettings;
+		fs.rmSync(capturedSettingsDir, { recursive: true, force: true });
+	}
+}
 
 // Boolean configuration requires a tagged value; legacy select config must stay
 // untagged for compatibility with older ACP agents.

@@ -86,6 +86,32 @@ try {
 	fs.rmSync(root, { recursive: true, force: true });
 }
 
+// Project-local and npx installs hoist cc's dependencies beside cc instead of
+// nesting them under the package; verification must find the hoisted copy
+// rather than warn that the installation is broken.
+{
+	const project = fs.mkdtempSync(path.join(os.tmpdir(), "cc-postinstall-hoisted-"));
+	try {
+		const adapter = REQUIRED_LOCAL_ADAPTERS[1];
+		const packageRoot = path.join(project, "node_modules", ...adapter.packageName.split("/"));
+		const entrypoint = path.join(packageRoot, "dist", "index.js");
+		fs.mkdirSync(path.dirname(entrypoint), { recursive: true });
+		fs.writeFileSync(entrypoint, "#!/usr/bin/env node\n");
+		fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({
+			name: adapter.packageName,
+			version: adapter.version,
+			bin: { [adapter.bin]: "dist/index.js" },
+		}));
+		const nestedNodeModules = path.join(project, "node_modules", "cc", "node_modules");
+		fs.mkdirSync(nestedNodeModules, { recursive: true });
+		const hoisted = inspectLocalAdapter(adapter, nestedNodeModules);
+		assert.equal(hoisted.ok, true, JSON.stringify(hoisted));
+		assert.equal(hoisted.packageDir, packageRoot);
+	} finally {
+		fs.rmSync(project, { recursive: true, force: true });
+	}
+}
+
 // Omitting npm optional dependencies leaves both JS adapters present but strips
 // the native executables they need. Verify that postinstall detects that exact
 // partial-install state and tells the user how to repair it.

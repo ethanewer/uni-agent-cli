@@ -612,4 +612,33 @@ await (async () => {
 	assert.equal(submitted.displayText, "/init");
 })();
 
+// A diverged-cwd teardown that reconnects solely to deliver queued prompts must
+// promote a "connecting" status: the quiet lifecycle then owns the label and
+// clears it on success or failure instead of leaving a silent (or stuck) wait.
+await (async () => {
+	const fixture = coldCommandFixture();
+	const client = {
+		exited: false,
+		sessionId: "old",
+		async stopAndWait() {},
+	};
+	Object.assign(fixture.app, {
+		client,
+		ready: true,
+		promptQueue: [{ text: "queued while cwd diverged", timing: "afterTurn" }],
+		agentSwitchTail: undefined,
+		workingDirectoryShutdownTail: undefined,
+		stopping: false,
+		cancelPermissionPrompts() {},
+		clearCancelGraceTimer() {},
+	});
+	const context = fixture.app.captureActiveAgentContext({ includeClient: true });
+	let reconnectOptions;
+	fixture.app.switchAgent = async (_key, _transport, options) => { reconnectOptions = options; };
+	assert.equal(fixture.app.disconnectDivergedWorkingDirectorySession(context, { quiet: true }), true);
+	await waitFor(() => reconnectOptions !== undefined, "the teardown finalizer should reconnect for queued prompts");
+	assert.equal(reconnectOptions.quiet, true);
+	assert.equal(reconnectOptions.statusState, "connecting", "the reconnect lifecycle must own a visible connecting status");
+})();
+
 console.log("slow startup UX tests passed");

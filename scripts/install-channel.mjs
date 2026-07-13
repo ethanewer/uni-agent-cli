@@ -623,8 +623,10 @@ let cleaned = false;
 const cleanup = () => {
   if (cleaned) return;
   cleaned = true;
+  // Remove only this process's lease file. Removing the shared lease directory
+  // here would race a starting runner between its guarded mkdir and lease
+  // write; GC reaps empty lease directories while holding the launch/GC guard.
   try { fs.rmSync(lease, { force: true }); } catch {}
-  try { fs.rmdirSync(path.dirname(lease)); } catch {}
 };
 
 process.once("exit", cleanup);

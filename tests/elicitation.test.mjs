@@ -58,6 +58,10 @@ const fullRequest = {
 	assert.equal(validateElicitationFieldValue(form.fields[0], "Alice 1").ok, false);
 	assert.equal(validateElicitationFieldValue(form.fields[2], "3").ok, false);
 	assert.equal(validateElicitationFieldValue(form.fields[3], "1.5").ok, false);
+	assert.equal(validateElicitationFieldValue(form.fields[3], null).ok, false);
+	assert.equal(validateElicitationFieldValue(form.fields[3], true).ok, false);
+	assert.equal(validateElicitationFieldValue(form.fields[3], ["4"]).ok, false);
+	assert.equal(validateElicitationFieldValue(form.fields[2], null).ok, false);
 	assert.deepEqual(validateElicitationFieldValue(form.fields[7], ""), { ok: true, omit: true });
 	const optionalArray = { ...form.fields[6], required: false };
 	assert.deepEqual(validateElicitationFieldValue(optionalArray, undefined), { ok: true, omit: true });
@@ -296,6 +300,37 @@ const fullRequest = {
 	assert.deepEqual(result, { action: "decline" });
 }
 
+// The Confirmation 'y'/'n' bindings answer the question semantically: 'y' on a
+// required boolean must record true even though False is highlighted, and 'n'
+// at review must decline instead of cancelling the whole form.
+{
+	const booleanRequest = {
+		mode: "form",
+		message: "Apply the migration now?",
+		requestedSchema: {
+			type: "object",
+			properties: { proceed: { type: "boolean", title: "Proceed" } },
+			required: ["proceed"],
+		},
+	};
+	const app = Object.create(HarnessApp.prototype);
+	app.ui = { requestRender() {} };
+	let accepted;
+	app.menuHandle = new ElicitationFormPanel(normalizeElicitationFormRequest(booleanRequest), (value) => { accepted = value; });
+	assert.equal(app.executeCcKeybindingAction("cc.confirm.yes"), true);
+	assert.equal(app.executeCcKeybindingAction("cc.confirm.yes"), true);
+	assert.equal(accepted.action, "accept");
+	assert.deepEqual({ ...accepted.content }, { proceed: true });
+
+	let declined;
+	const panel = new ElicitationFormPanel(normalizeElicitationFormRequest(booleanRequest), (value) => { declined = value; });
+	app.menuHandle = panel;
+	assert.equal(app.executeCcKeybindingAction("cc.confirm.no"), true);
+	assert.equal(panel.stage, "review", "'n' answers the boolean instead of cancelling the form");
+	assert.equal(app.executeCcKeybindingAction("cc.confirm.no"), true);
+	assert.deepEqual(declined, { action: "decline" });
+}
+
 // Capability negotiation is mode-specific: legacy callback embedders retain URL
 // support, while cc's explicit form-capable handler advertises both modes.
 await (async () => {
@@ -352,6 +387,112 @@ await (async () => {
 	await new Promise((resolve) => setTimeout(resolve, 0));
 	assert.deepEqual(writes[1].result, { action: "cancel" });
 })();
+
+// Esc settles a url elicitation while a slow clipboard write is still in
+// flight; the late clipboard failure must not surface a stale error against
+// whatever prompt is on screen by then.
+await (async () => {
+	let select;
+	const results = [];
+	let drained = 0;
+	let failCopy;
+	const app = Object.create(HarnessApp.prototype);
+	app.permissionPromptActive = true;
+	app.closeMenu = () => {};
+	app.drainPermissionQueue = () => { drained += 1; };
+	app.addError = (message) => assert.fail(message);
+	app.addNotice = () => {};
+	app.copyAuthenticationUrl = () => new Promise((_resolve, reject) => { failCopy = reject; });
+	app.openSelection = (_title, _entries, callback) => { select = callback; };
+	app.openElicitationRequest({
+		params: { mode: "url", message: "Sign in", url: "https://example.test/auth" },
+		resolve: (result) => results.push(result),
+	});
+	const copying = select({ value: "copy" });
+	await select(undefined);
+	failCopy(new Error("clipboard rejected"));
+	await copying;
+	assert.deepEqual(results, [{ action: "cancel" }]);
+	assert.equal(drained, 1);
+})();
+
+// When neither the browser launcher nor a clipboard tool exists (headless/SSH),
+// the explicit opt-in picker entry still delivers the URL, so authentication
+// remains possible. Failed deliveries never reveal the secret on their own.
+await (async () => {
+	const secretUrl = "https://example.test/auth?token=headless-secret";
+	let select;
+	let pickerEntries;
+	let closed = 0;
+	const results = [];
+	const notices = [];
+	const errors = [];
+	const app = Object.create(HarnessApp.prototype);
+	app.permissionPromptActive = true;
+	app.closeMenu = () => { closed += 1; };
+	app.drainPermissionQueue = () => {};
+	app.addNotice = (message) => notices.push(message);
+	app.addError = (message) => errors.push(message);
+	app.copyAuthenticationUrl = async () => { throw new Error("no clipboard tool"); };
+	app.openAuthenticationUrl = async () => { throw new Error("no url launcher"); };
+	app.openSelection = (_title, entries, callback) => {
+		pickerEntries = entries;
+		select = callback;
+	};
+	app.openElicitationRequest({
+		params: { mode: "url", message: "Sign in", url: secretUrl },
+		resolve: (result) => results.push(result),
+	});
+	assert.doesNotMatch(JSON.stringify(pickerEntries), /headless-secret/u);
+	await select({ value: "open" });
+	await select({ value: "copy" });
+	assert.deepEqual(results, [], "failed deliveries are not acknowledged");
+	assert.doesNotMatch([...notices, ...errors].join("\n"), /headless-secret/u);
+	await select({ value: "show" });
+	assert.ok(notices.some((message) => message.includes(secretUrl)), "the opt-in entry reveals the URL");
+	assert.deepEqual(results, [{ action: "accept" }]);
+	assert.equal(closed, 1);
+	assert.equal(app.permissionPromptActive, false);
+})();
+
+// A main-backend crash cancels only that backend's interactive prompts; a live
+// /btw fork keeps its pending permission/elicitation request open.
+{
+	const mainClient = { sessionId: "main", exited: true, stopping: true };
+	const forkClient = { sessionId: "fork", exited: false, stopping: false };
+	const app = Object.create(HarnessApp.prototype);
+	app.client = mainClient;
+	app.btwThread = { client: forkClient };
+	app.activeKey = "fake";
+	app.permissionPromptActive = true;
+	let mainResult;
+	let forkResult;
+	const forkRequest = {
+		kind: "elicitation",
+		params: { mode: "url", sessionId: "fork" },
+		context: { sourceClient: forkClient },
+		resolve: (value) => { forkResult = value; },
+	};
+	app.activeInteractiveRequest = forkRequest;
+	app.permissionQueue = [{
+		kind: "permission",
+		params: {},
+		context: { sourceClient: mainClient },
+		resolve: (value) => { mainResult = value; },
+	}];
+	let menuClosed = 0;
+	app.closeMenu = () => { menuClosed += 1; };
+	app.clearCancelGraceTimer = () => {};
+	app.updateSpinner = () => {};
+	app.clearLiveBackendCommands = () => false;
+	app.updateAutocomplete = () => {};
+	app.ui = { requestRender() {} };
+	app.handleBackendEvent({ type: "backend_exit" });
+	assert.deepEqual(mainResult, { outcome: "cancelled" });
+	assert.deepEqual(app.permissionQueue, []);
+	assert.equal(forkResult, undefined, "the live fork's active prompt is not cancelled");
+	assert.equal(menuClosed, 0, "the fork's prompt panel stays open");
+}
 
 // A queued request from a retired connection is cancelled without opening UI;
 // an active request whose session changes before submission is also cancelled.

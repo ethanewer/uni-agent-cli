@@ -454,7 +454,12 @@ export class BaseAcpAdapter {
 	// ---- sessions (capability-gated) ------------------------------------------
 
 	async listSessions() {
-		return this.connection.listSessions();
+		const sessions = await this.connection.listSessions();
+		// Mirror the connection's truncation marker: destructive callers resolve
+		// user-typed titles against this list and must be able to tell a complete
+		// list from one capped at the safety limit.
+		this.sessionListTruncated = this.connection.sessionListTruncated === true;
+		return sessions;
 	}
 
 	async loadSession(sessionId, options = {}) {

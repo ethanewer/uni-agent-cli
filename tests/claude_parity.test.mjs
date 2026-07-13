@@ -26,6 +26,10 @@ assert.deepEqual(shellInvocation("pwd", { platform: "darwin", environment: { SHE
 	command: "/bin/zsh",
 	args: ["-lc", "pwd"],
 });
+assert.deepEqual(shellInvocation("pwd", { platform: "darwin", environment: { SHELL: "/bin/tcsh" } }), {
+	command: "/bin/tcsh",
+	args: ["-c", "pwd"],
+}, "csh-family shells reject combined -lc");
 assert.deepEqual(shellInvocation("dir", { platform: "win32", environment: { ComSpec: "C:\\Windows\\cmd.exe" } }), {
 	command: "C:\\Windows\\cmd.exe",
 	args: ["/d", "/s", "/c", "dir"],

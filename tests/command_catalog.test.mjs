@@ -399,6 +399,26 @@ try {
 	fs.utimesSync(lockDirectory, staleTime, staleTime);
 	assert.equal(lockedWriter.remember("claude", ["after-stale-lock"]), true, "a stale lock is reclaimed without polling");
 
+	const invalidateCache = path.join(root, "invalidate-under-lock.json");
+	const invalidator = new BackendCommandCatalog(agents, { cwd: cwdA, cachePath: invalidateCache });
+	invalidator.remember("claude", ["old-account-command"]);
+	const invalidateLock = `${invalidateCache}.lock`;
+	fs.mkdirSync(invalidateLock);
+	fs.writeFileSync(path.join(invalidateLock, "owner"), "active-owner");
+	invalidator.invalidate("claude");
+	fs.rmSync(invalidateLock, { recursive: true, force: true });
+	invalidator.remember("codex", ["unrelated-command"]);
+	assert.deepEqual(
+		invalidator.commandsFor("claude"),
+		[],
+		"a later write cannot resurrect entries whose invalidation lost the lock race",
+	);
+	assert.doesNotMatch(
+		fs.readFileSync(invalidateCache, "utf8"),
+		/old-account-command/u,
+		"the pending removal reaches disk with the next successful write",
+	);
+
 	const boundedFile = path.join(root, "bounded.json");
 	new BackendCommandCatalog(agents, { cwd: cwdA, cachePath: boundedFile }).remember(
 		"claude",

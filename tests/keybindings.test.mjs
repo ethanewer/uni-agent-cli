@@ -14,7 +14,7 @@ import {
 	normalizeCcKeyStroke,
 	watchCcKeybindings,
 } from "../src/harness/keybindings.mjs";
-import { configureCcKeybindings, HarnessApp, localSlashCommands } from "../src/pi-harness.mjs";
+import { configureCcKeybindings, HarnessApp, localSlashCommands, SelectionPanel } from "../src/pi-harness.mjs";
 
 assert.deepEqual(normalizeCcKeyStroke("option+return"), { key: "alt+enter" });
 assert.deepEqual(normalizeCcKeyStroke("command+shift+P"), { key: "shift+super+p" });
@@ -24,6 +24,9 @@ assert.deepEqual(normalizeCcKeyStroke("PageUp"), { key: "pageUp" });
 assert.deepEqual(normalizeCcKeyStroke("ctrl+K   ctrl+S"), { key: "ctrl+k ctrl+s" });
 assert.match(normalizeCcKeyStroke("ctrl+k ctrl+s ctrl+x").error, /at most two/);
 assert.match(normalizeCcKeyStroke("hyper+k").error, /unknown modifier/);
+assert.deepEqual(normalizeCcKeyStroke("+"), { key: "+" });
+assert.deepEqual(normalizeCcKeyStroke("ctrl++"), { key: "ctrl++" });
+assert.match(normalizeCcKeyStroke("++").error, /empty key or modifier/);
 
 {
 	const keybindings = configureCcKeybindings({
@@ -454,6 +457,72 @@ assert.match(normalizeCcKeyStroke("hyper+k").error, /unknown modifier/);
 		binding: { default: true },
 	}), false, "the default Shift+Tab remains /btw focus while a side thread is open");
 	assert.equal(cycles, 0);
+}
+
+{
+	// Pure-UI keys stay usable while a foreground operation runs: the default
+	// Shift+Tab keeps toggling /btw pane focus, and a default plain Space keeps
+	// typing into the composer instead of being swallowed with a notice.
+	const app = Object.create(HarnessApp.prototype);
+	app.foregroundOperation = { commandName: "resume", status: "loading sessions", cancelled: false };
+	app.btwThread = {};
+	app.voiceModeEnabled = false;
+	app.lastKnownEditorText = "";
+	app.editor = { getText: () => "use opus" };
+	app.exitVoiceMode = () => {};
+	app.addNotice = () => assert.fail("pane focus and typing must not raise the in-progress notice");
+	assert.equal(app.executeCcKeybindingAction("cc.chat.cycleMode", {
+		binding: { default: true },
+	}), false, "the default Shift+Tab pane toggle bypasses the foreground-operation block");
+	assert.equal(app.executeCcKeybindingAction("cc.voice.pushToTalk", {
+		chord: "space",
+		binding: { default: true },
+	}), false, "a default plain Space stays composer text during a foreground operation");
+}
+
+{
+	// Confirmation 'y'/'n' on a permission prompt select the affirmative/negative
+	// option instead of replaying Enter (highlighted row) or Escape (cancel).
+	const options = [
+		{ optionId: "always", name: "Always allow", kind: "allow_always" },
+		{ optionId: "once", name: "Allow once", kind: "allow_once" },
+		{ optionId: "no", name: "Don't allow", kind: "reject_once" },
+	];
+	const selections = [];
+	const app = Object.create(HarnessApp.prototype);
+	app.ui = { requestRender() {} };
+	app.menuHandle = new SelectionPanel("Allow tool?", options.map((option) => ({
+		value: option,
+		label: option.name,
+	})), (entry) => selections.push(entry?.value?.optionId), { keybindingContext: "Confirmation" });
+	assert.equal(app.executeCcKeybindingAction("cc.confirm.yes"), true);
+	app.menuHandle.onSelect = (entry) => selections.push(entry?.value?.optionId);
+	assert.equal(app.executeCcKeybindingAction("cc.confirm.no"), true);
+	assert.deepEqual(selections, ["once", "no"], "y/n pick the narrowest allow/deny options");
+}
+
+{
+	// While agents run, Task claims the ctrl+x prefix; same-prefix chords in
+	// lower contexts (Chat ctrl+x ctrl+k) must still complete.
+	const result = compileCcKeybindings(undefined);
+	const dispatcher = new CcKeybindingDispatcher(result);
+	assert.deepEqual(dispatcher.handle("\x18", ["Task", "Chat", "Global"]), { consume: true, pending: true });
+	assert.equal(dispatcher.handle("\x0b", ["Task", "Chat", "Global"]).action, "cc.chat.killAgents");
+	assert.deepEqual(dispatcher.handle("\x18", ["Task", "Chat", "Global"]), { consume: true, pending: true });
+	assert.equal(dispatcher.handle("\x02", ["Task", "Chat", "Global"]).action, "cc.task.background");
+	dispatcher.dispose();
+}
+
+{
+	// The plus key is bindable even though "+" is also the modifier separator.
+	const result = compileCcKeybindings({
+		bindings: [{ context: "Chat", bindings: { "ctrl++": "chat:submit", "+": "chat:newline" } }],
+	});
+	assert.deepEqual(result.warnings, []);
+	const dispatcher = new CcKeybindingDispatcher(result);
+	assert.equal(dispatcher.handle("\x1b[43;5u", ["Chat", "Global"]).action, "tui.input.submit");
+	assert.equal(dispatcher.handle("+", ["Chat", "Global"]).action, "tui.input.newLine");
+	dispatcher.dispose();
 }
 
 {

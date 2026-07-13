@@ -521,4 +521,39 @@ check("loadGrants tolerates a missing/garbage file", () => {
 	assert.deepEqual(loadGrants(path.join(os.tmpdir(), `cc-missing-${process.pid}.json`)), []);
 });
 
+check("a corrupt grant store is quarantined, not silently overwritten", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-perms-corrupt-"));
+	const file = path.join(dir, "permissions.json");
+	const originalError = console.error;
+	console.error = () => {};
+	try {
+		fs.writeFileSync(file, '{"grants": [{"tool": "Read", "ac'); // torn write
+		assert.deepEqual(loadGrants(file), []);
+		// the corrupt bytes were moved aside for hand-repair, not left in place
+		assert.equal(fs.existsSync(file), false);
+		const quarantined = fs.readdirSync(dir).filter((name) => name.startsWith("permissions.json.corrupt-"));
+		assert.equal(quarantined.length, 1);
+		assert.equal(fs.readFileSync(path.join(dir, quarantined[0]), "utf8"), '{"grants": [{"tool": "Read", "ac');
+		// the store keeps working after quarantine
+		recordGrant({ agent: "codex", tool: "Write", action: "deny" }, file);
+		assert.equal(loadGrants(file).length, 1);
+	} finally {
+		console.error = originalError;
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+check("saveGrants replaces the store atomically and leaves no temp files", () => {
+	const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cc-perms-atomic-"));
+	const file = path.join(dir, "permissions.json");
+	try {
+		saveGrants([{ tool: "Read", action: "allow" }], file);
+		saveGrants([{ tool: "Read", action: "deny" }], file);
+		assert.deepEqual(loadGrants(file), [{ tool: "Read", action: "deny" }]);
+		assert.deepEqual(fs.readdirSync(dir), ["permissions.json"]);
+	} finally {
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+});
+
 console.log(`permissions: ${passed} checks passed`);

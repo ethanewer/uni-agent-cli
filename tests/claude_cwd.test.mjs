@@ -477,6 +477,103 @@ try {
 		}
 	}
 
+	// A no-op pre-conversation /cd (same directory) keeps the healthy background
+	// session; only an actual cwd change discards the mismatched session.
+	{
+		const originalCwd = process.cwd();
+		try {
+			process.chdir(first);
+			const canonicalFirst = fs.realpathSync(first);
+			const notices = [];
+			let disconnected = 0;
+			const app = Object.create(HarnessApp.prototype);
+			Object.assign(app, {
+				activeKey: "fake",
+				activeAgentGeneration: 0,
+				transport: "acp",
+				config: { agents: { fake: {} } },
+				conversationStarted: false,
+				client: { exited: false, capabilities: { changeWorkingDirectory: false } },
+				ready: true,
+				busy: false,
+				focusedThread: "main",
+				btwThread: undefined,
+				sessionSwitchInProgress: false,
+				selectionActionInProgress: false,
+				configUpdateCount: 0,
+				asyncPickerLoadCount: 0,
+				backendCommandCacheTimers: new Map(),
+				backendCommandCatalog: { persist() {}, setCwd() {} },
+				editor: { autocompleteProvider: { setBasePath() {} } },
+				clearLiveBackendCommands() {},
+				updateAutocomplete() {},
+				addCommandMessage() {},
+				addNotice: (message) => notices.push(message),
+				disconnectDivergedWorkingDirectorySession() { disconnected += 1; },
+				ui: { requestRender() {} },
+			});
+			await app.runChangeWorkingDirectory(first);
+			assert.equal(process.cwd(), canonicalFirst);
+			assert.deepEqual(notices, [`Already using ${canonicalFirst}`]);
+			assert.equal(disconnected, 0, "a no-op /cd keeps the healthy pre-conversation session");
+			await app.runChangeWorkingDirectory(second);
+			assert.equal(process.cwd(), fs.realpathSync(second));
+			assert.equal(disconnected, 1, "an actual pre-conversation /cd still discards the mismatched session");
+		} finally {
+			process.chdir(originalCwd);
+		}
+	}
+
+	// A locally-answered identity question never reaches the backend: it must not
+	// mark the conversation started (which would forfeit the local pre-session
+	// /cd path) and must not steer-cancel an in-flight backend turn.
+	{
+		const makeIdentityApp = () => {
+			const app = Object.create(HarnessApp.prototype);
+			Object.assign(app, {
+				activeKey: "fake",
+				transport: "acp",
+				activeAgentGeneration: 0,
+				config: { agents: { fake: {} } },
+				conversationStarted: false,
+				ready: true,
+				busy: false,
+				statusState: "",
+				promptQueue: [],
+				pendingUserEchoes: [],
+				activeToolIds: new Set(),
+				activeAnonymousToolCount: 0,
+				deferredLocalSlashCommands: [],
+				client: {
+					exited: false,
+					sessionId: "live",
+					capabilities: {},
+					prompt() { assert.fail("identity questions must be answered locally"); },
+					cancel() { assert.fail("a local identity answer must not cancel the backend turn"); },
+				},
+				ui: { requestRender() {} },
+				updateSpinner() {},
+				addUserMessage() { return {}; },
+				appendAssistantText() {},
+				closeCurrentAssistantText() {},
+				refreshCodexThreadStateSnapshot() {},
+				schedulePromptQueueDrain() {},
+			});
+			return app;
+		};
+		const idleApp = makeIdentityApp();
+		await idleApp.submitBackendPrompt("who are you?");
+		assert.equal(idleApp.conversationStarted, false, "a local identity answer leaves the session pre-conversation");
+
+		const busyApp = makeIdentityApp();
+		busyApp.busy = true;
+		busyApp.seenToolThisTurn = true;
+		await busyApp.submitBackendPrompt("who are you?");
+		assert.equal(busyApp.promptQueue.length, 1);
+		assert.equal(busyApp.promptQueue[0].timing, "afterTurn", "identity questions never steer-cancel the live turn");
+		assert.equal(Boolean(busyApp.afterToolCancelPending), false);
+	}
+
 	// A side-pane /cd rejection belongs to the side transcript. It must not look
 	// like the main session attempted a process-global directory change.
 	{

@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 
 import {
+	AcpClient,
 	codexMcpCliArguments,
 	formatCodexHooksReport,
 	formatCodexMcpCommandDisplay,
@@ -407,6 +408,32 @@ try {
 			await staleSelect({ value: action });
 			assert.deepEqual(stale.errors, []);
 		}
+	})();
+
+	// listSessions reports truncation so destructive title resolution (permanent
+	// deletion, archive) can fail closed instead of acting on whichever duplicate
+	// title happened to land inside the entry cap.
+	await (async () => {
+		const client = Object.create(AcpClient.prototype);
+		let calls = 0;
+		client.request = async () => {
+			calls += 1;
+			return {
+				sessions: Array.from({ length: 500 }, (_, index) => ({
+					sessionId: `page${calls}-${index}`,
+					title: "fix auth bug",
+				})),
+				nextCursor: `cursor-${calls}`,
+			};
+		};
+		const truncated = await client.listSessions();
+		assert.equal(truncated.length, 1000);
+		assert.equal(client.sessionListTruncated, true);
+
+		client.request = async () => ({ sessions: [{ sessionId: "only", title: "fix auth bug" }] });
+		const complete = await client.listSessions();
+		assert.equal(complete.length, 1);
+		assert.equal(client.sessionListTruncated, false);
 	})();
 
 	console.log("codex management tests passed");

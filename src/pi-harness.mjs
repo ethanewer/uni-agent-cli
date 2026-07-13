@@ -12,7 +12,7 @@ import { Editor } from "@mariozechner/pi-tui/dist/components/editor.js";
 import { Spacer } from "@mariozechner/pi-tui/dist/components/spacer.js";
 import { Text } from "@mariozechner/pi-tui/dist/components/text.js";
 import { KeybindingsManager, TUI_KEYBINDINGS, setKeybindings } from "@mariozechner/pi-tui/dist/keybindings.js";
-import { isKeyRelease, matchesKey } from "@mariozechner/pi-tui/dist/keys.js";
+import { isKeyRelease, isKittyProtocolActive, matchesKey } from "@mariozechner/pi-tui/dist/keys.js";
 import { ProcessTerminal } from "@mariozechner/pi-tui/dist/terminal.js";
 import { Container, TUI } from "@mariozechner/pi-tui/dist/tui.js";
 import { extractAnsiCode, normalizeTerminalOutput, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui/dist/utils.js";
@@ -31,6 +31,7 @@ import {
 	outcomeForDecision,
 	permissionRequestInfo,
 	pickAllowOption,
+	pickDenyOption,
 	policyNeedsGating,
 	recordGrant,
 	resolvePermissionPolicy,
@@ -319,6 +320,9 @@ const FORK_REGISTRY_LOCK_TIMEOUT_MS = 2_000;
 const FORK_REGISTRY_LOCK_WAIT = new Int32Array(new SharedArrayBuffer(4));
 const FORK_OPERATION_LOCK_TIMEOUT_MS = 2_000;
 const FORK_OPERATION_LOCK_PROTOCOL_VERSION = 3;
+const FORK_LEGACY_LOCK_STALE_MS = 30_000;
+const SETTINGS_LOCK_TIMEOUT_MS = 2_000;
+const SETTINGS_LOCK_STALE_MS = 10_000;
 const CODEX_LIVE_SESSION_LEASE_ORPHAN_GRACE_MS = 30_000;
 const FORK_LEGACY_PREFIX_MAX_BYTES = 16 * 1024 * 1024;
 const CLIPBOARD_IMAGE_LABEL = Symbol("cc.clipboardImageLabel");
@@ -1673,6 +1677,27 @@ export class ElicitationFormPanel {
 		this.error = "";
 	}
 
+	// Semantic yes/no for the Confirmation y/n bindings. Only the review stage
+	// and boolean fields have an unambiguous affirmative/negative choice; other
+	// stages return false so the caller keeps its regular key handling.
+	confirmChoice(affirmative) {
+		if (this.settled) return false;
+		if (this.stage === "review") {
+			this.selected = affirmative ? 0 : 1;
+			if (affirmative) this.submit();
+			else this.finish({ action: "decline" });
+			return true;
+		}
+		const field = this.activeField();
+		if (field?.type !== "boolean") return false;
+		const choices = this.currentChoices();
+		const index = choices.findIndex((entry) => !entry.omit && entry.value === affirmative);
+		if (index < 0) return false;
+		this.selected = index;
+		this.recordAndAdvance(affirmative);
+		return true;
+	}
+
 	recordAndAdvance(rawValue) {
 		const field = this.activeField();
 		const checked = validateElicitationFieldValue(field, rawValue);
@@ -2464,6 +2489,9 @@ class ManagedTerminal {
 			cwd: params.cwd || process.cwd(),
 			env,
 			stdio: ["ignore", "pipe", "pipe"],
+			// Own process group on POSIX so kill() reaches every descendant the
+			// command spawned, matching the backend child's tree-kill contract.
+			detached: process.platform !== "win32",
 		});
 		// Decode each stream incrementally so multibyte UTF-8 split across chunk
 		// boundaries is not corrupted into replacement characters.
@@ -2478,6 +2506,12 @@ class ManagedTerminal {
 		});
 		this.child.once("exit", (code, signal) => {
 			this.exitStatus = { exitCode: code, signal };
+			// Probed moments after the leader's exit, this proves the surviving
+			// group is ours (a numeric PGID cannot be recycled in milliseconds).
+			// kill() only ever signals an exited leader's group when this latch
+			// saw genuine survivors.
+			this.groupOutlivedLeader = process.platform !== "win32" &&
+				posixProcessGroupExists(Number(this.child.pid)) === true;
 			this.resolveExit(this.exitStatus);
 		});
 	}
@@ -2510,8 +2544,21 @@ class ManagedTerminal {
 		return this.exitStatus ?? (await this.exitPromise);
 	}
 
-	kill() {
-		if (this.child.exitCode === null && !this.child.killed) this.child.kill();
+	kill(signal = "SIGTERM") {
+		// Tree-aware: taskkill /T (+/F fallback) on Windows, process-group signal
+		// on POSIX, so grandchildren cannot outlive cc after quit. A leader that
+		// already exited can leave background descendants keeping its detached
+		// group alive; signal the group then too, but only when the exit-time
+		// latch proved the group had genuine survivors AND it still exists now.
+		// A group observed gone latches off for good, per the recycled-PGID
+		// invariant.
+		const leaderExited = (this.child.exitCode !== null && this.child.exitCode !== undefined) || Boolean(this.child.signalCode);
+		if (leaderExited && this.groupOutlivedLeader === true &&
+			posixProcessGroupExists(Number(this.child.pid)) !== true) {
+			this.groupOutlivedLeader = false;
+		}
+		const includeExitedGroup = leaderExited && this.groupOutlivedLeader === true;
+		terminateChild(this.child, signal, includeExitedGroup ? { includeExitedGroup: true } : {});
 	}
 }
 
@@ -2546,6 +2593,7 @@ export class AcpClient {
 		this.startupConfigDefaultWaiters = new Set();
 		this.terminals = new Map();
 		this.nextTerminalId = 1;
+		this.sessionListTruncated = false;
 		this.exited = false;
 		this.childClosed = true;
 		this.childExitObserved = true;
@@ -2924,23 +2972,41 @@ export class AcpClient {
 		const sessionIds = new Set();
 		const cursors = new Set();
 		let cursor = undefined;
+		// Truncation must be observable: destructive callers resolve user-typed
+		// titles against this list, and a silently capped list can hide the
+		// duplicate that would otherwise make the request ambiguous.
+		this.sessionListTruncated = false;
 		for (let page = 0; page < MAX_ACP_SESSION_LIST_PAGES; page += 1) {
 			const result = await this.request("session/list", {
 				cwd: process.cwd(),
 				...(cursor ? { cursor } : {}),
 			});
-			for (const session of result?.sessions ?? []) {
+			const entries = Array.isArray(result?.sessions) ? result.sessions : [];
+			for (let index = 0; index < entries.length; index += 1) {
+				const session = entries[index];
 				const id = session?.sessionId;
 				if (id && sessionIds.has(id)) continue;
 				if (id) sessionIds.add(id);
 				sessions.push(session);
-				if (sessions.length >= MAX_ACP_SESSION_LIST_ENTRIES) return sessions;
+				if (sessions.length >= MAX_ACP_SESSION_LIST_ENTRIES) {
+					// A list that ends exactly at the cap is complete; only an
+					// unconsumed remainder or continuation is a truncation.
+					this.sessionListTruncated = index + 1 < entries.length || Boolean(result?.nextCursor);
+					return sessions;
+				}
 			}
 			const nextCursor = result?.nextCursor;
-			if (!nextCursor || cursors.has(nextCursor)) break;
+			if (!nextCursor) return sessions;
+			if (cursors.has(nextCursor)) {
+				// A repeated cursor cannot make progress: the advertised
+				// continuation was never consumed, so the list may be incomplete.
+				this.sessionListTruncated = true;
+				return sessions;
+			}
 			cursors.add(nextCursor);
 			cursor = nextCursor;
 		}
+		this.sessionListTruncated = true;
 		return sessions;
 	}
 
@@ -2976,9 +3042,11 @@ export class AcpClient {
 		}
 		this.sessionId = sessionId;
 		this.createdSession = method === "session/new";
-		this.startupRequestedModel = method === "session/new" && typeof this.agent?._sessionDefaults?.model === "string"
-			? this.agent._sessionDefaults.model
-			: undefined;
+		// _ccStartupRequestedModel is published only once the saved default has
+		// actually been applied (applyStartupConfigDefaultsUnlocked). Publishing it
+		// here would let the legacy-alias migration treat the agent's own default
+		// model as the resolution of a request that was never made.
+		this.startupRequestedModel = undefined;
 		this.pendingStartupConfigDefaults = method === "session/new" && isPlainObject(this.agent?._sessionDefaults)
 			? { sessionId, values: { ...this.agent._sessionDefaults } }
 			: undefined;
@@ -3055,20 +3123,55 @@ export class AcpClient {
 		const pending = this.pendingStartupConfigDefaults;
 		if (!pending || pending.sessionId !== this.sessionId) return;
 		const defaults = pending.values;
+		let markerRecorded = false;
 		for (const [category, value] of [["model", defaults.model], ["thought_level", defaults.effort]]) {
 			if (this.pendingStartupConfigDefaults !== pending || pending.sessionId !== this.sessionId) return;
 			if (typeof value !== "string" || !value) continue;
 			const option = findConfigOption({ configOptions: this.configOptions }, category);
-			if (!option) continue;
+			if (!option) {
+				// A default the ACP models snapshot proves is already active needs no
+				// settable option; consume it instead of stalling the first prompt
+				// behind the waitForStartupConfigDefaults deadline. Anything else may
+				// still be satisfied by a config option that arrives late (a default
+				// saved under another transport), so it keeps waiting and is dropped
+				// only by the existing deadline.
+				if (category === "model" && this.models?.currentModelId === value) delete defaults.model;
+				continue;
+			}
 			delete defaults[category === "model" ? "model" : "effort"];
-			if (option.currentValue === value) continue;
+			if (option.currentValue === value) {
+				if (category === "model") {
+					this.startupRequestedModel = value;
+					markerRecorded = true;
+				}
+				continue;
+			}
 			try {
+				const before = option.currentValue;
 				await this.setConfigOption(option.id, value, option.type);
+				// An agent may acknowledge the request without applying it. The
+				// marker is proof for the legacy-alias migration that the live model
+				// is the requested default's resolution, so it is published only
+				// when the current value actually moved off its pre-request state
+				// (an alias resolves to a different id, so equality with the
+				// requested string cannot be demanded).
+				const after = currentConfigValue(findConfigOption({ configOptions: this.configOptions }, category));
+				if (category === "model" && pending.sessionId === this.sessionId && (after !== before || after === value)) {
+					this.startupRequestedModel = value;
+					markerRecorded = true;
+				}
 			} catch {
 				// A model may be retired or a harness may advertise a read-only option.
 				// Keep the session usable; the live option remains visible for correction.
 			}
 			if (this.pendingStartupConfigDefaults !== pending || pending.sessionId !== this.sessionId) return;
+		}
+		if (markerRecorded && pending.sessionId === this.sessionId) {
+			// setConfigOption applies the backend's response state and emits
+			// session_info BEFORE the marker above is recorded. Re-publish so the
+			// host observes _ccStartupRequestedModel even when the backend sends no
+			// further session update on its own.
+			this.onEvent({ type: "session_info", sessionInfo: this.getSessionInfo() });
 		}
 		if (!defaults.model && !defaults.effort && this.pendingStartupConfigDefaults === pending) {
 			this.pendingStartupConfigDefaults = undefined;
@@ -3222,8 +3325,9 @@ export class AcpClient {
 		// this state synchronous prevents commands such as /login from racing a
 		// just-stopped backend and writing to its closing stdin.
 		this.exited = true;
+		// Keep the map after this graceful tree SIGTERM so forceStop() and the
+		// stopAndWaitOwned escalation can SIGKILL a surviving terminal tree.
 		for (const terminal of this.terminals.values()) terminal.kill();
-		this.terminals.clear();
 		this.rejectPending(new Error("backend stopped"));
 		const termination = terminateChild(this.child, "SIGTERM", options);
 		// A successful taskkill /T is Windows' process-tree completion contract.
@@ -3238,6 +3342,7 @@ export class AcpClient {
 	}
 
 	forceStop() {
+		for (const terminal of this.terminals.values()) terminal.kill("SIGKILL");
 		const childExited = !this.child || this.childClosed || this.childExitObserved ||
 			this.child.exitCode !== null && this.child.exitCode !== undefined || Boolean(this.child.signalCode);
 		if (childExited) {
@@ -3250,8 +3355,6 @@ export class AcpClient {
 		}
 		this.stopping = true;
 		this.exited = true;
-		for (const terminal of this.terminals.values()) terminal.kill();
-		this.terminals.clear();
 		this.rejectPending(new Error("backend stopped"));
 		const termination = terminateChild(this.child, "SIGKILL");
 		if (this.activeStopTermination) Object.assign(this.activeStopTermination, mergeTerminationResults(this.activeStopTermination, termination));
@@ -3265,6 +3368,11 @@ export class AcpClient {
 		this.stopWaiterCount = (this.stopWaiterCount ?? 0) + 1;
 		let operation;
 		operation = this.stopAndWaitOwned(timeoutMs).finally(() => {
+			// A managed terminal command can ignore stop()'s graceful SIGTERM and
+			// outlive a backend that shut down promptly. SIGKILL cannot be ignored
+			// and needs no wait (terminal.kill probes group survival itself), so
+			// this sweep closes that gap without slowing shutdown.
+			for (const terminal of this.terminals.values()) terminal.kill("SIGKILL");
 			this.activeStopTermination = undefined;
 			this.stopWaiterCount = Math.max(0, (this.stopWaiterCount ?? 1) - 1);
 			if (this.stopAndWaitPromise === operation) this.stopAndWaitPromise = undefined;
@@ -3367,14 +3475,20 @@ export class AcpClient {
 			return;
 		}
 
-		termination = mergeTerminationResults(
+		// Graceful shutdown timed out: escalate surviving terminal trees along
+		// with the backend tree.
+		for (const terminal of this.terminals.values()) terminal.kill("SIGKILL");
+		// Merge in place: forceStop() keeps writing its result into
+		// activeStopTermination, which must remain this same object so the
+		// post-escalation wait below still observes a concurrent force-kill.
+		Object.assign(termination, mergeTerminationResults(
 			termination,
 			terminateChild(child, "SIGKILL", {
 				includeExitedGroup: true,
 				platform,
 				...(options.runWindowsTaskkill ? { runWindowsTaskkill: options.runWindowsTaskkill } : {}),
 			}),
-		);
+		));
 		if (!await waitForProcessTreeExit(child, () => directChildClosed, PROCESS_FORCE_KILL_WAIT_MS, termination, {
 			platform,
 			onPosixGroupGone: () => { this.processGroupConfirmedGone = true; },
@@ -4699,6 +4813,23 @@ export class HarnessApp {
 			this.forceFullRepaint({ immediate: true });
 			return true;
 		}
+		if (action === "cc.chat.cycleMode" && resolution.binding?.default === true && this.btwThread) {
+			// /btw already uses Shift+Tab as its documented pane-focus key. Keep
+			// that behavior for Claude's default binding — pane focus is pure UI,
+			// so it must stay available while a foreground operation runs; an
+			// explicit custom key still cycles modes while a side thread is open.
+			return false;
+		}
+		if (action === "cc.voice.pushToTalk") {
+			// A default plain Space outside an active voice capture is ordinary
+			// composer text; it must keep typing even while a foreground
+			// operation runs, so evaluate the passthrough before the block below.
+			const defaultPlainSpace = resolution.chord === "space" && resolution.binding?.default === true;
+			if (defaultPlainSpace && (!this.voiceModeEnabled || this.editor.getText() || this.lastKnownEditorText)) {
+				if (this.editor.getText() || this.lastKnownEditorText) this.exitVoiceMode();
+				return false;
+			}
+		}
 		const terminalMutation = this.workingTreeMutationOperation?.terminal === true
 			? this.workingTreeMutationOperation
 			: undefined;
@@ -4734,10 +4865,6 @@ export class HarnessApp {
 			return true;
 		}
 		if (action === "cc.chat.cycleMode") {
-			// /btw already uses Shift+Tab as its documented pane-focus key. Keep
-			// that behavior for Claude's default binding; an explicit custom key
-			// still cycles modes while a side thread is open.
-			if (resolution.binding?.default === true && this.btwThread) return false;
 			void this.cycleModeFromKeybinding();
 			return true;
 		}
@@ -4756,11 +4883,6 @@ export class HarnessApp {
 			return true;
 		}
 		if (action === "cc.voice.pushToTalk") {
-			const defaultPlainSpace = resolution.chord === "space" && resolution.binding?.default === true;
-			if (defaultPlainSpace && (!this.voiceModeEnabled || this.editor.getText() || this.lastKnownEditorText)) {
-				if (this.editor.getText() || this.lastKnownEditorText) this.exitVoiceMode();
-				return false;
-			}
 			if (resolution.chord !== "space") this.enterVoiceMode();
 			return this.handleVoiceKey(resolution.chord, {
 				isSpace: true,
@@ -4787,8 +4909,14 @@ export class HarnessApp {
 		if (action === "tui.select.cancel") return this.editor.performAutocompleteAction("dismiss");
 		if (action === "tui.select.up") return this.editor.performAutocompleteAction("previous");
 		if (action === "tui.select.down") return this.editor.performAutocompleteAction("next");
-		if (action === "cc.select.accept" || action === "cc.confirm.yes") return this.sendMenuKeyFromBinding("\r");
-		if (action === "cc.select.cancel" || action === "cc.confirm.no") return this.sendMenuKeyFromBinding("\x1b");
+		if (action === "cc.select.accept" || action === "cc.confirm.yes") {
+			if (action === "cc.confirm.yes" && this.answerConfirmationKey(true)) return true;
+			return this.sendMenuKeyFromBinding("\r");
+		}
+		if (action === "cc.select.cancel" || action === "cc.confirm.no") {
+			if (action === "cc.confirm.no" && this.answerConfirmationKey(false)) return true;
+			return this.sendMenuKeyFromBinding("\x1b");
+		}
 		if (action === "cc.select.previous" || action === "cc.confirm.previous") return this.sendMenuKeyFromBinding("\x1b[A");
 		if (action === "cc.select.next" || action === "cc.confirm.next") return this.sendMenuKeyFromBinding("\x1b[B");
 		if (action === "cc.confirm.toggle") {
@@ -4805,6 +4933,32 @@ export class HarnessApp {
 	sendMenuKeyFromBinding(data) {
 		if (!this.menuHandle?.handleInput) return false;
 		this.menuHandle.handleInput(data);
+		this.ui.requestRender();
+		return true;
+	}
+
+	// The Confirmation y/n bindings must answer the question, not replay
+	// Enter/Escape: Enter accepts whichever row is highlighted (False for a
+	// required boolean elicitation field) and Escape cancels the whole
+	// interaction. Panels without an unambiguous yes/no choice return false and
+	// keep the legacy accept/cancel behavior.
+	answerConfirmationKey(affirmative) {
+		if (this.menuHandle instanceof ElicitationFormPanel) {
+			if (!this.menuHandle.confirmChoice(affirmative)) return false;
+			this.ui.requestRender();
+			return true;
+		}
+		if (!(this.menuHandle instanceof SelectionPanel)) return false;
+		// Permission prompts carry the raw ACP options as entry values; pick the
+		// narrowest option in the requested direction. Panels whose values are
+		// not classifiable permission options fall through unchanged.
+		const entries = this.menuHandle.entries ?? [];
+		const option = affirmative
+			? pickAllowOption(entries.map((entry) => entry?.value))
+			: pickDenyOption(entries.map((entry) => entry?.value));
+		const entry = option === undefined ? undefined : entries.find((candidate) => candidate?.value === option);
+		if (!entry) return false;
+		this.menuHandle.onSelect(entry);
 		this.ui.requestRender();
 		return true;
 	}
@@ -5732,6 +5886,11 @@ export class HarnessApp {
 				if (client?.capabilities?.appendContext === true) {
 					try {
 						await client.appendContext(formatShellContext(result));
+						// The injected output is now part of this session's model context, so
+						// a pre-conversation /cd must not quietly discard the session.
+						if (!targetThread && this.isSessionCommandTargetActive(target)) {
+							this.conversationStarted = true;
+						}
 					} catch (error) {
 						if (!this.isSessionCommandTargetActive(target)) {
 							this.addNotice("Shell context injection finished after its original session changed; its error was not attached to the replacement session");
@@ -5841,7 +6000,11 @@ export class HarnessApp {
 			// While a turn is running, Enter queues "after tool" (steer at the next
 			// tool-call boundary); Tab queues "after turn". During a session switch
 			// or deferred config flush there is no live turn, so always queue behind it.
-			const timing = this.busy ? (options.queueTiming ?? "afterTool") : "afterTurn";
+			// An identity question is answered locally and never delivered to the
+			// backend, so it must not cancel the in-flight turn at a tool boundary.
+			const timing = this.busy && !localIdentityResponse(text, options.promptParts)
+				? (options.queueTiming ?? "afterTool")
+				: "afterTurn";
 			this.enqueuePrompt(text, timing, {
 				displayText,
 				compactCommand: options.compactCommand,
@@ -5851,7 +6014,9 @@ export class HarnessApp {
 			return;
 		}
 		const pendingUserEcho = this.trackPendingUserEcho(text);
-		this.conversationStarted = true;
+		// A locally-answered identity question never reaches the backend, so it
+		// must not forfeit the pre-conversation local /cd path.
+		if (!localIdentityResponse(text, options.promptParts)) this.conversationStarted = true;
 		const transcriptEntry = this.addUserMessage(displayText, { compactCommand: options.compactCommand });
 		this.armPendingUnsendPrompt({
 			text,
@@ -6415,7 +6580,7 @@ export class HarnessApp {
 					continue;
 				}
 				const pendingUserEcho = this.trackPendingUserEcho(prompt.text);
-				this.conversationStarted = true;
+				if (!localIdentityResponse(prompt.text, prompt.promptParts)) this.conversationStarted = true;
 				const transcriptEntry = this.addUserMessage(prompt.displayText ?? prompt.text, { compactCommand: prompt.compactCommand });
 				this.armPendingUnsendPrompt({
 					text: prompt.text,
@@ -7419,14 +7584,25 @@ export class HarnessApp {
 		);
 		const persisted = this.persistedModelPreferences(this.activeKey);
 		const liveModelOption = findConfigOption(state, "model");
-		const liveModelValue = currentConfigValue(liveModelOption);
-		const liveModelLabel = currentConfigLabel(liveModelOption) ?? state.models?.currentModelId;
-		const liveModel = liveModelValue !== undefined
-			? liveModelValue === persisted.model ? persisted.modelDisplay ?? liveModelLabel : liveModelLabel
-			: liveModelLabel;
-		const model = hasLiveSessionState ? liveModel : liveModel ?? persisted.modelDisplay ?? persisted.model;
-		const liveEffort = currentConfigValue(findConfigOption(state, "thought_level"));
-		const effort = hasLiveSessionState ? liveEffort : liveEffort ?? persisted.effort;
+		const liveModelValue = currentConfigValue(liveModelOption) ?? state.models?.currentModelId;
+		const snapshotModel = Array.isArray(state.models?.availableModels)
+			? state.models.availableModels.find((entry) => (entry?.modelId ?? entry?.id) === liveModelValue)
+			: undefined;
+		const liveModelLabel = currentConfigLabel(liveModelOption) ?? snapshotModel?.name ?? snapshotModel?.label ?? state.models?.currentModelId;
+		const persistedDisplay = liveModelValue !== undefined && liveModelValue === persisted.model
+			? persisted.modelDisplay
+			: liveModelValue !== undefined && liveModelValue === persisted.capturedModel
+				? persisted.capturedModelDisplay
+				: undefined;
+		const liveModel = persistedDisplay ?? liveModelLabel;
+		const model = hasLiveSessionState
+			? liveModel
+			: liveModel ?? persisted.modelDisplay ?? persisted.model ?? persisted.capturedModelDisplay ?? persisted.capturedModel;
+		const liveEffortOption = findConfigOption(state, "thought_level");
+		const liveEffort = currentConfigValue(liveEffortOption);
+		// Only a live thought_level option may suppress the persisted effort; a
+		// harness without one (e.g. models-snapshot agents) never reports effort.
+		const effort = hasLiveSessionState && liveEffortOption ? liveEffort : liveEffort ?? persisted.effort ?? persisted.capturedEffort;
 		return {
 			...(model ? { model: String(model) } : {}),
 			...(effort ? { effort: String(effort) } : {}),
@@ -7440,6 +7616,11 @@ export class HarnessApp {
 			...(typeof preferences.model === "string" && preferences.model ? { model: preferences.model } : {}),
 			...(typeof preferences.modelDisplay === "string" && preferences.modelDisplay ? { modelDisplay: preferences.modelDisplay } : {}),
 			...(typeof preferences.effort === "string" && preferences.effort ? { effort: preferences.effort } : {}),
+			...(typeof preferences.capturedModel === "string" && preferences.capturedModel ? { capturedModel: preferences.capturedModel } : {}),
+			...(typeof preferences.capturedModelDisplay === "string" && preferences.capturedModelDisplay
+				? { capturedModelDisplay: preferences.capturedModelDisplay }
+				: {}),
+			...(typeof preferences.capturedEffort === "string" && preferences.capturedEffort ? { capturedEffort: preferences.capturedEffort } : {}),
 		};
 	}
 
@@ -7453,22 +7634,29 @@ export class HarnessApp {
 			: undefined;
 		const label = currentConfigLabel(option) ?? snapshotModel?.name ?? snapshotModel?.label ?? value;
 		if (!persisted.model && state?._ccCreatedSession && value) {
+			const modelDisplay = label && label !== value ? label : undefined;
 			const token = `capture-model\0${key}\0${value}\0${label ?? ""}`;
 			this.modelDisplayAlignmentAttempts ??= new Set();
-			if (!this.modelDisplayAlignmentAttempts.has(token)) {
+			if (
+				(persisted.capturedModel !== value || persisted.capturedModelDisplay !== (modelDisplay ?? value)) &&
+				!this.modelDisplayAlignmentAttempts.has(token)
+			) {
 				this.modelDisplayAlignmentAttempts.add(token);
+				this.persistPreferenceSource = "captured";
 				try {
-					changed = this.persistModelPreference(key, "model", value, {
-						modelDisplay: label && label !== value ? label : undefined,
-					}) || changed;
+					changed = this.persistModelPreference(key, "model", value, { modelDisplay }) || changed;
 					persisted = this.persistedModelPreferences(key);
 				} catch (error) {
 					this.addNotice?.(`cc could not save the model name ${label ?? value}: ${error.message ?? error}`);
+				} finally {
+					this.persistPreferenceSource = undefined;
 				}
 			}
 		} else if (persisted.model && value && label) {
 			const exactId = value === persisted.model;
-			const savedIdIsAdvertised = flattenConfigOptions(option).some((entry) => entry.value === persisted.model);
+			const savedIdIsAdvertised = flattenConfigOptions(option).some((entry) => entry.value === persisted.model) ||
+				(Array.isArray(state?.models?.availableModels) &&
+					state.models.availableModels.some((entry) => (entry?.modelId ?? entry?.id) === persisted.model));
 			const legacyAlias = !exactId && !savedIdIsAdvertised && state?._ccStartupRequestedModel === persisted.model && (
 				modelNamesShareTerminalAlias(persisted.model, label) ||
 				String(persisted.modelDisplay ?? "").trim().toLowerCase() === String(label).trim().toLowerCase()
@@ -7489,15 +7677,18 @@ export class HarnessApp {
 		}
 		persisted = this.persistedModelPreferences(key);
 		const effort = currentConfigValue(findConfigOption(state, "thought_level"));
-		if (!persisted.effort && state?._ccCreatedSession && typeof effort === "string" && effort) {
+		if (!persisted.effort && state?._ccCreatedSession && typeof effort === "string" && effort && persisted.capturedEffort !== effort) {
 			const token = `capture-effort\0${key}\0${effort}`;
 			this.modelDisplayAlignmentAttempts ??= new Set();
 			if (this.modelDisplayAlignmentAttempts.has(token)) return changed;
 			this.modelDisplayAlignmentAttempts.add(token);
+			this.persistPreferenceSource = "captured";
 			try {
 				changed = this.persistModelPreference(key, "thought_level", effort) || changed;
 			} catch (error) {
 				this.addNotice?.(`cc could not save the reasoning effort ${effort}: ${error.message ?? error}`);
+			} finally {
+				this.persistPreferenceSource = undefined;
 			}
 		}
 		return changed;
@@ -7506,20 +7697,35 @@ export class HarnessApp {
 	persistModelPreference(key, category, value, options = {}) {
 		const field = category === "model" ? "model" : category === "thought_level" ? "effort" : undefined;
 		if (!field || typeof value !== "string" || !value) return false;
-		const patch = { [field]: value };
-		if (field === "model" && typeof options.modelDisplay === "string" && options.modelDisplay) {
-			patch.modelDisplay = options.modelDisplay;
-		}
+		// Auto-captured backend defaults live under captured* keys so they can
+		// stabilize the footer without being replayed as a session/new model
+		// request; sessionDefaults.model/effort are reserved for explicit choices.
+		const captured = this.persistPreferenceSource === "captured";
+		const modelDisplay = typeof options.modelDisplay === "string" && options.modelDisplay ? options.modelDisplay : undefined;
+		const patch = captured
+			? {
+				[field === "model" ? "capturedModel" : "capturedEffort"]: value,
+				...(field === "model" ? { capturedModelDisplay: modelDisplay ?? value } : {}),
+			}
+			: {
+				[field]: value,
+				...(field === "model" && modelDisplay ? { modelDisplay } : {}),
+			};
 		const saved = saveSettingsPatch({
-			theme: this.config?.settings?.theme ?? this.config?.theme ?? DEFAULT_SETTINGS.theme,
 			agents: { [key]: { sessionDefaults: patch } },
 		});
 		this.config.settings = normalizeSettings(deepMerge(this.config.settings ?? {}, saved), this.config.theme);
 		const defaults = this.persistedModelPreferences(key);
-		if (this.config?.agents?.[key]) this.config.agents[key]._sessionDefaults = { ...defaults };
+		// Only explicit choices become session/new startup requests; captured*
+		// entries exist for display stability and must never repin the backend.
+		const startupDefaults = {
+			...(defaults.model ? { model: defaults.model } : {}),
+			...(defaults.effort ? { effort: defaults.effort } : {}),
+		};
+		if (this.config?.agents?.[key]) this.config.agents[key]._sessionDefaults = { ...startupDefaults };
 		if (key === this.activeKey) {
-			this.client?.setSessionDefaults?.(defaults);
-			this.btwThread?.client?.setSessionDefaults?.(defaults);
+			this.client?.setSessionDefaults?.(startupDefaults);
+			this.btwThread?.client?.setSessionDefaults?.(startupDefaults);
 		}
 		return true;
 	}
@@ -7739,7 +7945,11 @@ export class HarnessApp {
 				this.addNotice("The session changed while /cd was waiting; run /cd again");
 				return;
 			}
+			const previousWorkingDirectory = process.cwd();
 			if (!this.commitLocalWorkingDirectoryChange(targetPath)) return;
+			// A no-op /cd left the host cwd untouched, so the healthy background
+			// session still matches it and must be kept.
+			if (process.cwd() === previousWorkingDirectory) return;
 			if (this.client && !this.client.exited) {
 				this.disconnectDivergedWorkingDirectorySession(
 					this.captureActiveAgentContext({ includeClient: true }),
@@ -7957,14 +8167,16 @@ export class HarnessApp {
 				this.ui.requestRender();
 				// Input entered while teardown was in flight remains queued. Reconnect
 				// only when there is work to deliver; otherwise the next prompt uses the
-				// normal lazy reconnect path.
+				// normal lazy reconnect path. The explicit statusState keeps the spinner
+				// visible while queued prompts wait, and makes the lifecycle own (and
+				// therefore clear) the label even when the reconnect fails.
 				if (
 					(this.promptQueue?.length ?? 0) > 0 &&
 					!this.agentSwitchTail &&
 					!this.replacementProcessFence &&
 					!this.stopping
 				) {
-					void this.switchAgent(context.key, context.transport, { quiet: true });
+					void this.switchAgent(context.key, context.transport, { quiet: true, statusState: "connecting" });
 				}
 			});
 		this.workingDirectoryShutdownTail = trackedShutdown;
@@ -9032,6 +9244,12 @@ export class HarnessApp {
 			this.addNotice("A session transition is already in progress");
 			return;
 		}
+		if (options.codex && legacyForkMigrationDeferred) {
+			// Deleting with lineage missing would silently skip legacy fork copies
+			// and leave their rollouts orphaned once the parent is gone.
+			this.addNotice("Permanent deletion is unavailable: the legacy fork import did not complete at startup. Restart cc to retry the import first.");
+			return;
+		}
 		const operationKey = this.activeKey;
 		const operationTransport = this.transport;
 		const operationClient = this.client;
@@ -9097,7 +9315,7 @@ export class HarnessApp {
 						if (liveSideThread && (deletingMain || deletingSide)) {
 							const sideClient = liveSideThread.client;
 							this.closeBtw({ stop: false });
-							await stopClientForNativeMutation(sideClient);
+							await this.trackRetiredClientShutdown(sideClient, stopClientForNativeMutation(sideClient));
 						}
 						if (deletingMain) {
 							this.ready = false;
@@ -9151,6 +9369,13 @@ export class HarnessApp {
 						const titleMatches = sessions.filter(
 							(session) => singleLineMenuText(session?.title ?? "") === normalizedTitle,
 						);
+						// A truncated list cannot prove a title is unambiguous: the
+						// duplicate may live beyond the cap, and deletion is permanent.
+						// A value matching no visible title still passes through below
+						// as an opaque session id, which needs no list at all.
+						if (titleMatches.length > 0 && targetClient.sessionListTruncated) {
+							throw new Error(`the session list was truncated before ${normalizedTitle} could be matched safely; use its session id`);
+						}
 						if (titleMatches.length > 1) {
 							throw new Error(`more than one session is named ${normalizedTitle}; use its session id to disambiguate`);
 						}
@@ -9340,7 +9565,7 @@ export class HarnessApp {
 			if (liveSideThread && (isMain || isSide)) {
 				const sideClient = liveSideThread.client;
 				this.closeBtw({ stop: false });
-				await stopClientForNativeMutation(sideClient);
+				await this.trackRetiredClientShutdown(sideClient, stopClientForNativeMutation(sideClient));
 			}
 			if (isMain) {
 				this.ready = false;
@@ -9827,7 +10052,7 @@ export class HarnessApp {
 			delete agent._sessionAuthEnv;
 			this.syncAgentAuthenticationState(transitionKey, client);
 			this.ready = false;
-			await stopClientsForReplacement([client, btwClient]);
+			await this.trackRetiredClientShutdown([client, btwClient], stopClientsForReplacement([client, btwClient]));
 			this.invalidateBackendCommandHints(transitionKey);
 			this.addNotice("Signed out. Run /login to authenticate again.");
 		} catch (error) {
@@ -10030,7 +10255,7 @@ export class HarnessApp {
 						// catalog structure while stripping URL userinfo, secret query values, and
 						// any explicitly sensitive fields before it reaches terminal scrollback.
 						const safeCatalog = redactCodexMcpJson(catalog);
-						this.showMarkdownBlock(`\`\`\`json\n${truncateDiff(JSON.stringify(safeCatalog, null, 2), 300)}\n\`\`\``);
+						this.showMarkdownBlock(fencedMarkdownBlock("json", truncateDiff(JSON.stringify(safeCatalog, null, 2), 300)));
 					}
 			} else {
 				this.addNotice(`Plugin marketplace ${action} completed.`);
@@ -11115,7 +11340,7 @@ export class HarnessApp {
 					throw new Error("Codex returned invalid MCP JSON");
 				}
 				const catalog = redactCodexMcpJson(parsed);
-				this.showMarkdownBlock(`\`\`\`json\n${truncateDiff(JSON.stringify(catalog, null, 2), CODEX_MCP_REPORT_MAX_LINES)}\n\`\`\``);
+				this.showMarkdownBlock(fencedMarkdownBlock("json", truncateDiff(JSON.stringify(catalog, null, 2), CODEX_MCP_REPORT_MAX_LINES)));
 				return;
 			}
 			const target = server ? ` ${server}` : "";
@@ -11161,7 +11386,7 @@ export class HarnessApp {
 			);
 			if (!this.isActiveAgentContext(context)) return;
 			const stdout = result.stdout.toString("utf8").trim();
-			if (stdout) this.showMarkdownBlock(`\`\`\`text\n${truncateDiff(stdout, 300)}\n\`\`\``);
+			if (stdout) this.showMarkdownBlock(fencedMarkdownBlock("text", truncateDiff(stdout, 300)));
 			if (result.code !== 0) {
 				const details = result.stderr.toString("utf8").trim();
 				this.addError(`Codex doctor exited ${result.signal ?? result.code}${details ? `: ${oneLine(details)}` : ""}`);
@@ -11596,7 +11821,7 @@ export class HarnessApp {
 			const stderr = result.stderr.toString("utf8").trim();
 			if (stdout) {
 				const language = args[0] === "diff" ? "diff" : "text";
-				this.showMarkdownBlock(`\`\`\`${language}\n${truncateDiff(stdout, 500)}\n\`\`\``);
+				this.showMarkdownBlock(fencedMarkdownBlock(language, truncateDiff(stdout, 500)));
 			}
 			if (result.code !== 0) this.addError(`Codex Cloud exited ${result.signal ?? result.code}${stderr ? `: ${oneLine(stderr)}` : ""}`);
 			else if (!stdout) this.addNotice(`Codex Cloud ${args[0]} completed.`);
@@ -13002,6 +13227,29 @@ export class HarnessApp {
 		return tracked;
 	}
 
+	// /logout and native /delete //archive //unarchive retire clients outside the
+	// tracked btw/agent-switch registries. Record those in-flight stops so
+	// stopAndExit can force-stop their process trees and wait for them to settle
+	// before the process exits. The caller keeps awaiting the original promise,
+	// so its error contract is unchanged.
+	trackRetiredClientShutdown(clients, shutdown) {
+		const retiring = (Array.isArray(clients) ? clients : [clients]).filter(Boolean);
+		if (retiring.length === 0) return shutdown;
+		this.activeRetiredClientShutdowns ??= new Set();
+		// `settled` never rejects (so an exit that never happens cannot leave an
+		// unhandled rejection) but resolves to the failure, so stopAndExit can
+		// still surface an unconfirmed process-tree stop instead of exiting clean.
+		const entry = { clients: retiring, settled: Promise.resolve(shutdown).then(() => undefined, (error) => error) };
+		this.activeRetiredClientShutdowns.add(entry);
+		// Only confirmed stops leave the registry. A failed retirement's clients
+		// are detached from every other registry by the time it settles, so the
+		// entry must stay visible for stopAndExit to force-stop at teardown.
+		void entry.settled.then((error) => {
+			if (error === undefined) this.activeRetiredClientShutdowns?.delete(entry);
+		});
+		return shutdown;
+	}
+
 	closeBtw(options = {}) {
 		const thread = this.btwThread;
 		const skipUi = options.skipUi === true;
@@ -13289,7 +13537,8 @@ export class HarnessApp {
 			} else if (!text.trim() && supplementalNotices.length === 0) {
 				this.addNotice("No changes in the working tree.");
 			} else if (text.trim()) {
-				this.showMarkdownBlock(`\`\`\`diff\n${truncateDiff(text, DIFF_DISPLAY_MAX_LINES, result.stdoutTruncated === true)}\n\`\`\``);
+				const body = truncateDiff(text, DIFF_DISPLAY_MAX_LINES, result.stdoutTruncated === true);
+				this.showMarkdownBlock(fencedMarkdownBlock("diff", body));
 			}
 			if (result.stdoutTruncated) supplementalNotices.push("Additional diff output was omitted because the display safety limit was reached.");
 			for (const notice of supplementalNotices) this.addNotice(notice);
@@ -13375,10 +13624,7 @@ export class HarnessApp {
 	setCopyAlwaysFullResponse(enabled) {
 		const value = enabled === true;
 		try {
-			saveSettingsPatch({
-				copyAlwaysFullResponse: value,
-				theme: this.config?.settings?.theme ?? this.config?.theme ?? DEFAULT_SETTINGS.theme,
-			});
+			saveSettingsPatch({ copyAlwaysFullResponse: value });
 		} catch (error) {
 			this.addError(`Could not save copy preference: ${error.message ?? error}`);
 			return false;
@@ -13869,6 +14115,7 @@ export class HarnessApp {
 		const entries = [
 			{ value: "open", label: "Open authentication page", description: safeUrlDescription(params.url) },
 			{ value: "copy", label: "Copy URL for manual opening", description: "May contain a one-time secret" },
+			{ value: "show", label: "Show URL in terminal", description: "Reveals the one-time URL on screen for manual opening" },
 			{ value: "decline", label: "Decline" },
 		];
 		this.openSelection(oneLine(params.message ?? "Authentication required"), entries, async (entry) => {
@@ -13884,9 +14131,22 @@ export class HarnessApp {
 					await this.copyAuthenticationUrl(params.url);
 					this.addNotice("Copied the authentication URL. Treat it as a secret until sign-in completes.");
 				} catch {
-					this.addError("Could not copy the authentication URL. Choose another option, retry, or press Esc to cancel.");
+					// The elicitation may have been settled (Esc, agent switch) while the
+					// clipboard write was in flight; a late failure must not surface a
+					// stale error against whatever prompt is on screen now.
+					if (!settled) {
+						this.addError("Could not copy the authentication URL. Choose another option, retry, or press Esc to cancel.");
+					}
 					return;
 				}
+				finish({ action: "accept" });
+				return;
+			}
+			if (entry?.value === "show") {
+				// Last-resort delivery for environments with no clipboard tool and no
+				// URL launcher (headless/SSH). Revealing the secret in the transcript is
+				// an explicit, deliberate choice — never an automatic failure fallback.
+				this.addNotice(`Open this authentication URL manually (it may contain a secret): ${singleLineMenuText(params.url)}`);
 				finish({ action: "accept" });
 				return;
 			}
@@ -14032,8 +14292,10 @@ export class HarnessApp {
 		} else if (event.type === "backend_exit") {
 			// The backend died unexpectedly. Mark it dead so queued prompts are
 			// preserved (not drained into errors) and the next submit reconnects
-			// against a fresh client instead of erroring on the dead one.
-			this.cancelPermissionPrompts();
+			// against a fresh client instead of erroring on the dead one. Only the
+			// dead backend's interactive prompts are cancelled — a live /btw fork
+			// keeps its own pending permission/elicitation requests.
+			this.cancelInteractiveRequestsForClient(this.client);
 			this.clearCancelGraceTimer();
 			this.ready = false;
 			this.busy = false;
@@ -14274,10 +14536,18 @@ export class HarnessApp {
 
 	requestUserExit(displayText = undefined) {
 		if (this.sessionSwitchInProgress) {
-			if (displayText) this.addCommandMessage(displayText);
-			this.addNotice("Exit is unavailable while a session transition is in progress");
-			this.ui.requestRender();
-			return false;
+			// A hung backend can leave the transition flag set forever; exit must
+			// never be permanently unavailable. A repeated exit request shortly after
+			// a blocked one forces the bounded stop() teardown unconditionally.
+			const now = performance.now();
+			const lastBlockedAt = this.lastBlockedExitRequestAt;
+			this.lastBlockedExitRequestAt = now;
+			if (lastBlockedAt === undefined || now - lastBlockedAt > 2_000) {
+				if (displayText) this.addCommandMessage(displayText);
+				this.addNotice("Exit is unavailable while a session transition is in progress");
+				this.ui.requestRender();
+				return false;
+			}
 		}
 		this.stop();
 		return true;
@@ -14353,12 +14623,28 @@ export class HarnessApp {
 		// Starting the awaitable stop installs close tracking before the TUI teardown
 		// or process exit can advance. Both main and side trees get bounded TERM/KILL
 		// escalation, and process.exit happens only after those waiters settle.
-		const mainWasStopping = this.client?.stopping === true;
+		// `stopping` is false while an authentication reconnect turn has detached
+		// the connection but still awaits retiring process trees (their stop keeps
+		// its default grace); those retiring connections are exactly what
+		// forceStop() accelerates, so gate on them too.
+		const mainNeedsForceStop = this.client?.stopping === true ||
+			(this.client?.retiringConnections?.size ?? 0) > 0;
 		const mainShutdown = this.client
 			? stopClientsForReplacement([this.client], { timeoutMs: FINAL_SHUTDOWN_GRACE_MS })
 			: Promise.resolve();
-		if (mainWasStopping) this.client?.forceStop?.();
+		if (mainNeedsForceStop) this.client?.forceStop?.();
 		for (const client of this.activeAgentShutdownClients ?? []) client.forceStop?.();
+		// Backend retirements started outside the tracked registries (/logout,
+		// native /delete //archive side clients) must not outlive cc either:
+		// force-stop their trees now and await their bounded stops below.
+		const retiredShutdowns = [...(this.activeRetiredClientShutdowns ?? [])];
+		for (const entry of retiredShutdowns) {
+			for (const retiredClient of entry.clients) retiredClient.forceStop?.();
+		}
+		// A superseded connection attempt may still be retiring its own process
+		// tree with default grace inside the agent-switch turn awaited below.
+		const supersededAttemptClient = this.connectionAttempt?.client;
+		if (supersededAttemptClient && supersededAttemptClient !== this.client) supersededAttemptClient.forceStop?.();
 		// A replacement may have detached `this.client` before waiting for its old
 		// process tree. Its lifecycle tail owns that tree until the wait completes.
 		// `stopping` makes every queued/reawakened switch return without spawning;
@@ -14381,7 +14667,17 @@ export class HarnessApp {
 			}
 		}
 		const shutdownResults = await Promise.allSettled(
-			[sideShutdown, mainShutdown, agentSwitchShutdown, nativeShutdown].filter(Boolean),
+			[
+				sideShutdown,
+				mainShutdown,
+				agentSwitchShutdown,
+				nativeShutdown,
+				...retiredShutdowns.map((entry) =>
+					entry.settled.then((error) => {
+						if (error !== undefined) throw error;
+					}),
+				),
+			].filter(Boolean),
 		);
 		if (uiStopFailure) shutdownResults.push({ status: "rejected", reason: uiStopFailure });
 		const failure = shutdownResults.find((result) => result.status === "rejected");
@@ -14444,7 +14740,10 @@ export function assistantResponseTexts(container) {
 			if (child.text?.trim()) parts.push(child.text.trim());
 			continue;
 		}
-		if (child instanceof UserMessage || child instanceof CommandMessage) commit();
+		// MutableUserMessage covers both live user prompts (UserMessage) and user
+		// text replayed from the backend on resume/branch/rewind (appendUserText
+		// creates the base class); both end the assistant response before them.
+		if (child instanceof MutableUserMessage || child instanceof CommandMessage) commit();
 	}
 	commit();
 	return responses;
@@ -16370,12 +16669,28 @@ function packageLocalAcpPackageRoot(agent, packageRoot = PACKAGE_ROOT) {
 	const packageName = agent?._requiredAgentName;
 	const segments = packageNameSegments(packageName);
 	if (!segments) return undefined;
-	const packageDir = path.join(packageRoot, "node_modules", ...segments);
-	const pkg = readNodePackage(packageDir);
-	if (!pkg || pkg.metadata.name !== packageName) return undefined;
-	if (agent?._packageLocalAcpVersion && pkg.metadata.version !== agent._packageLocalAcpVersion) return undefined;
-	if (agent?._minimumAgentVersion && !versionAtLeast(pkg.metadata.version, agent._minimumAgentVersion)) return undefined;
-	return packageDir;
+	// Project-local and npx installs hoist cc's dependencies into an ancestor
+	// node_modules instead of nesting them under the package. Mirror Node's
+	// ancestor traversal — the same layout postinstall verification accepts —
+	// while every candidate still has to pass the name and pinned-version
+	// checks below.
+	const candidates = [path.join(packageRoot, "node_modules", ...segments)];
+	let directory = packageRoot;
+	for (;;) {
+		const parent = path.dirname(directory);
+		if (parent === directory) break;
+		directory = parent;
+		if (path.basename(directory) === "node_modules") continue;
+		candidates.push(path.join(directory, "node_modules", ...segments));
+	}
+	for (const packageDir of candidates) {
+		const pkg = readNodePackage(packageDir);
+		if (!pkg || pkg.metadata.name !== packageName) continue;
+		if (agent?._packageLocalAcpVersion && pkg.metadata.version !== agent._packageLocalAcpVersion) continue;
+		if (agent?._minimumAgentVersion && !versionAtLeast(pkg.metadata.version, agent._minimumAgentVersion)) continue;
+		return packageDir;
+	}
+	return undefined;
 }
 
 export function resolveAgentAcpExecutable(agent, cwd = process.cwd(), env = mergedAgentEnvironment(agent), platform = process.platform) {
@@ -18011,8 +18326,16 @@ async function resolveCodexSessionTargetForCommand(target, agent = {}, client = 
 		archived: options.archived === true,
 		modelProvider,
 	});
+	// A list capped at its query limit cannot prove a name is unambiguous; these
+	// commands mutate or permanently delete sessions, so refuse to guess.
+	if (sessions !== undefined && sessions.length >= 10_000) {
+		throw new Error("the local Codex session index has too many sessions to resolve a name safely; use its UUID");
+	}
 	if (sessions === undefined && options.archived !== true && typeof client?.listSessions === "function") {
 		sessions = await client.listSessions();
+		if (client.sessionListTruncated) {
+			throw new Error("the ACP session list was truncated before the name could be matched safely; use its UUID");
+		}
 	}
 	// Archived sessions cannot be active and ACP does not list them. The native
 	// CLI accepts an archived session name directly, so it is safe to delegate
@@ -18721,6 +19044,21 @@ export function copyCodexRolloutWithNewId(srcPath, oldId, newId, options = {}) {
 	return dest;
 }
 
+function fencedMarkdownBlock(language, body) {
+	// The body can carry a code-fence line of its own (for example an
+	// unchanged ``` context line in a diff, or a backtick run inside a JSON
+	// string). Use a fence longer than any backtick run in the body so the
+	// wrapper cannot be closed early and the rest rendered as markdown.
+	// Computed iteratively: spreading every run into Math.max can exceed V8's
+	// argument limit on bodies with very many isolated backticks.
+	let longestRun = 0;
+	for (const run of body.matchAll(/`+/gu)) {
+		if (run[0].length > longestRun) longestRun = run[0].length;
+	}
+	const fence = "`".repeat(Math.max(3, longestRun + 1));
+	return `${fence}${language}\n${body}\n${fence}`;
+}
+
 function truncateDiff(text, maxLines = 500, outputTruncated = false) {
 	const lines = String(text).split("\n");
 	if (lines.length <= maxLines && !outputTruncated) return text;
@@ -19143,7 +19481,7 @@ function isArrowUp(data) {
 	return matchesKey(data, "up");
 }
 
-function createHarnessTerminal(resizeHooks = {}) {
+export function createHarnessTerminal(resizeHooks = {}) {
 	const terminal = new ProcessTerminal();
 	const start = terminal.start.bind(terminal);
 	const stop = terminal.stop.bind(terminal);
@@ -19161,7 +19499,10 @@ function createHarnessTerminal(resizeHooks = {}) {
 			// terminal's canonical buffer when Pi enables raw mode. In that race the
 			// line-ending arrives as LF, while Pi's key matcher expects CR for Enter.
 			// Normalize only a standalone LF so pasted/multiline content is untouched.
-			onInput(data === "\n" ? "\r" : data);
+			// Skip it when the Kitty protocol is active: there a lone LF is a
+			// shift+enter text mapping (e.g. Ghostty's `shift+enter=text:\n`), which
+			// must insert a newline rather than submit.
+			onInput(data === "\n" && !isKittyProtocolActive() ? "\r" : data);
 		}, () => {
 			if (RESIZE_SETTLE_DELAY_MS <= 0) {
 				// Still run the resize lifecycle so prepareResizeFullClear primes the
@@ -19461,7 +19802,11 @@ function compactPath(value) {
 export function loadConfig() {
 	const file = configPath();
 	const user = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : {};
-	const config = deepMerge(DEFAULT_CONFIG, user);
+	// deepMerge keeps base references for subtrees the user config leaves
+	// untouched, and the app writes session state (_sessionDefaults,
+	// _sessionAuthEnv, ...) onto config.agents.<key> in place. Clone the
+	// defaults so those mutations can never reach the module constant.
+	const config = deepMerge(clonePlain(DEFAULT_CONFIG), user);
 	const settings = normalizeSettings(deepMerge(config.settings ?? {}, loadSettings()), config.theme);
 	const defaultAgent = typeof settings.defaultAgent === "string" && config.agents?.[settings.defaultAgent]
 		? settings.defaultAgent
@@ -19479,7 +19824,15 @@ function configPath() {
 function loadSettings() {
 	const file = settingsPath();
 	if (!fs.existsSync(file)) return {};
-	return JSON.parse(fs.readFileSync(file, "utf8"));
+	try {
+		return JSON.parse(fs.readFileSync(file, "utf8"));
+	} catch (error) {
+		if (error?.code === "ENOENT") return {};
+		// cc rewrites this file itself, so a torn write (crash/ENOSPC mid-save)
+		// must degrade to defaults instead of making every launch fail to parse.
+		process.stderr.write(`cc: ignoring unreadable settings file ${file}: ${error.message ?? error}\n`);
+		return {};
+	}
 }
 
 function settingsPath() {
@@ -19828,9 +20181,23 @@ function forkOperationMutationGuardPath(lockPath) {
 	return `${lockPath}.mutation`;
 }
 
+// Publish a fully written lock file at its canonical path without replacing an
+// existing one. A hard link is the atomic primitive; filesystems without link
+// support (exFAT, some network/FUSE mounts) fall back to an EXCL copy, whose
+// non-atomic (torn-on-kill) window is covered by the aged invalid-artifact
+// reclaims below.
+function publishForkLockFileNoReplace(sourcePath, targetPath) {
+	try {
+		fs.linkSync(sourcePath, targetPath);
+	} catch (error) {
+		if (!["EACCES", "EPERM", "EXDEV", "ENOTSUP"].includes(error?.code)) throw error;
+		fs.copyFileSync(sourcePath, targetPath, fs.constants.COPYFILE_EXCL);
+	}
+}
+
 function restoreDisplacedForkMutationMarker(markerPath, quarantinePath) {
 	try {
-		fs.linkSync(quarantinePath, markerPath);
+		publishForkLockFileNoReplace(quarantinePath, markerPath);
 		fs.rmSync(quarantinePath, { force: true });
 		return true;
 	} catch {
@@ -19846,9 +20213,33 @@ function reclaimAbandonedForkOperationMutation(lockPath, options = {}) {
 	const state = readForkOperationOwner(markerPath);
 	if (!state) return true;
 	const owner = state.owner;
-	// Unknown/corrupt markers and markers from another host are deliberately
-	// fail-closed. Only a current-protocol marker whose local owner is definitely
-	// gone (or explicitly released) is safe to reclaim.
+	// Unknown markers and markers from another host are deliberately fail-closed.
+	// Only a current-protocol marker whose local owner is definitely gone (or
+	// explicitly released) is safe to reclaim — with one exception: a marker
+	// that does not parse can never be released or token-reclaimed either, so it
+	// would block fork mutations forever. Healthy publication completes in
+	// milliseconds even through the no-hard-link copy fallback, so an unparseable
+	// file older than the legacy aging grace is a torn artifact, not a
+	// mid-publication claim.
+	if (
+		state.invalid &&
+		state.stat?.isFile() === true &&
+		Date.now() - state.stat.mtimeMs > FORK_LEGACY_LOCK_STALE_MS
+	) {
+		const quarantinePath = `${markerPath}.reclaimed-${randomUUID()}`;
+		try {
+			fs.renameSync(markerPath, quarantinePath);
+		} catch (error) {
+			return error?.code === "ENOENT";
+		}
+		const moved = readForkOperationOwner(quarantinePath);
+		if (moved && !moved.invalid) {
+			// The canonical marker was repaired after the stale read; restore it.
+			restoreDisplacedForkMutationMarker(markerPath, quarantinePath);
+			return false;
+		}
+		return removeForkLockStorage(quarantinePath, "file");
+	}
 	if (
 		state.invalid ||
 		!state.stat?.isFile() ||
@@ -19964,7 +20355,7 @@ function beginForkOperationMutation(lockPath, timeoutMs = FORK_OPERATION_LOCK_TI
 		};
 		try {
 			fs.writeFileSync(candidatePath, `${JSON.stringify(marker)}\n`, { flag: "wx", mode: 0o600 });
-			fs.linkSync(candidatePath, markerPath);
+			publishForkLockFileNoReplace(candidatePath, markerPath);
 			fs.rmSync(candidatePath, { force: true });
 		} catch (error) {
 			try { fs.rmSync(candidatePath, { force: true }); } catch {}
@@ -20058,7 +20449,7 @@ function restoreDisplacedForkOperationLock(lockPath, quarantinePath, lockKind) {
 		try {
 			if (lockKind === "directory") fs.renameSync(quarantinePath, lockPath);
 			else {
-				fs.linkSync(quarantinePath, lockPath);
+				publishForkLockFileNoReplace(quarantinePath, lockPath);
 				fs.rmSync(quarantinePath, { force: true });
 			}
 			return true;
@@ -20080,6 +20471,68 @@ function restoreDisplacedForkOperationLock(lockPath, quarantinePath, lockKind) {
 	return removeForkLockStorage(quarantinePath, lockKind);
 }
 
+// Locks left behind by pre-protocol builds carry no protocolVersion to verify:
+// operation locks are directories whose owner.json lacks it, and registry locks
+// are bare mkdir directories with no owner at all. Apply the previous release's
+// reclaim rules (dead same-host PID immediately, 30-second mtime aging for
+// ownerless or ambiguous claims) so a crashed old cc cannot block fork storage
+// permanently. A legacy claim genuinely mid-publication stays protected by the
+// aging grace.
+function reclaimLegacyForkOperationLock(lockPath, state) {
+	// Every removal below goes through atomic rename-to-quarantine with a
+	// captured-state recheck: a pre-protocol cc does not honor the mutation
+	// marker, so it can reclaim and republish this path between the stale read
+	// and the removal — the recheck restores such a live successor instead of
+	// deleting it.
+	const sameLegacyOwner = (a, b) =>
+		a?.pid === b?.pid && a?.hostname === b?.hostname && a?.released === b?.released && a?.token === b?.token;
+	const reclaim = (kind, capturedMatchesJudgement) => {
+		const quarantinePath = `${lockPath}.reclaimed-${randomUUID()}`;
+		try {
+			fs.renameSync(lockPath, quarantinePath);
+		} catch (error) {
+			return error?.code === "ENOENT";
+		}
+		const captured = readForkOperationOwner(quarantinePath);
+		if (captured !== undefined && !capturedMatchesJudgement(captured)) {
+			restoreDisplacedForkOperationLock(lockPath, quarantinePath, kind);
+			return false;
+		}
+		return removeForkLockStorage(quarantinePath, kind);
+	};
+	// An unparseable lock FILE can never be released or token-reclaimed, so
+	// left alone it would block fork operations forever. Registry lock files
+	// are published fully written (hard link or EXCL copy), so one that stays
+	// unparseable past the aging grace is a torn no-hard-link copy artifact,
+	// not a mid-publication claim.
+	if (state?.stat?.isFile() === true && state.invalid) {
+		if (Date.now() - state.stat.mtimeMs < FORK_LEGACY_LOCK_STALE_MS) return false;
+		return reclaim("file", (captured) =>
+			captured.invalid === true && captured.stat?.isFile() === true && sameFileIdentity(captured.stat, state.stat));
+	}
+	if (state?.stat?.isDirectory() !== true) return false;
+	const owner = state.invalid ? undefined : state.owner;
+	const judgedOwner = isPlainObject(owner) ? owner : undefined;
+	// Stat identity (dev+ino+birthtime), not just owner content: two ownerless
+	// pre-protocol claims are indistinguishable by content, so a fresh live
+	// successor mkdir'd at this path must not pass for the aged one.
+	const sameDirectoryClaim = (captured) =>
+		captured.stat?.isDirectory() === true &&
+		sameFileIdentity(captured.stat, state.stat) &&
+		sameLegacyOwner(captured.invalid ? undefined : captured.owner, judgedOwner);
+	if (isPlainObject(owner)) {
+		if (owner.released === true) return reclaim("directory", sameDirectoryClaim);
+		if (owner.hostname && owner.hostname !== os.hostname()) return false;
+		const alive = processIsAlive(Number(owner.pid));
+		if (alive === true) return false;
+		if (alive === false && owner.hostname === os.hostname()) {
+			return reclaim("directory", sameDirectoryClaim);
+		}
+	}
+	if (Date.now() - state.stat.mtimeMs < FORK_LEGACY_LOCK_STALE_MS) return false;
+	return reclaim("directory", sameDirectoryClaim);
+}
+
 function reclaimAbandonedForkOperationLock(lockPath, options = {}) {
 	const lockKind = options.lockKind === "directory" ? "directory" : "file";
 	const mutationTimeoutMs = Number.isFinite(options.timeoutMs)
@@ -20092,14 +20545,15 @@ function reclaimAbandonedForkOperationLock(lockPath, options = {}) {
 		if (!state) return true;
 		const owner = state.owner;
 		// Current operation locks publish a complete candidate directory atomically,
-		// while registry locks publish a complete file by hard link. Never reap
-		// an ownerless/legacy directory: an older creator could still be between
-		// mkdir and owner.json and would otherwise delete a successor in its cleanup.
+		// while registry locks publish a complete file by hard link. Anything else
+		// is a pre-protocol leftover (or a legacy claim still between mkdir and
+		// owner.json) and falls back to the previous release's reclaim rules
+		// instead of blocking every later operation forever.
 		if (
 			state.invalid ||
 			!forkLockStateMatchesKind(state, lockKind) ||
 			owner?.protocolVersion !== FORK_OPERATION_LOCK_PROTOCOL_VERSION
-		) return false;
+		) return reclaimLegacyForkOperationLock(lockPath, state);
 		if (owner.released !== true) {
 			if (!owner.hostname || owner.hostname !== os.hostname()) return false;
 			if (processIsAlive(Number(owner.pid)) !== false) return false;
@@ -20197,12 +20651,7 @@ export async function acquireForkOperationLock(options = {}) {
 				options._testAfterOperationMkdirBeforeOwner?.({ lockPath });
 				const candidateOwnerPath = forkOperationOwnerPath(candidatePath);
 				const ownerPath = forkOperationOwnerPath(lockPath);
-				try {
-					fs.linkSync(candidateOwnerPath, ownerPath);
-				} catch (error) {
-					if (!["EACCES", "EPERM", "EXDEV", "ENOTSUP"].includes(error?.code)) throw error;
-					fs.copyFileSync(candidateOwnerPath, ownerPath, fs.constants.COPYFILE_EXCL);
-				}
+				publishForkLockFileNoReplace(candidateOwnerPath, ownerPath);
 			} catch (error) {
 				if (claimStat) removeOwnedForkOperationDirectory(lockPath, claimStat, token);
 				fs.rmSync(candidatePath, { recursive: true, force: true });
@@ -20213,6 +20662,13 @@ export async function acquireForkOperationLock(options = {}) {
 			// return ownership until it has either preserved this token or moved it out
 			// of the canonical path and completed its token verification.
 			while (forkOperationMutationInProgress(lockPath, options)) {
+				if (Date.now() >= deadline) {
+					// An unreclaimable marker (e.g. a suspended holder) must not hang
+					// this process forever while our publication blocks everyone else:
+					// unpublish and surface the same timeout the pre-check raises.
+					removeOwnedForkOperationDirectory(lockPath, claimStat, token);
+					throw new Error("another cc process is changing Codex fork storage; try again after it finishes");
+				}
 				await new Promise((resolve) => setTimeout(resolve, 25));
 			}
 			if (readForkOperationOwner(lockPath)?.owner?.token !== token) continue;
@@ -20263,13 +20719,23 @@ function acquireForkRegistryLock(lockPath, options = {}) {
 		}
 		const candidatePath = `${lockPath}.candidate-${token}-${randomUUID()}`;
 		try {
+			options._testBeforeRegistryPublish?.({ lockPath });
 			fs.writeFileSync(candidatePath, `${JSON.stringify(owner)}\n`, { flag: "wx", mode: 0o600 });
 			try {
-				fs.linkSync(candidatePath, lockPath);
+				publishForkLockFileNoReplace(candidatePath, lockPath);
 			} finally {
 				fs.rmSync(candidatePath, { force: true });
 			}
 			while (forkOperationMutationInProgress(lockPath, options)) {
+				if (Date.now() >= deadline) {
+					// The guarded release path cannot run while the mutation marker is
+					// stuck, and a lock with a live owner is never reclaimed, so removing
+					// our own publication directly cannot race a successor.
+					if (readForkOperationOwner(lockPath)?.owner?.token === token) {
+						removeForkLockStorage(lockPath, "file");
+					}
+					throw new Error("timed out waiting for the fork registry lock");
+				}
 				Atomics.wait(FORK_REGISTRY_LOCK_WAIT, 0, 0, 10);
 			}
 			if (readForkOperationOwner(lockPath)?.owner?.token !== token) continue;
@@ -20392,6 +20858,10 @@ function writeLegacyForkRegistryMigrationMarker(sourcePath, targetPath, consumed
 		try { fs.rmSync(temporary, { force: true }); } catch {}
 	}
 }
+
+// Set when the startup import of legacy fork lineage failed: the shared
+// registry may be missing legacy fork ids until a later launch retries it.
+let legacyForkMigrationDeferred = false;
 
 export async function migrateLegacyForkRegistry(options = {}) {
 	const requestedSource = options.sourcePath ?? process.env.CC_FORKS_MIGRATE_FROM;
@@ -20591,13 +21061,224 @@ export function applyHarnessSettings(config, settings = {}, grants = []) {
 	return { ...config, defaultAgent, settings, theme: settings.theme, agents };
 }
 
+// Two cc instances can persist settings at the same moment (model defaults are
+// captured on every fresh session), so the read-modify-write below is
+// serialized with an owner-stamped lock directory. Reclamation requires proof
+// (same-host dead pid, or an ownerless claim past the mid-publication aging
+// grace) — age alone never reaps a live-but-slow holder, and release is
+// token-verified so a reclaimed-and-replaced lock is never removed from under
+// its successor. On timeout the save proceeds unlocked: losing serialization
+// is strictly better than losing the save.
+function acquireSettingsLock(file) {
+	const lock = `${file}.lock`;
+	const ownerPath = path.join(lock, "owner.json");
+	const token = randomUUID();
+	const deadline = Date.now() + SETTINGS_LOCK_TIMEOUT_MS;
+	const readOwner = () => {
+		try {
+			const owner = JSON.parse(fs.readFileSync(ownerPath, "utf8"));
+			return isPlainObject(owner) ? owner : undefined;
+		} catch {
+			return undefined;
+		}
+	};
+	while (true) {
+		try {
+			fs.mkdirSync(lock);
+		} catch (error) {
+			if (error?.code !== "EEXIST") return undefined;
+			try {
+				const owner = readOwner();
+				const ownerPid = Number(owner?.pid);
+				// An owner record without a checkable identity (missing/invalid pid
+				// or hostname) can never be proven dead, so it ages out like a
+				// mid-publication ownerless claim instead of stalling saves forever.
+				const ownerIdentifiable = owner !== undefined &&
+					Number.isInteger(ownerPid) && ownerPid > 0 &&
+					typeof owner.hostname === "string" && owner.hostname !== "";
+				// A recycled pid must not impersonate a crashed owner forever:
+				// compare the live process's start identity against the stamped one
+				// where the platform can provide it (mirrors the session leases).
+				const liveIdentity = ownerIdentifiable && owner.hostname === os.hostname() &&
+					typeof owner.processStartIdentity === "string" && owner.processStartIdentity
+					? processStartIdentity(ownerPid)
+					: undefined;
+				const ownedByDeadProcess = ownerIdentifiable &&
+					owner.hostname === os.hostname() &&
+					(processIsAlive(ownerPid) === false ||
+						(liveIdentity !== undefined && liveIdentity !== owner.processStartIdentity));
+				const judgedStat = fs.statSync(lock);
+				const agedOwnerlessClaim = !ownerIdentifiable &&
+					Date.now() - judgedStat.mtimeMs > SETTINGS_LOCK_STALE_MS;
+				if (ownedByDeadProcess || agedOwnerlessClaim) {
+					// Reclaim by atomic rename so two contenders cannot both remove:
+					// only one rename wins, and a successor's fresh lock published in
+					// the meantime is captured intact and can be put back.
+					const reclaim = `${lock}.reclaim-${process.pid}-${randomUUID()}`;
+					try {
+						fs.renameSync(lock, reclaim);
+					} catch {
+						continue;
+					}
+					let captured;
+					try {
+						captured = JSON.parse(fs.readFileSync(path.join(reclaim, "owner.json"), "utf8"));
+					} catch {
+						captured = undefined;
+					}
+					// Stat identity too, not just owner content: two ownerless claims
+					// are indistinguishable by content, so a fresh live successor
+					// mkdir'd between the stale read and the rename must not pass for
+					// the aged one it replaced.
+					let capturedStat;
+					try {
+						capturedStat = fs.lstatSync(reclaim);
+					} catch {
+						capturedStat = undefined;
+					}
+					const capturedJudgedStale = sameFileIdentity(capturedStat, judgedStat) &&
+						(owner === undefined
+							? captured === undefined
+							: captured?.pid === owner.pid && captured?.token === owner.token);
+					if (capturedJudgedStale) {
+						fs.rmSync(reclaim, { recursive: true, force: true });
+					} else {
+						// The stale claim was already reclaimed and replaced by a live
+						// successor between the check and the rename; restore it.
+						try {
+							fs.renameSync(reclaim, lock);
+						} catch {
+							fs.rmSync(reclaim, { recursive: true, force: true });
+						}
+					}
+					continue;
+				}
+			} catch (statError) {
+				if (statError?.code === "ENOENT") continue;
+				return undefined;
+			}
+			if (Date.now() >= deadline) return undefined;
+			Atomics.wait(FORK_REGISTRY_LOCK_WAIT, 0, 0, 10);
+			continue;
+		}
+		let claimedStat;
+		try {
+			claimedStat = fs.lstatSync(lock);
+			const identity = processStartIdentity(process.pid);
+			fs.writeFileSync(ownerPath, `${JSON.stringify({
+				pid: process.pid,
+				hostname: os.hostname(),
+				token,
+				...(identity ? { processStartIdentity: identity } : {}),
+			})}\n`, { flag: "wx", mode: 0o600 });
+			// If this claim sat ownerless past the aging grace (e.g. the process
+			// was suspended right after mkdir), a successor may have reclaimed it
+			// and re-created the directory; the stamp above then landed in the
+			// successor's lock. Verify the directory is still the one this call
+			// created before treating the lock as held.
+			if (!sameFileIdentity(fs.lstatSync(lock), claimedStat)) {
+				try {
+					if (readOwner()?.token === token) fs.rmSync(ownerPath, { force: true });
+				} catch {}
+				return undefined;
+			}
+		} catch (error) {
+			// EEXIST/ENOENT mean a successor reclaimed this claim while it sat
+			// ownerless — the directory is not this claim's to remove any more.
+			if (error?.code !== "EEXIST" && error?.code !== "ENOENT") {
+				try { fs.rmSync(lock, { recursive: true, force: true }); } catch {}
+			}
+			return undefined;
+		}
+		return () => {
+			try {
+				if (readOwner()?.token === token) fs.rmSync(lock, { recursive: true, force: true });
+			} catch {}
+		};
+	}
+}
+
+// Follow symlinks manually (realpath rejects dangling links): an atomic
+// replace-by-rename must land on the link's target — creating it if absent —
+// rather than replacing a dotfile-manager's link with a regular file.
+function resolveWriteTargetThroughSymlinks(file) {
+	for (let hops = 0; hops < 8; hops += 1) {
+		let link;
+		try {
+			link = fs.readlinkSync(file);
+		} catch {
+			return file;
+		}
+		file = path.resolve(path.dirname(file), link);
+	}
+	return file;
+}
+
 export function saveSettingsPatch(patch) {
-	const file = settingsPath();
-	const current = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : {};
-	const next = normalizeSettings(deepMerge(current, patch));
-	fs.mkdirSync(path.dirname(file), { recursive: true });
-	fs.writeFileSync(file, `${JSON.stringify(next, null, 2)}\n`);
-	return next;
+	const linkPath = settingsPath();
+	fs.mkdirSync(path.dirname(linkPath), { recursive: true });
+	// Dotfile managers commonly symlink settings.json; replace-by-rename must
+	// land on the real target so the managed file is updated and the link
+	// survives, matching the old write-through behavior.
+	const file = resolveWriteTargetThroughSymlinks(linkPath);
+	if (file !== linkPath) fs.mkdirSync(path.dirname(file), { recursive: true });
+	const releaseLock = acquireSettingsLock(file);
+	try {
+		let current = {};
+		let raw;
+		try {
+			raw = fs.readFileSync(file, "utf8");
+		} catch (error) {
+			// Only a missing store is safely treated as empty. Any other read
+			// failure (EACCES, EIO) hides settings this merge cannot see, and
+			// completing the save would rename a near-empty file over them.
+			if (error?.code !== "ENOENT") throw error;
+		}
+		if (raw !== undefined) {
+			try {
+				current = JSON.parse(raw);
+			} catch {
+				// A torn or hand-corrupted file must not block saving; this write
+				// replaces it whole.
+			}
+		}
+		const next = normalizeSettings(deepMerge(current, patch));
+		// Only persist a theme the caller or the stored file chose explicitly.
+		// Materializing the fallback would permanently override a config.json
+		// theme, and an unrelated save must not rewrite a stored theme name this
+		// build cannot resolve.
+		const hasTheme = (value) => isPlainObject(value) && Object.prototype.hasOwnProperty.call(value, "theme");
+		if (!hasTheme(patch)) {
+			if (hasTheme(current)) next.theme = current.theme;
+			else delete next.theme;
+		}
+		// Write via temp file + rename so a crash mid-save can never leave a
+		// truncated settings.json behind for the next launch to choke on.
+		const temporary = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${randomUUID()}.tmp`);
+		try {
+			fs.writeFileSync(temporary, `${JSON.stringify(next, null, 2)}\n`, { flag: "wx", mode: 0o600 });
+			try {
+				fs.renameSync(temporary, file);
+			} catch (error) {
+				// Windows rename does not replace an existing file. Keep the normal
+				// path atomic everywhere else, and use the narrow remove+rename
+				// fallback only for a non-directory destination on Windows.
+				if (process.platform !== "win32" || !["EEXIST", "EPERM"].includes(error?.code)) throw error;
+				try {
+					if (fs.lstatSync(file).isDirectory()) throw error;
+				} catch (statError) {
+					if (statError?.code !== "ENOENT") throw statError;
+				}
+				fs.rmSync(file, { force: true });
+				fs.renameSync(temporary, file);
+			}
+		} finally {
+			fs.rmSync(temporary, { force: true });
+		}
+		return next;
+	} finally {
+		releaseLock?.();
+	}
 }
 
 function normalizeSettings(settings = {}, fallbackTheme = DEFAULT_SETTINGS.theme) {
@@ -20812,7 +21493,16 @@ export async function runCli(args = process.argv.slice(2)) {
 		process.exit(0);
 	}
 
-	await migrateLegacyForkRegistry();
+	try {
+		await migrateLegacyForkRegistry();
+	} catch (error) {
+		// Legacy fork-lineage import is retried on the next launch; a contended
+		// or stale legacy lock must not stop cc from launching at all. Permanent
+		// Codex deletion is gated on this flag meanwhile — with lineage missing
+		// it would silently skip legacy fork copies.
+		legacyForkMigrationDeferred = true;
+		process.stderr.write(`cc: skipping legacy fork registry migration: ${oneLine(error?.message ?? String(error))}\n`);
+	}
 	const config = loadConfig();
 	if (args.includes("--list")) {
 		for (const [key, agent] of Object.entries(config.agents)) {

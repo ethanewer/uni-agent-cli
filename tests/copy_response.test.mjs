@@ -9,7 +9,7 @@ import {
 	resolveCopyWritePath,
 	writeCopySelection,
 } from "../src/harness/copy-response.mjs";
-import { HarnessApp, SelectionPanel } from "../src/pi-harness.mjs";
+import { assistantResponseTexts, HarnessApp, SelectionPanel } from "../src/pi-harness.mjs";
 
 const response = [
 	"Use this:",
@@ -37,6 +37,16 @@ assert.deepEqual(
 	copyResponseChoices("Nothing inside:\n\n```js\n  \n```").map((choice) => choice.kind),
 	["full"],
 	"empty fenced blocks are not offered as copy/write targets",
+);
+assert.deepEqual(
+	fencedCodeBlocks("Truncated:\n\n```js\nconst x = 1;\nconsole.log(x);"),
+	[{ language: "js", text: "const x = 1;\nconsole.log(x);" }],
+	"an unclosed fence runs to the end of the response",
+);
+assert.deepEqual(
+	copyResponseChoices("Truncated:\n\n```js\nconst x = 1;").map((choice) => choice.kind),
+	["full", "code"],
+	"a response ending mid-fence still offers its code block",
 );
 
 let writeSelection;
@@ -82,6 +92,35 @@ function responseChat(text) {
 	app.appendAssistantText(text);
 	app.closeCurrentAssistantText();
 	return app.chat;
+}
+
+// User text replayed from the backend (resume/branch/rewind) is appended via
+// appendUserText, which creates the base MutableUserMessage class. It must
+// still be a response boundary, so /copy after a replay targets the latest
+// response instead of the merged transcript.
+{
+	const app = Object.create(HarnessApp.prototype);
+	Object.assign(app, {
+		chat: {
+			children: [],
+			addChild(child) { this.children.push(child); },
+		},
+		currentAssistantText: undefined,
+		currentToolSummary: undefined,
+		currentUserText: undefined,
+		lastAssistantText: "",
+		addHistorySpacer() {},
+		ui: { terminal: { rows: 24 } },
+	});
+	app.appendUserText("first replayed prompt");
+	app.appendAssistantText("first replayed response");
+	app.appendUserText("second replayed prompt");
+	app.appendAssistantText("second replayed response");
+	app.closeCurrentAssistantText();
+	assert.deepEqual(assistantResponseTexts(app.chat), [
+		"first replayed response",
+		"second replayed response",
+	]);
 }
 
 // /copy follows the focused side pane instead of silently falling back to the

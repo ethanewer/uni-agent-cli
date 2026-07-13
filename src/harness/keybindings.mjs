@@ -2,7 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { TUI_KEYBINDINGS } from "@mariozechner/pi-tui/dist/keybindings.js";
-import { matchesKey } from "@mariozechner/pi-tui/dist/keys.js";
+import { matchesKey, parseKey } from "@mariozechner/pi-tui/dist/keys.js";
 
 export const CC_KEYBINDINGS_SCHEMA = "https://www.schemastore.org/claude-code-keybindings.json";
 export const CC_KEYBINDINGS_DOCS = "https://code.claude.com/docs/en/keybindings";
@@ -187,7 +187,13 @@ export function normalizeCcKeyStroke(value) {
 }
 
 function normalizeCcSingleKeyStroke(source) {
+	// "+" is both a bindable symbol and the modifier separator, so a spelling
+	// ending in "+" ("+", "ctrl++") means the plus key itself.
 	const parts = source.split("+");
+	if (source === "+" || source.endsWith("++")) {
+		parts.pop();
+		parts[parts.length - 1] = "+";
+	}
 	if (parts.some((part) => !part)) return { error: "keystroke contains an empty key or modifier" };
 	const rawBase = parts.pop();
 	const modifiers = new Set();
@@ -394,10 +400,25 @@ export class CcKeybindingDispatcher {
 		for (const context of orderedContexts) {
 			const contextual = this.bindings.filter((binding) => binding.context === context);
 			const prefixes = contextual.filter(
-				(binding) => binding.strokes.length === 2 && matchesKey(data, binding.strokes[0]),
+				(binding) => binding.strokes.length === 2 && matchesCcStroke(data, binding.strokes[0]),
 			);
 			if (prefixes.length > 0) {
-				const pending = { candidates: prefixes };
+				// Once this context claims the prefix, same-prefix chords in lower
+				// contexts must stay completable: with the defaults, Task's
+				// ctrl+x ctrl+b would otherwise deaden Chat's ctrl+x ctrl+k exactly
+				// while agents are running.
+				const lowerContexts = new Set(orderedContexts.slice(orderedContexts.indexOf(context) + 1));
+				const pending = {
+					candidates: [
+						...prefixes,
+						...this.bindings.filter(
+							(binding) =>
+								lowerContexts.has(binding.context) &&
+								binding.strokes.length === 2 &&
+								matchesCcStroke(data, binding.strokes[0]),
+						),
+					],
+				};
 				this.pending = pending;
 				this.timer = this.setTimeout(() => {
 					if (this.pending === pending) this.reset();
@@ -406,7 +427,7 @@ export class CcKeybindingDispatcher {
 				return { consume: true, pending: true };
 			}
 			const single = contextual.find(
-				(binding) => binding.strokes.length === 1 && matchesKey(data, binding.strokes[0]),
+				(binding) => binding.strokes.length === 1 && matchesCcStroke(data, binding.strokes[0]),
 			);
 			if (single) return { consume: true, action: single.action, chord: single.key, binding: single };
 			if (componentOwnsInput(context, data)) {
@@ -494,7 +515,28 @@ function bindingsForContexts(bindings, contexts) {
 
 function firstMatchingBinding(bindings, data, strokeIndex, contexts) {
 	const ordered = bindingsForContexts(bindings, contexts);
-	return ordered.find((binding) => matchesKey(data, binding.strokes[strokeIndex]));
+	return ordered.find((binding) => matchesCcStroke(data, binding.strokes[strokeIndex]));
+}
+
+function matchesCcStroke(data, stroke) {
+	// pi-tui's matchesKey parses key ids by splitting on "+", so a plus-key
+	// stroke ("+", "ctrl++") can never match through it. Compare against the
+	// canonical id of the parsed input instead. Kitty-protocol terminals report
+	// the physical press as its unshifted codepoint plus Shift ("shift+=", or
+	// "shift++" where the shifted codepoint is primary), so those spellings of
+	// the same logical plus key must match too.
+	if (stroke === "+" || stroke.endsWith("++")) {
+		const parsed = parseKey(data);
+		if (typeof parsed !== "string" || !parsed) return false;
+		const normalized = normalizeCcKeyStroke(parsed).key;
+		if (!normalized) return false;
+		if (normalized === stroke) return true;
+		const modifiers = stroke === "+" ? [] : stroke.slice(0, -2).split("+");
+		const withShift = [...new Set([...modifiers, "shift"])];
+		return normalized === normalizeCcKeyStroke(`${withShift.join("+")}+=`).key ||
+			normalized === normalizeCcKeyStroke(`${withShift.join("+")}++`).key;
+	}
+	return matchesKey(data, stroke);
 }
 
 function componentOwnsInput(context, data) {
