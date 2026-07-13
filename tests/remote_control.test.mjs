@@ -182,6 +182,82 @@ assert.equal(
 		}],
 	}), false, "a valid short model ID is not mistaken for a canonical alias");
 }
+{
+	const app = Object.create(HarnessApp.prototype);
+	app.config = { settings: { agents: { claude: { sessionDefaults: {} } } } };
+	const persisted = [];
+	app.persistModelPreference = (key, category, value, options = {}) => {
+		persisted.push([key, category, value, options]);
+		const defaults = app.config.settings.agents[key].sessionDefaults;
+		if (category === "model") {
+			defaults.model = value;
+			defaults.modelDisplay = options.modelDisplay;
+		} else if (category === "thought_level") defaults.effort = value;
+		return true;
+	};
+	assert.equal(app.alignPersistedModelDisplay("claude", {
+		_ccCreatedSession: true,
+		configOptions: [
+			{
+				id: "model",
+				category: "model",
+				currentValue: "claude-fable-5[1m]",
+				options: [{ value: "claude-fable-5[1m]", name: "Fable" }],
+			},
+			{ id: "effort", category: "thought_level", currentValue: "high" },
+		],
+	}), true);
+	assert.deepEqual(persisted, [
+		["claude", "model", "claude-fable-5[1m]", { modelDisplay: "Fable" }],
+		["claude", "thought_level", "high", {}],
+	]);
+	assert.deepEqual(app.config.settings.agents.claude.sessionDefaults, {
+		model: "claude-fable-5[1m]",
+		modelDisplay: "Fable",
+		effort: "high",
+	});
+}
+{
+	const app = Object.create(HarnessApp.prototype);
+	app.config = { settings: { agents: { pi: { sessionDefaults: {} } } } };
+	const persisted = [];
+	app.persistModelPreference = (...args) => {
+		persisted.push(args);
+		app.config.settings.agents.pi.sessionDefaults.model = args[2];
+		app.config.settings.agents.pi.sessionDefaults.modelDisplay = args[3].modelDisplay;
+		return true;
+	};
+	assert.equal(app.alignPersistedModelDisplay("pi", {
+		_ccCreatedSession: true,
+		models: {
+			currentModelId: "provider/model-id",
+			availableModels: [{ modelId: "provider/model-id", name: "Friendly Model" }],
+		},
+	}), true);
+	assert.deepEqual(persisted, [["pi", "model", "provider/model-id", { modelDisplay: "Friendly Model" }]]);
+}
+{
+	const app = Object.create(HarnessApp.prototype);
+	app.config = { settings: { agents: { claude: { sessionDefaults: {} } } } };
+	let attempts = 0;
+	const notices = [];
+	app.persistModelPreference = () => {
+		attempts += 1;
+		throw new Error("read only");
+	};
+	app.addNotice = (message) => notices.push(message);
+	const state = {
+		_ccCreatedSession: true,
+		configOptions: [
+			{ id: "model", category: "model", currentValue: "fable", options: [{ value: "fable", name: "Fable" }] },
+			{ id: "effort", category: "thought_level", currentValue: "high" },
+		],
+	};
+	app.alignPersistedModelDisplay("claude", state);
+	app.alignPersistedModelDisplay("claude", state);
+	assert.equal(attempts, 2, "failed model and effort captures are each attempted only once");
+	assert.equal(notices.length, 2);
+}
 
 const remoteCalls = [];
 const liveSession = {

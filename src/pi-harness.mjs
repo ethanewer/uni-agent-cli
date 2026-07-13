@@ -2540,6 +2540,7 @@ export class AcpClient {
 		this.bufferedSessionUpdates = [];
 		this.pendingStartupConfigDefaults = undefined;
 		this.startupRequestedModel = undefined;
+		this.createdSession = false;
 		this.startupConfigDefaultsPromise = undefined;
 		this.startupConfigDefaultWaiters = new Set();
 		this.terminals = new Map();
@@ -2973,6 +2974,7 @@ export class AcpClient {
 			throw new Error("ACP session/new did not return a session id");
 		}
 		this.sessionId = sessionId;
+		this.createdSession = method === "session/new";
 		this.startupRequestedModel = method === "session/new" && typeof this.agent?._sessionDefaults?.model === "string"
 			? this.agent._sessionDefaults.model
 			: undefined;
@@ -3162,6 +3164,7 @@ export class AcpClient {
 			agentInfo: this.agentInfo,
 			authMethods: this.authMethods,
 			configOptions: this.configOptions,
+			...(this.createdSession ? { _ccCreatedSession: true } : {}),
 			...(this.startupRequestedModel ? { _ccStartupRequestedModel: this.startupRequestedModel } : {}),
 			models: this.models,
 			modes: this.modes,
@@ -7410,31 +7413,63 @@ export class HarnessApp {
 	}
 
 	alignPersistedModelDisplay(key, state) {
-		const persisted = this.persistedModelPreferences(key);
-		if (!persisted.model) return false;
+		let persisted = this.persistedModelPreferences(key);
+		let changed = false;
 		const option = findConfigOption(state, "model");
-		const value = currentConfigValue(option);
-		const label = currentConfigLabel(option);
-		if (!value || !label) return false;
-		const exactId = value === persisted.model;
-		const savedIdIsAdvertised = flattenConfigOptions(option).some((entry) => entry.value === persisted.model);
-		const legacyAlias = !exactId && !savedIdIsAdvertised && state?._ccStartupRequestedModel === persisted.model && (
-			modelNamesShareTerminalAlias(persisted.model, label) ||
-			String(persisted.modelDisplay ?? "").trim().toLowerCase() === String(label).trim().toLowerCase()
-		);
-		if (!exactId && !legacyAlias) return false;
-		const modelDisplay = label === value ? persisted.modelDisplay : label;
-		if (value === persisted.model && modelDisplay === persisted.modelDisplay) return false;
-		const token = `${key}\0${value}\0${modelDisplay ?? ""}`;
-		this.modelDisplayAlignmentAttempts ??= new Set();
-		if (this.modelDisplayAlignmentAttempts.has(token)) return false;
-		this.modelDisplayAlignmentAttempts.add(token);
-		try {
-			return this.persistModelPreference(key, "model", value, { modelDisplay });
-		} catch (error) {
-			this.addNotice?.(`cc could not save the model name ${label}: ${error.message ?? error}`);
-			return false;
+		const value = currentConfigValue(option) ?? state?.models?.currentModelId;
+		const snapshotModel = Array.isArray(state?.models?.availableModels)
+			? state.models.availableModels.find((model) => (model?.modelId ?? model?.id) === value)
+			: undefined;
+		const label = currentConfigLabel(option) ?? snapshotModel?.name ?? snapshotModel?.label ?? value;
+		if (!persisted.model && state?._ccCreatedSession && value) {
+			const token = `capture-model\0${key}\0${value}\0${label ?? ""}`;
+			this.modelDisplayAlignmentAttempts ??= new Set();
+			if (!this.modelDisplayAlignmentAttempts.has(token)) {
+				this.modelDisplayAlignmentAttempts.add(token);
+				try {
+					changed = this.persistModelPreference(key, "model", value, {
+						modelDisplay: label && label !== value ? label : undefined,
+					}) || changed;
+					persisted = this.persistedModelPreferences(key);
+				} catch (error) {
+					this.addNotice?.(`cc could not save the model name ${label ?? value}: ${error.message ?? error}`);
+				}
+			}
+		} else if (persisted.model && value && label) {
+			const exactId = value === persisted.model;
+			const savedIdIsAdvertised = flattenConfigOptions(option).some((entry) => entry.value === persisted.model);
+			const legacyAlias = !exactId && !savedIdIsAdvertised && state?._ccStartupRequestedModel === persisted.model && (
+				modelNamesShareTerminalAlias(persisted.model, label) ||
+				String(persisted.modelDisplay ?? "").trim().toLowerCase() === String(label).trim().toLowerCase()
+			);
+			const modelDisplay = label === value ? persisted.modelDisplay : label;
+			if ((exactId || legacyAlias) && (value !== persisted.model || modelDisplay !== persisted.modelDisplay)) {
+				const token = `${key}\0${value}\0${modelDisplay ?? ""}`;
+				this.modelDisplayAlignmentAttempts ??= new Set();
+				if (!this.modelDisplayAlignmentAttempts.has(token)) {
+					this.modelDisplayAlignmentAttempts.add(token);
+					try {
+						changed = this.persistModelPreference(key, "model", value, { modelDisplay }) || changed;
+					} catch (error) {
+						this.addNotice?.(`cc could not save the model name ${label}: ${error.message ?? error}`);
+					}
+				}
+			}
 		}
+		persisted = this.persistedModelPreferences(key);
+		const effort = currentConfigValue(findConfigOption(state, "thought_level"));
+		if (!persisted.effort && state?._ccCreatedSession && typeof effort === "string" && effort) {
+			const token = `capture-effort\0${key}\0${effort}`;
+			this.modelDisplayAlignmentAttempts ??= new Set();
+			if (this.modelDisplayAlignmentAttempts.has(token)) return changed;
+			this.modelDisplayAlignmentAttempts.add(token);
+			try {
+				changed = this.persistModelPreference(key, "thought_level", effort) || changed;
+			} catch (error) {
+				this.addNotice?.(`cc could not save the reasoning effort ${effort}: ${error.message ?? error}`);
+			}
+		}
+		return changed;
 	}
 
 	persistModelPreference(key, category, value, options = {}) {
