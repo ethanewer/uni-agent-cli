@@ -33,12 +33,18 @@ function prepaint(args) {
 	const theme = PREPAINT_THEMES[themeName] ?? PREPAINT_THEMES.system;
 	const styles = createPrepaintStyles(theme);
 	const agent = args.find((arg) => !arg.startsWith("-")) || preload.config.defaultAgent || "codex";
+	const defaults = preload.settings?.agents?.[agent]?.sessionDefaults;
+	const model = typeof defaults?.modelDisplay === "string" && defaults.modelDisplay
+		? defaults.modelDisplay
+		: typeof defaults?.model === "string" ? defaults.model : "";
+	const effort = typeof defaults?.effort === "string" ? defaults.effort : "";
+	const modelDetails = [model, effort].filter(Boolean).join(" ");
 	process.env.CC_PREPAINT_AGENT = agent;
 	process.env.CC_PREPAINT_THEME = themeName;
 	const cwd = compactCwd(process.cwd());
 	const rule = "─".repeat(Math.max(1, width));
 	const voice = `${styles.accent("○")}   ${styles.muted("Space to record · Ctrl+Space for text")}`;
-	const status = styles.muted(`${agent} acp · ${cwd}`);
+	const status = styles.muted(`${modelDetails ? `${agent} · ${modelDetails}` : `${agent} acp`} · ${cwd}`);
 	process.stdout.write(
 		`\x1b7\x1b[?2026h${styles.primary(rule)}\n${truncateEllipsis(voice, width)}\n${styles.primary(rule)}\n${truncateVisual(status, width)}\x1b[?2026l\x1b[?25l`,
 	);

@@ -1382,7 +1382,10 @@ async function main() {
 	const nativeSettings = {
 		agents: {
 			claude: { settings: { model: "sonnet", permissions: { defaultMode: "bypassPermissions" } } },
-			codex: { config: { model: "gpt-5", approval_policy: "never", sandbox_mode: "danger-full-access" } },
+			codex: {
+				config: { model: "gpt-5", approval_policy: "never", sandbox_mode: "danger-full-access" },
+				sessionDefaults: { model: "gpt-cc", effort: "medium" },
+			},
 			cursor: { args: ["--model", "gpt-5", "--force", "--sandbox", "disabled", "--approve-mcps"] },
 			"terminus-2": { args: ["--model", "openai/gpt-5", "--max-episodes", "2"] },
 			"mini-swe-agent": { args: ["--model", "openai/gpt-5", "--no-yolo"] },

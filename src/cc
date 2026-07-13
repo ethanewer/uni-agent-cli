@@ -132,6 +132,22 @@ theme_from_settings() {
 	normalize_theme "${theme:-system}"
 }
 
+model_details_from_settings() {
+	config_file=${CC_CONFIG:-"$HOME/.config/cc/config.json"}
+	settings_file=${CC_SETTINGS:-"$HOME/.config/cc/settings.json"}
+	prefix="settings.agents.$agent.sessionDefaults"
+	model=$(json_path_value "$config_file" "$prefix.modelDisplay")
+	[ -n "$model" ] || model=$(json_path_value "$config_file" "$prefix.model")
+	effort=$(json_path_value "$config_file" "$prefix.effort")
+	prefix="agents.$agent.sessionDefaults"
+	settings_model=$(json_path_value "$settings_file" "$prefix.modelDisplay")
+	[ -n "$settings_model" ] || settings_model=$(json_path_value "$settings_file" "$prefix.model")
+	settings_effort=$(json_path_value "$settings_file" "$prefix.effort")
+	[ -n "$settings_model" ] && model=$settings_model
+	[ -n "$settings_effort" ] && effort=$settings_effort
+	printf '%s' "$model${effort:+ $effort}"
+}
+
 apply_theme_colors() {
 	esc=$(printf '\033')
 	case "$1" in
@@ -226,6 +242,7 @@ if [ "$skip_prepaint" -eq 0 ] && [ -t 1 ]; then
 			;;
 	esac
 	theme=$(theme_from_settings)
+	model_details=$(model_details_from_settings)
 	apply_theme_colors "$theme"
 	rule=$(printf '%*s' "$width" '' | tr ' ' '─')
 	cwd=${PWD:-}
@@ -236,7 +253,11 @@ if [ "$skip_prepaint" -eq 0 ] && [ -t 1 ]; then
 	esac
 	voice_prompt="○   Space to record · Ctrl+Space for text"
 	voice_line=$(truncate_ellipsis_text "$voice_prompt" "$width")
-	status_line=$(truncate_visual_text "$agent acp · $cwd" "$width")
+	if [ -n "$model_details" ]; then
+		status_line=$(truncate_visual_text "$agent · $model_details · $cwd" "$width")
+	else
+		status_line=$(truncate_visual_text "$agent acp · $cwd" "$width")
+	fi
 	printf '\0337\033[?2026h%s%s%s\n' "$primary" "$rule" "$reset"
 	if [ "$(text_length "$voice_prompt")" -gt "$width" ]; then
 		case "$voice_line" in

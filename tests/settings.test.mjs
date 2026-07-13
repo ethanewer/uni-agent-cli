@@ -3672,6 +3672,12 @@ assert.equal(resolveThemeName("Light 2026"), "vscode-light-2026");
 assert.equal(resolveThemeName("missing-theme"), undefined);
 assert.equal(applyHarnessSettings(config, { agents: {}, theme: "matrix" }).theme, "matrix");
 assert.equal(applyHarnessSettings(config, { agents: {}, theme: "not-real" }).theme, "system");
+assert.deepEqual(
+	applyHarnessSettings(config, {
+		agents: { codex: { sessionDefaults: { model: "gpt-cc", effort: "medium" } } },
+	}).agents.codex._sessionDefaults,
+	{ model: "gpt-cc", effort: "medium" },
+);
 
 const previousCcSettings = process.env.CC_SETTINGS;
 const previousCcConfig = process.env.CC_CONFIG;
@@ -5688,6 +5694,74 @@ await (async () => {
 		false,
 		"URL elicitation stays unadvertised when the client has no handler",
 	);
+})();
+
+// Saved cc model defaults override whatever the native CLI reports for every new
+// ACP session, before that session is exposed to the TUI.
+await (async () => {
+	const requests = [];
+	const configOptions = [
+		{ id: "model", category: "model", currentValue: "native-model", options: [] },
+		{ id: "thought_level", category: "thought_level", currentValue: "low", options: [] },
+	];
+	const client = new AcpClient({ command: "fake", _sessionDefaults: { model: "cc-model", effort: "high" } }, () => {});
+	client.start = () => {};
+	client.request = async (method, params) => {
+		requests.push({ method, params });
+		if (method === "initialize") return { agentCapabilities: {}, agentInfo: {}, authMethods: [] };
+		if (method === "session/new") return { sessionId: "saved-defaults", configOptions };
+		if (method === "session/set_config_option") {
+			return {
+				configOptions: configOptions.map((option) => option.id === params.configId
+					? { ...option, currentValue: params.value }
+					: option),
+			};
+		}
+		return {};
+	};
+	await client.initialize();
+	assert.deepEqual(
+		requests.filter((entry) => entry.method === "session/set_config_option").map((entry) => [entry.params.configId, entry.params.value]),
+		[["model", "cc-model"], ["thought_level", "high"]],
+		"cc-owned defaults override native CLI state before the session becomes usable",
+	);
+	await client.loadSession("existing-session");
+	assert.equal(
+		requests.filter((entry) => entry.method === "session/set_config_option").length,
+		2,
+		"loading an existing session preserves its own model and effort",
+	);
+
+	const lateRequests = [];
+	const lateClient = new AcpClient({ command: "fake", _sessionDefaults: { model: "cc-model", effort: "high" } }, () => {});
+	lateClient.start = () => {};
+	lateClient.request = async (method, params) => {
+		lateRequests.push({ method, params });
+		if (method === "initialize") return { agentCapabilities: {}, agentInfo: {}, authMethods: [] };
+		if (method === "session/new") return { sessionId: "late-defaults" };
+		if (method === "session/set_config_option") return { configOptions };
+		return {};
+	};
+	await lateClient.initialize();
+	const promptPromise = lateClient.prompt("hello");
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(
+		lateRequests.some((entry) => entry.method === "session/prompt"),
+		false,
+		"the first prompt waits while saved defaults may still arrive",
+	);
+	lateClient.handleSessionUpdate({
+		sessionId: "late-defaults",
+		update: { sessionUpdate: "config_option_update", configOptions },
+	});
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.deepEqual(
+		lateRequests.filter((entry) => entry.method === "session/set_config_option").map((entry) => [entry.params.configId, entry.params.value]),
+		[["model", "cc-model"], ["thought_level", "high"]],
+		"new-session defaults are applied when config options arrive asynchronously",
+	);
+	await promptPromise;
+	assert.equal(lateRequests.at(-1).method, "session/prompt", "the prompt runs after late defaults settle");
 })();
 
 // Boolean configuration requires a tagged value; legacy select config must stay

@@ -158,6 +158,16 @@ export class BaseAcpAdapter {
 		if (applied.acp) applied.acp = clonePlain(applied.acp);
 		if (Array.isArray(settings.mcpServers)) applied.mcpServers = clonePlain(settings.mcpServers);
 		if (Array.isArray(settings.additionalDirectories)) applied.additionalDirectories = [...settings.additionalDirectories];
+		if (isPlainObject(settings.sessionDefaults)) {
+			applied._sessionDefaults = {
+				...(typeof settings.sessionDefaults.model === "string" && settings.sessionDefaults.model
+					? { model: settings.sessionDefaults.model }
+					: {}),
+				...(typeof settings.sessionDefaults.effort === "string" && settings.sessionDefaults.effort
+					? { effort: settings.sessionDefaults.effort }
+					: {}),
+			};
+		}
 
 		const command = applied.acp ?? applied;
 		const nativeArgs = stringArray(settings.args ?? settings.nativeArgs);
@@ -455,6 +465,15 @@ export class BaseAcpAdapter {
 
 	async setConfigOption(configId, value, type = undefined) {
 		return this.connection.setConfigOption(configId, value, type);
+	}
+
+	setSessionDefaults(defaults = {}) {
+		const normalized = {
+			...(typeof defaults.model === "string" && defaults.model ? { model: defaults.model } : {}),
+			...(typeof defaults.effort === "string" && defaults.effort ? { effort: defaults.effort } : {}),
+		};
+		this.launchSpec._sessionDefaults = normalized;
+		if (this.connection?.agent) this.connection.agent._sessionDefaults = normalized;
 	}
 
 	async setMode(modeId) {

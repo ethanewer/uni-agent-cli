@@ -2538,6 +2538,9 @@ export class AcpClient {
 		this.checklistSnapshot = this.checklistStore.list();
 		this.bufferingSessionUpdates = false;
 		this.bufferedSessionUpdates = [];
+		this.pendingStartupConfigDefaults = undefined;
+		this.startupConfigDefaultsPromise = undefined;
+		this.startupConfigDefaultWaiters = new Set();
 		this.terminals = new Map();
 		this.nextTerminalId = 1;
 		this.exited = false;
@@ -2896,6 +2899,7 @@ export class AcpClient {
 
 	async prompt(prompt) {
 		if (!this.sessionId) throw new Error("ACP session is not ready");
+		await this.waitForStartupConfigDefaults();
 		const parts = Array.isArray(prompt) ? prompt : [{ type: "text", text: prompt }];
 		const result = await this.request("session/prompt", {
 			sessionId: this.sessionId,
@@ -2968,6 +2972,9 @@ export class AcpClient {
 			throw new Error("ACP session/new did not return a session id");
 		}
 		this.sessionId = sessionId;
+		this.pendingStartupConfigDefaults = method === "session/new" && isPlainObject(this.agent?._sessionDefaults)
+			? { sessionId, values: { ...this.agent._sessionDefaults } }
+			: undefined;
 		// All of these fields describe one session. A sparse session/new or
 		// session/load response must not inherit usage, title, model, or mode state
 		// from the session that was just replaced; buffered updates below repopulate
@@ -2998,6 +3005,7 @@ export class AcpClient {
 			this.bufferedSessionUpdates = [];
 		}
 		if (beforeReplayError) throw beforeReplayError;
+		if (method === "session/new") await this.applyStartupConfigDefaults();
 		await this.applyStartupMode();
 		return result;
 	}
@@ -3023,6 +3031,70 @@ export class AcpClient {
 
 	async applyStartupMode() {
 		if (this.agent._startupMode) await this.setMode(this.agent._startupMode);
+	}
+
+	async applyStartupConfigDefaults() {
+		if (this.startupConfigDefaultsPromise) return await this.startupConfigDefaultsPromise;
+		const operation = this.applyStartupConfigDefaultsUnlocked();
+		this.startupConfigDefaultsPromise = operation;
+		try {
+			return await operation;
+		} finally {
+			if (this.startupConfigDefaultsPromise === operation) this.startupConfigDefaultsPromise = undefined;
+		}
+	}
+
+	async applyStartupConfigDefaultsUnlocked() {
+		const pending = this.pendingStartupConfigDefaults;
+		if (!pending || pending.sessionId !== this.sessionId) return;
+		const defaults = pending.values;
+		for (const [category, value] of [["model", defaults.model], ["thought_level", defaults.effort]]) {
+			if (this.pendingStartupConfigDefaults !== pending || pending.sessionId !== this.sessionId) return;
+			if (typeof value !== "string" || !value) continue;
+			const option = findConfigOption({ configOptions: this.configOptions }, category);
+			if (!option) continue;
+			delete defaults[category === "model" ? "model" : "effort"];
+			if (option.currentValue === value) continue;
+			try {
+				await this.setConfigOption(option.id, value, option.type);
+			} catch {
+				// A model may be retired or a harness may advertise a read-only option.
+				// Keep the session usable; the live option remains visible for correction.
+			}
+			if (this.pendingStartupConfigDefaults !== pending || pending.sessionId !== this.sessionId) return;
+		}
+		if (!defaults.model && !defaults.effort && this.pendingStartupConfigDefaults === pending) {
+			this.pendingStartupConfigDefaults = undefined;
+		}
+	}
+
+	async waitForStartupConfigDefaults(timeoutMs = 2_000) {
+		await this.applyStartupConfigDefaults();
+		const deadline = Date.now() + timeoutMs;
+		while (this.pendingStartupConfigDefaults?.sessionId === this.sessionId) {
+			const remaining = deadline - Date.now();
+			if (remaining <= 0) {
+				this.pendingStartupConfigDefaults = undefined;
+				return;
+			}
+			await new Promise((resolve) => {
+				const timer = setTimeout(() => {
+					this.startupConfigDefaultWaiters.delete(settle);
+					resolve();
+				}, remaining);
+				const settle = () => {
+					clearTimeout(timer);
+					resolve();
+				};
+				this.startupConfigDefaultWaiters.add(settle);
+			});
+			await this.applyStartupConfigDefaults();
+		}
+	}
+
+	notifyStartupConfigDefaultWaiters() {
+		for (const settle of this.startupConfigDefaultWaiters) settle();
+		this.startupConfigDefaultWaiters.clear();
 	}
 
 	async setConfigOption(configId, value, type = undefined) {
@@ -3538,6 +3610,7 @@ export class AcpClient {
 		}
 		if (kind === "config_option_update" && Array.isArray(update.configOptions)) {
 			this.applySessionState({ configOptions: update.configOptions });
+			void this.applyStartupConfigDefaults().finally(() => this.notifyStartupConfigDefaultWaiters());
 			return;
 		}
 		if (kind === "current_mode_update") {
@@ -7302,12 +7375,54 @@ export class HarnessApp {
 		}
 		const cachedState = sideThread ? undefined : this.sessionStates?.get?.(this.activeKey);
 		const state = liveState ?? cachedState ?? {};
-		const model = currentConfigValue(findConfigOption(state, "model")) ?? state.models?.currentModelId;
-		const effort = currentConfigValue(findConfigOption(state, "thought_level"));
+		const hasLiveSessionState = Boolean(
+			sourceClient?.sessionId && (Array.isArray(liveState?.configOptions) || liveState?.models),
+		);
+		const persisted = this.persistedModelPreferences(this.activeKey);
+		const liveModelOption = findConfigOption(state, "model");
+		const liveModelValue = currentConfigValue(liveModelOption);
+		const liveModelLabel = currentConfigLabel(liveModelOption) ?? state.models?.currentModelId;
+		const liveModel = liveModelValue !== undefined
+			? liveModelValue === persisted.model ? persisted.modelDisplay ?? liveModelLabel : liveModelLabel
+			: liveModelLabel;
+		const model = hasLiveSessionState ? liveModel : liveModel ?? persisted.modelDisplay ?? persisted.model;
+		const liveEffort = currentConfigValue(findConfigOption(state, "thought_level"));
+		const effort = hasLiveSessionState ? liveEffort : liveEffort ?? persisted.effort;
 		return {
 			...(model ? { model: String(model) } : {}),
 			...(effort ? { effort: String(effort) } : {}),
 		};
+	}
+
+	persistedModelPreferences(key = this.activeKey) {
+		const preferences = this.config?.settings?.agents?.[key]?.sessionDefaults;
+		if (!isPlainObject(preferences)) return {};
+		return {
+			...(typeof preferences.model === "string" && preferences.model ? { model: preferences.model } : {}),
+			...(typeof preferences.modelDisplay === "string" && preferences.modelDisplay ? { modelDisplay: preferences.modelDisplay } : {}),
+			...(typeof preferences.effort === "string" && preferences.effort ? { effort: preferences.effort } : {}),
+		};
+	}
+
+	persistModelPreference(key, category, value, options = {}) {
+		const field = category === "model" ? "model" : category === "thought_level" ? "effort" : undefined;
+		if (!field || typeof value !== "string" || !value) return false;
+		const patch = { [field]: value };
+		if (field === "model" && typeof options.modelDisplay === "string" && options.modelDisplay) {
+			patch.modelDisplay = options.modelDisplay;
+		}
+		const saved = saveSettingsPatch({
+			theme: this.config?.settings?.theme ?? this.config?.theme ?? DEFAULT_SETTINGS.theme,
+			agents: { [key]: { sessionDefaults: patch } },
+		});
+		this.config.settings = normalizeSettings(deepMerge(this.config.settings ?? {}, saved), this.config.theme);
+		const defaults = this.persistedModelPreferences(key);
+		if (this.config?.agents?.[key]) this.config.agents[key]._sessionDefaults = { ...defaults };
+		if (key === this.activeKey) {
+			this.client?.setSessionDefaults?.(defaults);
+			this.btwThread?.client?.setSessionDefaults?.(defaults);
+		}
+		return true;
 	}
 
 	remoteControlStateForSession(client = this.client, sessionId = client?.sessionId) {
@@ -8718,7 +8833,10 @@ export class HarnessApp {
 	async setConfigValueForCommandTarget(target, option, value, label = value, options = {}) {
 		if (target?.targetThread) {
 			if (!this.isSessionCommandTargetActive(target)) return false;
-			const changed = await this.setSideThreadConfigValue(target, option, value, options);
+			const changed = await this.setSideThreadConfigValue(target, option, value, {
+				...options,
+				...(option?.category === "model" || option?.id === "model" ? { modelDisplay: String(label ?? value) } : {}),
+			});
 			if (!changed && !this.isSessionCommandTargetActive(target)) {
 				this.reportClosedSessionCommandTarget(options.commandName ?? option?.category ?? option?.id ?? "config");
 			}
@@ -12178,6 +12296,17 @@ export class HarnessApp {
 		try {
 			await client.setConfigOption(option.id, value, option.type);
 			if (!isCurrentContext()) return false;
+			try {
+				const preferenceCategory = ["model", "thought_level"].includes(option.category)
+					? option.category
+					: option.id;
+				const modelDisplay = preferenceCategory === "model"
+					? String(label ?? value)
+					: undefined;
+				this.persistModelPreference(activeKey, preferenceCategory, String(value), { modelDisplay });
+			} catch (error) {
+				this.addNotice(`The ${option.category === "thought_level" ? "effort" : "model"} changed for this session, but cc could not save it: ${error.message ?? error}`);
+			}
 			this.syncRuntimePermissionModeForBackendMode(option, value);
 			if (options.showCommand !== false) this.addCommandMessage(displayText);
 			this.updateAutocomplete();
@@ -12413,6 +12542,17 @@ export class HarnessApp {
 				await client.setMode(value);
 			}
 			if (!this.isSessionCommandTargetActive(target)) return false;
+			try {
+				const preferenceCategory = ["model", "thought_level"].includes(option?.category)
+					? option.category
+					: option?.id;
+				const modelDisplay = preferenceCategory === "model"
+					? String(options.modelDisplay ?? value)
+					: undefined;
+				this.persistModelPreference(this.activeKey, preferenceCategory, String(value), { modelDisplay });
+			} catch (error) {
+				thread.addNotice(`The setting changed for this session, but cc could not save it: ${error.message ?? error}`);
+			}
 			if (isMode) {
 				// A direct permission/mode choice exits only this fork's prompt-based plan
 				// fallback. Main-session planning and an explicit agent-wide /yolo gate are
@@ -20350,6 +20490,16 @@ function applyAgentSettings(key, agent, settings, globalPermissions, grants = []
 	if (applied.acp) applied.acp = clonePlain(applied.acp);
 	if (Array.isArray(settings.mcpServers)) applied.mcpServers = clonePlain(settings.mcpServers);
 	if (Array.isArray(settings.additionalDirectories)) applied.additionalDirectories = [...settings.additionalDirectories];
+	if (isPlainObject(settings.sessionDefaults)) {
+		applied._sessionDefaults = {
+			...(typeof settings.sessionDefaults.model === "string" && settings.sessionDefaults.model
+				? { model: settings.sessionDefaults.model }
+				: {}),
+			...(typeof settings.sessionDefaults.effort === "string" && settings.sessionDefaults.effort
+				? { effort: settings.sessionDefaults.effort }
+				: {}),
+		};
+	}
 
 	const command = applied.acp ?? applied;
 	const nativeArgs = stringArray(settings.args ?? settings.nativeArgs);

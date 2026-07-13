@@ -102,6 +102,14 @@ assert.equal(
 	"cursor · composer-2 · /tmp/project",
 	"a harness may expose a model without a reasoning-effort option",
 );
+{
+	const app = Object.create(HarnessApp.prototype);
+	app.activeKey = "codex";
+	app.focusedThread = "main";
+	app.config = { settings: { agents: { codex: { sessionDefaults: { model: "gpt-saved", effort: "high" } } } } };
+	app.sessionStates = new Map();
+	assert.deepEqual(app.modelAndEffortForStatus(), { model: "gpt-saved", effort: "high" });
+}
 
 const remoteCalls = [];
 const liveSession = {
