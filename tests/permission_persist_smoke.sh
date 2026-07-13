@@ -14,7 +14,9 @@ PERSIST_SESSION="cc-permission-persist-$$"
 YOLO_SESSION="cc-permission-yolo-$$"
 REMEMBER_OFF_SESSION="cc-permission-remember-off-$$"
 SETTINGS_FILE="$(mktemp -t cc-perms-settings-XXXXXX.json)"
+REMEMBER_OFF_SETTINGS="$(mktemp -t cc-perms-roff-settings-XXXXXX.json)"
 printf '{}\n' > "$SETTINGS_FILE"
+cp "$ROOT/tests/fake_remember_off_settings.json" "$REMEMBER_OFF_SETTINGS"
 PERMS_FILE="$(mktemp -t cc-perms-XXXXXX.json)"
 REMEMBER_OFF_PERMS="$(mktemp -t cc-perms-roff-XXXXXX.json)"
 COMMAND_CACHE="$(mktemp -t cc-perms-commands-XXXXXX.json)"
@@ -24,7 +26,7 @@ cleanup() {
 	tmux kill-session -t "$PERSIST_SESSION" >/dev/null 2>&1 || true
 	tmux kill-session -t "$YOLO_SESSION" >/dev/null 2>&1 || true
 	tmux kill-session -t "$REMEMBER_OFF_SESSION" >/dev/null 2>&1 || true
-	rm -f "$PERMS_FILE" "$REMEMBER_OFF_PERMS" "$SETTINGS_FILE" "$COMMAND_CACHE"
+	rm -f "$PERMS_FILE" "$REMEMBER_OFF_PERMS" "$SETTINGS_FILE" "$REMEMBER_OFF_SETTINGS" "$COMMAND_CACHE"
 }
 trap cleanup EXIT
 
@@ -114,7 +116,7 @@ assert_without_text "$YOLO_SESSION" "Permission: Permission Test"
 
 # --- 3. remember:false downgrades an "always" pick and records nothing -----
 tmux new-session -d -s "$REMEMBER_OFF_SESSION" -c "$ROOT" -x 100 -y 30 \
-	"env CC_CONFIG=tests/fake_config.json CC_SETTINGS=tests/fake_remember_off_settings.json CC_PERMISSIONS=$REMEMBER_OFF_PERMS CC_COMMAND_CACHE=$COMMAND_CACHE CC_BACKGROUND_CONNECT_DELAY_MS=0 ./src/cc fake"
+	"env CC_CONFIG=tests/fake_config.json CC_SETTINGS=$REMEMBER_OFF_SETTINGS CC_PERMISSIONS=$REMEMBER_OFF_PERMS CC_COMMAND_CACHE=$COMMAND_CACHE CC_BACKGROUND_CONNECT_DELAY_MS=0 ./src/cc fake"
 wait_for_text "$REMEMBER_OFF_SESSION" "Space to record"
 sleep 0.5
 tmux send-keys -t "$REMEMBER_OFF_SESSION" / p e r m i s s i o n - a l w a y s Enter

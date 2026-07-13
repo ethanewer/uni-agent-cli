@@ -10,7 +10,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BASELINE_SESSION="cc-permission-baseline-$$"
 DANGER_SESSION="cc-permission-danger-$$"
 SETTINGS_FILE="$(mktemp -t cc-perms-auto-settings-XXXXXX.json)"
+DANGER_SETTINGS_FILE="$(mktemp -t cc-perms-auto-danger-settings-XXXXXX.json)"
 printf '{}\n' > "$SETTINGS_FILE"
+cp "$ROOT/tests/fake_danger_settings.json" "$DANGER_SETTINGS_FILE"
 # Isolate the permission grant store so the test never reads the developer's real
 # ~/.config/cc/permissions.json (a stray grant would auto-resolve the baseline
 # prompt and break the test). Point at a fresh, nonexistent file -> no grants.
@@ -21,7 +23,7 @@ rm -f "$PERMS_FILE" "$COMMAND_CACHE"
 cleanup() {
 	tmux kill-session -t "$BASELINE_SESSION" >/dev/null 2>&1 || true
 	tmux kill-session -t "$DANGER_SESSION" >/dev/null 2>&1 || true
-	rm -f "$PERMS_FILE" "$SETTINGS_FILE" "$COMMAND_CACHE"
+	rm -f "$PERMS_FILE" "$SETTINGS_FILE" "$DANGER_SETTINGS_FILE" "$COMMAND_CACHE"
 }
 trap cleanup EXIT
 
@@ -63,7 +65,7 @@ tmux send-keys -t "$BASELINE_SESSION" Down Enter
 wait_for_text "$BASELINE_SESSION" '"optionId": "allow"'
 
 tmux new-session -d -s "$DANGER_SESSION" -c "$ROOT" -x 100 -y 30 \
-	"env CC_CONFIG=tests/fake_config.json CC_SETTINGS=tests/fake_danger_settings.json CC_PERMISSIONS=$PERMS_FILE CC_COMMAND_CACHE=$COMMAND_CACHE CC_BACKGROUND_CONNECT_DELAY_MS=0 ./src/cc cursor"
+	"env CC_CONFIG=tests/fake_config.json CC_SETTINGS=$DANGER_SETTINGS_FILE CC_PERMISSIONS=$PERMS_FILE CC_COMMAND_CACHE=$COMMAND_CACHE CC_BACKGROUND_CONNECT_DELAY_MS=0 ./src/cc cursor"
 wait_for_text "$DANGER_SESSION" "Space to record"
 sleep 0.5
 tmux send-keys -t "$DANGER_SESSION" / p e r m i s s i o n - t e s t Enter
