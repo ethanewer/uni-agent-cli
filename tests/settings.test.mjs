@@ -130,6 +130,43 @@ assert.equal(singleLineMenuText("\x1b[31msession\nidentifier\x1b[0m"), "session 
 	}
 }
 {
+	// Input captured before the heavyweight TUI import is handed to Pi exactly
+	// once after its parser exists. Preserve UTF-8 characters split across raw
+	// chunks and restore the terminal mode that preceded the startup guard.
+	const originalStart = ProcessTerminal.prototype.start;
+	const originalStop = ProcessTerminal.prototype.stop;
+	const originalWrite = ProcessTerminal.prototype.write;
+	const startupGuardKey = Symbol.for("cc.startup-input-guard");
+	const encoded = Buffer.from("early € input", "utf8");
+	const replayed = [];
+	let restores = 0;
+	ProcessTerminal.prototype.start = function () {
+		this.wasRaw = true;
+		this.stdinBuffer = { process: (data) => replayed.push(data) };
+	};
+	ProcessTerminal.prototype.stop = () => {};
+	ProcessTerminal.prototype.write = () => {};
+	globalThis[startupGuardKey] = {
+		originalRaw: false,
+		handoff: () => [encoded.subarray(0, 8), encoded.subarray(8, 9), encoded.subarray(9)],
+		restore: () => { restores += 1; },
+	};
+	try {
+		const terminal = createHarnessTerminal();
+		terminal.start(() => {}, () => {});
+		assert.deepEqual(replayed, ["early € input"]);
+		assert.equal(terminal.wasRaw, false);
+		terminal.stop();
+		assert.equal(restores, 1);
+		assert.equal(globalThis[startupGuardKey], undefined);
+	} finally {
+		delete globalThis[startupGuardKey];
+		ProcessTerminal.prototype.start = originalStart;
+		ProcessTerminal.prototype.stop = originalStop;
+		ProcessTerminal.prototype.write = originalWrite;
+	}
+}
+{
 	const panel = new SelectionPanel("Resume\nsession", [{ label: "first\nsecond", description: "date\npath" }], () => {});
 	const lines = panel.render(80);
 	assert.ok(lines.every((line) => !line.includes("\n") && !line.includes("\r")));

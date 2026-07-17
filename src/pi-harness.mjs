@@ -19725,6 +19725,7 @@ export function createHarnessTerminal(resizeHooks = {}) {
 	let dynamicAlternateScreen = false;
 	let resizeTimer;
 	let fullClearReplacementOnce;
+	let startupInputGuard;
 	terminal.useFullClearReplacementOnce = (replacement) => {
 		fullClearReplacementOnce = replacement;
 	};
@@ -19772,12 +19773,37 @@ export function createHarnessTerminal(resizeHooks = {}) {
 		} else {
 			write("\x1b7");
 		}
+		// cc.mjs owns stdin in raw/no-echo mode before importing this module. End
+		// that temporary listener only after Pi's StdinBuffer is installed, then
+		// replay every captured byte through the same parser used for live input.
+		// No event-loop turn occurs between listener installation and handoff, so a
+		// byte can belong to exactly one consumer and can neither be lost nor doubled.
+		startupInputGuard = globalThis[Symbol.for("cc.startup-input-guard")];
+		if (startupInputGuard) {
+			terminal.wasRaw = startupInputGuard.originalRaw === true;
+			const decoder = new StringDecoder("utf8");
+			let buffered = "";
+			for (const chunk of startupInputGuard.handoff?.() ?? []) {
+				if (Buffer.isBuffer(chunk)) buffered += decoder.write(chunk);
+				else {
+					buffered += decoder.end();
+					buffered += String(chunk);
+				}
+			}
+			buffered += decoder.end();
+			if (buffered) terminal.stdinBuffer?.process(buffered);
+		}
 	};
 	terminal.stop = () => {
 		if (resizeTimer) clearTimeout(resizeTimer);
 		resizeTimer = undefined;
 		resizeHooks.onResizeEnd?.({ render: false });
 		stop();
+		startupInputGuard?.restore?.();
+		if (globalThis[Symbol.for("cc.startup-input-guard")] === startupInputGuard) {
+			delete globalThis[Symbol.for("cc.startup-input-guard")];
+		}
+		startupInputGuard = undefined;
 		if (useAlternateScreen || dynamicAlternateScreen) {
 			dynamicAlternateScreen = false;
 			write("\x1b[?1049l\x1b[?25h");

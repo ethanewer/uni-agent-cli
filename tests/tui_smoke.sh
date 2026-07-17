@@ -303,6 +303,32 @@ assert_no_mouse_tracking_enabled() {
 	fi
 }
 
+# Reproduce the earliest-input race with the full TUI import deliberately held
+# after the prepaint is visible. Both the fast shell launcher and the installed
+# Node bin must suppress terminal echo, retain every byte, and show it in the
+# editor on the first live frame without requiring a retry.
+for startup_launcher in "./src/cc" "node src/cc.mjs"; do
+	tmux new-session -d -s "$SESSION" -x 100 -y 30 "cd $ROOT_Q && $PANE_ENV PI_TUI_WRITE_LOG=$WRITE_LOG_Q CC_CONFIG=tests/fake_config.json CC_SETTINGS=$SETTINGS_FILE_Q CC_BACKGROUND_CONNECT_DELAY_MS=0 CC_TEST_STARTUP_IMPORT_DELAY_MS=800 $startup_launcher fake"
+	wait_for_text "Space to record"
+	tmux send-keys -l -t "$SESSION" startup-race-input
+	if [ "$startup_launcher" = "node src/cc.mjs" ]; then
+		tmux send-keys -t "$SESSION" Enter
+	fi
+	sleep 0.1
+	if capture | grep -Fq "startup-race-input"; then
+		echo "Startup input was echoed outside the editor before the TUI owned stdin ($startup_launcher)" >&2
+		capture >&2
+		exit 1
+	fi
+	if [ "$startup_launcher" = "./src/cc" ]; then
+		wait_for_text "startup-race-input"
+		tmux send-keys -t "$SESSION" Enter
+	fi
+	wait_for_text "echo: startup-race-input"
+	stop_session
+	: > "$WRITE_LOG"
+done
+
 # Backend commands arrive after the editor is already usable. Typing /r during
 # that cold-start window must refresh in place when command discovery finishes;
 # the user should not have to erase and retype it.
