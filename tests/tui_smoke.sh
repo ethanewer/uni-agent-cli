@@ -717,6 +717,17 @@ wait_for_text "echo: queued-tab"
 tmux send-keys -t "$SESSION" / c l e a r Enter
 wait_without_text "queued-tab"
 
+# A backend crash with an after-turn message already committed must reconnect
+# and send it automatically; no extra Enter or unrelated prompt may be needed.
+tmux send-keys -t "$SESSION" c r a s h Space t u r n Enter
+wait_for_text "crash turn started"
+tmux send-keys -t "$SESSION" q u e u e d - a f t e r - c r a s h Tab
+wait_for_text "queued: queued-after-crash"
+wait_for_text "echo: queued-after-crash"
+
+tmux send-keys -t "$SESSION" / c l e a r Enter
+wait_without_text "queued-after-crash"
+
 # Enter once the tool has finished still steers via after-tool.
 tmux send-keys -t "$SESSION" s l o w Space t o o l Enter
 wait_for_text "✓ Slow Tool"

@@ -115,7 +115,7 @@ including the CSI-u and modifyOtherKeys encodings used by modern terminals and t
 | **Esc** (nothing queued) | Interrupt the current turn. A second Esc force-settles a stuck cancel. |
 | **↑** (empty input) | Pull the last queued message back into the editor. |
 
-Queued messages are shown above the input box (`after tool: …` / `queued: …`). If the backend crashes while messages are queued, they are preserved and re-sent against a fresh connection on your next submit — never silently dropped.
+Queued messages are shown above the input box (`after tool: …` / `queued: …`). A queue-owned progress check prevents completed menus, config changes, session transitions, or other temporary blockers from stranding them. If the main backend crashes, queued messages are preserved and re-sent automatically against a fresh connection. If a `/btw` backend crashes, its queued input is returned to the composer in original order because that ephemeral fork cannot be resumed safely.
 
 ## Custom keybindings
 

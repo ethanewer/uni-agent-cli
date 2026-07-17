@@ -2444,9 +2444,9 @@ await (async () => {
 	assert.deepEqual(applied, [["model", "Model", "gpt-next", "model", { targetThread: undefined }]]);
 })();
 
-// /btw snapshots a rollout, so it must wait for the active main turn to settle.
-// Its prompt-bearing form reserves staged images before that wait and forwards
-// the structured parts to the fork instead of orphaning the attachment.
+// /btw owns an independent backend and must start immediately while the main
+// turn is active. Its prompt-bearing form still reserves and forwards staged
+// images instead of orphaning the attachment.
 await (async () => {
 	const forwarded = [];
 	const app = Object.create(HarnessApp.prototype);
@@ -2469,13 +2469,54 @@ await (async () => {
 	});
 	await app.runLocalSlashCommand("btw", "inspect [Image 4]");
 	assert.equal(app.clipboardImages.length, 0);
-	assert.equal(app.deferredLocalSlashCommands.length, 1);
-	assert.equal(app.deferredLocalSlashCommands[0].promptParts.find((part) => part.type === "image")?.data, "aW1hZ2U0");
-	app.busy = false;
-	await app.flushDeferredLocalSlashCommands();
+	assert.equal(app.deferredLocalSlashCommands.length, 0);
 	assert.equal(forwarded.length, 1);
 	assert.equal(forwarded[0].question, "inspect [Image 4]");
 	assert.equal(forwarded[0].promptParts.find((part) => part.type === "image")?.data, "aW1hZ2U0");
+})();
+
+// A backend crash with committed prompts already waiting must reconnect and
+// wake the queue without requiring an unrelated extra submit.
+await (async () => {
+	const oldClient = { exited: true };
+	const replacementClient = { exited: false };
+	let reconnects = 0;
+	let drains = 0;
+	const app = Object.create(HarnessApp.prototype);
+	Object.assign(app, {
+		client: oldClient,
+		ready: true,
+		busy: true,
+		cancelRequested: false,
+		afterToolCancelPending: false,
+		promptQueue: [{ text: "do not lose me", timing: "afterTurn" }],
+		permissionQueue: [],
+		activeInteractiveRequest: undefined,
+		activeKey: "fake",
+		availableCommands: new Map(),
+		commandsLoaded: new Set(),
+		statusState: "working",
+		pendingUnsendPrompt: undefined,
+		clearCancelGraceTimer() {},
+		updateSpinner() {},
+		updateAutocomplete() {},
+		armPromptQueueWatchdog() {},
+		schedulePromptQueueDrain() { drains += 1; },
+		async ensureConnected(options) {
+			assert.deepEqual(options, { statusState: "connecting", preserveDeferredCommands: true });
+			reconnects += 1;
+			this.client = replacementClient;
+			this.ready = true;
+			return true;
+		},
+		ui: { requestRender() {} },
+	});
+	app.handleBackendEvent({ type: "backend_exit" });
+	await Promise.resolve();
+	await Promise.resolve();
+	assert.equal(reconnects, 1);
+	assert.equal(drains, 1);
+	assert.deepEqual(app.promptQueue.map((entry) => entry.text), ["do not lose me"]);
 })();
 
 // Prompts typed on a focused /btw during a transition wait for its outcome:
@@ -2780,7 +2821,10 @@ await (async () => {
 	app.promptQueueDrainScheduled = false;
 	app.promptQueue = [{ text: "after model", timing: "afterTurn" }];
 	let drains = 0;
-	app.flushPromptQueue = async () => { drains += 1; };
+	app.flushPromptQueue = async () => {
+		drains += 1;
+		app.promptQueue.shift();
+	};
 	app.schedulePromptQueueDrain();
 	assert.equal(app.promptQueueDrainScheduled, false);
 	app.sessionSwitchInProgress = false;

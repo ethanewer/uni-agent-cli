@@ -264,6 +264,7 @@ const DEFAULT_TRANSCRIPTION_MODEL = "gpt-4o-mini-transcribe";
 const BACKGROUND_CONNECT_DELAY_MS = parseDelay(process.env.CC_BACKGROUND_CONNECT_DELAY_MS, 250);
 const MARKDOWN_PRELOAD_DELAY_MS = parseDelay(process.env.CC_MARKDOWN_PRELOAD_DELAY_MS, 750);
 const RESIZE_SETTLE_DELAY_MS = parseDelay(process.env.CC_RESIZE_SETTLE_DELAY_MS, 90);
+const PROMPT_QUEUE_WATCHDOG_DELAY_MS = 250;
 const VS_CODE_AUTO_ACTIVATION_MAX_INPUT_GAP_MS = 15;
 const VS_CODE_AUTO_ACTIVATION_MAX_SUBMIT_AGE_MS = 75;
 const CLIPBOARD_IMAGE_TIMEOUT_MS = 2_500;
@@ -1901,6 +1902,7 @@ export class BtwThread {
 		this.lastAssistantText = "";
 		this.pendingUserEchoes = [];
 		this.queue = [];
+		this.queueWatchdogTimer = undefined;
 		this.localCommandQueue = [];
 		this.localCommandDrainActive = false;
 		this.queuedInputOrder = 0;
@@ -1956,13 +1958,16 @@ export class BtwThread {
 			return;
 		}
 		if (event.type === "backend_exit") {
+			this.clearQueueWatchdog();
 			this.busy = false;
 			this.statusState = "";
 			this.state = "error";
 			this.availableCommands = [];
 			this.commandsLoaded = false;
 			this.settleReadyWaiters(false);
-			this.cancelDeferredLocalCommands();
+			const hasQueuedInput = this.queue.length > 0 || this.localCommandQueue.length > 0;
+			if (hasQueuedInput) queueMicrotask(() => this.app.recoverExitedBtwThread?.(this));
+			else this.cancelDeferredLocalCommands();
 			this.closeCurrentAssistantText();
 			if (this.app.btwThread === this && this.app.focusedThread === "btw") {
 				this.app.updateAutocomplete();
@@ -2008,9 +2013,22 @@ export class BtwThread {
 	async submit(text, promptParts, options = {}) {
 		const trimmed = text.trim();
 		if (!trimmed) return;
-		if (!this.client || this.client.exited) {
-			this.addError("Side thread backend has exited — press esc to close.");
-			this.app.onThreadActivity();
+		if (this.app.btwThread !== this || !this.client || this.client.exited) {
+			const entry = {
+				text: trimmed,
+				promptParts,
+				...(options.displayText ? { displayText: options.displayText } : {}),
+				queuedInputOrder: options.queuedInputOrder ?? this.nextQueuedInputOrder(),
+			};
+			// Enter has already cleared the focused composer by the time submit runs.
+			// Treat input aimed at a just-exited side backend exactly like input that
+			// was already queued there: close the dead pane and return it visibly to
+			// main instead of consuming it into an error-only transcript.
+			if (!this.app.recoverExitedBtwThread?.(this, [entry])) {
+				this.app.restoreQueuedTextToComposer([entry]);
+				this.app.addNotice?.("The /btw backend is no longer open. Input was returned to the composer.");
+				this.app.ui?.requestRender?.();
+			}
 			return;
 		}
 		if (this.app.workingTreeMutationOperation?.terminal === true) {
@@ -2052,6 +2070,7 @@ export class BtwThread {
 				queuedInputOrder: options.queuedInputOrder ?? this.nextQueuedInputOrder(),
 			});
 			this.queue.sort((left, right) => left.queuedInputOrder - right.queuedInputOrder);
+			this.armQueueWatchdog();
 			if (rootQueueReason) this.addNotice(`Queued while ${rootQueueReason}. It will send automatically afterward.`);
 			this.app.onThreadActivity();
 			return;
@@ -2072,8 +2091,21 @@ export class BtwThread {
 	}
 
 	deferLocalCommand(name, argument = "", options = {}) {
-		if (this.app.btwThread !== this || !this.client || this.client.exited) {
+		if (this.app.btwThread !== this) {
 			this.app.reportClosedSessionCommandTarget?.(name, argument);
+			return Promise.resolve(false);
+		}
+		if (!this.client || this.client.exited) {
+			const entry = {
+				text: slashCommandText(name, argument),
+				promptParts: options.promptParts,
+				queuedInputOrder: this.nextQueuedInputOrder(),
+			};
+			if (!this.app.recoverExitedBtwThread?.(this, [entry])) {
+				this.app.restoreQueuedTextToComposer([entry]);
+				this.app.addNotice?.("The /btw backend is no longer open. The command was returned to the composer.");
+				this.app.ui?.requestRender?.();
+			}
 			return Promise.resolve(false);
 		}
 		if (this.app.workingTreeMutationOperation?.terminal === true) {
@@ -2117,6 +2149,32 @@ export class BtwThread {
 		});
 	}
 
+	clearQueueWatchdog() {
+		if (this.queueWatchdogTimer) clearTimeout(this.queueWatchdogTimer);
+		this.queueWatchdogTimer = undefined;
+	}
+
+	armQueueWatchdog() {
+		if (
+			this.queueWatchdogTimer ||
+			this.app.btwThread !== this ||
+			this.client?.exited ||
+			(this.queue.length === 0 && this.localCommandQueue.length === 0)
+		) return;
+		const timer = setTimeout(() => {
+			if (this.queueWatchdogTimer === timer) this.queueWatchdogTimer = undefined;
+			if (this.app.btwThread !== this) return;
+			if (!this.client || this.client.exited) {
+				this.app.recoverExitedBtwThread?.(this);
+				return;
+			}
+			this.drainQueue();
+			if (this.queue.length > 0 || this.localCommandQueue.length > 0) this.armQueueWatchdog();
+		}, PROMPT_QUEUE_WATCHDOG_DELAY_MS);
+		timer.unref?.();
+		this.queueWatchdogTimer = timer;
+	}
+
 	nextQueuedInputOrder() {
 		if (typeof this.app.nextQueuedInputOrder === "function") return this.app.nextQueuedInputOrder();
 		this.queuedInputOrder += 1;
@@ -2127,7 +2185,43 @@ export class BtwThread {
 		for (const command of this.localCommandQueue.splice(0)) command.resolve(false);
 	}
 
+	takeQueuedInput() {
+		const prompts = this.queue.splice(0);
+		const commands = this.localCommandQueue.splice(0);
+		for (const command of commands) command.resolve(false);
+		return [
+			...prompts,
+			...commands.map((command) => ({
+				text: slashCommandText(command.name, command.argument),
+				promptParts: command.promptParts,
+				queuedInputOrder: command.queuedInputOrder,
+			})),
+		].sort(
+			(left, right) =>
+				(left.queuedInputOrder ?? Number.MAX_SAFE_INTEGER) -
+				(right.queuedInputOrder ?? Number.MAX_SAFE_INTEGER),
+		);
+	}
+
 	drainQueue() {
+		// Ownership/backend validity is the dequeue commit point. An operation
+		// finalizer can race backend_exit and call drainQueue before that event's
+		// recovery microtask; never shift a head which the dead-pane recovery still
+		// needs to return to the composer.
+		if (this.app.btwThread !== this) {
+			const entries = this.takeQueuedInput();
+			this.clearQueueWatchdog();
+			if (entries.length > 0) {
+				this.app.restoreQueuedTextToComposer(entries);
+				this.app.addNotice?.("The /btw thread closed. Its queued input was returned to the composer.");
+				this.app.ui?.requestRender?.();
+			}
+			return;
+		}
+		if (!this.client || this.client.exited) {
+			this.app.recoverExitedBtwThread?.(this);
+			return;
+		}
 		if (
 			!this.ready ||
 			this.busy ||
@@ -2139,7 +2233,10 @@ export class BtwThread {
 			(this.app.configUpdateCount ?? 0) > 0 ||
 			this.app.menuHandle ||
 			this.app.selectionActionInProgress
-		) return;
+		) {
+			this.armQueueWatchdog();
+			return;
+		}
 		const command = this.localCommandQueue[0];
 		const prompt = this.queue[0];
 		if (!command && !prompt) return;
@@ -2168,8 +2265,8 @@ export class BtwThread {
 			});
 			return;
 		}
-		this.queue.shift();
 		this.addUserMessage(prompt.displayText ?? prompt.text);
+		this.queue.shift();
 		void this.sendPrompt(prompt.text, prompt.promptParts);
 	}
 
@@ -2256,6 +2353,7 @@ export class BtwThread {
 	}
 
 	stop() {
+		this.clearQueueWatchdog();
 		this.clearCancelGraceTimer();
 		this.settleReadyWaiters(false);
 		this.cancelDeferredLocalCommands();
@@ -4106,6 +4204,8 @@ export class HarnessApp {
 		this.promptQueue = [];
 		this.flushingPromptQueue = false;
 		this.promptQueueDrainScheduled = false;
+		this.promptQueueWatchdogTimer = undefined;
+		this.queuedPromptReconnect = undefined;
 		this.pendingNewSessionCommandName = undefined;
 		// `/clear` starts a fresh backend session, but Claude exposes one same-process
 		// escape hatch in `/rewind` back to the session that preceded it.
@@ -5715,6 +5815,7 @@ export class HarnessApp {
 					compactCommand: text.startsWith("/"),
 					queuedInputOrder: this.nextQueuedInputOrder(),
 				});
+				this.armPromptQueueWatchdog();
 				this.ui.requestRender();
 				return;
 			}
@@ -6570,11 +6671,12 @@ export class HarnessApp {
 				!this.client?.exited &&
 				this.promptQueue.length > 0
 			) {
-				const prompt = this.promptQueue.shift();
+				const prompt = this.promptQueue[0];
 				if (
 					prompt.sessionCommandTarget &&
 					!this.isSessionCommandTargetActive(prompt.sessionCommandTarget)
 				) {
+					this.promptQueue.shift();
 					this.addNotice("Queued shell output was not sent because its original session changed");
 					this.ui.requestRender();
 					continue;
@@ -6590,7 +6692,9 @@ export class HarnessApp {
 					transcriptEntry,
 				});
 				this.ui.requestRender();
-				await this.sendPrompt(prompt.text, { pendingUserEcho, promptParts: prompt.promptParts });
+				const sending = this.sendPrompt(prompt.text, { pendingUserEcho, promptParts: prompt.promptParts });
+				this.promptQueue.shift();
+				await sending;
 			}
 		} finally {
 			this.flushingPromptQueue = false;
@@ -6623,6 +6727,7 @@ export class HarnessApp {
 		// example /model) to the target session. It explicitly schedules the queue
 		// after those commands finish, so never leave an early timer armed here.
 		if (this.stopping || !Array.isArray(this.promptQueue) || this.promptQueue.length === 0) return;
+		this.armPromptQueueWatchdog();
 		if (
 			this.foregroundOperation ||
 			this.workingTreeMutationOperation ||
@@ -6640,6 +6745,107 @@ export class HarnessApp {
 			void this.flushPromptQueue();
 		}, 0);
 		timer.unref?.();
+	}
+
+	armPromptQueueWatchdog() {
+		if (
+			this.stopping ||
+			this.promptQueueWatchdogTimer ||
+			!this.hasQueuedMainInput()
+		) return;
+		const timer = setTimeout(() => {
+			if (this.promptQueueWatchdogTimer === timer) this.promptQueueWatchdogTimer = undefined;
+			void this.checkPromptQueueProgress();
+		}, PROMPT_QUEUE_WATCHDOG_DELAY_MS);
+		timer.unref?.();
+		this.promptQueueWatchdogTimer = timer;
+	}
+
+	hasQueuedMainInput() {
+		return Boolean(
+			(Array.isArray(this.promptQueue) && this.promptQueue.length > 0) ||
+			(Array.isArray(this.deferredLocalSlashCommands) && this.deferredLocalSlashCommands.length > 0) ||
+			(Array.isArray(this.deferredBtwPrompts) && this.deferredBtwPrompts.length > 0)
+		);
+	}
+
+	async checkPromptQueueProgress() {
+		if (this.stopping || !this.hasQueuedMainInput()) return;
+		if (!this.sessionSwitchInProgress && (this.deferredLocalSlashCommands?.length ?? 0) > 0) {
+			try {
+				await this.flushDeferredLocalSlashCommands();
+			} catch (error) {
+				this.addError(`Could not run queued command: ${error.message ?? error}`);
+				this.ui.requestRender();
+			}
+		}
+		if (!this.sessionSwitchInProgress && (this.deferredBtwPrompts?.length ?? 0) > 0) {
+			await this.settleDeferredBtwPrompts();
+		}
+		const liveClient = this.ready && this.client && !this.client.exited;
+		if (liveClient && this.promptQueue.length > 0) {
+			try {
+				await this.flushPromptQueue();
+			} catch (error) {
+				this.addError(`Could not send queued messages: ${error.message ?? error}`);
+				this.ui.requestRender();
+			}
+		}
+		if (!this.hasQueuedMainInput() || this.stopping) return;
+		// Keep checking while a live session or an explicit lifecycle owner can
+		// still make progress. A failed/disconnected startup stops here rather than
+		// creating an automatic restart loop; backend_exit performs one bounded
+		// reconnect attempt, and later user input can explicitly retry.
+		if (
+			(this.ready && this.client && !this.client.exited) ||
+			this.agentSwitchAttempt ||
+			this.connectionAttempt ||
+			this.sessionSwitchInProgress ||
+			this.workingDirectoryShutdownTail ||
+			this.foregroundOperation ||
+			this.workingTreeMutationOperation ||
+			this.selectionActionInProgress ||
+			(this.configUpdateCount ?? 0) > 0 ||
+			(this.asyncPickerLoadCount ?? 0) > 0 ||
+			this.menuHandle
+		) this.armPromptQueueWatchdog();
+	}
+
+	async reconnectForQueuedPrompts(exitedClient = this.client) {
+		if (
+			this.stopping ||
+			this.replacementProcessFence ||
+			!this.hasQueuedMainInput() ||
+			this.client !== exitedClient
+		) return false;
+		if (this.queuedPromptReconnect) return await this.queuedPromptReconnect;
+		let operation;
+		operation = (async () => {
+			if (this.ready && this.client && !this.client.exited) {
+				this.armPromptQueueWatchdog();
+				this.schedulePromptQueueDrain();
+				return true;
+			}
+			let connected = false;
+			try {
+				connected = await this.ensureConnected({
+					statusState: "connecting",
+					preserveDeferredCommands: true,
+				});
+			} catch (error) {
+				this.addError(`Could not reconnect to send queued messages: ${error.message ?? error}`);
+				this.ui.requestRender();
+				return false;
+			}
+			if (!connected || this.stopping || !this.hasQueuedMainInput()) return false;
+			this.armPromptQueueWatchdog();
+			this.schedulePromptQueueDrain();
+			return true;
+		})().finally(() => {
+			if (this.queuedPromptReconnect === operation) this.queuedPromptReconnect = undefined;
+		});
+		this.queuedPromptReconnect = operation;
+		return await operation;
 	}
 
 	queueCurrentInput(timing) {
@@ -8392,6 +8598,7 @@ export class HarnessApp {
 		}
 		this.updateSpinner();
 		this.ui.requestRender();
+		this.armPromptQueueWatchdog();
 	}
 
 	nextQueuedInputOrder() {
@@ -8448,17 +8655,7 @@ export class HarnessApp {
 	takeTerminalMutationSideInput() {
 		const thread = this.btwThread;
 		if (!thread) return [];
-		const prompts = Array.isArray(thread.queue) ? thread.queue.splice(0) : [];
-		const commands = Array.isArray(thread.localCommandQueue) ? thread.localCommandQueue.splice(0) : [];
-		const entries = [
-			...prompts,
-			...commands.map((command) => ({
-				text: slashCommandText(command.name, command.argument),
-				promptParts: command.promptParts,
-				queuedInputOrder: command.queuedInputOrder,
-			})),
-		];
-		for (const command of commands) command.resolve(false);
+		const entries = thread.takeQueuedInput();
 		if (entries.length > 0) {
 			thread.addNotice(
 				"Codex Cloud apply could not be confirmed stopped. Queued side input was returned to the composer; restart cc before continuing.",
@@ -8466,6 +8663,24 @@ export class HarnessApp {
 			this.onThreadActivity();
 		}
 		return entries;
+	}
+
+	recoverExitedBtwThread(thread, additionalEntries = []) {
+		if (this.btwThread !== thread || !thread?.client?.exited) return false;
+		const entries = [
+			...thread.takeQueuedInput(),
+			...(Array.isArray(additionalEntries) ? additionalEntries : []),
+		].sort(
+			(left, right) =>
+				(left.queuedInputOrder ?? Number.MAX_SAFE_INTEGER) -
+				(right.queuedInputOrder ?? Number.MAX_SAFE_INTEGER),
+		);
+		if (entries.length === 0) return false;
+		this.closeBtw();
+		this.restoreQueuedTextToComposer(entries);
+		this.addNotice("The /btw backend exited. Its queued input was returned to the composer.");
+		this.ui.requestRender();
+		return true;
 	}
 
 	async flushDeferredLocalSlashCommands() {
@@ -8515,10 +8730,16 @@ export class HarnessApp {
 		if (deferred.length === 0) return;
 		if (this.btwThread) {
 			const thread = this.btwThread;
+			if (thread.client?.exited) {
+				this.recoverExitedBtwThread(thread, deferred);
+				return;
+			}
 			for (const entry of deferred) {
 				// submit() marks an idle thread busy synchronously; later calls then enter
 				// its own queue. Never await a model turn while finalizing the main transition.
-				void thread.submit(entry.text, entry.promptParts).catch((error) => {
+				void thread.submit(entry.text, entry.promptParts, {
+					queuedInputOrder: entry.queuedInputOrder,
+				}).catch((error) => {
 					if (this.btwThread === thread) thread.addError(error.message ?? String(error));
 				});
 			}
@@ -8820,7 +9041,9 @@ export class HarnessApp {
 			quiet: true,
 			statusState,
 			continueSessionSwitch: options.continueSessionSwitch === true,
-			preserveDeferredCommands: this.flushingDeferredLocalSlashCommands === true,
+			preserveDeferredCommands:
+				options.preserveDeferredCommands === true ||
+				this.flushingDeferredLocalSlashCommands === true,
 		});
 		return connectedInContext();
 	}
@@ -13050,13 +13273,6 @@ export class HarnessApp {
 				promptParts,
 			}]);
 		};
-		if (this.busy) {
-			this.deferLocalSlashCommand(commandName, trimmed, {
-				promptParts,
-				reason: "the current turn finishes",
-			});
-			return;
-		}
 		if (this.replacementProcessFence) {
 			this.addCommandMessage(commandText);
 			this.reportReplacementProcessFence();
@@ -13179,7 +13395,6 @@ export class HarnessApp {
 			// Fork setup failed (submit handles its own errors internally), so the
 			// fork's backend never got going — stop it to avoid a leaked process.
 			thread.settleReadyWaiters(false);
-			thread.cancelDeferredLocalCommands();
 			const shutdown = this.trackBtwShutdown(btwClient);
 			if (this.btwThread === thread) {
 				thread.addError(`Could not start side thread: ${error.message ?? error}`);
@@ -13253,6 +13468,12 @@ export class HarnessApp {
 	closeBtw(options = {}) {
 		const thread = this.btwThread;
 		const skipUi = options.skipUi === true;
+		// Closing invalidates the side session, but it must not invalidate user input
+		// which has not started. Harvest both side FIFOs before clearing their owner;
+		// takeQueuedInput also settles deferred command promises exactly once.
+		const queuedInput = !skipUi && options.restoreQueuedInput !== false
+			? thread?.takeQueuedInput?.() ?? []
+			: [];
 		if (!skipUi && this.menuHandle instanceof ChecklistPanel && this.menuHandle.target?.targetThread === thread) {
 			this.closeMenu();
 		}
@@ -13266,11 +13487,16 @@ export class HarnessApp {
 		}
 		this.btwThread = undefined;
 		this.focusedThread = "main";
+		if (queuedInput.length > 0) {
+			this.restoreQueuedTextToComposer(queuedInput);
+			this.addNotice("The /btw thread closed. Its queued input was returned to the composer.");
+		}
 		if (!skipUi) this.updateAutocomplete();
 		this.mainView.stick = true;
 		if (thread) {
 			thread.settleReadyWaiters?.(false);
 			thread.cancelDeferredLocalCommands?.();
+			thread.clearQueueWatchdog?.();
 			this.cancelInteractiveRequestsForClient(thread.client);
 			thread.cancelRequested = true;
 			thread.clearCancelGraceTimer?.();
@@ -14291,11 +14517,12 @@ export class HarnessApp {
 			this.addError(event.message);
 		} else if (event.type === "backend_exit") {
 			// The backend died unexpectedly. Mark it dead so queued prompts are
-			// preserved (not drained into errors) and the next submit reconnects
-			// against a fresh client instead of erroring on the dead one. Only the
-			// dead backend's interactive prompts are cancelled — a live /btw fork
-			// keeps its own pending permission/elicitation requests.
-			this.cancelInteractiveRequestsForClient(this.client);
+			// preserved (not drained into errors) and reconnect automatically when
+			// there is already work waiting. Only the dead backend's interactive
+			// prompts are cancelled — a live /btw fork keeps its own pending
+			// permission/elicitation requests.
+			const exitedClient = this.client;
+			this.cancelInteractiveRequestsForClient(exitedClient);
 			this.clearCancelGraceTimer();
 			this.ready = false;
 			this.busy = false;
@@ -14305,6 +14532,12 @@ export class HarnessApp {
 			this.statusState = "";
 			this.updateSpinner();
 			if (this.clearLiveBackendCommands(this.activeKey)) this.updateAutocomplete();
+			if (this.hasQueuedMainInput()) {
+				// Let an initialize/switch call that emitted backend_exit publish its
+				// lifecycle attempt before joining it. Unexpected exits have no owner,
+				// so the same path starts exactly one replacement connection.
+				queueMicrotask(() => void this.reconnectForQueuedPrompts(exitedClient));
+			}
 		} else if (event.type === "cursor_todos") {
 			this.disarmPendingUnsendPrompt();
 			this.addNotice(cursorTodosText(event.todos));
@@ -14605,6 +14838,8 @@ export class HarnessApp {
 		if (this.spinnerTimer) clearInterval(this.spinnerTimer);
 		if (this.markdownPreloadTimer) clearTimeout(this.markdownPreloadTimer);
 		if (this.startupConnectTimer) clearTimeout(this.startupConnectTimer);
+		if (this.promptQueueWatchdogTimer) clearTimeout(this.promptQueueWatchdogTimer);
+		this.promptQueueWatchdogTimer = undefined;
 		this.clearCancelGraceTimer();
 		this.cancelPermissionPrompts({ skipUi: options.skipUiStop === true });
 		this.voiceController?.dispose();
@@ -16206,7 +16441,7 @@ function shouldDeferLocalSlashCommand(name) {
 }
 
 function shouldDeferBusyConfigCommand(name) {
-	return ["model", "mode", "effort", "reasoning", "thinking", "plan", "config", "fast", "permissions", "rename", "usage", "cloud", "goal", "btw", "side", "memories"].includes(name);
+	return ["model", "mode", "effort", "reasoning", "thinking", "plan", "config", "fast", "permissions", "rename", "usage", "cloud", "goal", "memories"].includes(name);
 }
 
 function shouldDeferBusySideConfigCommand(name) {
