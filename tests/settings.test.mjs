@@ -167,6 +167,36 @@ assert.equal(singleLineMenuText("\x1b[31msession\nidentifier\x1b[0m"), "session 
 	}
 }
 {
+	// VS Code (including tmux panes launched from its terminal) must stay in the
+	// normal buffer so the terminal retains transcript scrollback. /btw may still
+	// opt into its temporary, app-scrolled alternate-screen page view.
+	const originalStart = ProcessTerminal.prototype.start;
+	const originalStop = ProcessTerminal.prototype.stop;
+	const originalWrite = ProcessTerminal.prototype.write;
+	const originalTermProgram = process.env.TERM_PROGRAM;
+	const writes = [];
+	ProcessTerminal.prototype.start = () => {};
+	ProcessTerminal.prototype.stop = () => {};
+	ProcessTerminal.prototype.write = (data) => writes.push(data);
+	process.env.TERM_PROGRAM = "vscode";
+	try {
+		const terminal = createHarnessTerminal();
+		terminal.start(() => {}, () => {});
+		assert.equal(writes.join("").includes("\x1b[?1049h"), false);
+		terminal.enterAlternateScreen();
+		terminal.exitAlternateScreen();
+		terminal.stop();
+		assert.equal(writes.filter((data) => data.includes("\x1b[?1049h")).length, 1);
+		assert.equal(writes.filter((data) => data.includes("\x1b[?1049l")).length, 1);
+	} finally {
+		if (originalTermProgram === undefined) delete process.env.TERM_PROGRAM;
+		else process.env.TERM_PROGRAM = originalTermProgram;
+		ProcessTerminal.prototype.start = originalStart;
+		ProcessTerminal.prototype.stop = originalStop;
+		ProcessTerminal.prototype.write = originalWrite;
+	}
+}
+{
 	const panel = new SelectionPanel("Resume\nsession", [{ label: "first\nsecond", description: "date\npath" }], () => {});
 	const lines = panel.render(80);
 	assert.ok(lines.every((line) => !line.includes("\n") && !line.includes("\r")));
@@ -5138,6 +5168,11 @@ if (process.platform !== "win32" && spawnSync("sqlite3", ["--version"]).status =
 		recoveryApp.addCommandMessage = () => {};
 		recoveryApp.addNotice = () => {};
 		recoveryApp.addError = (message) => failures.push(message);
+		recoveryApp.runFencedCodexAppServerRequests = async (_invocation, requests) => {
+			assert.equal(requests[0].method, "thread/list");
+			assert.equal(requests[0].params.ancestorThreadId, targetId);
+			return [{ data: [], nextCursor: null }];
+		};
 		recoveryApp.resetConversationView = () => calls.push(["reset"]);
 		recoveryApp.switchAgent = async (key, transport, options) => {
 			calls.push(["switch", key, transport, {

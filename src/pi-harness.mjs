@@ -19721,7 +19721,6 @@ export function createHarnessTerminal(resizeHooks = {}) {
 	const start = terminal.start.bind(terminal);
 	const stop = terminal.stop.bind(terminal);
 	const write = terminal.write.bind(terminal);
-	const useAlternateScreen = isVsCodeTerminal();
 	let dynamicAlternateScreen = false;
 	let resizeTimer;
 	let fullClearReplacementOnce;
@@ -19758,13 +19757,7 @@ export function createHarnessTerminal(resizeHooks = {}) {
 			}, RESIZE_SETTLE_DELAY_MS);
 			resizeTimer.unref?.();
 		});
-		if (useAlternateScreen) {
-			write("\x1b[?1049h\x1b[2J\x1b[H");
-			delete process.env.CC_PREPAINTED;
-			delete process.env.CC_PREPAINT_AGENT;
-			delete process.env.CC_PREPAINT_THEME;
-			delete process.env.CC_ADOPTED_PREPAINT;
-		} else if (process.env.CC_PREPAINTED === "1") {
+		if (process.env.CC_PREPAINTED === "1") {
 			if (process.env.CC_ADOPTED_PREPAINT !== "1") write("\x1b8\x1b[J\x1b7");
 			delete process.env.CC_PREPAINTED;
 			delete process.env.CC_PREPAINT_AGENT;
@@ -19804,13 +19797,13 @@ export function createHarnessTerminal(resizeHooks = {}) {
 			delete globalThis[Symbol.for("cc.startup-input-guard")];
 		}
 		startupInputGuard = undefined;
-		if (useAlternateScreen || dynamicAlternateScreen) {
+		if (dynamicAlternateScreen) {
 			dynamicAlternateScreen = false;
 			write("\x1b[?1049l\x1b[?25h");
 		}
 	};
 	terminal.enterAlternateScreen = () => {
-		if (useAlternateScreen || dynamicAlternateScreen) return;
+		if (dynamicAlternateScreen) return;
 		dynamicAlternateScreen = true;
 		// Xterm 1049 uses the same save/restore slot as DECSC/DECRC on common
 		// terminals. Restore the normal-flow anchor first so 1049 preserves that
@@ -19818,7 +19811,7 @@ export function createHarnessTerminal(resizeHooks = {}) {
 		write("\x1b8\x1b[?1049h\x1b[2J\x1b[H");
 	};
 	terminal.exitAlternateScreen = () => {
-		if (useAlternateScreen || !dynamicAlternateScreen) return;
+		if (!dynamicAlternateScreen) return;
 		dynamicAlternateScreen = false;
 		write("\x1b[?1049l\x1b7\x1b[?25h");
 	};
@@ -19827,7 +19820,7 @@ export function createHarnessTerminal(resizeHooks = {}) {
 		const fullClearReplacement = hasFullClear ? fullClearReplacementOnce : undefined;
 		if (hasFullClear) fullClearReplacementOnce = undefined;
 		const rewritten = rewriteFullScreenClear(data, {
-			alternateScreen: useAlternateScreen || dynamicAlternateScreen,
+			alternateScreen: dynamicAlternateScreen,
 			fullClearReplacement,
 		});
 		write(hideCursorDuringRender(rewritten));
@@ -21822,6 +21815,11 @@ export async function runCli(args = process.argv.slice(2)) {
 			});
 		});
 	}
+	// Startup owns temporary SIGINT/SIGTERM handlers while this heavyweight
+	// module, config, and app are being constructed. Production handlers now own
+	// both signals, so release the temporary restorers synchronously before the
+	// first event-loop turn can dispatch a signal to both owners.
+	globalThis[Symbol.for("cc.startup-input-guard")]?.releaseSignalHandlers?.();
 	await app.start();
 }
 

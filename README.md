@@ -277,6 +277,12 @@ Most current Codex workflows are reachable through either an advertised backend 
 - `/approve`, background-terminal `/ps`/`/stop`, and per-session personality require live-thread app-server methods that the maintained adapter does not yet expose. Starting a competing app-server turn would bypass `cc`'s approvals and event stream, so `cc` does not do that.
 - `cc` supports ACP URL and form elicitation. Form requests are bounded and validated before rendering, support text and constrained numeric/boolean/single- or multi-select fields, mask secret-like fields, and never print submitted values into the transcript.
 
+### Scrolling
+
+The main conversation stays in the terminal's normal buffer, including in VS Code and in tmux panes launched from VS Code, so completed output remains in native scrollback while a turn is running. Use the VS Code terminal scrollbar, mouse wheel, or trackpad normally. In tmux, use copy mode (`Ctrl+B`, then `[`) and scroll with PgUp/PgDn, arrows, or the mouse when tmux mouse support is enabled; press `q` to return to the prompt.
+
+`/btw` temporarily uses its own fixed-height page view. Its per-thread scrolling keys are listed below.
+
 ### `/btw` — forked side thread (page view)
 
 `/btw` **forks the current conversation** into a side thread. The fork inherits the full prior context **and can use tools** — it's a real branch, not a read-only aside — and the original thread is untouched. `/btw` on its own opens the fork ready for input; `/btw <question>` opens it and asks immediately. Works even while the main agent is mid-turn.

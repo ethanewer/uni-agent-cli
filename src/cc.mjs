@@ -6,8 +6,7 @@ import { spawnSync } from "node:child_process";
 
 const STARTUP_INPUT_GUARD = Symbol.for("cc.startup-input-guard");
 
-function restoreInheritedTerminalMode() {
-	const state = process.env.CC_STARTUP_STTY_STATE;
+function restoreTerminalMode(state) {
 	if (!state) return true;
 	try {
 		const restored = spawnSync("stty", [state], {
@@ -19,6 +18,12 @@ function restoreInheritedTerminalMode() {
 		// Best effort only; setRawMode(false) below still restores ordinary launches.
 		return false;
 	}
+	return true;
+}
+
+function restoreInheritedTerminalMode() {
+	const state = process.env.CC_STARTUP_STTY_STATE;
+	if (!restoreTerminalMode(state)) return false;
 	delete process.env.CC_STARTUP_STTY_STATE;
 	return true;
 }
@@ -27,8 +32,15 @@ function beginStartupInputGuard(enabled) {
 	if (!enabled || !process.stdin.isTTY || typeof process.stdin.setRawMode !== "function") return undefined;
 	const chunks = [];
 	const originalRaw = process.stdin.isRaw === true;
+	const inheritedTerminalMode = process.env.CC_STARTUP_STTY_STATE;
 	let listening = true;
 	let restored = false;
+	let terminating = false;
+	const startupSignalHandlers = new Map();
+	const releaseSignalHandlers = () => {
+		for (const [signal, handler] of startupSignalHandlers) process.removeListener(signal, handler);
+		startupSignalHandlers.clear();
+	};
 	const onData = (data) => chunks.push(Buffer.isBuffer(data) ? Buffer.from(data) : String(data));
 	process.stdin.on("data", onData);
 	try {
@@ -46,7 +58,9 @@ function beginStartupInputGuard(enabled) {
 	}
 	const guard = {
 		originalRaw,
+		releaseSignalHandlers,
 		handoff() {
+			releaseSignalHandlers();
 			if (listening) process.stdin.removeListener("data", onData);
 			listening = false;
 			return chunks.splice(0);
@@ -54,6 +68,7 @@ function beginStartupInputGuard(enabled) {
 		restore() {
 			if (restored) return;
 			restored = true;
+			releaseSignalHandlers();
 			if (listening) process.stdin.removeListener("data", onData);
 			listening = false;
 			try {
@@ -61,10 +76,28 @@ function beginStartupInputGuard(enabled) {
 			} catch {
 				// The terminal may already have disappeared.
 			}
-			restoreInheritedTerminalMode();
+			// libuv may have initialized its TTY handle while the shell launcher's
+			// cbreak guard was active. Restore the shell's exact termios snapshot as
+			// the final authority instead of assuming setRawMode(false) is equivalent.
+			restoreTerminalMode(inheritedTerminalMode);
 		},
 	};
 	globalThis[STARTUP_INPUT_GUARD] = guard;
+	for (const signal of ["SIGINT", "SIGTERM"]) {
+		const handler = () => {
+			if (terminating) return;
+			terminating = true;
+			guard.restore();
+			try {
+				// Preserve ordinary signal exit semantics after restoring terminal ownership.
+				process.kill(process.pid, signal);
+			} catch {
+				process.exit(signal === "SIGINT" ? 130 : 143);
+			}
+		};
+		startupSignalHandlers.set(signal, handler);
+		process.once(signal, handler);
+	}
 	return guard;
 }
 

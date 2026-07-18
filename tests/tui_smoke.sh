@@ -33,11 +33,14 @@ rm -f "$COMMAND_CACHE"
 # prompt step). Point at a fresh, nonexistent file -> no grants.
 PERMS_FILE="$(mktemp -t cc-tui-perms.XXXXXX)"
 rm -f "$PERMS_FILE"
+STTY_RESULT="$(mktemp -t cc-tui-stty-result.XXXXXX)"
+rm -f "$STTY_RESULT"
 printf '%s\n' '{"agents":{"fake":{"sessionDefaults":{"model":"fast","effort":"high"}}}}' > "$SETTINGS_FILE"
 ROOT_Q="$(printf "%q" "$ROOT")"
 WRITE_LOG_Q="$(printf "%q" "$WRITE_LOG")"
 SETTINGS_FILE_Q="$(printf "%q" "$SETTINGS_FILE")"
 PERMS_FILE_Q="$(printf "%q" "$PERMS_FILE")"
+STTY_RESULT_Q="$(printf "%q" "$STTY_RESULT")"
 CONFIG_SETTINGS_THEME_FILE_Q="$(printf "%q" "$CONFIG_SETTINGS_THEME_FILE")"
 CONFIG_TOP_THEME_FILE_Q="$(printf "%q" "$CONFIG_TOP_THEME_FILE")"
 COMMANDS_GATE_Q="$(printf "%q" "$COMMANDS_GATE")"
@@ -136,7 +139,7 @@ stop_session() {
 cleanup() {
 	force_stop_session
 	tmux kill-server >/dev/null 2>&1 || true
-	rm -f "$WRITE_LOG" "$SETTINGS_FILE" "$CONFIG_SETTINGS_THEME_FILE" "$CONFIG_TOP_THEME_FILE" "$COMMANDS_GATE" "$NEW_GATE" "$SESSION_LIST_GATE" "$START_LOG" "$COMMAND_CACHE" "$PERMS_FILE"
+	rm -f "$WRITE_LOG" "$SETTINGS_FILE" "$CONFIG_SETTINGS_THEME_FILE" "$CONFIG_TOP_THEME_FILE" "$COMMANDS_GATE" "$NEW_GATE" "$SESSION_LIST_GATE" "$START_LOG" "$COMMAND_CACHE" "$PERMS_FILE" "$STTY_RESULT"
 }
 trap cleanup EXIT
 
@@ -309,7 +312,13 @@ assert_no_mouse_tracking_enabled() {
 # editor on the first live frame without requiring a retry.
 for startup_launcher in "./src/cc" "node src/cc.mjs"; do
 	tmux new-session -d -s "$SESSION" -x 100 -y 30 "cd $ROOT_Q && $PANE_ENV PI_TUI_WRITE_LOG=$WRITE_LOG_Q CC_CONFIG=tests/fake_config.json CC_SETTINGS=$SETTINGS_FILE_Q CC_BACKGROUND_CONNECT_DELAY_MS=0 CC_TEST_STARTUP_IMPORT_DELAY_MS=800 $startup_launcher fake"
-	wait_for_text "Space to record"
+	if [ "$VSCODE_TERMINAL" -eq 1 ]; then
+		# VS Code skips the placeholder prepaint, so type while the deterministic
+		# import delay is still active instead of waiting for the real editor.
+		sleep 0.1
+	else
+		wait_for_text "Space to record"
+	fi
 	tmux send-keys -l -t "$SESSION" startup-race-input
 	if [ "$startup_launcher" = "node src/cc.mjs" ]; then
 		tmux send-keys -t "$SESSION" Enter
@@ -325,6 +334,60 @@ for startup_launcher in "./src/cc" "node src/cc.mjs"; do
 		tmux send-keys -t "$SESSION" Enter
 	fi
 	wait_for_text "echo: startup-race-input"
+	stop_session
+	: > "$WRITE_LOG"
+done
+
+# An external termination can land after the shell has disabled canonical echo
+# but before the full app installs its signal handlers. Return to a persistent
+# parent shell and inspect its functional termios flags so this path can never
+# leave the user's prompt in cbreak/no-echo mode. (macOS clears the transient
+# PENDIN bit when the shell consumes pending input, so opaque stty blobs need not
+# remain byte-identical even when every user-visible mode is restored.)
+for startup_signal in INT TERM; do
+	rm -f "$STTY_RESULT"
+	tmux new-session -d -s "$SESSION" -x 100 -y 30 "cd $ROOT_Q && exec sh"
+	tmux send-keys -l -t "$SESSION" "$PANE_ENV CC_CONFIG=tests/fake_config.json CC_SETTINGS=$SETTINGS_FILE_Q CC_BACKGROUND_CONNECT_DELAY_MS=0 CC_TEST_STARTUP_IMPORT_DELAY_MS=5000 ./src/cc fake; stty -a > $STTY_RESULT_Q"
+	tmux send-keys -t "$SESSION" Enter
+	if [ "$VSCODE_TERMINAL" -eq 1 ]; then
+		sleep 0.1
+	else
+		wait_for_text "Space to record"
+	fi
+	startup_shell_pid="$(tmux display-message -p -t "$SESSION" '#{pane_pid}')"
+	startup_node_pid="$(ps -axo ppid=,pid=,command= | awk -v parent="$startup_shell_pid" '$1 == parent && /node .*src\/cc\.mjs/ { print $2; exit }')"
+	if [ -z "$startup_node_pid" ]; then
+		echo "Could not find cc Node process during startup SIG$startup_signal test" >&2
+		capture >&2
+		exit 1
+	fi
+	kill -"$startup_signal" "$startup_node_pid"
+	for _ in {1..50}; do
+		if [ -s "$STTY_RESULT" ]; then break; fi
+		sleep 0.1
+	done
+	if [ ! -s "$STTY_RESULT" ]; then
+		echo "Parent shell did not resume after startup SIG$startup_signal" >&2
+		capture >&2
+		exit 1
+	fi
+	restored_terminal_modes="$(tr '\n' ' ' < "$STTY_RESULT")"
+	for required_mode in icanon echo isig; do
+		case " $restored_terminal_modes " in
+			*" -$required_mode "*|*" -$required_mode;"*)
+				echo "SIG$startup_signal during startup left $required_mode disabled in the parent shell" >&2
+				capture >&2
+				exit 1
+				;;
+			*" $required_mode "*|*" $required_mode;"*)
+				;;
+			*)
+				echo "Could not verify restored terminal mode $required_mode after startup SIG$startup_signal" >&2
+				cat "$STTY_RESULT" >&2
+				exit 1
+				;;
+		esac
+	done
 	stop_session
 	: > "$WRITE_LOG"
 done
@@ -383,15 +446,11 @@ stop_session
 
 tmux new-session -d -s "$SESSION" -x 100 -y 30 "cd $ROOT_Q && printf 'outside-before-cc\n' && $PANE_ENV PI_TUI_WRITE_LOG=$WRITE_LOG_Q CC_CONFIG=tests/fake_config.json CC_SETTINGS=$SETTINGS_FILE_Q CC_BACKGROUND_CONNECT_DELAY_MS=0 FAKE_ACP_NEW_DELAY=0.4 ./src/cc fake"
 
-if [ "$VSCODE_TERMINAL" -eq 0 ]; then
-	wait_for_text "outside-before-cc"
-fi
+wait_for_text "outside-before-cc"
 wait_for_text "Space to record"
 
 tmux resize-window -t "$SESSION" -x 100 -y 32
-if [ "$VSCODE_TERMINAL" -eq 0 ]; then
-	wait_for_text "outside-before-cc"
-fi
+wait_for_text "outside-before-cc"
 wait_for_text "Space to record"
 
 tmux resize-window -t "$SESSION" -x 74 -y 26
@@ -877,12 +936,10 @@ sleep 0.3
 tmux send-keys -t "$SESSION" Escape
 wait_without_text "btw (fork)"
 wait_for_text "slow done"
-if [ "$VSCODE_TERMINAL" = "0" ]; then
-	if ! grep -Fq "$(printf '\0338\033[?1049h')" "$WRITE_LOG" || ! grep -Fq "$(printf '\033[?1049l\0337')" "$WRITE_LOG"; then
-		echo "/btw did not preserve the normal-buffer anchor around the alternate-screen page view" >&2
-		cat "$WRITE_LOG" >&2
-		exit 1
-	fi
+if ! grep -Fq "$(printf '\0338\033[?1049h')" "$WRITE_LOG" || ! grep -Fq "$(printf '\033[?1049l\0337')" "$WRITE_LOG"; then
+	echo "/btw did not preserve the normal-buffer anchor around the alternate-screen page view" >&2
+	cat "$WRITE_LOG" >&2
+	exit 1
 fi
 
 tmux send-keys -t "$SESSION" / c l e a r Enter
@@ -916,15 +973,17 @@ if tmux has-session -t "$SESSION" >/dev/null 2>&1; then
 	capture >&2
 	exit 1
 fi
-if [ "$VSCODE_TERMINAL" = "0" ] && ! grep -Fq "$(printf '\033[?1049l\0337')" "$WRITE_LOG"; then
+if ! grep -Fq "$(printf '\033[?1049l\0337')" "$WRITE_LOG"; then
 	echo "quitting from /btw did not restore and re-save the normal-buffer anchor before TUI shutdown" >&2
 	cat "$WRITE_LOG" >&2
 	exit 1
 fi
 
 printf '{}\n' > "$SETTINGS_FILE"
-tmux new-session -d -s "$SESSION" -x 100 -y 12 "cd $ROOT_Q && $PANE_ENV PI_TUI_WRITE_LOG=$WRITE_LOG_Q CC_CONFIG=tests/e2e_trace_config.json CC_SETTINGS=$SETTINGS_FILE_Q CC_BACKGROUND_CONNECT_DELAY_MS=0 ./src/cc trace"
+: > "$WRITE_LOG"
+tmux new-session -d -s "$SESSION" -x 100 -y 12 "cd $ROOT_Q && $PANE_ENV TERM_PROGRAM=vscode VSCODE_PID=12345 PI_TUI_WRITE_LOG=$WRITE_LOG_Q CC_CONFIG=tests/e2e_trace_config.json CC_SETTINGS=$SETTINGS_FILE_Q CC_BACKGROUND_CONNECT_DELAY_MS=0 sh -c 'printf \"vscode-scroll-anchor\\n\"; exec ./src/cc trace'"
 wait_for_text "trace acp"
+wait_for_text "vscode-scroll-anchor"
 tmux send-keys -t "$SESSION" -l "many tools"
 sleep 0.1
 tmux send-keys -t "$SESSION" Enter
@@ -935,7 +994,7 @@ tmux send-keys -t "$SESSION" -X page-up
 tmux send-keys -t "$SESSION" -X page-up
 sleep 1.8
 if [ "$(tmux display-message -p -t "$SESSION" "#{pane_in_mode}")" != "1" ]; then
-	echo "Trace pane left copy mode while agent was running" >&2
+	echo "VS Code tmux pane left copy mode while agent was running" >&2
 	capture >&2
 	exit 1
 fi
@@ -945,8 +1004,18 @@ trace_prompt_count="$(capture_all | awk '$0 == "many tools" { count++ } END { pr
 trace_tool_1_count="$(capture_all | awk 'index($0, "Trace Tool 01") { count++ } END { print count + 0 }')"
 trace_tool_30_count="$(capture_all | awk 'index($0, "Trace Tool 30") { count++ } END { print count + 0 }')"
 if [ "$trace_prompt_count" != "1" ] || [ "$trace_tool_1_count" != "1" ] || [ "$trace_tool_30_count" != "1" ]; then
-	echo "Trace content duplicated in scrollback: prompt=$trace_prompt_count tool1=$trace_tool_1_count tool30=$trace_tool_30_count" >&2
+	echo "VS Code tmux trace content missing or duplicated in scrollback: prompt=$trace_prompt_count tool1=$trace_tool_1_count tool30=$trace_tool_30_count" >&2
 	capture_all >&2
+	exit 1
+fi
+if [ "$(capture_all | awk '$0 == "vscode-scroll-anchor" { count++ } END { print count + 0 }')" != "1" ]; then
+	echo "VS Code tmux pane did not retain the pre-CLI normal-buffer scrollback anchor" >&2
+	capture_all >&2
+	exit 1
+fi
+if grep -Fq "$(printf '\033[?1049h')" "$WRITE_LOG"; then
+	echo "VS Code tmux pane entered the alternate screen and disabled native scrollback" >&2
+	cat "$WRITE_LOG" >&2
 	exit 1
 fi
 
