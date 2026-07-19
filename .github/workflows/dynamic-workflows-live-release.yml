@@ -1,0 +1,48 @@
+name: Dynamic workflows authenticated release
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - workflows
+
+permissions:
+  contents: read
+
+jobs:
+  authenticated-release:
+    runs-on: macos-15
+    timeout-minutes: 60
+    environment: dynamic-workflows-release
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install tmux
+        run: command -v tmux >/dev/null 2>&1 || brew install tmux
+      - run: npm ci --ignore-scripts
+      - run: node scripts/postinstall.mjs
+      - name: Deterministic release gates and authenticated installed-artifact E2E
+        env:
+          CC_WORKFLOW_E2E_RESULT_PATH: ${{ github.workspace }}/dynamic-workflows-live-result.json
+        run: |
+          set -o pipefail
+          npm pack --ignore-scripts --json > dynamic-workflows-pack.json
+          TARBALL="$(node -e 'const fs=require("fs"); console.log(JSON.parse(fs.readFileSync("dynamic-workflows-pack.json","utf8"))[0].filename)')"
+          shasum -a 256 "$TARBALL" > "$TARBALL.sha256"
+          CC_WORKFLOW_E2E_TARBALL="$PWD/$TARBALL" npm run release:workflows 2>&1 | tee dynamic-workflows-live-release.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dynamic-workflows-live-release-${{ github.sha }}
+          path: |
+            dynamic-workflows-live-release.log
+            dynamic-workflows-pack.json
+            dynamic-workflows-live-result.json
+            cc-*.tgz
+            cc-*.tgz.sha256
+          if-no-files-found: error

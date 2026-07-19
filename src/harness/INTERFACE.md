@@ -111,7 +111,7 @@ capabilities: Capabilities          // valid after connect(); pre-connect = decl
 buildLaunchSpec(settings): AgentSpec // native-settings → spawn args/env/sessionMeta/startupMode/autoApprove
 async connect(options?)              // spawn + initialize (+ first session unless {createSession:false})
 async newSession(options?)
-async prompt(parts): {stopReason}
+async prompt(parts): {stopReason, usage?} // usage is normalized turn accounting when advertised
 cancel()
 stop(): Promise                         // terminal close; signals synchronously
 stopAndWait(): Promise                  // complete process-tree teardown
@@ -120,6 +120,36 @@ async acquireSessionLoadGuard(id): release  // hold adapter-owned safety fences 
 setRuntimePermissionMode(mode?)         // host-owned in-memory policy override
 getSessionInfo(): SessionInfo        // sessionId, capabilities, configOptions, models, modes, agentInfo
 ```
+
+The workflow worker extension is optional so adapters written against the
+pre-workflow interface remain loadable while workflows are disabled:
+
+```text
+getWorkflowCapabilities(): WorkflowCapabilities
+getResolvedModel(): {id, verified} | null
+getWorkflowDefaults(): {model?, effort?}
+async applyWorkflowModel(id): {id, verified}
+async applyWorkflowReadOnly()
+async applyWorkflowAgentType(id)
+```
+
+`WorkflowCapabilities` independently reports `childCwd`, `modelOverride`,
+`modelVerification`, `usage`, `mcpLaunch`, `terminalLaunch`,
+`enforcedReadOnly`, and `agentProfiles`. These are truthful launch/session
+properties used by dynamic workflow workers; they are not inferred from a
+backend name. An explicit workflow model or read-only request fails closed when
+the adapter cannot apply and verify it. An adapter without the extension fails
+closed as a workflow worker only after the user opts in; it still conforms to
+the ordinary harness contract.
+
+The workflow adapter factory is also passed `workflowLaunch: {model?, effort?}`
+before construction. This permits launch-argument-only model selection; the
+connected adapter must still return the exact selection from `getResolvedModel()`
+with `verified: true`. `modelOverride` means a post-connect change is supported,
+while `modelVerification` may be true for a read-only live model projection.
+When `usage` is true, each completed `prompt()` may return normalized turn usage
+under `usage`; missing measurements remain explicitly unknown and are charged by
+the workflow runtime's conservative fallback.
 
 ### Optional (capability-gated — only called when the matching flag is set)
 
@@ -216,7 +246,7 @@ behavior that reads adapter outputs:
 ## Boundary enforcement
 
 - `HarnessApp.createRuntimeAdapter()` is the only production constructor for
-  main and `/btw` adapters.
+  main, `/btw`, and dynamic-workflow adapters.
 - `createAcpConnection()` is the sole production `new AcpClient(...)` site. It
   is injected below the adapter boundary and is not exposed to TUI call sites.
 - A built-in bridge is selected only for cc's exact pinned Claude adapter.

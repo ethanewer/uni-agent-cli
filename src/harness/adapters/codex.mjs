@@ -21,6 +21,8 @@ function parseCodexConfig(value) {
 }
 
 export class CodexAdapter extends BaseAcpAdapter {
+	static workflowMcpLaunch = true;
+
 	codexService(name, options = {}) {
 		const service = this.services?.codex?.[name] ?? this.services?.[name];
 		if (typeof service === "function") return service;

@@ -6,8 +6,15 @@ import { fileURLToPath } from "node:url";
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const pi = fs.readFileSync(path.join(root, "src", "pi-harness.mjs"), "utf8");
 
-assert.match(pi, /import \{ createAdapter \} from "\.\/harness\/registry\.mjs";/u);
+assert.match(pi, /import \{ adapterClassFor, createAdapter \} from "\.\/harness\/registry\.mjs";/u);
 assert.match(pi, /createRuntimeAdapter\(key, agentConfig/u);
+assert.doesNotMatch(pi, /^import .*\.\/workflows\//mu, "disabled startup must not statically import workflow modules");
+for (const module of ["manager", "registry", "tui", "broker", "sandbox-parent"]) {
+	assert.match(pi, new RegExp(`import\\(\\"\\./workflows/${module}\\.mjs\\"\\)`), `${module} must load only through the opt-in initializer`);
+}
+assert.match(pi, /adapterClassFor\(key\)\.workflowMcpLaunch === true/u, "workflow MCP injection must honor the adapter launch capability");
+assert.match(pi, /const workflowActive = callbacks\.workflowChild === true \|\| \(this\.workflowsDisabled === false && !this\.workflowSubsystemStopping\)/u);
+assert.match(pi, /const workflowBrokerShutdown = this\.workflowManager\s*\?/u, "disabled shutdown must not create a workflow promise chain");
 assert.equal(
 	[...pi.matchAll(/new AcpClient\s*\(/gu)].length,
 	1,
@@ -20,8 +27,8 @@ assert.match(
 );
 assert.equal(
 	[...pi.matchAll(/this\.createRuntimeAdapter\(/gu)].length,
-	2,
-	"main and /btw must both resolve through the adapter registry",
+	3,
+	"main, /btw, and workflow workers must all resolve through the centralized adapter registry",
 );
 assert.doesNotMatch(
 	pi,

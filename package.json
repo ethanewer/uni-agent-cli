@@ -12,11 +12,16 @@
     "src/pi-harness.mjs",
     "src/harness/**/*.mjs",
     "src/harness/**/*.md",
+    "src/workflows/**/*.mjs",
+    "src/workflows/**/*.py",
     "src/harnesses/**/*.py",
     "src/harnesses/**/*.txt",
     "scripts/install-channel.mjs",
     "scripts/postinstall.mjs",
-    "README.md"
+    "README.md",
+    "LICENSE",
+	"LICENSE-APACHE-2.0",
+    "NOTICE"
   ],
   "engines": {
     "node": ">=22"
@@ -26,18 +31,30 @@
   },
   "scripts": {
     "postinstall": "node scripts/postinstall.mjs",
+	"prepublishOnly": "npm run test:release",
     "install:channels": "node scripts/install-channel.mjs all",
-    "check": "node --check src/cc.mjs && node --check src/pi-harness.mjs && node --check scripts/postinstall.mjs && node --check scripts/install-channel.mjs && for f in src/harness/*.mjs src/harness/adapters/*.mjs; do node --check \"$f\" || exit 1; done && python3 -c \"import pathlib; files=list(pathlib.Path('src/harnesses').rglob('*.py'))+[pathlib.Path('tests/e2e_harness_bridges.py')]; [compile(path.read_text(), str(path), 'exec') for path in files]\"",
-		"test": "npm run check && node tests/command_catalog.test.mjs && node tests/settings.test.mjs && node tests/slow_startup_ux.test.mjs && node tests/codex_session_index_async.test.mjs && node tests/codex_features.test.mjs && node tests/codex_thread.test.mjs && node tests/codex_fork.test.mjs && node tests/codex_management.test.mjs && node tests/codex_apps.test.mjs && node tests/codex_native_ui.test.mjs && node tests/codex_feedback_app.test.mjs && node tests/codex_memory.test.mjs && node tests/codex_import.test.mjs && node tests/codex_config_report.test.mjs && node tests/codex_parity_ui.test.mjs && node tests/claude_parity.test.mjs && node tests/shell_history.test.mjs && node tests/claude_cwd.test.mjs && node tests/append_context.test.mjs && node tests/background_tasks.test.mjs && node tests/checklists.test.mjs && node tests/checkpoints.test.mjs && node tests/remote_control.test.mjs && node tests/branch.test.mjs && node tests/adapter_boundary.test.mjs && node tests/keybindings.test.mjs && node tests/copy_response.test.mjs && node tests/prompt_color.test.mjs && node tests/elicitation.test.mjs && node tests/permissions.test.mjs && node tests/harness_adapter.test.mjs && node tests/postinstall.test.mjs && node tests/channel_installer.test.mjs && python3 -c \"compile(open('tests/fake_acp.py').read(), 'tests/fake_acp.py', 'exec')\" && bash tests/permission_auto_smoke.sh && bash tests/permission_persist_smoke.sh && bash tests/tui_smoke.sh"
+    "pretest": "node tests/dynamic_workflows.test.mjs",
+	"test:workflows:e2e": "bash tests/dynamic_workflows_e2e.sh",
+	"test:workflows:e2e:release": "CC_WORKFLOW_E2E_REQUIRED=1 bash tests/dynamic_workflows_e2e.sh",
+	"test:workflows:e2e:live": "bash tests/dynamic_workflows_live_e2e.sh",
+	"test:package:install": "bash tests/package_install_smoke.sh",
+	"test:release": "npm test && npm run test:workflows:e2e:release && npm pack --dry-run --ignore-scripts && npm run test:package:install",
+	"release:workflows": "npm run test:release && npm run test:workflows:e2e:live",
+    "check": "node --check src/cc.mjs && node --check src/pi-harness.mjs && node --check scripts/postinstall.mjs && node --check scripts/install-channel.mjs && for f in src/harness/*.mjs src/harness/adapters/*.mjs; do node --check \"$f\" || exit 1; done && python3 -c \"import pathlib; files=list(pathlib.Path('src/harnesses').rglob('*.py'))+list(pathlib.Path('src/workflows').rglob('*.py'))+[pathlib.Path('tests/e2e_harness_bridges.py')]; [compile(path.read_text(), str(path), 'exec') for path in files]\"",
+    "test": "npm run check && node tests/command_catalog.test.mjs && node tests/settings.test.mjs && node tests/slow_startup_ux.test.mjs && node tests/codex_session_index_async.test.mjs && node tests/codex_features.test.mjs && node tests/codex_thread.test.mjs && node tests/codex_fork.test.mjs && node tests/codex_management.test.mjs && node tests/codex_apps.test.mjs && node tests/codex_native_ui.test.mjs && node tests/codex_feedback_app.test.mjs && node tests/codex_memory.test.mjs && node tests/codex_import.test.mjs && node tests/codex_config_report.test.mjs && node tests/codex_parity_ui.test.mjs && node tests/claude_parity.test.mjs && node tests/shell_history.test.mjs && node tests/claude_cwd.test.mjs && node tests/append_context.test.mjs && node tests/background_tasks.test.mjs && node tests/checklists.test.mjs && node tests/checkpoints.test.mjs && node tests/remote_control.test.mjs && node tests/branch.test.mjs && node tests/adapter_boundary.test.mjs && node tests/keybindings.test.mjs && node tests/copy_response.test.mjs && node tests/prompt_color.test.mjs && node tests/elicitation.test.mjs && node tests/permissions.test.mjs && node tests/harness_adapter.test.mjs && node tests/postinstall.test.mjs && node tests/channel_installer.test.mjs && python3 -c \"compile(open('tests/fake_acp.py').read(), 'tests/fake_acp.py', 'exec')\" && bash tests/permission_auto_smoke.sh && bash tests/permission_persist_smoke.sh && bash tests/dynamic_workflows_e2e.sh && bash tests/tui_smoke.sh"
   },
   "keywords": [],
   "author": "",
-  "license": "MIT",
+  "license": "(MIT AND Apache-2.0)",
   "dependencies": {
     "@agentclientprotocol/claude-agent-acp": "0.58.1",
     "@agentclientprotocol/codex-acp": "1.1.2",
     "@agentclientprotocol/sdk": "1.2.1",
     "@anthropic-ai/claude-agent-sdk": "0.3.205",
-    "@mariozechner/pi-tui": "^0.73.0"
+    "@mariozechner/pi-tui": "^0.73.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "acorn": "^8.15.0",
+    "ajv": "^8.20.0",
+    "zod": "^4.4.3"
   }
 }

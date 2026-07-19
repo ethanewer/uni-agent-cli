@@ -25,6 +25,35 @@ export const CHANNEL_ADAPTERS = Object.freeze([
 	Object.freeze({ package: "@agentclientprotocol/codex-acp", bin: "codex-acp", minimumVersion: "1.1.2" }),
 ]);
 
+export const WORKFLOW_RELEASE_FILES = Object.freeze([
+	"LICENSE", "LICENSE-APACHE-2.0", "NOTICE", "src/harness/terminal-safety.mjs",
+	"src/harness/acp-base.mjs", "src/harness/interface.mjs", "src/harness/adapters/claude.mjs",
+	"src/harness/adapters/codex.mjs", "src/harness/adapters/cursor.mjs", "src/harness/adapters/opencode.mjs",
+	"src/harness/adapters/pi.mjs", "src/harnesses/acp_bridge.py", "src/harnesses/mini_swe_agent/bridge.py",
+	"src/harnesses/terminus_2/bridge.py",
+	"src/workflows/adapter-executor.mjs", "src/workflows/broker.mjs", "src/workflows/durability.mjs",
+	"src/workflows/journal.mjs", "src/workflows/manager.mjs", "src/workflows/mcp-server.mjs",
+	"src/workflows/meta.mjs", "src/workflows/ownership-lock.mjs", "src/workflows/personal-workflow-helper.mjs",
+	"src/workflows/project-save-helper.py", "src/workflows/registry.mjs", "src/workflows/sandbox-child.mjs",
+	"src/workflows/sandbox-parent.mjs", "src/workflows/scheduler.mjs", "src/workflows/schema-worker.mjs",
+	"src/workflows/schema.mjs", "src/workflows/state-root.mjs", "src/workflows/tui.mjs",
+	"src/workflows/types.mjs", "src/workflows/worker-supervisor.mjs", "src/workflows/worktrees.mjs",
+]);
+
+function runtimeSourceFiles(root) {
+	const files = [];
+	const visit = (directory) => {
+		for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+			const file = path.join(directory, entry.name);
+			if (entry.isSymbolicLink()) throw new Error(`release runtime source must not be a symlink: ${path.relative(root, file)}`);
+			if (entry.isDirectory()) visit(file);
+			else if (entry.isFile() && (entry.name.endsWith(".mjs") || entry.name.endsWith(".py"))) files.push(file);
+		}
+	};
+	visit(path.join(root, "src"));
+	return files.sort();
+}
+
 const ADAPTER_FALLBACK_VERSIONS = Object.freeze({
 	stable: Object.freeze({
 		"@agentclientprotocol/claude-agent-acp": "0.39.0",
@@ -396,8 +425,19 @@ export function inspectNativePayloads(releaseDir, options = {}) {
 }
 
 export function verifyRelease(releaseDir, runCommand = run) {
-	for (const relative of ["package.json", "package-lock.json", "src/cc.mjs", "src/pi-harness.mjs"]) {
-		if (!fs.statSync(path.join(releaseDir, relative)).isFile()) throw new Error(`release is missing ${relative}`);
+	let manifest;
+	try { manifest = JSON.parse(fs.readFileSync(path.join(releaseDir, "package.json"), "utf8")); }
+	catch (error) { throw new Error("release has an invalid package.json", { cause: error }); }
+	const declaredFiles = Array.isArray(manifest?.files) ? manifest.files : [];
+	const requiresWorkflows = declaredFiles.some((entry) => String(entry).startsWith("src/workflows/")) ||
+		["src/workflows", "LICENSE-APACHE-2.0", "src/harness/terminal-safety.mjs"].some((relative) => fs.existsSync(path.join(releaseDir, relative)));
+	for (const relative of ["package.json", "package-lock.json", "src/cc.mjs", "src/pi-harness.mjs", ...(requiresWorkflows ? WORKFLOW_RELEASE_FILES : [])]) {
+		let stat;
+		try { stat = fs.lstatSync(path.join(releaseDir, relative)); } catch (error) {
+			if (error?.code === "ENOENT") throw new Error(`release is missing ${relative}`);
+			throw error;
+		}
+		if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`release is missing ${relative}`);
 	}
 	const adapters = CHANNEL_ADAPTERS.map((adapter) => inspectAdapter(releaseDir, adapter));
 	inspectNativePayloads(releaseDir);
@@ -410,7 +450,17 @@ export function verifyRelease(releaseDir, runCommand = run) {
 		].join(path.delimiter),
 		CC_SKIP_ADAPTER_INSTALL: "1",
 	};
-	runCommand(process.execPath, ["--check", path.join(releaseDir, "src", "cc.mjs")], { env });
+	if (process.platform !== "win32") {
+		try {
+			runCommand("python3", ["-I", "-c", "import ast"], { env, stdio: ["ignore", "ignore", "pipe"] });
+		} catch (error) {
+			throw new Error("channel release verification requires python3 with the standard-library ast module", { cause: error });
+		}
+	}
+	for (const file of runtimeSourceFiles(releaseDir)) {
+		if (file.endsWith(".mjs")) runCommand(process.execPath, ["--check", file], { env });
+		else if (process.platform !== "win32") runCommand("python3", ["-I", "-c", "import ast,sys; ast.parse(open(sys.argv[1], encoding='utf-8').read(), filename=sys.argv[1])", file], { env });
+	}
 	runCommand(process.execPath, [path.join(releaseDir, "src", "cc.mjs"), "--help"], {
 		env,
 		stdio: ["ignore", "ignore", "pipe"],

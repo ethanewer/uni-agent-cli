@@ -38,6 +38,8 @@ import {
 	selectedOutcome,
 	stripFlags,
 } from "./harness/permissions.mjs";
+
+const WORKFLOW_WORKER_SUPERVISOR = fileURLToPath(new URL("./workflows/worker-supervisor.mjs", import.meta.url));
 import {
 	CODEX_FEEDBACK_CATEGORIES,
 	codexFeedbackUploadParams,
@@ -70,7 +72,8 @@ import {
 import { BackendCommandCatalog, backendCommandCachePath, normalizeBackendCommands } from "./harness/command-catalog.mjs";
 import { BUNDLED_ACP_ADAPTERS } from "./harness/bundled-adapters.mjs";
 import { capabilitiesFromWire } from "./harness/interface.mjs";
-import { createAdapter } from "./harness/registry.mjs";
+import { adapterClassFor, createAdapter } from "./harness/registry.mjs";
+import { sanitizeUntrustedTerminalLine, sanitizeUntrustedTerminalText } from "./harness/terminal-safety.mjs";
 import {
 	CC_NATIVE_INPUT_CONTEXT,
 	CC_UNBOUND_ACTION,
@@ -141,7 +144,6 @@ import {
 	ChecklistStore,
 	emptyChecklistSnapshot,
 } from "./harness/checklists.mjs";
-
 // Backend extensions that arrive while session/new/load/fork is in flight must
 // share the same ordered replay queue as ACP session/update messages. Symbols
 // keep these host-private records impossible to spoof over the JSON wire.
@@ -149,6 +151,15 @@ const BUFFERED_BACKGROUND_TASK_UPDATE = Symbol("cc.background-task-update");
 const BUFFERED_CURSOR_TODOS_UPDATE = Symbol("cc.cursor-todos-update");
 
 const HARNESS = "/harness";
+const WORKFLOW_MODES = Object.freeze(["disabled", "clone-only", "flexible"]);
+function normalizeWorkflowMode(value) {
+	return WORKFLOW_MODES.includes(value) ? value : "disabled";
+}
+export function resolveWorkflowMode(settings = {}, environment = process.env, platform = process.platform) {
+	if (platform !== "darwin") return "disabled";
+	if (environment.CC_DISABLE_WORKFLOWS === "1" || settings?.disableWorkflows === true) return "disabled";
+	return normalizeWorkflowMode(settings?.workflowMode);
+}
 // Commands the shared UI owns when localSlashCommands exposes them, even if a
 // backend advertises the same name.
 const RESERVED_LOCAL_COMMANDS = new Set([
@@ -195,6 +206,9 @@ const RESERVED_LOCAL_COMMANDS = new Set([
 	"cd",
 	"tasks",
 	"todos",
+	"workflow",
+	"workflows",
+	"workflow-mode",
 	"rewind",
 	"checkpoint",
 	"undo",
@@ -306,6 +320,9 @@ const EMBEDDED_FILE_MAX_TOTAL_BYTES = 2 * 1024 * 1024;
 const EMBEDDED_FILE_MAX_MENTIONS = 32;
 const DIFF_DISPLAY_MAX_LINES = 500;
 const DIFF_OUTPUT_MAX_BYTES = 512 * 1024;
+const TERMINAL_OUTPUT_CAPTURE_MAX_BYTES = 2 * 1024 * 1024;
+const WORKFLOW_ACP_FRAME_MAX_BYTES = 1024 * 1024;
+const WORKFLOW_ACP_STDIN_QUEUE_MAX_BYTES = 8 * 1024 * 1024;
 const DIFF_UNTRACKED_MANIFEST_MAX_BYTES = 128 * 1024;
 const DIFF_UNTRACKED_MAX_PATHS = 128;
 // Keep the temporary-index `git add` invocation below Windows' much smaller
@@ -325,6 +342,25 @@ const SETTINGS_LOCK_TIMEOUT_MS = 2_000;
 const SETTINGS_LOCK_STALE_MS = 10_000;
 const CODEX_LIVE_SESSION_LEASE_ORPHAN_GRACE_MS = 30_000;
 const FORK_LEGACY_PREFIX_MAX_BYTES = 16 * 1024 * 1024;
+// At most maxLiveRuns (128) completions plus retirement retries should be live.
+// Keep extra headroom for mode transitions while preventing a long-lived TUI
+// process from retaining every historical delivery ID forever.
+const WORKFLOW_DELIVERY_DEDUP_LIMIT = 512;
+
+function rememberWorkflowDeliveryId(app, deliveryId) {
+	if (!deliveryId) return true;
+	app.workflowDeliveryIds ??= new Set();
+	if (app.workflowDeliveryIds.has(deliveryId)) return false;
+	app.workflowDeliveryIds.add(deliveryId);
+	while (app.workflowDeliveryIds.size > WORKFLOW_DELIVERY_DEDUP_LIMIT) {
+		app.workflowDeliveryIds.delete(app.workflowDeliveryIds.values().next().value);
+	}
+	return true;
+}
+
+function forgetWorkflowDeliveryId(app, deliveryId) {
+	if (deliveryId) app.workflowDeliveryIds?.delete(deliveryId);
+}
 const CLIPBOARD_IMAGE_LABEL = Symbol("cc.clipboardImageLabel");
 const STREAMING_MARKDOWN_MUTABLE_TAIL_LINES = 4;
 const PI_TUI_FULL_CLEAR = "\x1b[2J\x1b[H\x1b[3J";
@@ -999,6 +1035,9 @@ export function statusLineText(status = {}, cwd = process.cwd()) {
 			: `${status.agent ?? "?"} ${status.transport ?? "acp"}`,
 		status.permissionMode ? `${status.permissionMode === "ask" ? "⏸ " : ""}permissions ${status.permissionMode}` : undefined,
 		status.remoteControl?.error ? "remote error" : status.remoteControl?.enabled ? "remote on" : status.remoteControl ? "remote off" : undefined,
+		status.workflowMode === "clone-only"
+			? "workflows clone only"
+			: status.workflowMode === "flexible" ? "workflows flexible" : undefined,
 		compactCwd(cwd),
 	].filter(Boolean);
 	return `${state}${parts.join(" · ")}`;
@@ -1206,11 +1245,12 @@ export function singleLineMenuText(value) {
 		plain += source[index];
 		index += 1;
 	}
-	return plain
+	const collapsed = plain
 		.replace(/[\r\n\t\f\v]+/g, " ")
 		.replace(/[\u0000-\u001f\u007f-\u009f]/g, "")
 		.replace(/\s+/gu, " ")
 		.trim();
+	return collapsed;
 }
 
 export class SelectionPanel {
@@ -2005,18 +2045,35 @@ export class BtwThread {
 		for (const resolve of waiters) resolve(ready);
 	}
 
+	async retireWorkflowDelivery(delivery, prompt) {
+		if (typeof this.app.retainWorkflowDeliveryRetirement === "function") {
+			return await this.app.retainWorkflowDeliveryRetirement(delivery, prompt);
+		}
+		const changed = await this.app.workflowManager?.markDelivery(delivery.runId, "origin-retired", { deliveryId: delivery.deliveryId });
+		forgetWorkflowDeliveryId(this.app, delivery.deliveryId);
+		return changed;
+	}
+
 	async submit(text, promptParts, options = {}) {
 		const trimmed = text.trim();
 		if (!trimmed) return;
 		if (!this.client || this.client.exited) {
+			if (options.workflowDelivery) {
+				await this.retireWorkflowDelivery(options.workflowDelivery, { text: trimmed, promptParts, internal: true, workflowDelivery: options.workflowDelivery });
+			}
 			this.addError("Side thread backend has exited — press esc to close.");
 			this.app.onThreadActivity();
 			return;
 		}
 		if (this.app.workingTreeMutationOperation?.terminal === true) {
-			if (options.displayText) this.addUserMessage(options.displayText);
-			else this.app.restoreQueuedTextToComposer([{ text: trimmed, promptParts }]);
-			this.addNotice("Input was not sent because Codex Cloud apply may still be changing files. Restart cc before continuing.");
+			if (options.workflowDelivery) {
+				await this.retireWorkflowDelivery(options.workflowDelivery, { text: trimmed, promptParts, internal: true, workflowDelivery: options.workflowDelivery });
+				this.addNotice("Workflow output was not delivered because Codex Cloud apply may still be changing files. Restart cc, then inspect /workflows.");
+			} else {
+				if (options.displayText) this.addUserMessage(options.displayText);
+				else this.app.restoreQueuedTextToComposer([{ text: trimmed, promptParts }]);
+				this.addNotice("Input was not sent because Codex Cloud apply may still be changing files. Restart cc before continuing.");
+			}
 			this.app.onThreadActivity();
 			return;
 		}
@@ -2045,9 +2102,11 @@ export class BtwThread {
 			this.app.menuHandle ||
 			this.app.selectionActionInProgress
 		) {
-			this.queue.push({
-				text: trimmed,
-				promptParts,
+				this.queue.push({
+					text: trimmed,
+					promptParts,
+					...(options.internal ? { internal: true } : {}),
+					...(options.workflowDelivery ? { workflowDelivery: options.workflowDelivery } : {}),
 				...(options.displayText ? { displayText: options.displayText } : {}),
 				queuedInputOrder: options.queuedInputOrder ?? this.nextQueuedInputOrder(),
 			});
@@ -2056,8 +2115,28 @@ export class BtwThread {
 			this.app.onThreadActivity();
 			return;
 		}
-		this.addUserMessage(options.displayText ?? trimmed);
-		await this.sendPrompt(trimmed, promptParts);
+		if (!options.internal) this.addUserMessage(options.displayText ?? trimmed);
+		try {
+			await this.sendPrompt(trimmed, promptParts, {
+				internal: options.internal,
+				workflowDelivery: options.workflowDelivery,
+				propagateError: Boolean(options.workflowDelivery),
+			});
+		} catch (error) {
+			if (options.workflowDelivery && error?.workflowSendingPersisted !== true) {
+				if (this.app.btwThread !== this) {
+					await this.retireWorkflowDelivery(options.workflowDelivery, { text: trimmed, promptParts, internal: true, workflowDelivery: options.workflowDelivery });
+				} else {
+					this.queue.push({
+						text: trimmed, promptParts, internal: true, workflowDelivery: options.workflowDelivery,
+						queuedInputOrder: options.queuedInputOrder ?? this.nextQueuedInputOrder(),
+					});
+					this.queue.sort((left, right) => left.queuedInputOrder - right.queuedInputOrder);
+					this.addNotice("Workflow delivery remains queued because its sending state could not be saved. Inspect /workflows and retry after storage is available.");
+				}
+				this.app.onThreadActivity();
+			}
+		}
 	}
 
 	// Called once the fork session exists; flushes anything typed while connecting.
@@ -2169,12 +2248,32 @@ export class BtwThread {
 			return;
 		}
 		this.queue.shift();
-		this.addUserMessage(prompt.displayText ?? prompt.text);
-		void this.sendPrompt(prompt.text, prompt.promptParts);
+		if (!prompt.internal) this.addUserMessage(prompt.displayText ?? prompt.text);
+		void this.sendPrompt(prompt.text, prompt.promptParts, {
+			internal: prompt.internal,
+			workflowDelivery: prompt.workflowDelivery,
+			propagateError: Boolean(prompt.workflowDelivery),
+		}).catch(async (error) => {
+			if (prompt.workflowDelivery && error?.workflowSendingPersisted !== true) {
+				if (this.app.btwThread !== this) {
+					await this.retireWorkflowDelivery(prompt.workflowDelivery, prompt);
+				} else {
+					this.queue.push(prompt);
+					this.queue.sort((left, right) => left.queuedInputOrder - right.queuedInputOrder);
+					this.addNotice("Workflow delivery remains queued because its sending state could not be saved. Inspect /workflows and retry after storage is available.");
+				}
+			}
+			this.app.onThreadActivity();
+		});
 	}
 
-	async sendPrompt(text, promptParts) {
-		if (!this.client || this.client.exited) return;
+	async sendPrompt(text, promptParts, options = {}) {
+		if (!this.client || this.client.exited) {
+			if (options.workflowDelivery) {
+				await this.retireWorkflowDelivery(options.workflowDelivery, { text, promptParts, internal: true, workflowDelivery: options.workflowDelivery });
+			}
+			return;
+		}
 		this.busy = true;
 		this.cancelRequested = false;
 		this.activeToolIds.clear();
@@ -2192,6 +2291,9 @@ export class BtwThread {
 			this.state = "done";
 			this.statusState = "";
 			this.app.onThreadActivity();
+			if ((this.app.deferredLocalSlashCommands?.length ?? 0) > 0) {
+				queueMicrotask(() => { void this.app.flushDeferredLocalSlashCommands(); });
+			}
 			// submit() and drainQueue() already rendered the user message. Continue
 			// the same FIFO drain a backend turn's finally block performs so a local
 			// response cannot strand prompts queued behind it.
@@ -2217,10 +2319,42 @@ export class BtwThread {
 			configOptions: this.client.getSessionInfo?.().configOptions ?? this.client.configOptions,
 			onNotice: (message) => this.addNotice(message),
 		});
+		const deliveryClient = options.workflowDelivery ? this.client : undefined;
+		const deliverySessionId = deliveryClient?.sessionId;
+		let workflowSendingPersisted = false;
+		let promptFailure;
 		try {
-			const result = await this.client.prompt(payload);
+			if (options.workflowDelivery) {
+				await this.app.workflowManager.markDelivery(options.workflowDelivery.runId, "sending", { deliveryId: options.workflowDelivery.deliveryId });
+				workflowSendingPersisted = true;
+				if (
+					this.app.btwThread !== this || this.client !== deliveryClient || deliveryClient.exited ||
+					!sameSessionId(deliveryClient.sessionId, deliverySessionId)
+				) {
+					await this.retireWorkflowDelivery(options.workflowDelivery, {
+						text, promptParts, internal: true, workflowDelivery: options.workflowDelivery,
+					});
+					return;
+				}
+			}
+			const result = await (deliveryClient ?? this.client).prompt(payload);
+			if (options.workflowDelivery) {
+				await this.app.workflowManager.markDelivery(options.workflowDelivery.runId, "delivered", { deliveryId: options.workflowDelivery.deliveryId });
+				forgetWorkflowDeliveryId(this.app, options.workflowDelivery.deliveryId);
+			}
 			if (!this.cancelRequested && result?.stopReason === "refusal") this.addNotice("The model declined to respond.");
 		} catch (error) {
+			promptFailure = error instanceof Error ? error : new Error(String(error));
+			try { promptFailure.workflowSendingPersisted = workflowSendingPersisted; }
+			catch {
+				promptFailure = Object.assign(new Error(promptFailure.message, { cause: error }), { workflowSendingPersisted });
+			}
+			if (options.workflowDelivery && workflowSendingPersisted) {
+				await this.app.workflowManager.markDelivery(options.workflowDelivery.runId, "ambiguous", {
+					deliveryId: options.workflowDelivery.deliveryId,
+					message: error.message ?? String(error),
+				}).catch(() => {});
+			}
 			this.addError(error.message ?? String(error));
 		} finally {
 			this.clearCancelGraceTimer();
@@ -2239,8 +2373,12 @@ export class BtwThread {
 			// entries. A cancellation settles only the active turn, so continue with
 			// those entries just as a normal turn completion does. Never revive work
 			// from a side thread that was closed or replaced while the prompt settled.
-			if (this.app.btwThread === this && this.client && !this.client.exited) this.drainQueue();
+			if (
+				this.app.btwThread === this && this.client && !this.client.exited &&
+				!(options.workflowDelivery && promptFailure && !workflowSendingPersisted)
+			) this.drainQueue();
 		}
+		if (promptFailure && options.propagateError) throw promptFailure;
 	}
 
 	interrupt() {
@@ -2259,6 +2397,11 @@ export class BtwThread {
 		this.clearCancelGraceTimer();
 		this.settleReadyWaiters(false);
 		this.cancelDeferredLocalCommands();
+		for (const prompt of this.queue.splice(0)) {
+			if (prompt.workflowDelivery) {
+				void this.retireWorkflowDelivery(prompt.workflowDelivery, prompt);
+			}
+		}
 		this.client?.stop?.();
 	}
 
@@ -2420,6 +2563,7 @@ class RootView {
 		if (!app.pageViewActive) {
 			return [
 				...app.chat.render(width),
+				...(app.workflowMode !== "disabled" && app.workflowSummary ? app.workflowSummary.render(width) : []),
 				...app.commandPanel.render(width),
 				...app.queueSummary.render(width),
 				...app.editor.render(width),
@@ -2432,6 +2576,36 @@ class RootView {
 	renderPage(width) {
 		const app = this.app;
 		const rows = app.ui.terminal.rows || 24;
+		if (app.workflowApprovalSourceView) {
+			const view = app.workflowApprovalSourceView;
+			const viewport = Math.max(0, rows - 3);
+			const body = view.source.split("\n").flatMap((part) => wrapTextWithAnsi(` ${part}`, Math.max(1, width)));
+			const maximum = Math.max(0, body.length - viewport);
+			view.scroll = Math.min(Math.max(0, view.scroll), maximum);
+			const visible = body.slice(view.scroll, view.scroll + viewport);
+			while (visible.length < viewport) visible.push("");
+			return [
+				truncateVisual(chalk.bold("cc workflow approval · exact source"), width),
+				truncateVisual("─".repeat(Math.max(1, width)), width),
+				...visible,
+				truncateVisual(chalk.dim("↑↓/pgup/pgdn scroll · esc return to approval"), width),
+			];
+		}
+		if (app.workflowPage) {
+			const menuLines = app.commandPanel.render(width);
+			const editorLines = app.editor.render(width);
+			const statusLines = app.status.render(width);
+			// Keep a useful dashboard viewport even when the normal prompt queue is
+			// large. The page needs three chrome rows, so six lines preserve three
+			// rows of selectable workflow content.
+			const minimumWorkflowPageLines = 6;
+			const maximumQueueLines = Math.max(0, rows - menuLines.length - editorLines.length - statusLines.length - minimumWorkflowPageLines);
+			const renderedQueue = app.queueSummary.render(width);
+			const queueLines = maximumQueueLines > 0 ? renderedQueue.slice(-maximumQueueLines) : [];
+			const pageHeight = Math.max(3, rows - menuLines.length - queueLines.length - editorLines.length - statusLines.length);
+			const frame = [...app.workflowPage.render(width, pageHeight), ...menuLines, ...queueLines, ...editorLines, ...statusLines];
+			return frame.length > rows ? frame.slice(frame.length - rows) : frame;
+		}
 		const onBtw = app.focusedThread === "btw" && Boolean(app.btwThread);
 		const chat = onBtw ? app.btwThread.chat : app.chat;
 		const view = onBtw ? app.btwThread.view : app.mainView;
@@ -2469,50 +2643,94 @@ class RootView {
 	}
 }
 
-class ManagedTerminal {
+export class ManagedTerminal {
 	constructor(id, params) {
 		this.id = id;
-		this.outputByteLimit = params.outputByteLimit ?? 128 * 1024;
+		this.workflowChild = params.workflowChild === true;
+		const requestedOutputLimit = Number.isSafeInteger(params.outputByteLimit) && params.outputByteLimit > 0
+			? params.outputByteLimit
+			: 128 * 1024;
+		this.outputByteLimit = Math.min(requestedOutputLimit, TERMINAL_OUTPUT_CAPTURE_MAX_BYTES);
 		this.output = "";
 		this.truncated = false;
 		this.exitStatus = undefined;
 		this.exitPromise = new Promise((resolve) => {
 			this.resolveExit = resolve;
 		});
+		this.supervisorExitStatus = undefined;
+		this.workflowTerminalStatusConfirmed = false;
 
 		const terminalEnv = {};
 		for (const entry of params.env ?? []) {
 			if (entry?.name) terminalEnv[entry.name] = entry.value ?? "";
 		}
 		const env = mergeEnvironments([process.env, terminalEnv]);
-		this.child = spawn(params.command, params.args ?? [], {
+		if (params.workflowChild === true && !params.cwdIdentity) {
+			throw new Error("workflow terminal working-directory identity is unavailable");
+		}
+		const workflowChildEnvironment = params.workflowChild === true ? serializeWorkflowChildEnvironment(env) : undefined;
+		const executable = params.workflowChild === true ? process.execPath : params.command;
+		const pinnedCwdArguments = params.workflowChild === true
+			? ["--cwd-identity", Buffer.from(JSON.stringify(params.cwdIdentity)).toString("base64url")]
+			: [];
+		const args = params.workflowChild === true
+			? [WORKFLOW_WORKER_SUPERVISOR, "--preserve-exit", "--owner-stdin", "--status-fd", "3", "--child-env-fd", "4", ...pinnedCwdArguments, params.command, ...(params.args ?? [])]
+			: (params.args ?? []);
+		this.child = spawn(executable, args, {
 			cwd: params.cwd || process.cwd(),
-			env,
-			stdio: ["ignore", "pipe", "pipe"],
+			env: params.workflowChild === true ? workflowSupervisorEnvironment(env) : env,
+			stdio: params.workflowChild === true ? ["pipe", "pipe", "pipe", "pipe", "pipe"] : ["ignore", "pipe", "pipe"],
 			// Own process group on POSIX so kill() reaches every descendant the
 			// command spawned, matching the backend child's tree-kill contract.
 			detached: process.platform !== "win32",
 		});
+		if (this.workflowChild) {
+			this.child.stdio[4].on("error", () => {});
+			this.child.stdio[4].end(workflowChildEnvironment);
+		}
 		// Decode each stream incrementally so multibyte UTF-8 split across chunk
 		// boundaries is not corrupted into replacement characters.
 		const stdoutDecoder = new StringDecoder("utf8");
 		const stderrDecoder = new StringDecoder("utf8");
+		let statusBuffer = "";
+		let statusClosed = !this.workflowChild;
+		const maybeResolveExit = () => {
+			if (!this.supervisorExitStatus || !statusClosed) return;
+			if (this.workflowChild && this.supervisorExitStatus.exitCode === 85 && !this.supervisorExitStatus.signal) {
+				try {
+					const parsed = JSON.parse(statusBuffer.trim());
+					if ((!Number.isInteger(parsed?.code) && parsed?.code !== null) || (parsed?.signal !== null && typeof parsed?.signal !== "string")) throw new Error("invalid terminal status");
+					this.exitStatus = { exitCode: parsed.code, signal: parsed.signal };
+					this.workflowTerminalStatusConfirmed = true;
+				} catch { this.exitStatus = this.supervisorExitStatus; }
+			} else this.exitStatus = this.supervisorExitStatus;
+			this.resolveExit(this.exitStatus);
+		};
+		if (this.workflowChild) {
+			this.child.stdio[3].setEncoding("utf8");
+			this.child.stdio[3].on("data", (chunk) => {
+				statusBuffer += chunk;
+				if (Buffer.byteLength(statusBuffer, "utf8") > 1024) this.child.stdio[3].destroy();
+			});
+			this.child.stdio[3].once("close", () => { statusClosed = true; maybeResolveExit(); });
+		}
 		this.child.stdout.on("data", (chunk) => this.appendOutput(stdoutDecoder.write(chunk)));
 		this.child.stderr.on("data", (chunk) => this.appendOutput(stderrDecoder.write(chunk)));
 		this.child.once("error", (error) => {
 			this.appendOutput(`${error.message}\n`);
-			this.exitStatus = { exitCode: null, signal: "ERROR" };
-			this.resolveExit(this.exitStatus);
+			this.supervisorExitStatus = { exitCode: null, signal: "ERROR" };
+			statusClosed = true;
+			maybeResolveExit();
 		});
 		this.child.once("exit", (code, signal) => {
-			this.exitStatus = { exitCode: code, signal };
+			this.supervisorExitStatus = { exitCode: code, signal };
 			// Probed moments after the leader's exit, this proves the surviving
 			// group is ours (a numeric PGID cannot be recycled in milliseconds).
 			// kill() only ever signals an exited leader's group when this latch
 			// saw genuine survivors.
 			this.groupOutlivedLeader = process.platform !== "win32" &&
 				posixProcessGroupExists(Number(this.child.pid)) === true;
-			this.resolveExit(this.exitStatus);
+			maybeResolveExit();
 		});
 	}
 
@@ -2542,6 +2760,51 @@ class ManagedTerminal {
 
 	async waitForExit() {
 		return this.exitStatus ?? (await this.exitPromise);
+	}
+
+	async stopAndWait(timeoutMs = 5_000) {
+		this.kill("SIGTERM");
+		let timer;
+		let status = await Promise.race([
+			this.waitForExit(),
+			new Promise((resolve) => { timer = setTimeout(() => resolve(undefined), timeoutMs); timer.unref?.(); }),
+		]);
+		clearTimeout(timer);
+		if (!status) {
+			this.kill("SIGKILL");
+			status = await Promise.race([
+				this.waitForExit(),
+				new Promise((resolve) => { timer = setTimeout(() => resolve(undefined), PROCESS_FORCE_KILL_WAIT_MS); timer.unref?.(); }),
+			]);
+			clearTimeout(timer);
+		}
+		if (!status) throw processTreeTerminationError("managed terminal process tree did not exit after SIGKILL");
+		const supervisorStatus = this.supervisorExitStatus ?? status;
+		if (this.workflowChild && !this.workflowTerminalStatusConfirmed) {
+			throw processTreeTerminationError("managed terminal supervisor exited without confirmed backend-tree status");
+		}
+		if (supervisorStatus.exitCode === 86) {
+			throw processTreeTerminationError("managed terminal supervisor could not confirm its process tree stopped");
+		}
+		if (this.workflowChild && supervisorStatus.signal) {
+			throw processTreeTerminationError("managed terminal supervisor was force-killed before it could confirm its backend descendants stopped");
+		}
+		if (process.platform !== "win32" && this.groupOutlivedLeader === true) {
+			// waitForExit() settles for the leader, not for its detached process
+			// group. An ordinary ACP terminal may therefore leave a resistant helper
+			// behind after the root exits; retain the exit-time ownership latch until
+			// absence is actually observed.
+			this.kill("SIGKILL");
+			const deadline = Date.now() + PROCESS_FORCE_KILL_WAIT_MS;
+			while (posixProcessGroupExists(Number(this.child.pid)) === true && Date.now() < deadline) {
+				await new Promise((resolve) => setTimeout(resolve, 25));
+			}
+			if (posixProcessGroupExists(Number(this.child.pid)) === true) {
+				throw processTreeTerminationError("managed terminal descendants did not exit after SIGKILL");
+			}
+			this.groupOutlivedLeader = false;
+		}
+		return status;
 	}
 
 	kill(signal = "SIGTERM") {
@@ -2602,14 +2865,27 @@ export class AcpClient {
 		this.stopWaiterCount = 0;
 		this.stopAndWaitPromise = undefined;
 		this.stopping = false;
+		this.workflowSupervisorTerminationFailure = undefined;
 		this.stderrTail = "";
 		this.stdoutBuffer = "";
+		this.stdoutBufferBytes = 0;
+		this.workflowStdinQueue = [];
+		this.workflowStdinQueueBytes = 0;
+		this.workflowStdinWriteActive = false;
+		this.workflowTransportFailure = undefined;
 	}
 
 	start() {
 		const command = this.agent.acp ?? this.agent;
 		const env = mergedAgentEnvironment(this.agent);
-		const cwd = process.cwd();
+		// CC_WORKFLOW_CHILD is an internal cc capability marker, not a user-facing
+		// environment option. Ordinary adapters must not inherit or configure it.
+		const workflowChild = this.agent?._ccWorkflowChild === true;
+		for (const name of Object.keys(env)) {
+			if (name.toUpperCase() === "CC_WORKFLOW_CHILD" && !workflowChild) delete env[name];
+		}
+		if (workflowChild) env.CC_WORKFLOW_CHILD = "1";
+		const cwd = this.sessionCwd ?? process.cwd();
 		// npm exposes global bins as .cmd shims on Windows, which Node cannot spawn
 		// with shell:false. Resolve only package-local JS entrypoints and execute
 		// them with Node; never enable a command shell for ACP launch data. For a
@@ -2622,12 +2898,26 @@ export class AcpClient {
 		this.exitedProcessGroupForceSignalled = false;
 		this.stopWaiterCount = 0;
 		this.stopAndWaitPromise = undefined;
-		this.child = spawn(executable, [...prefixArgs, ...(command.args ?? [])], {
+		this.workflowSupervisorTerminationFailure = undefined;
+		this.workflowChild = workflowChild;
+		const launchExecutable = workflowChild ? process.execPath : executable;
+		const pinnedCwdArguments = workflowChild && this.workflowCwdIdentity
+			? ["--cwd-identity", Buffer.from(JSON.stringify(this.workflowCwdIdentity)).toString("base64url")]
+			: [];
+		const workflowChildEnvironment = workflowChild ? serializeWorkflowChildEnvironment(env) : undefined;
+		const launchArguments = workflowChild
+			? [WORKFLOW_WORKER_SUPERVISOR, "--child-env-fd", "3", ...pinnedCwdArguments, executable, ...prefixArgs, ...(command.args ?? [])]
+			: [...prefixArgs, ...(command.args ?? [])];
+		this.child = spawn(launchExecutable, launchArguments, {
 			cwd,
-			env,
+			env: workflowChild ? workflowSupervisorEnvironment(env) : env,
 			detached: process.platform !== "win32",
-			stdio: ["pipe", "pipe", "pipe"],
+			stdio: workflowChild ? ["pipe", "pipe", "pipe", "pipe"] : ["pipe", "pipe", "pipe"],
 		});
+		if (workflowChild) {
+			this.child.stdio[3].on("error", () => {});
+			this.child.stdio[3].end(workflowChildEnvironment);
+		}
 		this.child.once("error", (error) => {
 			this.rejectPending(error);
 			this.onEvent({ type: "error", message: error.message });
@@ -2657,6 +2947,9 @@ export class AcpClient {
 		this.child.once("close", (code, signal) => {
 			this.childClosed = true;
 			this.exited = true;
+			this.workflowStdinQueue = [];
+			this.workflowStdinQueueBytes = 0;
+			this.workflowStdinWriteActive = false;
 			if (process.platform !== "win32") {
 				const pid = Number(this.child?.pid);
 				if (!Number.isInteger(pid) || pid <= 0 || !posixProcessGroupExists(pid)) {
@@ -2667,6 +2960,13 @@ export class AcpClient {
 			const tail = this.stderrTail.trim();
 			const lastLines = tail ? tail.split(/\r?\n/).filter(Boolean).slice(-3).join(" | ") : "";
 			const stderr = lastLines ? `: ${oneLine(lastLines)}` : "";
+				if (workflowChild && (code !== 85 || signal)) {
+					this.workflowSupervisorTerminationFailure = processTreeTerminationError(
+						signal
+							? `workflow worker supervisor exited by ${signal} before its separately-grouped backend descendants could be confirmed stopped${stderr}`
+							: `workflow worker supervisor exited without a confirmed descendant-shutdown sentinel (code ${String(code)})${stderr}`,
+					);
+			}
 			const hadPending = this.pending.size > 0;
 			this.rejectPending(new Error(`backend exited (${reason})${stderr}`));
 			if (!this.stopping) this.onEvent({ type: "backend_exit" });
@@ -2690,11 +2990,19 @@ export class AcpClient {
 	handleStdoutText(text) {
 		if (!text) return;
 		this.stdoutBuffer += text;
+		this.stdoutBufferBytes = (this.stdoutBufferBytes ?? 0) + Buffer.byteLength(text, "utf8");
+		if (this.workflowChild && this.stdoutBufferBytes > WORKFLOW_ACP_FRAME_MAX_BYTES) {
+			this.stdoutBuffer = "";
+			this.stdoutBufferBytes = 0;
+			this.failWorkflowTransport(Object.assign(new Error("workflow ACP backend emitted an oversized JSON frame"), { code: "WORKFLOW_ACP_FRAME_LIMIT" }));
+			return;
+		}
 		while (true) {
 			const newlineIndex = this.stdoutBuffer.indexOf("\n");
 			if (newlineIndex < 0) return;
 			this.handleLine(this.normalizeStdoutLine(this.stdoutBuffer.slice(0, newlineIndex)));
 			this.stdoutBuffer = this.stdoutBuffer.slice(newlineIndex + 1);
+			this.stdoutBufferBytes = Buffer.byteLength(this.stdoutBuffer, "utf8");
 		}
 	}
 
@@ -2702,6 +3010,7 @@ export class AcpClient {
 		if (!this.stdoutBuffer) return;
 		this.handleLine(this.normalizeStdoutLine(this.stdoutBuffer));
 		this.stdoutBuffer = "";
+		this.stdoutBufferBytes = 0;
 	}
 
 	normalizeStdoutLine(line) {
@@ -2709,6 +3018,28 @@ export class AcpClient {
 	}
 
 	async initialize(options = {}) {
+		if (options.cwd !== undefined) {
+			const requestedCwd = path.resolve(String(options.cwd));
+			let stat;
+			try {
+				stat = fs.statSync(requestedCwd);
+			} catch (error) {
+				throw new Error(`ACP working directory is unavailable: ${requestedCwd} (${error.message ?? error})`);
+			}
+			if (!stat.isDirectory()) throw new Error(`ACP working directory is not a directory: ${requestedCwd}`);
+			this.sessionCwd = requestedCwd;
+		}
+		if (options.workflowCwdIdentity !== undefined) {
+			const identity = options.workflowCwdIdentity;
+			if (!identity || ["canonicalRoot", "device", "inode"].some((key) => typeof identity[key] !== "string")) {
+				throw new Error("workflow working-directory identity is invalid");
+			}
+			this.workflowCwdIdentity = Object.freeze({
+				canonicalRoot: path.resolve(identity.canonicalRoot),
+				device: identity.device,
+				inode: identity.inode,
+			});
+		}
 		this.start();
 		const elicitationModes = {};
 		if (typeof this.onElicitationRequest === "function") {
@@ -2978,7 +3309,7 @@ export class AcpClient {
 		this.sessionListTruncated = false;
 		for (let page = 0; page < MAX_ACP_SESSION_LIST_PAGES; page += 1) {
 			const result = await this.request("session/list", {
-				cwd: process.cwd(),
+				cwd: this.sessionCwd ?? process.cwd(),
 				...(cursor ? { cursor } : {}),
 			});
 			const entries = Array.isArray(result?.sessions) ? result.sessions : [];
@@ -3097,7 +3428,10 @@ export class AcpClient {
 		);
 		return {
 			...params,
-			cwd: process.cwd(),
+			// The workflow supervisor has already chdir'd onto the approved inode.
+			// Preserve that kernel-held reference instead of giving a backend an
+			// absolute pathname it could reopen after rename/substitution.
+			cwd: this.workflowChild ? "." : (this.sessionCwd ?? process.cwd()),
 			mcpServers,
 			...(additionalDirectories.length > 0 ? { additionalDirectories } : {}),
 			...(this.agent._sessionMeta ? { _meta: this.agent._sessionMeta } : {}),
@@ -3367,12 +3701,24 @@ export class AcpClient {
 		if (this.stopAndWaitPromise) return this.stopAndWaitPromise;
 		this.stopWaiterCount = (this.stopWaiterCount ?? 0) + 1;
 		let operation;
-		operation = this.stopAndWaitOwned(timeoutMs).finally(() => {
-			// A managed terminal command can ignore stop()'s graceful SIGTERM and
-			// outlive a backend that shut down promptly. SIGKILL cannot be ignored
-			// and needs no wait (terminal.kill probes group survival itself), so
-			// this sweep closes that gap without slowing shutdown.
-			for (const terminal of this.terminals.values()) terminal.kill("SIGKILL");
+		if (this.workflowChild) {
+			// Workflow workers must prove every backend-owned terminal tree stopped.
+			this.stopping = true;
+			const terminalStops = [...this.terminals.values()].map((terminal) => terminal.stopAndWait(timeoutMs));
+			operation = Promise.allSettled([this.stopAndWaitOwned(timeoutMs), ...terminalStops]).then((results) => {
+				const failures = results.filter((result) => result.status === "rejected").map((result) => result.reason);
+				if (failures.length === 1) throw failures[0];
+				if (failures.length > 1) throw new AggregateError(failures, "one or more ACP or managed-terminal process trees did not stop cleanly");
+				if (this.workflowSupervisorTerminationFailure) throw this.workflowSupervisorTerminationFailure;
+				return results[0].value;
+			});
+		} else {
+			// Preserve the pre-workflow terminal lifecycle for ordinary adapters.
+			operation = this.stopAndWaitOwned(timeoutMs).finally(() => {
+				for (const terminal of this.terminals.values()) terminal.kill("SIGKILL");
+			});
+		}
+		operation = operation.finally(() => {
 			this.activeStopTermination = undefined;
 			this.stopWaiterCount = Math.max(0, (this.stopWaiterCount ?? 1) - 1);
 			if (this.stopAndWaitPromise === operation) this.stopAndWaitPromise = undefined;
@@ -3496,6 +3842,9 @@ export class AcpClient {
 			throw processTreeTerminationError(`ACP backend process tree did not exit after SIGKILL`);
 		}
 		this.processGroupConfirmedGone = true;
+		if (this.workflowChild) {
+			throw processTreeTerminationError(`workflow worker supervisor did not exit within ${timeoutMs}ms and was force-killed before descendant shutdown could be confirmed`);
+		}
 		throw processTreeForceKilledError(`ACP backend did not exit within ${timeoutMs}ms; its process tree was force-killed`);
 	}
 
@@ -3519,7 +3868,56 @@ export class AcpClient {
 
 	write(message) {
 		if (!this.child || this.exited) throw new Error("ACP backend is not running");
-		this.child.stdin.write(`${JSON.stringify(message)}\n`);
+		const serialized = `${JSON.stringify(message)}\n`;
+		if (!this.workflowChild) {
+			this.child.stdin.write(serialized);
+			return;
+		}
+		const bytes = Buffer.byteLength(serialized, "utf8");
+		if (bytes > WORKFLOW_ACP_FRAME_MAX_BYTES) {
+			const error = Object.assign(new Error("workflow ACP request exceeds its frame bound"), { code: "WORKFLOW_ACP_FRAME_LIMIT" });
+			this.failWorkflowTransport(error);
+			throw error;
+		}
+		if ((this.workflowStdinQueueBytes ?? 0) + bytes > WORKFLOW_ACP_STDIN_QUEUE_MAX_BYTES) {
+			const error = Object.assign(new Error("workflow ACP backend stopped reading its bounded request queue"), { code: "WORKFLOW_ACP_BACKPRESSURE_LIMIT" });
+			this.failWorkflowTransport(error);
+			throw error;
+		}
+		this.workflowStdinQueue.push({ serialized, bytes });
+		this.workflowStdinQueueBytes += bytes;
+		this.flushWorkflowStdin();
+	}
+
+	flushWorkflowStdin() {
+		if (this.workflowStdinWriteActive || this.workflowStdinQueue.length === 0 || !this.child || this.exited) return;
+		this.workflowStdinWriteActive = true;
+		const current = this.workflowStdinQueue[0];
+		try {
+			this.child.stdin.write(current.serialized, (error) => {
+				this.workflowStdinWriteActive = false;
+				if (this.workflowStdinQueue[0] === current) {
+					this.workflowStdinQueue.shift();
+					this.workflowStdinQueueBytes -= current.bytes;
+				}
+				if (error) this.failWorkflowTransport(error);
+				else this.flushWorkflowStdin();
+			});
+		} catch (error) {
+			this.workflowStdinWriteActive = false;
+			this.failWorkflowTransport(error);
+		}
+	}
+
+	failWorkflowTransport(error) {
+		if (this.workflowTransportFailure) return this.workflowTransportFailure;
+		this.workflowTransportFailure = error;
+		this.workflowStdinQueue = [];
+		this.workflowStdinQueueBytes = 0;
+		this.rejectPending(error);
+		try { this.onEvent({ type: "error", message: error.message, code: error.code }); } catch { /* teardown still proceeds */ }
+		this.stop();
+		return error;
 	}
 
 	// Best-effort write for replies/notifications: the backend may exit while a
@@ -3681,11 +4079,21 @@ export class AcpClient {
 
 	async handleTerminalRequest(message) {
 		try {
+			if (this.stopping || this.exited) throw new Error("backend is stopping; terminal requests are unavailable");
 			let result;
 			const params = message.params ?? {};
 			if (message.method === "terminal/create") {
 				const terminalId = `terminal-${this.nextTerminalId++}`;
-				this.terminals.set(terminalId, new ManagedTerminal(terminalId, params));
+				this.terminals.set(terminalId, new ManagedTerminal(terminalId, {
+					...params,
+					workflowChild: this.workflowChild === true,
+					// A workflow backend may omit or spoof terminal/create.cwd. Bind every
+					// terminal to the worker session's already-approved directory instead.
+					...(this.workflowChild === true ? {
+						cwd: this.sessionCwd,
+						cwdIdentity: this.workflowCwdIdentity,
+					} : {}),
+				}));
 				result = { terminalId };
 			} else if (message.method === "terminal/output") {
 				result = this.getTerminal(params.terminalId).outputResponse();
@@ -3696,7 +4104,8 @@ export class AcpClient {
 				result = {};
 			} else if (message.method === "terminal/release") {
 				const terminal = this.getTerminal(params.terminalId);
-				terminal.kill();
+				if (this.workflowChild) await terminal.stopAndWait();
+				else terminal.kill();
 				this.terminals.delete(params.terminalId);
 				result = {};
 			} else {
@@ -4117,6 +4526,9 @@ export class HarnessApp {
 		this.permissionQueue = [];
 		this.permissionPromptActive = false;
 		this.activeInteractiveRequest = undefined;
+		this.workflowApprovalQueue = [];
+		this.workflowApprovalPromptActive = false;
+		this.activeWorkflowApproval = undefined;
 		// Persisted "allow always" grants (harness-agnostic, survive restarts) and
 		// the per-agent runtime mode override set by /yolo. See src/harness/permissions.mjs.
 		this.permissionGrants = loadGrants();
@@ -4171,6 +4583,10 @@ export class HarnessApp {
 		this.focusedThread = "main";
 		// Page-view scroll state for the main thread (offset from top; stick=follow tail).
 		this.mainView = { offset: 0, stick: true };
+		this.workflowPage = undefined;
+		this.workflowApprovalSourceView = undefined;
+		this.workflowMode = resolveWorkflowMode(this.config.settings);
+		this.workflowsDisabled = this.workflowMode === "disabled";
 
 		const terminal = createHarnessTerminal({
 			onResizeStart: () => this.beginResize(),
@@ -4206,6 +4622,7 @@ export class HarnessApp {
 				...this.modelAndEffortForStatus(),
 				permissionMode: this.permissionModeForStatus(),
 				remoteControl: this.remoteControlStateForActiveSession(),
+				...(this.workflowsDisabled === false ? { workflowMode: this.workflowMode } : {}),
 			};
 		});
 		this.queueSummary = new PromptQueueSummary(
@@ -4227,9 +4644,9 @@ export class HarnessApp {
 		this.ui.addInputListener((data) => this.handleGlobalInput(data));
 	}
 
-	// The page view is active exactly when a /btw fork is open.
+	// /btw and workflow inspection share the one cc-owned page surface.
 	get pageViewActive() {
-		return Boolean(this.btwThread);
+		return Boolean(this.btwThread || this.workflowPage || this.workflowApprovalSourceView);
 	}
 
 	focusedView() {
@@ -4242,6 +4659,7 @@ export class HarnessApp {
 	// Arrow-Up is left for the main queue's "edit last queued" when one is queued.
 	handlePageScroll(data) {
 		if (!this.pageViewActive) return false;
+		if (this.workflowPage && !this.workflowPage.focused) return false;
 		const view = this.focusedView();
 		const page = Math.max(1, (this.ui.terminal.rows || 24) - 4);
 		const editorEmpty = !this.editor.getText();
@@ -4291,8 +4709,153 @@ export class HarnessApp {
 		}, this.keybindingsOptions);
 	}
 
+	clearWorkflowSubsystemState(options = {}) {
+		if (this.workflowDeliveryRetirementTimer) clearTimeout(this.workflowDeliveryRetirementTimer);
+		this.workflowDeliveryRetirementTimer = undefined;
+		this.workflowDeliveryRetirementPromise = undefined;
+		this.workflowSubsystemPromise = undefined;
+		this.workflowSubsystemStartupPromise = undefined;
+		this.workflowRegistry = undefined;
+		this.workflowBroker = undefined;
+		this.workflowManager = undefined;
+		this.workflowSummary = undefined;
+		this.WorkflowPageClass = undefined;
+		this.workflowAdapters = undefined;
+		this.workflowDeliveryIds = undefined;
+		this.workflowPendingDeliveries = undefined;
+		this.workflowPendingDeliveryRetirements = undefined;
+		this.workflowActiveDeliverySubmissions = undefined;
+		this.workflowStateRoot = undefined;
+		if (options.preserveRestartFence !== true) this.workflowSubsystemRequiresRestart = undefined;
+	}
+
+	async rollbackWorkflowEnable() {
+		const manager = this.workflowManager;
+		const broker = this.workflowBroker;
+		// stopAll permanently closes a manager, and a broker cleanup failure can
+		// leave privileged state partially live. Poison before either operation;
+		// only clearWorkflowSubsystemState after both settle successfully removes it.
+		this.workflowSubsystemRequiresRestart = true;
+		this.workflowSubsystemStopping = true;
+		if (this.workflowPage) this.closeWorkflowPage();
+		try {
+			manager?.abortWorktreeOperations?.(Object.assign(new Error("Workflow enable was rolled back"), { code: "WORKFLOW_ENABLE_ROLLBACK" }));
+			const results = await Promise.allSettled([
+				manager?.stopAll?.() ?? Promise.resolve(),
+				broker?.stop?.() ?? Promise.resolve(),
+			]);
+			const failure = results.find((result) => result.status === "rejected");
+			if (failure) throw new Error(`workflow enable rollback could not confirm complete cleanup: ${failure.reason?.message ?? failure.reason}`, { cause: failure.reason });
+			this.clearWorkflowSubsystemState();
+		} finally {
+			this.workflowSubsystemStopping = false;
+		}
+	}
+
+	async ensureWorkflowSubsystem() {
+		if (this.workflowSubsystemRequiresRestart) {
+			throw new Error("The workflow subsystem was partially torn down; restart cc before enabling workflows again");
+		}
+		if (this.workflowManager && this.workflowRegistry && this.workflowBroker && this.workflowSummary) return;
+		if (!this.workflowSubsystemPromise) {
+			this.workflowSubsystemPromise = (async () => {
+			const [managerModule, registryModule, tuiModule, brokerModule, sandboxModule, worktreesModule, stateRootModule] = await Promise.all([
+					import("./workflows/manager.mjs"),
+					import("./workflows/registry.mjs"),
+					import("./workflows/tui.mjs"),
+					import("./workflows/broker.mjs"),
+					import("./workflows/sandbox-parent.mjs"),
+				import("./workflows/worktrees.mjs"),
+				import("./workflows/state-root.mjs"),
+				]);
+				const sandboxProbe = sandboxModule.probeWorkflowSandbox();
+				if (!sandboxProbe.ok) throw Object.assign(new Error(sandboxProbe.message), { code: "WORKFLOW_SANDBOX_UNAVAILABLE" });
+				const gitProbe = worktreesModule.probeWorkflowGitSupport();
+				if (!gitProbe.ok) throw Object.assign(new Error(gitProbe.message), { code: "WORKFLOW_GIT_UNAVAILABLE" });
+				tuiModule.configureWorkflowStyles((style, value) => {
+					if (style === "inverse") return chalk.black.bgBlue(value);
+					return typeof chalk[style] === "function" ? chalk[style](value) : value;
+				});
+			this.workflowStateRoot = await stateRootModule.prepareWorkflowStateRoot(path.dirname(settingsPath()));
+				this.workflowAdapters = new Set();
+					this.workflowDeliveryIds = new Set();
+					this.workflowPendingDeliveries = new Map();
+					this.workflowActiveDeliverySubmissions = new Map();
+				this.workflowPendingDeliveryRetirements = new Map();
+				this.WorkflowPageClass = tuiModule.WorkflowPage;
+				this.workflowRegistry = new registryModule.WorkflowRegistry({
+					projectRoot: process.cwd(),
+					stateRoot: this.workflowStateRoot,
+					personalRoot: path.dirname(settingsPath()),
+				});
+				this.workflowBroker = new brokerModule.WorkflowBroker({
+					stateRoot: this.workflowStateRoot,
+						handle: (method, params, owner, context) => this.handleWorkflowBrokerRequest(method, params, owner, context),
+				});
+					this.workflowManager = new managerModule.WorkflowManager({
+						harnesses: this.config.agents,
+						stateRoot: this.workflowStateRoot,
+						registry: this.workflowRegistry,
+						concurrency: {
+							global: this.config.settings?.workflowGlobalConcurrency,
+							perRun: this.config.settings?.workflowRunConcurrency,
+							perHarness: this.config.settings?.workflowHarnessConcurrency,
+						},
+					approve: (request) => this.approveWorkflowLaunch(request),
+					createAdapter: ({ harness, agentConfig, workflowLaunch, onEvent, isCurrent, runId, agentId }) =>
+						this.createRuntimeAdapter(harness, agentConfig, { onEvent, isCurrent, workflowChild: true, workflowLaunch, workflowContext: { runId, agentId } }),
+					registerAdapter: (adapter) => { this.workflowAdapters.add(adapter); },
+					unregisterAdapter: (adapter) => {
+						this.workflowAdapters.delete(adapter);
+						this.cancelInteractiveRequestsForClient(adapter);
+					},
+					onChange: () => this.ui?.requestRender?.(),
+					onComplete: (run, origin) => this.deliverWorkflowCompletion(run, origin),
+					onRestartRequired: (error) => {
+						this.workflowSubsystemRequiresRestart = true;
+						this.addNotice(`The workflow subsystem entered a fail-closed state; restart cc before using workflows again: ${sanitizeUntrustedTerminalText(error.message ?? error)}`);
+						this.ui?.requestRender?.();
+					},
+				});
+				this.workflowSummary = new tuiModule.WorkflowTaskSummary(() => this.workflowManager.list());
+				// Recovery is part of enabling, not best-effort decoration. Starting the
+				// broker with unreadable durable state could reuse capacity or identities
+				// that still belong to live work from the prior process.
+				await this.workflowManager.loadHistory();
+			})();
+		}
+		try {
+			await this.workflowSubsystemPromise;
+		} catch (error) {
+			const preserveRestartFence = this.workflowSubsystemRequiresRestart === true || this.workflowManager?.terminationFailure !== undefined;
+			this.clearWorkflowSubsystemState({ preserveRestartFence });
+			throw error;
+		}
+	}
+
 	async start() {
 		this.ui.start();
+		if (this.workflowsDisabled === false) {
+			const startup = (async () => {
+			try {
+				await this.ensureWorkflowSubsystem();
+				if (this.workflowsDisabled === false && !this.workflowSubsystemStopping) await this.workflowBroker.start();
+			} catch (error) {
+				// A persisted enabled preference is only a request. If privileged startup
+				// cannot be completed, restore the exact dormant in-process shape while
+				// leaving the on-disk preference intact for a compatible future launch.
+				this.workflowMode = "disabled";
+				this.workflowsDisabled = true;
+				this.clearWorkflowSubsystemState({ preserveRestartFence: this.workflowSubsystemRequiresRestart === true });
+				this.updateAutocomplete?.();
+				this.addNotice(`Dynamic workflow launch is unavailable and workflows were disabled for this process: ${sanitizeUntrustedTerminalText(error.message ?? error)}`);
+				this.ui.requestRender();
+			}
+			})();
+			this.workflowSubsystemStartupPromise = startup;
+			try { await startup; }
+			finally { if (this.workflowSubsystemStartupPromise === startup) this.workflowSubsystemStartupPromise = undefined; }
+		}
 		this.startKeybindingsWatcher();
 		if (this.keybindingsResult?.exists && this.keybindingsResult.warnings.length > 0) {
 			this.addNotice(`Keybindings loaded with warnings. Run /keybindings show for details.`);
@@ -4458,6 +5021,34 @@ export class HarnessApp {
 
 	createRuntimeAdapter(key, agentConfig, callbacks = {}) {
 		let adapter;
+		const workflowActive = callbacks.workflowChild === true || (this.workflowsDisabled === false && !this.workflowSubsystemStopping);
+		const runtimeAdapterId = workflowActive ? randomUUID() : undefined;
+		const workflowDeliveryAdapterId = workflowActive ? (callbacks.workflowDeliveryAdapterId ?? runtimeAdapterId) : undefined;
+		let effectiveAgentConfig = callbacks.workflowChild === true
+			? {
+				...agentConfig,
+				env: { ...(agentConfig.env ?? {}), CC_WORKFLOW_CHILD: "1" },
+			}
+			: agentConfig;
+		const workflowLaunch = callbacks.workflowChild === true ? callbacks.workflowLaunch : undefined;
+			let workflowBrokerToken;
+			let workflowBrokerOwner;
+			let workflowServer;
+		if (
+			callbacks.workflowChild !== true &&
+			this.workflowsDisabled === false &&
+			!this.workflowSubsystemStopping &&
+			this.workflowBroker?.endpoint &&
+			adapterClassFor(key).workflowMcpLaunch === true
+		) {
+				workflowBrokerOwner = { adapterId: runtimeAdapterId };
+				workflowServer = this.workflowBroker.issue(workflowBrokerOwner, { mode: this.workflowMode });
+			workflowBrokerToken = workflowServer?.env?.find((entry) => entry.name === "CC_WORKFLOW_BROKER_TOKEN")?.value;
+			if (workflowServer) effectiveAgentConfig = {
+				...agentConfig,
+				mcpServers: [...(Array.isArray(agentConfig.mcpServers) ? agentConfig.mcpServers : []), workflowServer],
+			};
+		}
 		const isCurrent = () => callbacks.isCurrent?.(adapter) !== false;
 		const host = {
 			onEvent: (event) => {
@@ -4470,6 +5061,7 @@ export class HarnessApp {
 					agentKey: key,
 					adapter,
 					sourceClient: adapter,
+					workflowContext: callbacks.workflowContext,
 				});
 			},
 			requestInteraction: (method, params, context = {}) => {
@@ -4479,6 +5071,7 @@ export class HarnessApp {
 					agentKey: key,
 					adapter,
 					sourceClient: adapter,
+					workflowContext: callbacks.workflowContext,
 				});
 			},
 			onElicitationRequest: (params) => {
@@ -4487,6 +5080,7 @@ export class HarnessApp {
 					agentKey: key,
 					adapter,
 					sourceClient: adapter,
+					workflowContext: callbacks.workflowContext,
 				});
 			},
 			elicitationCapabilities: { url: true, form: true },
@@ -4495,13 +5089,181 @@ export class HarnessApp {
 			collectEnvironmentVariables: (method, environment, context) =>
 				this.collectAdapterEnvironmentVariables(method, environment, context),
 		};
-		adapter = createAdapter(key, agentConfig, host, {
-			settings: this.config.settings?.agents?.[key] ?? {},
-			globalPermissions: this.config.settings?.permissions,
-			grants: this.permissionGrants,
-			connectionFactory: createAcpConnection,
-			services: harnessAdapterServices(),
-		});
+			try {
+				const nativeSettings = this.config.settings?.agents?.[key] ?? {};
+				const launchDefaults = workflowLaunch && (workflowLaunch.model || workflowLaunch.effort)
+					? {
+						...(nativeSettings.sessionDefaults ?? {}),
+						...(workflowLaunch.model ? { model: workflowLaunch.model } : {}),
+						...(workflowLaunch.effort ? { effort: workflowLaunch.effort } : {}),
+					}
+					: nativeSettings.sessionDefaults;
+				adapter = createAdapter(key, effectiveAgentConfig, host, {
+					settings: launchDefaults === nativeSettings.sessionDefaults ? nativeSettings : { ...nativeSettings, sessionDefaults: launchDefaults },
+					workflowLaunch,
+					globalPermissions: this.config.settings?.permissions,
+					grants: this.permissionGrants,
+					connectionFactory: createAcpConnection,
+					services: harnessAdapterServices(),
+				});
+			} catch (error) {
+				if (workflowBrokerToken) this.workflowBroker?.revoke(workflowBrokerToken);
+				throw error;
+			}
+			const adapterLaunchSpec = adapter.launchSpec && typeof adapter.launchSpec === "object" ? adapter.launchSpec : undefined;
+			const mutableAdapterLaunchSpec = adapterLaunchSpec && Object.isExtensible(adapterLaunchSpec) ? adapterLaunchSpec : undefined;
+			if (callbacks.workflowChild === true && !mutableAdapterLaunchSpec) {
+				if (workflowBrokerToken) this.workflowBroker?.revoke(workflowBrokerToken);
+				throw new Error("workflow child adapters must expose a mutable launchSpec so cc can enforce its recursion fence");
+			}
+			if (callbacks.workflowChild === true && mutableAdapterLaunchSpec) {
+				// Per-agent native settings are merged while the adapter builds its
+				// launch spec. They must not be able to erase cc's recursion fence.
+				mutableAdapterLaunchSpec.env = { ...(mutableAdapterLaunchSpec.env ?? {}), CC_WORKFLOW_CHILD: "1" };
+				if (mutableAdapterLaunchSpec.acp) {
+					mutableAdapterLaunchSpec.acp.env = { ...(mutableAdapterLaunchSpec.acp.env ?? {}), CC_WORKFLOW_CHILD: "1" };
+				}
+			} else if (mutableAdapterLaunchSpec) {
+				// Preserve the pre-workflow launch shape while removing ambient/configured
+				// attempts to opt an ordinary adapter into workflow-only bridge behavior.
+				if (mutableAdapterLaunchSpec.env) delete mutableAdapterLaunchSpec.env.CC_WORKFLOW_CHILD;
+				if (mutableAdapterLaunchSpec.acp?.env) delete mutableAdapterLaunchSpec.acp.env.CC_WORKFLOW_CHILD;
+			}
+			if (mutableAdapterLaunchSpec) {
+				Object.defineProperty(mutableAdapterLaunchSpec, "_ccWorkflowChild", {
+					value: callbacks.workflowChild === true,
+					enumerable: false,
+					configurable: false,
+				});
+			}
+			if (workflowServer) {
+				// Adapter settings are applied while constructing launchSpec and may
+				// replace the registry-level mcpServers array. Install cc's reserved
+				// server into the final spawn spec so custom MCP configuration and the
+				// model-facing Workflow tools coexist.
+				const configured = Array.isArray(adapter.launchSpec?.mcpServers) ? adapter.launchSpec.mcpServers : [];
+				adapter.launchSpec.mcpServers = [
+					...configured.filter((entry) => entry?.name !== "cc-dynamic-workflows"),
+					workflowServer,
+				];
+			}
+			if (workflowActive) {
+			Object.defineProperty(adapter, "ccRuntimeAdapterId", {
+				value: runtimeAdapterId,
+				enumerable: false,
+				configurable: false,
+			});
+				Object.defineProperty(adapter, "ccWorkflowDeliveryAdapterId", {
+					value: workflowDeliveryAdapterId,
+					enumerable: false,
+					configurable: false,
+				});
+				Object.defineProperty(adapter, "ccWorkflowLaunchInjected", {
+					value: Boolean(workflowBrokerToken),
+					enumerable: false,
+					configurable: false,
+				});
+				Object.defineProperty(adapter, "ccWorkflowLaunchMode", {
+					value: workflowBrokerToken ? this.workflowMode : undefined,
+					enumerable: false,
+					configurable: false,
+				});
+		}
+			if (workflowBrokerToken) {
+				const tokenFromServer = (server) => server?.env?.find((entry) => entry.name === "CC_WORKFLOW_BROKER_TOKEN")?.value;
+				const installWorkflowServer = (server) => {
+					const servers = adapter.launchSpec?.mcpServers;
+					if (!Array.isArray(servers)) return;
+					const index = servers.findLastIndex((entry) => entry?.name === "cc-dynamic-workflows");
+					if (index >= 0 && server) servers[index] = server;
+					else if (index >= 0) servers.splice(index, 1);
+					else if (server) servers.push(server);
+				};
+				const bindWorkflowOrigin = () => {
+					if (adapter.sessionId === undefined || workflowBrokerOwner.sessionId !== undefined) return;
+					Object.assign(workflowBrokerOwner, this.workflowOwnerIdentityForAdapter(adapter));
+				};
+				const rotateWorkflowOrigin = () => {
+					this.workflowBroker.revoke(workflowBrokerToken);
+					workflowBrokerOwner = { adapterId: runtimeAdapterId };
+					workflowServer = this.workflowsDisabled === false
+						? this.workflowBroker.issue(workflowBrokerOwner, { mode: this.workflowMode })
+						: undefined;
+					workflowBrokerToken = tokenFromServer(workflowServer);
+					installWorkflowServer(workflowServer);
+				};
+				const transitionWorkflowOrigin = async (transition, args) => {
+					const prior = { owner: workflowBrokerOwner, server: workflowServer, token: workflowBrokerToken };
+					const priorSessionId = adapter.sessionId;
+					const candidateOwner = { adapterId: runtimeAdapterId };
+					const candidateServer = this.workflowsDisabled === false
+						? this.workflowBroker.issue(candidateOwner, { mode: this.workflowMode })
+						: undefined;
+					const candidateToken = tokenFromServer(candidateServer);
+					installWorkflowServer(candidateServer);
+					try {
+						const result = await transition(...args);
+						this.workflowBroker.revoke(prior.token);
+						workflowBrokerOwner = candidateOwner;
+						workflowServer = candidateServer;
+						workflowBrokerToken = candidateToken;
+						bindWorkflowOrigin();
+						return result;
+					} catch (error) {
+						if (!sameSessionId(adapter.sessionId, priorSessionId)) {
+							// Some ACP transitions commit the new session before a later replay or
+							// post-configuration step fails. Keep authority aligned with the live
+							// adapter session even though the transition still reports its error.
+							this.workflowBroker.revoke(prior.token);
+							workflowBrokerOwner = candidateOwner;
+							workflowServer = candidateServer;
+							workflowBrokerToken = candidateToken;
+							bindWorkflowOrigin();
+						} else {
+							this.workflowBroker.revoke(candidateToken);
+							installWorkflowServer(prior.server);
+						}
+						throw error;
+					}
+				};
+				const afterConnectionsRetired = typeof adapter.afterConnectionsRetired === "function"
+					? adapter.afterConnectionsRetired.bind(adapter)
+					: async () => {};
+				adapter.afterConnectionsRetired = async (...args) => {
+					await afterConnectionsRetired(...args);
+					rotateWorkflowOrigin();
+				};
+				const afterConnectionInitialized = typeof adapter.afterConnectionInitialized === "function"
+					? adapter.afterConnectionInitialized.bind(adapter)
+					: async () => {};
+				adapter.afterConnectionInitialized = async (...args) => {
+					const result = await afterConnectionInitialized(...args);
+					bindWorkflowOrigin();
+					return result;
+				};
+				const connect = adapter.connect.bind(adapter);
+				adapter.connect = async (...args) => {
+					if (workflowBrokerOwner.sessionId !== undefined) return transitionWorkflowOrigin(connect, args);
+					const result = await connect(...args);
+					bindWorkflowOrigin();
+					return result;
+				};
+					for (const method of ["newSession", "loadSession", "fork"]) {
+					if (typeof adapter[method] !== "function") continue;
+					const transition = adapter[method].bind(adapter);
+						adapter[method] = async (...args) => transitionWorkflowOrigin(transition, args);
+					}
+					if (typeof adapter.rewindCheckpoint === "function") {
+						const rewindCheckpoint = adapter.rewindCheckpoint.bind(adapter);
+						adapter.rewindCheckpoint = async (...args) => ["conversation", "both"].includes(args[1])
+							? transitionWorkflowOrigin(rewindCheckpoint, args)
+							: rewindCheckpoint(...args);
+					}
+				const stopAndWait = adapter.stopAndWait.bind(adapter);
+			adapter.stopAndWait = (...args) => Promise.resolve(stopAndWait(...args)).finally(() => {
+				this.workflowBroker.revoke(workflowBrokerToken);
+			});
+		}
 		const runtimeMode = this.runtimePermissionMode?.get(key);
 		if (runtimeMode) adapter.setRuntimePermissionMode(runtimeMode);
 		return adapter;
@@ -4518,6 +5280,12 @@ export class HarnessApp {
 
 	async switchAgent(key, transport = "acp", options = {}) {
 		if (this.stopping) return;
+		if (this.workflowSubsystemStopping && options.workflowDisableReconnect !== true) {
+			const teardown = this.workflowSubsystemTeardownPromise;
+			if (!teardown) return;
+			await teardown.catch(() => {});
+			if (this.workflowSubsystemStopping || this.stopping) return;
+		}
 		// Serialize the complete retirement + startup lifecycle. A second switch that
 		// observes `client = undefined` while the first is still reaping the old tree
 		// must wait, rather than launching a competing backend.
@@ -4559,6 +5327,12 @@ export class HarnessApp {
 			release();
 			if (this.agentSwitchTail === tail) this.agentSwitchTail = undefined;
 			if (this.agentSwitchAttempt === lifecycleAttempt) this.agentSwitchAttempt = undefined;
+			if (
+				!this.stopping &&
+				!this.sessionSwitchInProgress &&
+				!this.agentSwitchTail &&
+				(this.deferredLocalSlashCommands ?? []).some((command) => command.name === "workflow-mode")
+			) queueMicrotask(() => void this.flushDeferredLocalSlashCommands());
 		}
 	}
 
@@ -4584,12 +5358,16 @@ export class HarnessApp {
 		) {
 			this.activeAgentGeneration = (this.activeAgentGeneration ?? 0) + 1;
 			this.previousClearedSession = undefined;
+			if (this.workflowPendingDeliveries?.size) void this.activateWorkflowDeliveries();
 		}
 		const previousClient = this.client;
 		const previousBtwClient = this.btwThread?.client;
 		const transitionWasInProgress = this.sessionSwitchInProgress === true;
-		this.cancelPermissionPrompts();
-		this.closeMenu();
+		// Harness replacement revokes only the retiring parent sessions. Workflow
+		// workers have independent interactive ownership and remain live.
+		this.cancelInteractiveRequestsForClient(previousClient);
+		this.cancelInteractiveRequestsForClient(previousBtwClient);
+		if (!this.permissionPromptActive) this.closeMenu();
 		// A /btw fork is branched from the current agent's session; switching
 		// agents invalidates it, so tear it down.
 		if (this.btwThread) this.closeBtw({ stop: false });
@@ -4677,7 +5455,13 @@ export class HarnessApp {
 		// A deferred config command can discover that the backend exited and reconnect
 		// through ensureConnected(). Only that narrow reconnect path preserves the
 		// remaining ordered flush; an explicit harness switch discards old-agent work.
-		if (!this.sessionSwitchInProgress && options.preserveDeferredCommands !== true) this.deferredLocalSlashCommands = [];
+		if (!this.sessionSwitchInProgress && options.preserveDeferredCommands !== true) {
+			// Most queued commands are bound to the adapter being replaced. Workflow
+			// policy is process-global, so preserve it and drain it after this complete
+			// lifecycle turn releases its process-tree fence.
+			this.deferredLocalSlashCommands = (this.deferredLocalSlashCommands ?? [])
+				.filter((command) => command.name === "workflow-mode");
+		}
 		this.activeToolIds.clear();
 		this.activeAnonymousToolCount = 0;
 		this.seenToolThisTurn = false;
@@ -4707,6 +5491,7 @@ export class HarnessApp {
 		client = this.createRuntimeAdapter(key, agent, {
 			isCurrent: (candidate) => this.client === candidate,
 			onEvent: (event) => this.handleBackendEvent(event),
+			workflowDeliveryAdapterId: options.workflowDeliveryAdapterId,
 		});
 		this.client = client;
 		this.clientInstallSequence = (this.clientInstallSequence ?? 0) + 1;
@@ -5073,6 +5858,35 @@ export class HarnessApp {
 		// keybinding actions must not jump ahead of the buffered editor input.
 		if (this.clipboardPasteInProgress) {
 			this.bufferClipboardPasteInput(data);
+			return { consume: true };
+		}
+		if (this.workflowApprovalSourceView) {
+			const view = this.workflowApprovalSourceView;
+			const page = Math.max(1, (this.ui?.terminal?.rows || 24) - 4);
+			if (isCtrlD(data)) this.requestUserExit();
+			else if (isEscape(data) || data === "q") this.closeWorkflowApprovalSourceView();
+			else if (matchesKey(data, "up") || data === "k") view.scroll = Math.max(0, view.scroll - 1);
+			else if (matchesKey(data, "down") || data === "j") view.scroll += 1;
+			else if (matchesKey(data, "pageup")) view.scroll = Math.max(0, view.scroll - page);
+			else if (matchesKey(data, "pagedown")) view.scroll += page;
+			this.ui?.requestRender?.();
+			return { consume: true };
+		}
+		if (
+			!this.pageViewActive && !this.menuHandle && this.workflowsDisabled === false &&
+			this.workflowSummary?.activeRuns?.().length > 0 && !this.editor.getText() && isSubmitInput(data)
+		) {
+			void this.openWorkflowPage().catch((error) => this.addError(error.message ?? String(error)));
+			return { consume: true };
+		}
+		if (this.workflowPage && !this.menuHandle && isTabInput(data)) {
+			this.workflowPage.focused = !this.workflowPage.focused;
+			this.ui.requestRender();
+			return { consume: true };
+		}
+		if (this.workflowPage?.focused && !this.menuHandle) {
+			if (this.workflowPage.handleInput(data)) return { consume: true };
+			if (this.handleCcKeybindingInput(data)) return { consume: true };
 			return { consume: true };
 		}
 		if (this.handleCcKeybindingInput(data)) return { consume: true };
@@ -6096,9 +6910,9 @@ export class HarnessApp {
 	}
 
 	restoreSoftQueuedPromptsToComposer() {
-		const queued = this.promptQueue.filter((entry) => entry.timing === "afterTurn");
+		const queued = this.promptQueue.filter((entry) => entry.timing === "afterTurn" && !entry.internal);
 		if (queued.length === 0) return;
-		this.promptQueue = this.promptQueue.filter((entry) => entry.timing !== "afterTurn");
+		this.promptQueue = this.promptQueue.filter((entry) => entry.timing !== "afterTurn" || entry.internal);
 		this.pendingPromptDisplay = undefined;
 		this.restoreQueuedTextToComposer(queued);
 	}
@@ -6463,6 +7277,7 @@ export class HarnessApp {
 		if (!this.client || !this.ready || this.client.exited) {
 			this.expirePendingUserEcho(options.pendingUserEcho);
 			this.disarmPendingUnsendPrompt(options.pendingUserEcho);
+			if (options.propagateError) throw new Error("the originating workflow session is no longer ready");
 			return;
 		}
 		const client = this.client;
@@ -6476,6 +7291,7 @@ export class HarnessApp {
 		this.statusState = "working";
 		this.updateSpinner();
 		this.ui.requestRender();
+		let promptFailure;
 		try {
 			const localIdentity = localIdentityResponse(text, options.promptParts);
 			if (localIdentity) {
@@ -6498,9 +7314,13 @@ export class HarnessApp {
 			const result = await client.prompt(this.promptForActiveCapabilities(backendText, backendParts));
 			if (this.client === client) this.noticeForStopReason(result?.stopReason);
 		} catch (error) {
+			promptFailure = error;
 			if (this.client === client) this.addError(error.message ?? String(error));
 		} finally {
-			if (this.client !== client) return;
+			if (this.client !== client) {
+				if (options.propagateError) throw promptFailure ?? new Error("the originating workflow session changed while delivery was sending");
+				return;
+			}
 			this.clearCancelGraceTimer();
 			this.expirePendingUserEcho(options.pendingUserEcho);
 			this.disarmPendingUnsendPrompt(options.pendingUserEcho);
@@ -6529,6 +7349,7 @@ export class HarnessApp {
 			}
 			if (!userCanceled) this.schedulePromptQueueDrain();
 		}
+		if (promptFailure && options.propagateError) throw promptFailure;
 	}
 
 	noticeForStopReason(stopReason) {
@@ -6539,8 +7360,19 @@ export class HarnessApp {
 	}
 
 	async flushPromptQueue() {
+		if (this.promptQueueDrainPromise) return await this.promptQueueDrainPromise;
+		const operation = this.flushPromptQueueUnlocked();
+		this.promptQueueDrainPromise = operation;
+		try { return await operation; }
+		finally {
+			if (this.promptQueueDrainPromise === operation) this.promptQueueDrainPromise = undefined;
+		}
+	}
+
+	async flushPromptQueueUnlocked() {
 		if (
 			this.stopping ||
+			this.workflowSubsystemStopping ||
 			!this.ready ||
 			this.busy ||
 			this.foregroundOperation ||
@@ -6558,6 +7390,7 @@ export class HarnessApp {
 		try {
 			while (
 				this.ready &&
+				!this.workflowSubsystemStopping &&
 				!this.busy &&
 				!this.foregroundOperation &&
 				!this.workingTreeMutationOperation &&
@@ -6571,6 +7404,22 @@ export class HarnessApp {
 				this.promptQueue.length > 0
 			) {
 				const prompt = this.promptQueue.shift();
+				if (prompt.internal && !this.workflowPromptTargetIsCurrent(prompt.workflowOrigin)) {
+					if (prompt.workflowRunId) {
+						try {
+							await this.workflowManager?.markDelivery(prompt.workflowRunId, "origin-retired", { deliveryId: prompt.deliveryId });
+							forgetWorkflowDeliveryId(this, prompt.deliveryId);
+						} catch (error) {
+							this.promptQueue.unshift(prompt);
+							this.addNotice(`A workflow result could not be retired because its delivery state could not be saved: ${sanitizeUntrustedTerminalText(error.message ?? error)}`);
+							this.ui.requestRender();
+							return;
+						}
+					}
+					this.addNotice("A workflow result was not delivered because its original session changed; it remains in /workflows");
+					this.ui.requestRender();
+					continue;
+				}
 				if (
 					prompt.sessionCommandTarget &&
 					!this.isSessionCommandTargetActive(prompt.sessionCommandTarget)
@@ -6581,16 +7430,49 @@ export class HarnessApp {
 				}
 				const pendingUserEcho = this.trackPendingUserEcho(prompt.text);
 				if (!localIdentityResponse(prompt.text, prompt.promptParts)) this.conversationStarted = true;
-				const transcriptEntry = this.addUserMessage(prompt.displayText ?? prompt.text, { compactCommand: prompt.compactCommand });
-				this.armPendingUnsendPrompt({
-					text: prompt.text,
-					displayText: prompt.displayText ?? prompt.text,
-					promptParts: prompt.promptParts,
-					pendingUserEcho,
-					transcriptEntry,
-				});
-				this.ui.requestRender();
-				await this.sendPrompt(prompt.text, { pendingUserEcho, promptParts: prompt.promptParts });
+				const transcriptEntry = prompt.internal ? undefined : this.addUserMessage(prompt.displayText ?? prompt.text, { compactCommand: prompt.compactCommand });
+				if (!prompt.internal) {
+					this.armPendingUnsendPrompt({
+						text: prompt.text,
+						displayText: prompt.displayText ?? prompt.text,
+						promptParts: prompt.promptParts,
+						pendingUserEcho,
+						transcriptEntry,
+					});
+				}
+					this.ui.requestRender();
+						let workflowSendingPersisted = false;
+						try {
+							if (prompt.workflowRunId) {
+								await this.workflowManager?.markDelivery(prompt.workflowRunId, "sending", { deliveryId: prompt.deliveryId });
+								workflowSendingPersisted = true;
+								// markDelivery is durable I/O and can overlap a session replacement.
+								// Revalidate after it settles; sendPrompt then captures the client
+								// synchronously before its first await.
+								if (!this.workflowPromptTargetIsCurrent(prompt.workflowOrigin)) {
+									await this.workflowManager?.markDelivery(prompt.workflowRunId, "origin-retired", { deliveryId: prompt.deliveryId });
+									forgetWorkflowDeliveryId(this, prompt.deliveryId);
+									this.addNotice("A workflow result was not delivered because its original session changed; it remains in /workflows");
+									this.ui.requestRender();
+									continue;
+								}
+							}
+							await this.sendPrompt(prompt.text, { pendingUserEcho, promptParts: prompt.promptParts, propagateError: Boolean(prompt.workflowRunId) });
+							if (prompt.workflowRunId) {
+								await this.workflowManager?.markDelivery(prompt.workflowRunId, "delivered", { deliveryId: prompt.deliveryId });
+								forgetWorkflowDeliveryId(this, prompt.deliveryId);
+							}
+						} catch (error) {
+							if (prompt.workflowRunId && workflowSendingPersisted) {
+								await this.workflowManager?.markDelivery(prompt.workflowRunId, "ambiguous", { deliveryId: prompt.deliveryId, message: error.message ?? String(error) }).catch(() => {});
+							}
+							if (prompt.workflowRunId && !workflowSendingPersisted) {
+								this.promptQueue.unshift(prompt);
+								this.addNotice("Workflow delivery remains queued because its sending state could not be saved. Inspect /workflows and retry after storage is available.");
+								this.ui.requestRender();
+								return;
+							}
+					}
 			}
 		} finally {
 			this.flushingPromptQueue = false;
@@ -6603,12 +7485,18 @@ export class HarnessApp {
 	}
 
 	enqueuePrompt(text, timing = "afterTurn", options = {}) {
+		const workflowDelivery = Boolean(options.deliveryId);
+		if (options.deliveryId && !rememberWorkflowDeliveryId(this, options.deliveryId)) return false;
 		this.promptQueue.push({
 			text,
 			timing,
 			displayText: options.displayText,
 			compactCommand: options.compactCommand,
 			promptParts: options.promptParts,
+			...(options.internal ? { internal: true } : {}),
+			...(options.deliveryId ? { deliveryId: options.deliveryId } : {}),
+			...(options.workflowRunId ? { workflowRunId: options.workflowRunId } : {}),
+			...(options.workflowOrigin ? { workflowOrigin: options.workflowOrigin } : {}),
 			...(options.sessionCommandTarget ? { sessionCommandTarget: options.sessionCommandTarget } : {}),
 			queuedInputOrder: this.nextQueuedInputOrder(),
 		});
@@ -6616,13 +7504,169 @@ export class HarnessApp {
 		this.ui.requestRender();
 		if (timing === "afterTool") this.maybeCancelAfterTool();
 		this.schedulePromptQueueDrain();
+		return workflowDelivery ? true : undefined;
+	}
+
+	workflowPromptTargetIsCurrent(origin) {
+		return Boolean(origin && this.client && !this.client.exited &&
+			(this.client.ccWorkflowDeliveryAdapterId ?? this.client.ccRuntimeAdapterId) === origin.adapterId &&
+			(this.activeAgentGeneration ?? 0) === origin.generation &&
+			sameSessionId(this.client.sessionId, origin.sessionId));
+	}
+
+	activateWorkflowDeliveries() {
+		if (!this.workflowPendingDeliveries?.size) return Promise.resolve();
+		const retirements = [];
+		for (const [deliveryId, pending] of this.workflowPendingDeliveries) {
+			if (this.workflowSubsystemStopping) {
+				if (pending.retirementPromise || !this.workflowManager) continue;
+				pending.retirementPromise = Promise.resolve(this.workflowManager.markDelivery(pending.runId, "origin-retired", { deliveryId }))
+					.then((changed) => {
+						if (changed === false) throw new Error("workflow run is no longer available for durable delivery retirement");
+						if (this.workflowPendingDeliveries.get(deliveryId) === pending) this.workflowPendingDeliveries.delete(deliveryId);
+						forgetWorkflowDeliveryId(this, deliveryId);
+					})
+					.finally(() => { pending.retirementPromise = undefined; });
+				retirements.push(pending.retirementPromise);
+				continue;
+			}
+			if (!this.stopping && this.workflowPromptTargetIsCurrent(pending.origin)) {
+				this.workflowPendingDeliveries.delete(deliveryId);
+				this.enqueuePrompt(pending.text, "afterTurn", {
+					internal: true,
+					deliveryId,
+					workflowRunId: pending.runId,
+					workflowOrigin: pending.origin,
+				});
+				continue;
+			}
+			// Only a sanctioned policy reload inherits the delivery lineage. An
+			// unsanctioned crash reconnect can preserve generation/session values but
+			// receives a new lineage and must not capture an old completion.
+			const originCanReturn = Boolean(!this.stopping && this.client && !this.client.exited &&
+				(this.client.ccWorkflowDeliveryAdapterId ?? this.client.ccRuntimeAdapterId) === pending.origin.adapterId &&
+				(this.activeAgentGeneration ?? 0) === pending.origin.generation);
+			if (originCanReturn || pending.retirementPromise || !this.workflowManager) continue;
+			pending.retirementPromise = Promise.resolve(this.workflowManager.markDelivery(pending.runId, "origin-retired", { deliveryId }))
+				.then(() => {
+					if (this.workflowPendingDeliveries.get(deliveryId) === pending) this.workflowPendingDeliveries.delete(deliveryId);
+					forgetWorkflowDeliveryId(this, deliveryId);
+				})
+				.catch((error) => {
+					this.addNotice(`A workflow delivery could not be retired durably: ${sanitizeUntrustedTerminalText(error.message ?? error)}`);
+				})
+				.finally(() => { pending.retirementPromise = undefined; });
+			retirements.push(pending.retirementPromise);
+		}
+		return Promise.all(retirements).then(() => undefined);
+	}
+
+	retireQueuedMainWorkflowDeliveries() {
+		if (!Array.isArray(this.promptQueue) || !this.workflowManager) return Promise.resolve();
+		const retained = [];
+		const ordinary = [];
+		for (const prompt of this.promptQueue) {
+			if (prompt.internal && prompt.workflowRunId && prompt.deliveryId) retained.push(prompt);
+			else ordinary.push(prompt);
+		}
+		if (retained.length === 0) return Promise.resolve();
+		this.promptQueue = ordinary;
+		this.workflowPendingDeliveryRetirements ??= new Map();
+		for (const prompt of retained) {
+			if (!this.workflowPendingDeliveryRetirements.has(prompt.deliveryId)) {
+				this.workflowPendingDeliveryRetirements.set(prompt.deliveryId, {
+					delivery: { runId: prompt.workflowRunId, deliveryId: prompt.deliveryId },
+					prompt: { ...prompt },
+					reported: false,
+				});
+			}
+		}
+		return this.retryWorkflowDeliveryRetirements();
+	}
+
+	discardPromptQueueForSessionReset() {
+		const retirement = this.retireQueuedMainWorkflowDeliveries();
+		// retireQueuedMainWorkflowDeliveries synchronously moves durable workflow
+		// notifications into the retry store before ordinary input is discarded.
+		this.promptQueue = [];
+		this.pendingPromptDisplay = undefined;
+		return retirement;
+	}
+
+	retainWorkflowDeliveryRetirement(delivery, prompt) {
+		this.workflowPendingDeliveryRetirements ??= new Map();
+		const existing = this.workflowPendingDeliveryRetirements.get(delivery.deliveryId);
+		this.workflowPendingDeliveryRetirements.set(delivery.deliveryId, existing ?? {
+			delivery: { ...delivery },
+			prompt: { ...prompt },
+			reported: false,
+		});
+		return this.retryWorkflowDeliveryRetirements();
+	}
+
+	trackWorkflowDeliverySubmission(thread, delivery, prompt, operation) {
+		this.workflowActiveDeliverySubmissions ??= new Map();
+		let tracked;
+		tracked = Promise.resolve(operation)
+			.catch(async (error) => {
+				// submit() normally handles backend errors itself. A failure outside that
+				// path must still move the durable completion out of queued/sending before
+				// workflow teardown is allowed to unload the manager.
+				await this.retainWorkflowDeliveryRetirement(delivery, prompt);
+				this.addNotice(`A /btw workflow delivery failed and was retired: ${sanitizeUntrustedTerminalText(error.message ?? error)}`);
+			})
+			.finally(() => {
+				if (this.workflowActiveDeliverySubmissions?.get(delivery.deliveryId)?.promise === tracked) {
+					this.workflowActiveDeliverySubmissions.delete(delivery.deliveryId);
+				}
+			});
+		this.workflowActiveDeliverySubmissions.set(delivery.deliveryId, { thread, promise: tracked });
+		return tracked;
+	}
+
+	awaitWorkflowDeliverySubmissions(thread = undefined) {
+		const submissions = [...(this.workflowActiveDeliverySubmissions?.values() ?? [])]
+			.filter((entry) => thread === undefined || entry.thread === thread)
+			.map((entry) => entry.promise);
+		return Promise.all(submissions).then(() => undefined);
+	}
+
+	retryWorkflowDeliveryRetirements() {
+		if (!this.workflowPendingDeliveryRetirements?.size || !this.workflowManager) return Promise.resolve();
+		if (this.workflowDeliveryRetirementPromise) return this.workflowDeliveryRetirementPromise;
+		const pending = [...this.workflowPendingDeliveryRetirements.entries()];
+		this.workflowDeliveryRetirementPromise = Promise.all(pending.map(async ([deliveryId, entry]) => {
+			try {
+				const changed = await this.workflowManager.markDelivery(entry.delivery.runId, "origin-retired", { deliveryId });
+				if (changed === false) throw new Error("workflow run is no longer available for durable delivery retirement");
+				if (this.workflowPendingDeliveryRetirements.get(deliveryId) === entry) this.workflowPendingDeliveryRetirements.delete(deliveryId);
+				forgetWorkflowDeliveryId(this, deliveryId);
+			} catch (error) {
+				if (!entry.reported) {
+					entry.reported = true;
+					this.addNotice(`A queued workflow delivery could not be retired durably and remains pending: ${sanitizeUntrustedTerminalText(error.message ?? error)}`);
+				}
+			}
+		})).finally(() => {
+			this.workflowDeliveryRetirementPromise = undefined;
+			if (this.workflowPendingDeliveryRetirements.size && !this.stopping && !this.workflowDeliveryRetirementTimer) {
+				this.workflowDeliveryRetirementTimer = setTimeout(() => {
+					this.workflowDeliveryRetirementTimer = undefined;
+					void this.retryWorkflowDeliveryRetirements();
+				}, 1_000);
+				this.workflowDeliveryRetirementTimer.unref?.();
+			}
+		});
+		return this.workflowDeliveryRetirementPromise;
 	}
 
 	schedulePromptQueueDrain() {
 		// The transition owner must first apply deferred local commands (for
 		// example /model) to the target session. It explicitly schedules the queue
 		// after those commands finish, so never leave an early timer armed here.
-		if (this.stopping || !Array.isArray(this.promptQueue) || this.promptQueue.length === 0) return;
+		if (this.stopping || this.workflowSubsystemStopping) return;
+		this.activateWorkflowDeliveries();
+		if (!Array.isArray(this.promptQueue) || this.promptQueue.length === 0) return;
 		if (
 			this.foregroundOperation ||
 			this.workingTreeMutationOperation ||
@@ -6666,9 +7710,9 @@ export class HarnessApp {
 		}
 		// After-turn messages are a soft queue: stop, do not send, and hand them
 		// back to the composer (newline-joined) so the user can edit/resubmit.
-		const queued = this.promptQueue.filter((entry) => entry.timing === "afterTurn");
+		const queued = this.promptQueue.filter((entry) => entry.timing === "afterTurn" && !entry.internal);
 		if (queued.length > 0) {
-			this.promptQueue = this.promptQueue.filter((entry) => entry.timing !== "afterTurn");
+			this.promptQueue = this.promptQueue.filter((entry) => entry.timing !== "afterTurn" || entry.internal);
 			this.pendingPromptDisplay = undefined;
 			this.restoreQueuedTextToComposer(queued);
 		}
@@ -6693,7 +7737,9 @@ export class HarnessApp {
 
 	unqueuePromptForEditing() {
 		if (this.promptQueue.length === 0) return false;
-		const prompt = this.promptQueue.pop();
+		const index = this.promptQueue.findLastIndex((entry) => !entry.internal);
+		if (index < 0) return false;
+		const [prompt] = this.promptQueue.splice(index, 1);
 		this.editor.setText(prompt.text);
 		this.restagePromptImages(prompt.text, prompt.promptParts);
 		this.pendingPromptDisplay = prompt.displayText ? { text: prompt.text, displayText: prompt.displayText } : undefined;
@@ -6737,8 +7783,7 @@ export class HarnessApp {
 
 	deferNewSessionUntilIdle(commandName = "new") {
 		this.pendingNewSessionCommandName = commandName;
-		this.promptQueue = [];
-		this.pendingPromptDisplay = undefined;
+		void this.discardPromptQueueForSessionReset();
 		// Own the transition immediately, not only after the canceled turn settles.
 		// Config commands entered in this window must apply to the fresh session.
 		this.clearConfigUpdates();
@@ -6950,6 +7995,738 @@ export class HarnessApp {
 		return undefined;
 	}
 
+	approveWorkflowLaunch(request) {
+		return new Promise((resolve) => {
+			this.workflowApprovalQueue ??= [];
+			const pending = { request, resolve, settled: false };
+			let settled = false;
+			const finish = (value) => {
+				if (settled) return;
+				settled = true;
+				pending.settled = true;
+				request.signal?.removeEventListener("abort", onAbort);
+				this.workflowApprovalQueue = this.workflowApprovalQueue.filter((entry) => entry !== pending);
+				if (this.activeWorkflowApproval === pending) {
+					this.activeWorkflowApproval = undefined;
+					this.workflowApprovalPromptActive = false;
+				}
+				if (this.workflowApprovalSourceView?.owner === pending) this.closeWorkflowApprovalSourceView({ resume: false });
+				resolve(value);
+				queueMicrotask(() => {
+					this.drainWorkflowApprovalQueue();
+					this.drainPermissionQueue();
+				});
+			};
+			const onAbort = () => {
+				if (this.activeWorkflowApproval === pending) this.closeMenu({ cancelSelection: true });
+				if (this.workflowApprovalSourceView?.owner === pending) this.closeWorkflowApprovalSourceView({ resume: false });
+				finish(false);
+			};
+			if (request.signal?.aborted) { finish(false); return; }
+			request.signal?.addEventListener("abort", onAbort, { once: true });
+			const ask = () => {
+				if (settled) return;
+				const originModel = sanitizeUntrustedTerminalLine(request.origin.model?.id ?? "configured default");
+				const originEffort = request.origin.effort?.id ? sanitizeUntrustedTerminalLine(request.origin.effort.id) : undefined;
+				const originHarness = sanitizeUntrustedTerminalLine(request.origin.harness);
+				const phaseNames = request.meta.phases.length > 0 ? request.meta.phases.map((phase) => sanitizeUntrustedTerminalLine(phase)).join(", ") : "Unphased";
+				const entries = [
+					{
+						value: "run",
+						label: "Run once",
+						description: `${phaseNames} · ${originHarness}/${originModel}${originEffort ? `/${originEffort}` : ""} · ${this.workflowModeLabel(request.origin.workflowMode)} · concurrency ${request.launch.requestedConcurrency} requested / ${request.launch.effectiveConcurrency} effective`,
+					},
+					{
+						value: "remember",
+						label: "Run and remember for this project",
+						description: `Exact source, args, policy, limits, and saved identity · SHA-256 ${request.approvalKey}`,
+					},
+					{ value: "source", label: "Review details and source", description: `SHA-256 ${request.sourceHash}` },
+					{ value: "cancel", label: "Cancel" },
+				];
+				const recovery = request.recoveryOf ? ` Recovery of ${request.recoveryOf.slice(0, 8)} reruns every model call; no cached result is replayed.` : "";
+				const routing = request.routingDynamic ? " Flexible routing may select configured harness/model pairs at runtime." : " Clone Only locks every worker to the displayed parent tuple.";
+				this.openSelection(`Run workflow “${sanitizeUntrustedTerminalLine(request.meta.name)}”?${recovery}${routing} Budget ${request.launch.tokenBudget ?? "unlimited"}; concurrency ${request.launch.requestedConcurrency} requested / ${request.launch.effectiveConcurrency} effective.`, entries, async (entry) => {
+					this.closeMenu();
+					if (entry?.value === "source") {
+						this.openWorkflowApprovalSourceView([
+							`Workflow: ${request.meta.name}`,
+							`Source SHA-256: ${request.sourceHash}`,
+							`Approval SHA-256: ${request.approvalKey}`,
+							"",
+							"Exact approval identity:",
+							JSON.stringify(request.approvalIdentity, null, 2),
+							"",
+							"Exact approved source:",
+							fencedMarkdownBlock("js", request.source),
+						].join("\n"), ask, pending);
+						return;
+					}
+					finish(entry?.value === "run" ? { approved: true } : entry?.value === "remember" ? { approved: true, remember: true } : false);
+				}, { wrapTitle: true });
+			};
+			pending.open = ask;
+			this.workflowApprovalQueue.push(pending);
+			this.drainWorkflowApprovalQueue();
+		});
+	}
+
+	openWorkflowApprovalSourceView(source, onClose, owner) {
+		const ownsAlternateScreen = !this.pageViewActive;
+		this.workflowApprovalSourceView = {
+			source: sanitizeUntrustedTerminalText(source), scroll: 0, onClose, owner, ownsAlternateScreen,
+		};
+		if (ownsAlternateScreen) this.ui?.terminal?.enterAlternateScreen?.();
+		this.ui?.requestRender?.(true);
+	}
+
+	closeWorkflowApprovalSourceView(options = {}) {
+		const view = this.workflowApprovalSourceView;
+		if (!view) return;
+		this.workflowApprovalSourceView = undefined;
+		if (view.ownsAlternateScreen) {
+			if (this.workflowPage) this.workflowPageOwnsAlternateScreen = true;
+			else if (!this.btwThread) this.ui?.terminal?.exitAlternateScreen?.();
+		}
+		this.ui?.requestRender?.(true);
+		if (options.resume !== false) queueMicrotask(() => view.onClose?.());
+	}
+
+	drainWorkflowApprovalQueue() {
+		if (
+			this.workflowApprovalPromptActive ||
+			this.permissionPromptActive ||
+			this.menuHandle ||
+			this.selectionActionInProgress
+		) return;
+		this.workflowApprovalQueue ??= [];
+		let pending;
+		do { pending = this.workflowApprovalQueue.shift(); }
+		while (pending?.settled);
+		if (!pending) return;
+		this.activeWorkflowApproval = pending;
+		this.workflowApprovalPromptActive = true;
+		pending.open();
+	}
+
+	workflowOrigin(targetThread = undefined, authority = "human") {
+		const client = targetThread?.client ?? this.client;
+		if (!client || client.exited) throw new Error("Connect a harness before starting a workflow");
+		let state;
+		try { state = client.getSessionInfo?.(); } catch { state = undefined; }
+		const effort = currentConfigValue(findConfigOption(state, "thought_level"));
+		return {
+			adapterId: client.ccWorkflowDeliveryAdapterId ?? client.ccRuntimeAdapterId,
+			sessionId: client.sessionId,
+			generation: targetThread ? 0 : this.activeAgentGeneration,
+			thread: targetThread ? "btw" : "main",
+			harness: this.activeKey,
+			model: client.getResolvedModel?.() ?? null,
+			effort: typeof effort === "string" && effort ? { id: effort, verified: true } : null,
+			workflowMode: this.workflowMode,
+			cwd: process.cwd(),
+			authority,
+		};
+	}
+
+	workflowOriginForBrokerOwner(owner) {
+		if (!owner?.adapterId || owner.sessionId === undefined || owner.generation === undefined || !owner.thread) {
+			throw Object.assign(new Error("workflow broker origin was not bound when the harness session connected"), { code: "WORKFLOW_ORIGIN_UNBOUND" });
+		}
+		let origin;
+		if (this.client?.ccRuntimeAdapterId === owner.adapterId) origin = this.workflowOrigin(undefined, "model");
+		else if (this.btwThread?.client?.ccRuntimeAdapterId === owner.adapterId) origin = this.workflowOrigin(this.btwThread, "model");
+		else throw Object.assign(new Error("the workflow tool belongs to a retired adapter generation"), { code: "WORKFLOW_ORIGIN_RETIRED" });
+		if (!sameSessionId(owner.sessionId, origin.sessionId) || owner.generation !== origin.generation || owner.thread !== origin.thread) {
+			throw Object.assign(new Error("the workflow tool token belongs to a different session generation"), { code: "WORKFLOW_ORIGIN_RETIRED" });
+		}
+		return origin;
+	}
+
+	workflowOwnerIdentityForAdapter(adapter) {
+		if (this.client === adapter) {
+			return { sessionId: adapter.sessionId, generation: this.activeAgentGeneration ?? 0, thread: "main" };
+		}
+		if (this.btwThread?.client === adapter) {
+			return { sessionId: adapter.sessionId, generation: 0, thread: "btw" };
+		}
+		throw Object.assign(new Error("workflow launch adapter is no longer active"), { code: "WORKFLOW_ORIGIN_RETIRED" });
+	}
+
+	async handleWorkflowBrokerRequest(method, params, owner, context = {}) {
+		if (this.workflowsDisabled || this.workflowSubsystemStopping) throw new Error("dynamic workflows are disabled");
+		if (method === "Workflow") {
+			const started = await this.workflowManager.start(params, this.workflowOriginForBrokerOwner(owner), {
+				signal: context.signal,
+				deferExecution: true,
+			});
+			context.onResponseFailure?.(() => this.workflowManager.rollbackStart(started.taskId));
+			context.onResponseAccepted?.(() => this.workflowManager.acceptStart(started.taskId));
+			context.onResponseCommitted?.(() => this.workflowManager.commitStart(started.taskId));
+			if (context.signal?.aborted) {
+				await this.workflowManager.rollbackStart(started.taskId);
+				throw context.signal.reason;
+			}
+			return started;
+		}
+		if (method === "WorkflowStatus") {
+			const origin = this.workflowOriginForBrokerOwner(owner);
+			const status = this.workflowManager.status(params.taskId, params.action ?? "status", origin);
+			if (params.requireCommitted === true && !this.workflowManager.isStartCommitted(params.taskId)) {
+				throw Object.assign(new Error("workflow launch has not reached its durable commit boundary"), { code: "WORKFLOW_LAUNCH_NOT_COMMITTED" });
+			}
+			return status;
+		}
+		throw new Error(`unknown workflow broker method: ${method}`);
+	}
+
+	workflowModeLabel(mode = this.workflowMode) {
+		return ({ disabled: "Disabled", "clone-only": "Enabled — Clone Only", flexible: "Enabled — Flexible" })[mode] ?? "Disabled";
+	}
+
+	async refreshActiveWorkflowLaunchPolicy(previous, next) {
+		const original = this.client;
+		const enabling = previous === "disabled" && next !== "disabled";
+		const sideHasWorkflowPolicy = this.btwThread?.client?.ccWorkflowLaunchInjected === true;
+		if (previous === next || (!enabling && !original?.ccWorkflowLaunchInjected && !sideHasWorkflowPolicy)) return true;
+		// Side sessions cannot be reloaded safely in place. Retire them before the
+		// broker policy changes so no live model retains the previous tool contract.
+		if (sideHasWorkflowPolicy || (enabling && this.btwThread?.client)) {
+			await this.closeBtw({ immediateRender: true });
+			if (this.replacementProcessFence || (this.activeBtwShutdownClients?.size ?? 0) > 0) {
+				throw new Error("The workflow /btw process tree could not be confirmed stopped before changing policy");
+			}
+		}
+		if (!original || original.exited || (!enabling && !original.ccWorkflowLaunchInjected)) return true;
+		// Replacing an ACP adapter clears its connection, so retain the durable
+		// identity before switchAgent() retires the original client.
+		const originalSessionId = original.sessionId;
+		const originalDeliveryAdapterId = original.ccWorkflowDeliveryAdapterId ?? original.ccRuntimeAdapterId;
+		let reconnectError;
+		if (originalSessionId === undefined) {
+			reconnectError = new Error("the active harness has no durable session id to reload with the updated workflow policy");
+		} else {
+			try {
+				await this.switchAgent(this.activeKey, this.transport, {
+					quiet: true,
+					loadSessionId: originalSessionId,
+					statusState: "updating workflow policy",
+					beforeSessionReplay: () => this.resetConversationView(),
+					preserveDeferredCommands: true,
+					// This is the sole adapter replacement allowed to inherit completion
+					// routing. Crash/auth reconnects omit this capability.
+					workflowDeliveryAdapterId: originalDeliveryAdapterId,
+				});
+				if (
+					this.replacementProcessFence ||
+					!this.ready || !this.client || this.client.exited ||
+					!sameSessionId(this.client.sessionId, originalSessionId) ||
+					this.client === original ||
+					!this.client.ccRuntimeAdapterId ||
+					(adapterClassFor(this.activeKey).workflowMcpLaunch === true && (
+						this.client.ccWorkflowLaunchInjected !== true || this.client.ccWorkflowLaunchMode !== next
+					))
+				) throw new Error(`the active harness did not reconnect to the original session with the updated workflow policy (ready=${this.ready}, client=${Boolean(this.client)}, exited=${this.client?.exited}, session=${String(this.client?.sessionId)} expected=${String(originalSessionId)}, replaced=${this.client !== original}, injected=${this.client?.ccWorkflowLaunchInjected}, mode=${String(this.client?.ccWorkflowLaunchMode)} expectedMode=${next})`);
+			} catch (error) {
+				reconnectError = error;
+			}
+		}
+		if (!reconnectError) return true;
+		// A model-facing MCP process cannot have its environment or tool description
+		// rewritten in place. Fail closed by retiring every possibly stale adapter;
+		// the new mode remains active and the user can reconnect the harness.
+		this.ready = false;
+		const stale = this.client;
+		try {
+			await stopClientsForReplacement([stale, original]);
+		} catch (stopError) {
+			this.workflowSubsystemRequiresRestart = true;
+			this.recordReplacementProcessFence(stopError);
+			this.client ??= original;
+			throw new Error(`The workflow mode changed, but a stale workflow-capable backend could not be confirmed stopped: ${stopError.message ?? stopError}`, { cause: stopError });
+		}
+		this.client = undefined;
+		this.addNotice(`Workflow mode changed, but the active harness could not be reconnected automatically: ${sanitizeUntrustedTerminalText(reconnectError.message ?? reconnectError)}. Reconnect the harness before asking the model to launch a workflow.`);
+		return false;
+	}
+
+	async teardownWorkflowSubsystem() {
+		const precedingAgentSwitch = this.agentSwitchTail;
+		let reconnect;
+		const warnings = [];
+		this.workflowSubsystemStopping = true;
+		if (this.workflowPage) this.closeWorkflowPage();
+		try {
+			// Initialization and startup broker activation publish their objects in
+			// stages. Join both before taking the teardown snapshot; their enabled checks
+			// observe workflowSubsystemStopping and cannot start new privileged work.
+			await (this.workflowSubsystemPromise ?? Promise.resolve()).catch(() => {});
+			await (this.workflowSubsystemStartupPromise ?? Promise.resolve()).catch(() => {});
+			const manager = this.workflowManager;
+			const broker = this.workflowBroker;
+			// A harness replacement detaches this.client while its prior process tree
+			// is being reaped. Join that complete lifecycle before taking the adapter
+			// snapshot; its process fence is fatal to a normal Disabled transition.
+			await (precedingAgentSwitch ?? Promise.resolve());
+			if (this.replacementProcessFence || (this.activeAgentShutdownClients?.size ?? 0) > 0) {
+				throw new Error("An active harness process tree could not be confirmed stopped before disabling workflows");
+			}
+			reconnect = this.client && (this.client.ccRuntimeAdapterId || this.client.ccWorkflowLaunchInjected)
+				? { key: this.activeKey, transport: this.transport, sessionId: this.client.sessionId, client: this.client }
+				: undefined;
+			// A completion already removed from promptQueue is owned by this promise.
+			// Let it finish against its original adapter before delivery retirement or
+			// adapter replacement can begin.
+			await (this.promptQueueDrainPromise ?? Promise.resolve());
+			const mainDeliveryRetirement = manager ? this.retireQueuedMainWorkflowDeliveries() : Promise.resolve();
+				const sideShutdown = this.btwThread
+				? this.closeBtw({ immediateRender: true })
+				: Promise.resolve();
+					await Promise.all([
+						sideShutdown ?? Promise.resolve(),
+						mainDeliveryRetirement,
+						this.awaitWorkflowDeliverySubmissions(),
+					]);
+				if (this.replacementProcessFence || (this.activeBtwShutdownClients?.size ?? 0) > 0) {
+					throw new Error("The workflow /btw process tree could not be confirmed stopped before disabling workflows");
+				}
+			if (manager) {
+				await this.activateWorkflowDeliveries();
+				await this.retryWorkflowDeliveryRetirements();
+				if (this.workflowPendingDeliveries?.size || this.workflowPendingDeliveryRetirements?.size) {
+					throw new Error("workflow delivery state could not be retired durably while preparing to disable workflows");
+				}
+			}
+			manager?.abortWorktreeOperations?.(Object.assign(new Error("Workflow operation cancelled because workflows were disabled"), { code: "WORKFLOW_DISABLED" }));
+			if (manager) {
+				// stopAll also asserts that every worker process tree was confirmed gone.
+				// An unconfirmed tree aborts this transition before broker-token
+				// revocation, so cc never publishes a normal dormant Disabled state.
+				// stopAll permanently closes this manager. Until the entire disable
+				// commits, retain a poison marker so a later queued enable cannot reuse
+				// these objects if adapter teardown or delivery retirement then fails.
+				this.workflowSubsystemRequiresRestart = true;
+				await manager.stopAll();
+				// stopAll awaits every onComplete callback. Sweep both delivery stores
+				// again afterward so a callback already past its first stopping check is
+				// still retired before the manager disappears.
+				await (this.promptQueueDrainPromise ?? Promise.resolve());
+				await this.retireQueuedMainWorkflowDeliveries();
+				await this.activateWorkflowDeliveries();
+				await this.retryWorkflowDeliveryRetirements();
+				if (this.workflowPendingDeliveries?.size || this.workflowPendingDeliveryRetirements?.size) {
+					throw new Error("workflow delivery state could not be retired durably while disabling workflows");
+				}
+			}
+			// An enabled adapter has workflow-specific wrappers and, for supported
+			// harnesses, an MCP server in its session launch. Replace it with a clean
+			// disabled-mode adapter while reloading the same durable conversation.
+			if (reconnect && this.client) {
+				let reconnectError;
+				if (reconnect.sessionId === undefined) {
+					reconnectError = new Error("the active harness has no durable session id to reload without workflow wiring");
+				} else {
+					try {
+						await this.switchAgent(reconnect.key, reconnect.transport, {
+							quiet: true,
+							workflowDisableReconnect: true,
+							loadSessionId: reconnect.sessionId,
+							statusState: "disabling workflows",
+							beforeSessionReplay: () => this.resetConversationView(),
+							preserveDeferredCommands: true,
+						});
+						if (
+							this.replacementProcessFence ||
+							!this.ready || !this.client || this.client.exited ||
+							!sameSessionId(this.client.sessionId, reconnect.sessionId) ||
+							this.client === reconnect.client ||
+							this.client.ccRuntimeAdapterId || this.client.ccWorkflowLaunchInjected
+						) throw new Error("the active harness did not reconnect to the original session with disabled-mode adapter wiring");
+					} catch (error) {
+						reconnectError = error;
+					}
+				}
+				if (reconnectError) {
+					warnings.push(`The active harness could not be reconnected cleanly: ${sanitizeUntrustedTerminalText(reconnectError.message ?? reconnectError)}`);
+					this.ready = false;
+					const stale = this.client;
+					try {
+						await stopClientsForReplacement([stale, reconnect.client]);
+					} catch (stopError) {
+						// Retain a handle for shutdown/recovery and fail before the broker commit
+						// point. Disabled must never claim a dormant process boundary here.
+						this.client ??= reconnect.client;
+						throw new Error(`A workflow-capable backend could not be confirmed stopped: ${stopError.message ?? stopError}`, { cause: stopError });
+					}
+					this.client = undefined;
+				}
+			}
+			// Broker token revocation is the teardown commit point. Every model/worker
+			// process and durable completion record has already been settled. Beyond
+			// this point a partial broker failure completes fail-closed cleanup and is
+			// reported as a warning rather than restoring broken Enabled wiring.
+			try { await broker?.stop?.(); }
+			catch (error) { warnings.push(`The workflow broker reported a shutdown error: ${sanitizeUntrustedTerminalText(error.message ?? error)}`); }
+			this.clearWorkflowSubsystemState();
+			return warnings;
+		} catch (error) {
+			throw error;
+		} finally {
+			this.workflowSubsystemStopping = false;
+		}
+	}
+
+	workflowPlatformSupported() {
+		return process.platform === "darwin";
+	}
+
+	setWorkflowMode(mode, options = {}) {
+		const previous = this.workflowModeTransitionTail ?? Promise.resolve();
+		const operation = previous.catch(() => {}).then(() => this.setWorkflowModeUnlocked(mode, { ...options }));
+		this.workflowModeTransitionTail = operation;
+		void operation.finally(() => {
+			if (this.workflowModeTransitionTail === operation) this.workflowModeTransitionTail = undefined;
+			queueMicrotask(() => { void this.flushDeferredLocalSlashCommands(); });
+		}).catch(() => {});
+		return operation;
+	}
+
+	async setWorkflowModeUnlocked(mode, options = {}) {
+		if (this.stopping) throw new Error("Cannot change workflow mode while cc is shutting down");
+		const next = normalizeWorkflowMode(mode);
+		if (next !== mode) throw new Error(`Unknown workflow mode: ${mode}`);
+		if (next !== "disabled" && !this.workflowPlatformSupported()) {
+			throw Object.assign(new Error("Dynamic workflows currently require macOS"), { code: "WORKFLOW_PLATFORM_UNSUPPORTED" });
+		}
+		if (next !== "disabled" && this.workflowSubsystemRequiresRestart) {
+			throw new Error("The workflow subsystem was partially torn down; restart cc before enabling workflows again");
+		}
+		if (next !== "disabled" && this.config.settings?.disableWorkflows === true) {
+			throw new Error("disableWorkflows=true forces workflows to remain disabled; remove that setting before enabling them");
+		}
+		if (next !== "disabled" && process.env.CC_DISABLE_WORKFLOWS === "1") {
+			throw new Error("CC_DISABLE_WORKFLOWS=1 forces workflows to remain disabled");
+		}
+		const previous = this.workflowMode;
+		if (next === "disabled") {
+			let teardownWarnings = [];
+			if (previous !== "disabled" || this.workflowManager || this.workflowBroker) {
+				const teardown = this.teardownWorkflowSubsystem();
+				this.workflowSubsystemTeardownPromise = teardown;
+				try { teardownWarnings = await teardown; }
+				finally {
+					if (this.workflowSubsystemTeardownPromise === teardown) this.workflowSubsystemTeardownPromise = undefined;
+				}
+			}
+			// Publish and persist Disabled only after teardown and adapter replacement
+			// succeeded. A failed transition remains visibly enabled (and may require
+			// process restart); it never claims a dormant boundary with unconfirmed trees.
+			this.workflowMode = next;
+			this.workflowsDisabled = true;
+			this.config.settings = { ...(this.config.settings ?? {}), workflowMode: next };
+			try {
+				saveSettingsPatch({ workflowMode: next });
+			} catch (error) {
+				this.addNotice(`Workflows are disabled for this process, but the setting could not be saved: ${sanitizeUntrustedTerminalText(error.message ?? error)}`);
+			}
+			if (options.showCommand !== false) this.addCommandMessage(slashPromptDisplay("/workflow-mode", this.workflowModeLabel(next)));
+			this.updateAutocomplete();
+			if (previous !== "disabled") {
+				this.addNotice("Workflows are disabled. Active workflows were stopped and workflow tools were removed from the active harness.");
+			}
+			for (const warning of teardownWarnings) this.addNotice(warning);
+			this.ui.requestRender();
+			return true;
+		}
+		let startedBroker = false;
+		try {
+			if (next !== "disabled") await this.ensureWorkflowSubsystem();
+			if (this.stopping) throw new Error("Cannot enable workflows while cc is shutting down");
+			if (next !== "disabled" && !this.workflowBroker?.server) {
+				await this.workflowBroker.start();
+				startedBroker = true;
+			}
+			if (this.stopping) throw new Error("Cannot enable workflows while cc is shutting down");
+			saveSettingsPatch({ workflowMode: next });
+		} catch (error) {
+			if (previous === "disabled") {
+				try { await this.rollbackWorkflowEnable(); }
+				catch (rollbackError) {
+					throw new AggregateError([error, rollbackError], `Could not enable workflows and could not confirm rollback: ${rollbackError.message ?? rollbackError}`);
+				}
+			} else if (startedBroker) await this.workflowBroker?.stop().catch(() => {});
+			throw error;
+		}
+		this.workflowMode = next;
+		this.workflowsDisabled = false;
+		this.config.settings = { ...(this.config.settings ?? {}), workflowMode: next };
+		try {
+			await this.refreshActiveWorkflowLaunchPolicy(previous, next);
+		} catch (error) {
+			// A rejected command must leave one unambiguous policy. Restore both the
+			// in-memory broker policy and the durable setting before surfacing it.
+			this.workflowMode = previous;
+			this.workflowsDisabled = previous === "disabled";
+			this.config.settings = { ...(this.config.settings ?? {}), workflowMode: previous };
+			try { saveSettingsPatch({ workflowMode: previous }); }
+			catch (rollbackError) {
+				this.workflowSubsystemRequiresRestart = true;
+				throw new AggregateError([error, rollbackError], "Workflow policy refresh failed and its durable setting could not be restored; restart cc before using workflows");
+			}
+			if (previous === "disabled") {
+				try { await this.rollbackWorkflowEnable(); }
+				catch (rollbackError) {
+					throw new AggregateError([error, rollbackError], "Workflow policy refresh failed and the newly enabled subsystem could not be fully rolled back");
+				}
+			}
+			throw error;
+		}
+		if (options.showCommand !== false) this.addCommandMessage(slashPromptDisplay("/workflow-mode", this.workflowModeLabel(next)));
+		this.updateAutocomplete();
+		if (next !== "disabled") {
+			if (adapterClassFor(this.activeKey).workflowMcpLaunch !== true) {
+				this.addNotice(`${sanitizeUntrustedTerminalLine(this.activeKey)} can run as a workflow worker, but its adapter does not support model-facing workflow launch`);
+			} else if (this.client && !this.client.ccWorkflowLaunchInjected) {
+				this.addNotice("Workflow policy is enabled, but the active harness did not expose model-facing Workflow tools.");
+			}
+		}
+		this.ui.requestRender();
+		return true;
+	}
+
+	async runWorkflowModeCommand(argument = "") {
+		const requested = String(argument).trim().toLowerCase();
+		const aliases = new Map([
+			["disabled", "disabled"], ["off", "disabled"],
+			["clone", "clone-only"], ["clone-only", "clone-only"], ["enabled-clone-only", "clone-only"],
+			["flexible", "flexible"], ["open", "flexible"], ["enabled-flexible", "flexible"],
+		]);
+		if (requested) {
+			const mode = aliases.get(requested);
+			if (!mode) {
+				this.addCommandMessage(slashCommandText("workflow-mode", argument));
+				this.addNotice("Unknown workflow mode. Choose disabled, clone-only, or flexible.");
+				return;
+			}
+			await this.setWorkflowMode(mode);
+			return;
+		}
+		const descriptions = {
+			disabled: "Models and humans cannot start new workflows (default)",
+			"clone-only": "Every worker must clone the parent harness, exact model, and reasoning effort",
+			flexible: "Workflow scripts may choose any supported configured harness, model, and effort",
+		};
+		this.openSelection("Dynamic workflows", WORKFLOW_MODES.map((mode) => ({
+			value: mode,
+			label: this.workflowModeLabel(mode),
+			description: descriptions[mode],
+			active: mode === this.workflowMode,
+		})), async (entry) => {
+			this.closeMenu();
+			if (entry) await this.setWorkflowMode(entry.value);
+		});
+	}
+
+	async runWorkflowCommand(argument, options = {}) {
+		if (this.workflowsDisabled || this.workflowSubsystemStopping) throw new Error("Dynamic workflows are disabled by configuration");
+		await this.ensureWorkflowSubsystem();
+		if (this.workflowsDisabled || this.workflowSubsystemStopping || !this.workflowManager) throw new Error("Dynamic workflows were disabled while the command was opening");
+		const name = String(argument ?? "").trim();
+		this.addCommandMessage(slashCommandText("workflow", argument));
+		if (!name) {
+			const saved = await this.workflowRegistry.list({ projectRoot: process.cwd() });
+			if (saved.length === 0) {
+				this.addNotice(`No saved workflows. Add one under .cc/workflows/<name>.js or ${sanitizeUntrustedTerminalLine(path.join(path.dirname(settingsPath()), "workflows", "<name>.js"))}`);
+				return;
+			}
+			this.addNotice(saved.map((entry) => `${sanitizeUntrustedTerminalLine(entry.name)} (${sanitizeUntrustedTerminalLine(entry.scope)})${entry.error ? ` — invalid: ${sanitizeUntrustedTerminalLine(entry.error)}` : ` — ${sanitizeUntrustedTerminalLine(entry.meta.description)}`}`).join("\n"));
+			this.ui.requestRender();
+			return;
+		}
+		const started = await this.workflowManager.start({ name }, this.workflowOrigin(options.targetThread));
+		this.addNotice(`Started workflow ${sanitizeUntrustedTerminalLine(started.name)} (${sanitizeUntrustedTerminalLine(started.taskId).slice(0, 8)}). Open /workflows to inspect it.`);
+		this.ui.requestRender();
+	}
+
+	async openWorkflowPage() {
+		if (this.workflowPage) return;
+		if (this.workflowsDisabled || this.workflowSubsystemStopping) throw new Error("Dynamic workflows are disabled by configuration");
+		await this.ensureWorkflowSubsystem();
+		if (this.workflowsDisabled || this.workflowSubsystemStopping || !this.WorkflowPageClass || !this.workflowManager) {
+			throw new Error("Dynamic workflows were disabled while the task view was opening");
+		}
+		const ownsAlternateScreen = !this.pageViewActive;
+		this.workflowPage = new this.WorkflowPageClass({
+			manager: this.workflowManager,
+			onClose: () => this.closeWorkflowPage(),
+			onChange: () => this.ui.requestRender(),
+			onNotice: (message) => { this.addNotice(sanitizeUntrustedTerminalText(message)); this.ui.requestRender(); },
+			onApply: (run, agent, attempt) => this.confirmWorkflowWorktreeApply(run, agent, attempt),
+			onRecover: (run) => this.workflowManager.recover(run.id, this.workflowOrigin()),
+			onSave: (run) => this.saveWorkflowFromPage(run),
+		});
+		this.workflowPageOwnsAlternateScreen = ownsAlternateScreen;
+		if (ownsAlternateScreen) this.ui?.terminal?.enterAlternateScreen?.();
+		this.forceFullRepaint({ immediate: true });
+	}
+
+	closeWorkflowPage() {
+		if (!this.workflowPage) return;
+		this.workflowPage = undefined;
+		// A /btw page opened while this workflow page owned the alternate buffer.
+		// Transfer ownership to the still-visible side page instead of dropping it
+		// into normal terminal scrollback. closeBtw will exit when that page closes.
+		if (this.workflowPageOwnsAlternateScreen) {
+			if (this.workflowApprovalSourceView) this.workflowApprovalSourceView.ownsAlternateScreen = true;
+			else if (!this.btwThread) this.ui?.terminal?.exitAlternateScreen?.();
+		}
+		this.workflowPageOwnsAlternateScreen = false;
+		this.forceFullRepaint({ immediate: true });
+	}
+
+	async saveWorkflowFromPage(run) {
+		this.openSelection(`Save workflow ${sanitizeUntrustedTerminalLine(run.name)}`, [
+			{ value: "personal", label: "Personal", description: "Save under cc's private user state" },
+			{ value: "project", label: "Project", description: "Save under .cc/workflows in this project" },
+			{ value: "cancel", label: "Cancel", description: "Do not save" },
+		], async (entry) => {
+			this.closeMenu();
+			if (!entry || entry.value === "cancel") return;
+			const save = async (overwrite) => {
+					const saved = await this.workflowManager.save(run.id, entry.value, { overwrite, projectRoot: process.cwd() });
+				this.addNotice(`Saved workflow ${sanitizeUntrustedTerminalLine(saved.name)} to ${sanitizeUntrustedTerminalLine(saved.scope)} workflows.`);
+			};
+			try { await save(false); }
+			catch (error) {
+				if (error?.code !== "EEXIST" && !/exist/iu.test(error?.message ?? "")) throw error;
+				this.openSelection(`Overwrite existing ${sanitizeUntrustedTerminalLine(entry.value)} workflow ${sanitizeUntrustedTerminalLine(run.name)}?`, [
+					{ value: "overwrite", label: "Overwrite", description: "Replace the existing saved workflow explicitly" },
+					{ value: "cancel", label: "Cancel", description: "Keep the existing file" },
+				], async (choice) => {
+					this.closeMenu();
+					if (choice?.value === "overwrite") await save(true);
+				});
+			}
+		});
+	}
+
+	async confirmWorkflowWorktreeApply(run, agent, attempt = undefined, confirmedPreview = undefined) {
+		const selectedAttempt = attempt ?? agent.attempts?.at(-1);
+		const worktree = selectedAttempt?.worktree ?? agent.worktree;
+		const preview = confirmedPreview ?? await this.withWorkflowWorktreeMutation(
+			"Workflow worktree preview is reading repository state",
+			() => this.workflowManager.previewWorktree(run.id, agent.id, selectedAttempt?.number),
+		);
+		if (!confirmedPreview && this.workflowPage?.showApplyPreview) {
+			this.workflowPage.showApplyPreview(preview, () => this.confirmWorkflowWorktreeApply(run, agent, selectedAttempt, preview));
+			return;
+		}
+		const target = `${sanitizeUntrustedTerminalLine(preview.target.branch)}@${sanitizeUntrustedTerminalLine(preview.target.head).slice(0, 12)}`;
+		const movement = preview.target.divergedFromBase ? `different from worker base ${sanitizeUntrustedTerminalLine(worktree.base).slice(0, 12)}` : "same revision as worker base";
+		const cleanliness = preview.target.dirty ? "target has uncommitted changes" : "target is clean";
+		const summary = `${target} · ${movement} · ${cleanliness}${preview.stat ? ` · ${sanitizeUntrustedTerminalLine(preview.stat).slice(0, 140)}` : ""}`;
+		this.openSelection(`Apply retained changes from ${sanitizeUntrustedTerminalLine(agent.label)}?`, [
+			{ value: "apply", label: "Apply changes", description: summary },
+			{ value: "cancel", label: "Cancel", description: "Leave the retained worktree unchanged" },
+		], async (entry) => {
+			this.closeMenu();
+			if (entry?.value !== "apply") return;
+			const applied = await this.withWorkflowWorktreeMutation(
+				"Workflow worktree changes are being applied",
+				() => this.workflowManager.applyWorktree(run.id, agent.id, { expectedTarget: preview.target, attempt: selectedAttempt?.number }),
+			);
+			this.addNotice(`Applied workflow worktree changes${applied.stat ? `:\n${sanitizeUntrustedTerminalText(applied.stat)}` : "."}`);
+			this.ui.requestRender();
+		});
+	}
+
+	async withWorkflowWorktreeMutation(label, operation) {
+		if (this.stopping) throw new Error("cc is shutting down; workflow worktree changes cannot start");
+		if (this.busy || this.btwThread?.busy) throw new Error("Wait for running model turns before applying workflow worktree changes");
+		if ((this.activeShellInputCount ?? 0) > 0) throw new Error("Wait for running shell commands before applying workflow worktree changes");
+		if (this.workingTreeMutationOperation) throw new Error("Another working-tree mutation is already running");
+		const token = { label };
+		this.workingTreeMutationOperation = token;
+		this.ui.requestRender();
+		try { return await operation(); }
+		finally {
+			if (this.workingTreeMutationOperation === token) this.workingTreeMutationOperation = undefined;
+			this.ui.requestRender();
+		}
+	}
+
+	async deliverWorkflowCompletion(run, origin) {
+		const deliveryId = run.delivery?.deliveryId ?? `workflow:${run.id}:complete`;
+		if (this.workflowSubsystemStopping) {
+			await this.workflowManager.markDelivery(run.id, "origin-retired", { deliveryId });
+			forgetWorkflowDeliveryId(this, deliveryId);
+			return { state: "origin-retired", deliveryId };
+		}
+		const sideThread = origin.thread === "btw" ? this.btwThread : undefined;
+		const client = sideThread?.client ?? this.client;
+		const exactOrigin = client && !client.exited &&
+			(client.ccWorkflowDeliveryAdapterId ?? client.ccRuntimeAdapterId) === origin.adapterId &&
+			(origin.thread === "btw"
+				? true
+				: (this.activeAgentGeneration ?? 0) === origin.generation) &&
+			sameSessionId(client.sessionId, origin.sessionId);
+		if (!exactOrigin) {
+			const samePhysicalMain = origin.thread !== "btw" && this.client && !this.client.exited &&
+				(this.client.ccWorkflowDeliveryAdapterId ?? this.client.ccRuntimeAdapterId) === origin.adapterId &&
+				(this.activeAgentGeneration ?? 0) === origin.generation;
+			if (samePhysicalMain) {
+				const result = run.status === "completed" ? JSON.stringify(run.result) : run.error?.message ?? run.status;
+				const text = `<task-notification delivery-id="${deliveryId}" task-id="${run.id}" status="${run.status}">\nDynamic workflow “${run.name}” finished. Result: ${result}\nIf this notification is duplicated, handle this delivery ID only once. Summarize the result for the user or continue the parent task.\n</task-notification>`;
+				await this.workflowManager.markDelivery(run.id, "waiting-for-session", { deliveryId });
+				this.workflowPendingDeliveries.set(deliveryId, { text, runId: run.id, origin: { adapterId: origin.adapterId, sessionId: origin.sessionId, generation: origin.generation } });
+				this.addNotice(`Workflow ${sanitizeUntrustedTerminalLine(run.name)} ${sanitizeUntrustedTerminalLine(run.status)}; delivery is waiting for its original session to be reloaded.`);
+				this.ui.requestRender();
+				return { state: "waiting-for-session", deliveryId };
+			}
+			await this.workflowManager.markDelivery(run.id, "origin-retired", { deliveryId });
+			forgetWorkflowDeliveryId(this, deliveryId);
+			this.addNotice(`Workflow ${sanitizeUntrustedTerminalLine(run.name)} ${sanitizeUntrustedTerminalLine(run.status)}, but its original session is no longer active. The result remains in /workflows.`);
+			this.ui.requestRender();
+			return { state: "origin-retired" };
+		}
+			const result = run.status === "completed" ? JSON.stringify(run.result) : run.error?.message ?? run.status;
+			const text = `<task-notification delivery-id="${deliveryId}" task-id="${run.id}" status="${run.status}">\nDynamic workflow “${run.name}” finished. Result: ${result}\nIf this notification is duplicated, handle this delivery ID only once. Summarize the result for the user or continue the parent task.\n</task-notification>`;
+			if (this.stopping) {
+				await this.retainWorkflowDeliveryRetirement(
+					{ runId: run.id, deliveryId },
+					{ text, internal: true, workflowDelivery: { runId: run.id, deliveryId } },
+				);
+				return { state: "origin-retirement-pending", deliveryId };
+			}
+			await this.workflowManager.markDelivery(run.id, "queued", { deliveryId });
+		if (sideThread) {
+			if (!rememberWorkflowDeliveryId(this, deliveryId)) return;
+			if (this.btwThread !== sideThread || !sideThread.client || sideThread.client.exited) {
+				await this.retainWorkflowDeliveryRetirement(
+					{ runId: run.id, deliveryId },
+					{ text, internal: true, workflowDelivery: { runId: run.id, deliveryId } },
+				);
+				return { state: "origin-retirement-pending", deliveryId };
+			}
+				const delivery = { runId: run.id, deliveryId };
+				const prompt = { text, internal: true, workflowDelivery: delivery };
+				void this.trackWorkflowDeliverySubmission(
+					sideThread,
+					delivery,
+					prompt,
+					sideThread.submit(text, undefined, { internal: true, workflowDelivery: delivery }),
+				);
+			return { state: "queued", deliveryId };
+		}
+		this.enqueuePrompt(text, "afterTurn", {
+			internal: true,
+			deliveryId,
+			workflowRunId: run.id,
+			workflowOrigin: { adapterId: origin.adapterId, sessionId: origin.sessionId, generation: origin.generation },
+		});
+		return { state: "queued", deliveryId };
+	}
+
 	async runLocalSlashCommand(name, argument, options = {}) {
 		// `/plan <prompt>` and `/btw <prompt>` both become later backend prompts.
 		// Reserve staged images before any deferral so a subsequent queued message
@@ -6976,7 +8753,13 @@ export class HarnessApp {
 			}
 			return;
 		}
-		if (this.sessionSwitchInProgress && shouldDeferLocalSlashCommand(name)) {
+		const lifecycleCommandName = name === "workflows" && String(argument).trim().toLowerCase() === "mode"
+			? "workflow-mode"
+			: name;
+		if (
+			(this.sessionSwitchInProgress || this.workflowModeTransitionTail || (lifecycleCommandName === "workflow-mode" && this.agentSwitchTail)) &&
+			shouldDeferLocalSlashCommand(lifecycleCommandName)
+		) {
 			this.deferLocalSlashCommand(name, argument, {
 				promptParts: promptBearingParts,
 				targetThread: options.targetThread,
@@ -6985,7 +8768,7 @@ export class HarnessApp {
 			return;
 		}
 		const sideTarget = options.targetThread;
-		if (sideTarget && !options.fromSideCommandQueue && shouldDeferBusySideConfigCommand(name)) {
+		if (sideTarget && !options.fromSideCommandQueue && shouldDeferBusySideConfigCommand(lifecycleCommandName)) {
 			await sideTarget.deferLocalCommand(name, argument, {
 				promptParts: promptBearingParts,
 				reason: sideTarget.busy
@@ -7000,11 +8783,11 @@ export class HarnessApp {
 			});
 			return;
 		}
-		if (!sideTarget && this.busy && shouldDeferBusyConfigCommand(name)) {
+		if (!sideTarget && (this.busy || this.btwThread?.busy) && shouldDeferBusyConfigCommand(lifecycleCommandName)) {
 			this.deferLocalSlashCommand(name, argument, {
 				promptParts: promptBearingParts,
 				targetThread: options.targetThread,
-				reason: "the current turn finishes",
+				reason: this.busy ? "the current turn finishes" : "the current /btw turn finishes",
 			});
 			return;
 		}
@@ -7073,6 +8856,23 @@ export class HarnessApp {
 		}
 		if (name === "btw" || name === "side") {
 			await this.runBtw(argument, { promptParts: promptBearingParts, commandName: name });
+			return;
+		}
+		if (name === "workflow") {
+			await this.runWorkflowCommand(argument, { targetThread: options.targetThread });
+			return;
+		}
+		if (name === "workflow-mode") {
+			await this.runWorkflowModeCommand(argument);
+			return;
+		}
+		if (name === "workflows") {
+			if (String(argument).trim().toLowerCase() === "mode") {
+				await this.runWorkflowModeCommand("");
+				return;
+			}
+			this.addCommandMessage(slashCommandText(name, argument));
+			await this.openWorkflowPage();
 			return;
 		}
 		if (name === "diff") {
@@ -8404,6 +10204,11 @@ export class HarnessApp {
 		const queued = [];
 		let retainedTargetBoundPrompt = false;
 		for (const entry of queuedEntries) {
+			if (entry.internal) {
+				this.promptQueue.push(entry);
+				retainedTargetBoundPrompt = true;
+				continue;
+			}
 			if (!entry.sessionCommandTarget) {
 				queued.push(entry);
 				continue;
@@ -8472,15 +10277,19 @@ export class HarnessApp {
 		this.deferredLocalSlashCommands ??= [];
 		// A config/picker finalizer can fire while the drain that started it is
 		// still awaiting the command. Never let that finalizer create a second
-		// consumer for the same FIFO.
-		if (this.stopping || this.flushingDeferredLocalSlashCommands) return;
+		// consumer for the same FIFO. Adapter replacement is also one serialized
+		// lifecycle: policy commands must not run in the gap between two queued
+		// turns, or the later adapter can be created with stale workflow wiring.
+		if (this.stopping || this.flushingDeferredLocalSlashCommands || this.agentSwitchTail) return;
 		this.flushingDeferredLocalSlashCommands = true;
 		try {
 			while (
 				!this.stopping &&
+				!this.agentSwitchTail &&
 				!this.foregroundOperation &&
 				!this.workingTreeMutationOperation &&
 				!this.sessionSwitchInProgress &&
+				!this.workflowModeTransitionTail &&
 				!this.menuHandle &&
 				this.deferredLocalSlashCommands.length > 0
 			) {
@@ -8489,16 +10298,36 @@ export class HarnessApp {
 				// cannot run yet, leave it in place; shifting and immediately re-adding
 				// it would rotate this loop forever and starve the operation we await.
 				if (
-					(this.busy && shouldDeferBusyConfigCommand(command.name)) ||
+					((this.busy || this.btwThread?.busy) && shouldDeferBusyConfigCommand(command.name)) ||
 					((this.asyncPickerLoadCount ?? 0) > 0 && shouldDeferDuringLocalOperation(command.name)) ||
 					((this.configUpdateCount ?? 0) > 0 && shouldDeferDuringLocalOperation(command.name))
 				) break;
-				this.deferredLocalSlashCommands.shift();
-				await this.runLocalSlashCommand(command.name, command.argument, {
-					fromDeferredLocalSlashQueue: true,
-					promptParts: command.promptParts,
-					targetThread: command.targetThread,
-				});
+				try {
+					// Keep ownership in the FIFO until execution commits. A fatal adapter
+					// process fence can make a deferred policy transition reject; shifting
+					// first would silently lose the user's command from a fire-and-forget
+					// lifecycle drain.
+					await this.runLocalSlashCommand(command.name, command.argument, {
+						fromDeferredLocalSlashQueue: true,
+						promptParts: command.promptParts,
+						targetThread: command.targetThread,
+					});
+					const commandIndex = this.deferredLocalSlashCommands.indexOf(command);
+					if (commandIndex >= 0) this.deferredLocalSlashCommands.splice(commandIndex, 1);
+				} catch (error) {
+					// Preserve strict FIFO order by returning the failed command and every
+					// later deferred command to visible user input. The rejection is
+					// reported here because many lifecycle drains are intentionally
+					// scheduled without an awaiting caller.
+					const deferred = this.deferredLocalSlashCommands.splice(0);
+					this.restoreQueuedTextToComposer(deferred.map((entry) => ({
+						text: slashCommandText(entry.name, entry.argument),
+						promptParts: entry.promptParts,
+						queuedInputOrder: entry.queuedInputOrder,
+					})));
+					this.addError?.(`Could not run queued ${slashCommandText(command.name, command.argument)}: ${error.message ?? error}. The command was returned to the composer.`);
+					break;
+				}
 			}
 		} finally {
 			this.flushingDeferredLocalSlashCommands = false;
@@ -8926,6 +10755,7 @@ export class HarnessApp {
 				? `remote ${remoteControl.url}${remoteControl.error ? ` (last change failed: ${remoteControl.error})` : ""}`
 				: remoteControl?.error ? `remote error: ${remoteControl.error}` : remoteControl ? "remote off" : undefined,
 			formatUsageSummary(usage),
+			this.workflowsDisabled === false ? `workflows ${this.workflowModeLabel()}` : undefined,
 			`theme ${themeLabel(this.themeName)}`,
 			state.sessionId ? `session ${state.sessionId}` : undefined,
 		].filter(Boolean);
@@ -12465,9 +14295,8 @@ export class HarnessApp {
 			// queue in deferNewSessionUntilIdle(); anything present now was typed while
 			// cancellation settled and belongs to the replacement session.
 			if (!options.afterTurn) {
-				this.promptQueue = [];
+				await this.discardPromptQueueForSessionReset();
 				this.deferredLocalSlashCommands = [];
-				this.pendingPromptDisplay = undefined;
 			}
 			this.statusState = "starting new session";
 			this.clearConfigUpdates();
@@ -12506,8 +14335,7 @@ export class HarnessApp {
 		// the command. On the after-turn continuation, the queue contains only input
 		// entered while cancellation was settling, which belongs to the new session.
 		if (!options.afterTurn) {
-			this.promptQueue = [];
-			this.pendingPromptDisplay = undefined;
+			await this.discardPromptQueueForSessionReset();
 		}
 		this.statusState = "starting new session";
 		this.clearConfigUpdates();
@@ -13252,6 +15080,25 @@ export class HarnessApp {
 
 	closeBtw(options = {}) {
 		const thread = this.btwThread;
+		// Capture submissions already removed from the side queue. Clearing btwThread
+		// below makes each submit path retire/reclassify itself; the returned fence
+		// keeps the workflow manager alive until that durable transition finishes.
+		const activeWorkflowDeliverySubmissions = this.awaitWorkflowDeliverySubmissions?.(thread) ?? Promise.resolve();
+		let hasQueuedWorkflowDelivery = false;
+		for (const prompt of thread?.queue ?? []) {
+			if (prompt.workflowDelivery?.deliveryId) {
+				hasQueuedWorkflowDelivery = true;
+				this.workflowPendingDeliveryRetirements ??= new Map();
+				this.workflowPendingDeliveryRetirements.set(prompt.workflowDelivery.deliveryId, {
+					delivery: prompt.workflowDelivery,
+					prompt: { ...prompt },
+					reported: false,
+				});
+			}
+		}
+		const workflowDeliveryRetirements = hasQueuedWorkflowDelivery
+			? HarnessApp.prototype.retryWorkflowDeliveryRetirements.call(this)
+			: Promise.resolve();
 		const skipUi = options.skipUi === true;
 		if (!skipUi && this.menuHandle instanceof ChecklistPanel && this.menuHandle.target?.targetThread === thread) {
 			this.closeMenu();
@@ -13286,10 +15133,16 @@ export class HarnessApp {
 			// fork page was open. A revoked terminal skips every UI operation here; even
 			// closing an active side checklist can otherwise write or block before the
 			// backend process trees have been signalled.
-			this.ui.terminal.exitAlternateScreen?.();
+			if (this.workflowPage) this.workflowPageOwnsAlternateScreen = true;
+			else if (this.workflowApprovalSourceView) this.workflowApprovalSourceView.ownsAlternateScreen = true;
+			else this.ui.terminal.exitAlternateScreen?.();
 			this.forceFullRepaint({ immediate: options.immediateRender === true });
 		}
-		return this.btwShutdownTail ?? Promise.resolve();
+		return Promise.all([
+			this.btwShutdownTail ?? Promise.resolve(),
+			workflowDeliveryRetirements,
+			activeWorkflowDeliverySubmissions,
+		]).then(() => undefined);
 	}
 
 	// Codex's ACP bridge does not expose session/fork — session/load and
@@ -13780,9 +15633,11 @@ export class HarnessApp {
 				if (!this.sessionSwitchInProgress && (this.deferredLocalSlashCommands?.length ?? 0) > 0) {
 					await this.flushDeferredLocalSlashCommands();
 				}
-				this.btwThread?.drainQueue?.();
-				this.schedulePromptQueueDrain();
-				this.ui.requestRender();
+					this.btwThread?.drainQueue?.();
+					this.schedulePromptQueueDrain();
+					this.drainWorkflowApprovalQueue();
+					this.drainPermissionQueue();
+					this.ui.requestRender();
 			}
 		};
 		const guardedOnSelect = guardSelectionAction(onSelect);
@@ -13871,6 +15726,10 @@ export class HarnessApp {
 		}
 		this.schedulePromptQueueDrain();
 		this.btwThread?.drainQueue?.();
+		queueMicrotask(() => {
+			this.drainWorkflowApprovalQueue();
+			this.drainPermissionQueue();
+		});
 	}
 
 	updateFilterEditor(query) {
@@ -13969,11 +15828,13 @@ export class HarnessApp {
 	completeInteractiveRequest(request) {
 		if (this.activeInteractiveRequest === request) this.activeInteractiveRequest = undefined;
 		this.permissionPromptActive = false;
+		this.drainWorkflowApprovalQueue();
 		this.drainPermissionQueue();
 	}
 
 	drainPermissionQueue() {
-		if (this.permissionPromptActive) return;
+		if (this.permissionPromptActive || this.workflowApprovalPromptActive || this.menuHandle || this.selectionActionInProgress) return;
+		this.permissionQueue ??= [];
 		const request = this.permissionQueue.shift();
 		if (!request) return;
 		this.permissionPromptActive = true;
@@ -14013,7 +15874,7 @@ export class HarnessApp {
 		const sourceClient = request?.context?.sourceClient;
 		if (!sourceClient) return true;
 		if (sourceClient.exited || sourceClient.stopping) return false;
-		if (this.client !== sourceClient && this.btwThread?.client !== sourceClient) return false;
+		if (this.client !== sourceClient && this.btwThread?.client !== sourceClient && !this.workflowAdapters?.has(sourceClient)) return false;
 		const requestedSessionId = request.params?.sessionId ?? request.params?.scope?.sessionId;
 		if (requestedSessionId !== undefined && sourceClient.sessionId !== undefined) {
 			return sameSessionId(requestedSessionId, sourceClient.sessionId);
@@ -14031,6 +15892,7 @@ export class HarnessApp {
 
 	openCursorInteraction(request) {
 		const { method, params, resolve } = request;
+		const workflowLabel = interactiveWorkflowLabel(request);
 		const finish = (result) => {
 			this.closeMenu();
 			resolve(result);
@@ -14042,7 +15904,7 @@ export class HarnessApp {
 				{ value: "accepted", label: "Accept plan" },
 				{ value: "rejected", label: "Reject plan" },
 			];
-			this.openSelection(`Plan: ${oneLine(params.name ?? params.overview ?? "proposed plan")}`, entries, (entry) => {
+			this.openSelection(`${workflowLabel}Plan: ${oneLine(params.name ?? params.overview ?? "proposed plan")}`, entries, (entry) => {
 				finish({ outcome: { outcome: entry?.value === "accepted" ? "accepted" : "rejected" } });
 			});
 			return;
@@ -14057,7 +15919,7 @@ export class HarnessApp {
 			const question = questions[index] ?? {};
 			const options = Array.isArray(question.options) ? question.options : [];
 			const entries = options.map((option) => ({ value: option.id, label: oneLine(option.label ?? option.id) }));
-			const title = oneLine(question.prompt ?? params.title ?? "Question");
+			const title = `${workflowLabel}${oneLine(question.prompt ?? params.title ?? "Question")}`;
 			this.openSelection(title, entries, (entry) => {
 				if (!entry) {
 					finish({ outcome: { outcome: "cancelled" } });
@@ -14073,6 +15935,7 @@ export class HarnessApp {
 
 	openElicitationRequest(request) {
 		const { params, resolve } = request;
+		const workflowLabel = interactiveWorkflowLabel(request);
 		let settled = false;
 		let opening = false;
 		const finish = (result) => {
@@ -14099,6 +15962,7 @@ export class HarnessApp {
 			let form;
 			try {
 				form = normalizeElicitationFormRequest(params);
+				if (workflowLabel) form = { ...form, title: `${workflowLabel}${form.title}` };
 			} catch (error) {
 				this.addNotice(`${singleLineMenuText(params.message ?? "Input requested")}: form could not be displayed (${singleLineMenuText(error.message ?? error)})`);
 				finish({ action: "cancel" });
@@ -14118,7 +15982,7 @@ export class HarnessApp {
 			{ value: "show", label: "Show URL in terminal", description: "Reveals the one-time URL on screen for manual opening" },
 			{ value: "decline", label: "Decline" },
 		];
-		this.openSelection(oneLine(params.message ?? "Authentication required"), entries, async (entry) => {
+		this.openSelection(`${workflowLabel}${oneLine(params.message ?? "Authentication required")}`, entries, async (entry) => {
 			if (settled) return;
 			if (opening) {
 				// A repeated selection while the browser command is in flight is noise,
@@ -14187,6 +16051,11 @@ export class HarnessApp {
 			if (settled) return;
 			settled = true;
 			this.closeMenu();
+			if (!this.interactiveRequestIsCurrent(request)) {
+				resolve(cancelledOutcome());
+				this.completeInteractiveRequest(request);
+				return;
+			}
 			const option = entry?.value;
 			// An "always" pick should never make BOTH cc and the backend persist it.
 			// cc downgrades the backend reply to a one-time (non-persistent) option so
@@ -14220,7 +16089,7 @@ export class HarnessApp {
 			if (toRemember) this.rememberPermissionChoice(context.agentKey, params, toRemember);
 			this.completeInteractiveRequest(request);
 		};
-		this.openSelection(permissionTitle(params), entries, finish, { emptyText: "No permission options" });
+		this.openSelection(`${interactiveWorkflowLabel(request)}${permissionTitle(params)}`, entries, finish, { emptyText: "No permission options" });
 	}
 
 	cancelledInteractiveResult(request) {
@@ -14234,11 +16103,11 @@ export class HarnessApp {
 	cancelInteractiveRequestsForClient(client) {
 		if (!client) return;
 		const remaining = [];
-		for (const request of this.permissionQueue) {
+		for (const request of this.permissionQueue ?? []) {
 			if (request.context?.sourceClient === client) request.resolve(this.cancelledInteractiveResult(request));
 			else remaining.push(request);
 		}
-		this.permissionQueue = remaining;
+		if (this.permissionQueue) this.permissionQueue = remaining;
 		if (this.activeInteractiveRequest?.context?.sourceClient === client) {
 			this.closeMenu({ cancelSelection: true });
 		}
@@ -14587,6 +16456,25 @@ export class HarnessApp {
 
 	async stopAndExit(options = {}) {
 		this.stopping = true;
+		// A disable may be waiting for an internal prompt drain owned by the active
+		// backend. Start its bounded tree teardown before joining the mode tail so
+		// shutdown itself breaks that dependency, while still waiting to snapshot
+		// workflow objects until no late transition can mutate them.
+		const workflowModeTransitionShutdown = this.workflowModeTransitionTail;
+		const workflowModeTransitionClient = workflowModeTransitionShutdown ? this.client : undefined;
+		const workflowModeTransitionBackendShutdown = workflowModeTransitionClient
+			? stopClientsForReplacement([workflowModeTransitionClient], { timeoutMs: FINAL_SHUTDOWN_GRACE_MS })
+				.then(() => ({ error: undefined }), (error) => ({ error }))
+			: undefined;
+		if (workflowModeTransitionShutdown) await workflowModeTransitionShutdown.catch(() => {});
+		const promptQueueDrainShutdown = this.promptQueueDrainPromise ?? Promise.resolve();
+		// Abort any preview/apply Git process immediately. Workflow stopAll below
+		// awaits its settled process before terminal ownership returns to the shell.
+		this.workflowManager?.abortWorktreeOperations?.();
+		// Once terminal shutdown begins, an exact-origin model prompt can no longer
+		// be delivered. Remove queued workflow completions synchronously and put
+		// them behind the same durable retirement fence used by /btw teardown.
+		const queuedMainWorkflowDeliveryShutdown = this.retireQueuedMainWorkflowDeliveries?.() ?? Promise.resolve();
 		// Invalidate pending UI intent synchronously. Native helpers are stopped by
 		// their tracker below; their late completions must not open menus or render
 		// errors after terminal ownership has returned to the shell.
@@ -14620,6 +16508,47 @@ export class HarnessApp {
 				timeoutMs: FINAL_SHUTDOWN_GRACE_MS,
 			});
 		}
+		const workflowDeliveryShutdown = this.workflowManager
+			? Promise.resolve(queuedMainWorkflowDeliveryShutdown)
+				.then(() => this.activateWorkflowDeliveries())
+				.then(() => this.retryWorkflowDeliveryRetirements())
+				.then(() => {
+					if (this.workflowPendingDeliveries?.size || this.workflowPendingDeliveryRetirements?.size) {
+						throw new Error("workflow delivery state could not be retired durably during shutdown");
+					}
+				})
+			: Promise.resolve();
+		// Delivery state is retired and synced before stopAll closes run journals.
+		// The side-thread retirement started by closeBtw participates in the same
+		// fence, so no completion races a closed metadata handle during shutdown.
+		let workflowDeliveryShutdownError;
+		const workflowBrokerShutdown = this.workflowManager
+				? Promise.all([
+					sideShutdown ?? Promise.resolve(),
+					workflowDeliveryShutdown,
+					this.awaitWorkflowDeliverySubmissions(),
+				])
+				.catch((error) => { workflowDeliveryShutdownError = error; })
+				.then(() => this.workflowManager.stopAll())
+					.then(async () => {
+					// stopAll itself completes active runs, so their onComplete callbacks can
+					// create new retirement work after the pre-stop fence above. Drain and
+					// verify that second generation before journals/broker state disappear.
+						try {
+							await promptQueueDrainShutdown;
+							await this.retireQueuedMainWorkflowDeliveries();
+							await this.activateWorkflowDeliveries();
+						await this.retryWorkflowDeliveryRetirements();
+						if (this.workflowPendingDeliveries?.size || this.workflowPendingDeliveryRetirements?.size) {
+							throw new Error("workflow delivery state created during shutdown could not be retired durably");
+						}
+					} catch (error) {
+						workflowDeliveryShutdownError ??= error;
+					}
+				})
+				.then(() => this.workflowBroker?.stop?.())
+				.then(() => { if (workflowDeliveryShutdownError) throw workflowDeliveryShutdownError; })
+			: undefined;
 		// Starting the awaitable stop installs close tracking before the TUI teardown
 		// or process exit can advance. Both main and side trees get bounded TERM/KILL
 		// escalation, and process.exit happens only after those waiters settle.
@@ -14629,7 +16558,7 @@ export class HarnessApp {
 		// forceStop() accelerates, so gate on them too.
 		const mainNeedsForceStop = this.client?.stopping === true ||
 			(this.client?.retiringConnections?.size ?? 0) > 0;
-		const mainShutdown = this.client
+		const mainShutdown = this.client && this.client !== workflowModeTransitionClient
 			? stopClientsForReplacement([this.client], { timeoutMs: FINAL_SHUTDOWN_GRACE_MS })
 			: Promise.resolve();
 		if (mainNeedsForceStop) this.client?.forceStop?.();
@@ -14669,6 +16598,10 @@ export class HarnessApp {
 		const shutdownResults = await Promise.allSettled(
 			[
 				sideShutdown,
+				workflowBrokerShutdown,
+				workflowModeTransitionBackendShutdown?.then((outcome) => {
+					if (outcome.error) throw outcome.error;
+				}),
 				mainShutdown,
 				agentSwitchShutdown,
 				nativeShutdown,
@@ -14870,7 +16803,7 @@ class PromptQueueSummary {
 	invalidate() {}
 
 	render(width) {
-		const queue = this.getQueue();
+		const queue = this.getQueue().filter((entry) => !entry.internal);
 		if (queue.length === 0) return [];
 		return ["", ...queue.map((entry) => {
 			const prefix = entry.timing === "afterTool" ? `${this.getSpinner()} after tool` : "⇥ queued";
@@ -15630,6 +17563,12 @@ function permissionTitle(params = {}) {
 	return title ? `Permission: ${oneLine(title)}` : "Permission request";
 }
 
+function interactiveWorkflowLabel(request = {}) {
+	const workflow = request.context?.workflowContext;
+	if (!workflow?.runId) return "";
+	return `Workflow ${String(workflow.runId).slice(0, 8)}${workflow.agentId ? ` · agent ${String(workflow.agentId).split(":").at(-1)}` : ""} · `;
+}
+
 function permissionOptionLabel(option = {}, index = 0) {
 	return oneLine(option.name ?? option.label ?? humanizePermissionKind(option.kind) ?? `Option ${index + 1}`);
 }
@@ -15971,6 +17910,20 @@ export function localSlashCommands(app) {
 		{ name: "voice", description: "Enter voice input mode" },
 		{ name: "btw", description: "Fork this conversation into a side thread (full context + tools)", argumentHint: "<question>" },
 		{ name: "side", description: "Alias for /btw", argumentHint: "<question>" },
+		...(app.workflowsDisabled === false ? [
+			{ name: "workflow", description: "Run or list saved dynamic workflows", argumentHint: "[name]" },
+		] : []),
+		{
+			name: "workflow-mode",
+			description: "Choose who dynamic workflows may launch",
+			argumentHint: "[disabled|clone-only|flexible]",
+			getArgumentCompletions: (prefix) => WORKFLOW_MODES.filter((mode) => mode.startsWith(prefix.toLowerCase())).map((mode) => ({
+				value: mode, label: mode, description: app.workflowModeLabel(mode),
+			})),
+		},
+		...(app.workflowsDisabled === false ? [
+			{ name: "workflows", description: "Open the dynamic workflow task view; use 'mode' for policy", argumentHint: "[mode]" },
+		] : []),
 		{ name: "diff", description: "Show the working-tree git diff" },
 		{ name: "todos", description: "Show the active session checklist" },
 		{
@@ -16202,15 +18155,15 @@ function codexFeedbackSlashCommand() {
 }
 
 function shouldDeferLocalSlashCommand(name) {
-	return ["resume", "fork", "branch", "model", "mode", "effort", "reasoning", "thinking", "plan", "config", "fast", "permissions", "delete", "archive", "unarchive", "login", "logout", "btw", "side", "diff", "copy", "theme", "plugins", "hooks", "app", "apps", "feedback", "import", "memories", "debug-config", "mcp", "doctor", "experimental", "init", "rename", "usage", "cloud", "goal", "cd", "tasks", "todos", "rewind", "checkpoint", "undo", "remote-control", "rc"].includes(name);
+	return ["resume", "fork", "branch", "model", "mode", "effort", "reasoning", "thinking", "plan", "config", "fast", "permissions", "delete", "archive", "unarchive", "login", "logout", "btw", "side", "diff", "copy", "theme", "plugins", "hooks", "app", "apps", "feedback", "import", "memories", "debug-config", "mcp", "doctor", "experimental", "init", "rename", "usage", "cloud", "goal", "cd", "tasks", "todos", "rewind", "checkpoint", "undo", "remote-control", "rc", "workflow", "workflows", "workflow-mode"].includes(name);
 }
 
 function shouldDeferBusyConfigCommand(name) {
-	return ["model", "mode", "effort", "reasoning", "thinking", "plan", "config", "fast", "permissions", "rename", "usage", "cloud", "goal", "btw", "side", "memories"].includes(name);
+	return ["model", "mode", "effort", "reasoning", "thinking", "plan", "config", "fast", "permissions", "rename", "usage", "cloud", "goal", "btw", "side", "memories", "workflow-mode"].includes(name);
 }
 
 function shouldDeferBusySideConfigCommand(name) {
-	return ["model", "mode", "effort", "reasoning", "thinking", "plan", "config", "fast", "permissions"].includes(name);
+	return ["model", "mode", "effort", "reasoning", "thinking", "plan", "config", "fast", "permissions", "workflow-mode"].includes(name);
 }
 
 function shouldDeferDuringLocalOperation(name) {
@@ -16495,6 +18448,30 @@ export function mergeEnvironments(sources, platform = process.platform) {
 		}
 	}
 	return result;
+}
+
+const WORKFLOW_CHILD_ENVIRONMENT_MAX_BYTES = 1024 * 1024;
+
+function workflowSupervisorEnvironment() {
+	// This Node process is part of cc's trusted containment boundary. Never let a
+	// harness-controlled environment influence its loader, crypto configuration,
+	// module resolution, locale, or executable lookup. The complete requested
+	// environment travels over a private inherited pipe and is installed only on
+	// the untrusted child after the supervisor has initialized.
+	return {
+		PATH: "/usr/bin:/bin",
+		LANG: "C",
+		LC_ALL: "C",
+		TZ: "UTC",
+	};
+}
+
+function serializeWorkflowChildEnvironment(environment = {}) {
+	const serialized = JSON.stringify(environment);
+	if (Buffer.byteLength(serialized, "utf8") > WORKFLOW_CHILD_ENVIRONMENT_MAX_BYTES) {
+		throw new Error("workflow child environment exceeds 1 MiB");
+	}
+	return serialized;
 }
 
 function environmentValue(env, name, platform = process.platform) {

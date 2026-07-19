@@ -14,6 +14,8 @@ export const CLAUDE_ACP_AGENT_NAME = BUNDLED_ACP_ADAPTERS.claude.packageName;
 export const CLAUDE_ACP_MIN_VERSION = BUNDLED_ACP_ADAPTERS.claude.minimumVersion;
 
 export class ClaudeAdapter extends BaseAcpAdapter {
+	static workflowMcpLaunch = true;
+
 	static defaultAgentConfig = {
 		label: "Claude Code",
 		transport: "acp",

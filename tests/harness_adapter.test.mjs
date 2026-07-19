@@ -299,18 +299,46 @@ async function main() {
 	{
 		const required = {};
 		for (const m of REQUIRED_METHODS) required[m] = () => {};
+		required.getWorkflowCapabilities = () => ({
+			childCwd: false, modelOverride: false, modelVerification: false, usage: false,
+			mcpLaunch: false, terminalLaunch: false, enforcedReadOnly: false, agentProfiles: false,
+		});
 		const bogus = { key: "bogus", label: "Bogus", capabilities: { ...emptyCapabilities(), fork: true }, fork: () => {}, ...required };
 		const report = checkAdapterConformance(bogus);
 		assert.equal(report.ok, false);
 		assert.ok(report.problems.some((p) => p.toLowerCase().includes("fork")), "fork:true must be rejected");
 		const good = { key: "good", label: "Good", capabilities: { ...emptyCapabilities(), fork: "native" }, fork: () => {}, ...required };
 		assert.equal(checkAdapterConformance(good).ok, true);
+		const legacy = { ...good };
+		delete legacy.getWorkflowCapabilities;
+		assert.equal(checkAdapterConformance(legacy).ok, true, "pre-workflow third-party adapters remain conformant");
 		ok("conformance:fork-value-validated");
+	}
+	{
+		const required = {};
+		for (const m of REQUIRED_METHODS) required[m] = () => {};
+		const invalidWorkflow = {
+			key: "invalid-workflow", label: "Invalid workflow", capabilities: emptyCapabilities(), ...required,
+			getWorkflowCapabilities: () => ({
+				childCwd: true, modelOverride: true, modelVerification: true, usage: true,
+				mcpLaunch: false, terminalLaunch: false, enforcedReadOnly: true, agentProfiles: true,
+			}),
+		};
+		const problems = checkAdapterConformance(invalidWorkflow).problems.join("\n");
+		assert.match(problems, /getResolvedModel/u);
+		assert.match(problems, /applyWorkflowModel/u);
+		assert.match(problems, /applyWorkflowReadOnly/u);
+		assert.match(problems, /applyWorkflowAgentType/u);
+		ok("conformance:workflow-capability-methods-required");
 	}
 	// A deletion capability must have a matching optional method.
 	{
 		const required = {};
 		for (const m of REQUIRED_METHODS) required[m] = () => {};
+		required.getWorkflowCapabilities = () => ({
+			childCwd: false, modelOverride: false, modelVerification: false, usage: false,
+			mcpLaunch: false, terminalLaunch: false, enforcedReadOnly: false, agentProfiles: false,
+		});
 		const missing = { key: "missing-delete", label: "Missing delete", capabilities: { ...emptyCapabilities(), delete: true }, ...required };
 		const report = checkAdapterConformance(missing);
 		assert.equal(report.ok, false);
@@ -325,6 +353,10 @@ async function main() {
 	{
 		const required = {};
 		for (const method of REQUIRED_METHODS) required[method] = () => {};
+		required.getWorkflowCapabilities = () => ({
+			childCwd: false, modelOverride: false, modelVerification: false, usage: false,
+			mcpLaunch: false, terminalLaunch: false, enforcedReadOnly: false, agentProfiles: false,
+		});
 		const configOnly = {
 			key: "config-only",
 			label: "Config only",
@@ -351,10 +383,28 @@ async function main() {
 		assert.equal(checkAdapterConformance({ ...modeWithWrongMethod, setMode: () => {} }).ok, true);
 		ok("conformance:config-and-mode-methods-required-separately");
 	}
+	// ACP's legacy models projection proves the selected model, but it is not a
+	// writable post-connect override surface unless the agent also advertises a
+	// model config option.
+	{
+		const adapter = new BaseAcpAdapter("legacy-models", { label: "Legacy models" }, noopHost(), {
+			connectionFactory() { throw new Error("not used"); },
+		});
+		adapter.getSessionInfo = () => ({ models: { currentModelId: "observed-model", availableModels: [] }, configOptions: [] });
+		assert.deepEqual(adapter.getResolvedModel(), { id: "observed-model", verified: true });
+		assert.equal(adapter.getWorkflowCapabilities().modelOverride, false);
+		assert.equal(adapter.getWorkflowCapabilities().modelVerification, true);
+		await assert.rejects(adapter.applyWorkflowModel("observed-model"), /cannot apply/u);
+		ok("workflow:legacy-models-read-only");
+	}
 	// Authentication methods and logout are independently capability-gated.
 	{
 		const required = {};
 		for (const method of REQUIRED_METHODS) required[method] = () => {};
+		required.getWorkflowCapabilities = () => ({
+			childCwd: false, modelOverride: false, modelVerification: false, usage: false,
+			mcpLaunch: false, terminalLaunch: false, enforcedReadOnly: false, agentProfiles: false,
+		});
 		const authMissing = { key: "missing-auth", label: "Missing auth", capabilities: { ...emptyCapabilities(), auth: true }, ...required };
 		assert.ok(checkAdapterConformance(authMissing).problems.some((problem) => problem.includes("authenticate")));
 		const logoutMissing = { key: "missing-logout", label: "Missing logout", capabilities: { ...emptyCapabilities(), logout: true }, ...required };

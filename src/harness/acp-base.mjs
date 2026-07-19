@@ -60,6 +60,18 @@ export const REVIEW_PRESET = {
 	],
 };
 
+function workflowConfigOption(sessionInfo, category) {
+	const options = Array.isArray(sessionInfo?.configOptions) ? sessionInfo.configOptions : [];
+	return options.find((option) => option?.category === category || option?.id === category);
+}
+
+function workflowConfigValues(option) {
+	const raw = option?.options ?? option?.values ?? option?.choices ?? [];
+	return Array.isArray(raw)
+		? raw.map((entry) => typeof entry === "string" ? entry : entry?.value ?? entry?.id).filter(Boolean)
+		: [];
+}
+
 export class BaseAcpAdapter {
 	/**
 	 * @param {string} key            registry key (e.g. "codex")
@@ -140,6 +152,84 @@ export class BaseAcpAdapter {
 	 */
 	refineCapabilities(caps) {
 		return caps;
+	}
+
+	// Workflow-specific capabilities stay separate from ACP's generic `mcp`
+	// baseline. In particular, a bridge may speak ACP while discarding session
+	// MCP configuration; callers must never infer model-facing Workflow launch
+	// support from capabilities.mcp alone.
+	getWorkflowCapabilities() {
+		const sessionInfo = this.getSessionInfo();
+		const modelOption = workflowConfigOption(sessionInfo, "model");
+		const agentOption = workflowConfigOption(sessionInfo, "agent");
+		return Object.freeze({
+			childCwd: true,
+			// A config option is the writable surface; ACP's currentModelId is still a
+			// truthful read-only verification surface for a launch-time selection.
+			modelOverride: Boolean(modelOption),
+			modelVerification: Boolean(modelOption?.currentValue ?? sessionInfo?.models?.currentModelId),
+			// BaseAcpAdapter always normalizes optional session/prompt usage. Whether
+			// a particular turn supplies a measurement is attempt data, not a changing
+			// adapter capability.
+			usage: true,
+			mcpLaunch: false,
+			terminalLaunch: false,
+			enforcedReadOnly: false,
+			agentProfiles: Boolean(agentOption),
+			...(this.workflowLaunchCapabilities() ?? {}),
+		});
+	}
+
+	workflowLaunchCapabilities() {
+		return { mcpLaunch: this.constructor.workflowMcpLaunch === true && this.capabilities?.mcp === true };
+	}
+
+	getResolvedModel() {
+		const sessionInfo = this.getSessionInfo();
+		const option = workflowConfigOption(sessionInfo, "model");
+		const id = option?.currentValue ?? sessionInfo?.models?.currentModelId ?? sessionInfo?._ccStartupRequestedModel;
+		return typeof id === "string" && id ? { id, verified: Boolean(option?.currentValue ?? sessionInfo?.models?.currentModelId) } : null;
+	}
+
+	getWorkflowDefaults() {
+		return Object.freeze({ ...(this.launchSpec?._sessionDefaults ?? {}) });
+	}
+
+	async applyWorkflowModel(id) {
+		if (typeof id !== "string" || !id.trim()) throw new Error("workflow model must be a non-empty string");
+		const requested = id.trim();
+		const before = this.getSessionInfo();
+		const option = workflowConfigOption(before, "model");
+		if (!option) throw new Error(`harness ${this.key} cannot apply an explicit workflow model`);
+		const values = workflowConfigValues(option);
+		if (values.length > 0 && !values.includes(requested)) {
+			throw new Error(`harness ${this.key} does not advertise workflow model ${requested}`);
+		}
+		await this.setConfigOption(option.id ?? "model", requested, option.type);
+		const resolved = this.getResolvedModel();
+		if (!resolved?.verified || resolved.id !== requested) {
+			throw new Error(`harness ${this.key} could not verify workflow model ${requested}`);
+		}
+		return resolved;
+	}
+
+	async applyWorkflowReadOnly() {
+		throw new Error(`harness ${this.key} does not advertise enforced workflow read-only mode`);
+	}
+
+	async applyWorkflowAgentType(id) {
+		if (typeof id !== "string" || !id.trim()) throw new Error("workflow agentType must be a non-empty string");
+		const requested = id.trim();
+		const option = workflowConfigOption(this.getSessionInfo(), "agent");
+		if (!option) throw new Error(`harness ${this.key} does not advertise workflow agent profiles`);
+		const values = workflowConfigValues(option);
+		if (values.length > 0 && !values.includes(requested)) {
+			throw new Error(`harness ${this.key} does not advertise workflow agent profile ${requested}`);
+		}
+		await this.setConfigOption(option.id ?? "agent", requested, option.type);
+		const after = workflowConfigOption(this.getSessionInfo(), "agent");
+		if (after?.currentValue !== requested) throw new Error(`harness ${this.key} could not verify workflow agent profile ${requested}`);
+		return { id: requested, verified: true };
 	}
 
 	// ---- native-settings translation (replaces applyAgentSettings switches) ---

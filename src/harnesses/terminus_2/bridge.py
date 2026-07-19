@@ -19,25 +19,50 @@ from acp_bridge import AcpBridge, require_python_version
 
 
 class LocalTmuxSession:
-    def __init__(self, cwd, name=None):
+    def __init__(self, cwd, name=None, pinned_cwd=False):
         if shutil.which("tmux") is None:
             raise RuntimeError("terminus-2 requires tmux on PATH")
         self.name = name or f"cc-terminus-2-{uuid.uuid4().hex}"
+        self.socket_name = self.name
         self.cwd = cwd
         self.started_at = time.monotonic()
         self._last_output = ""
-        subprocess.run(
-            ["tmux", "new-session", "-d", "-s", self.name, "-c", cwd, "bash"],
-            check=True,
+        # Keep the private server as an owned foreground child. A normal detached
+        # tmux server reparents immediately and can escape process-group teardown
+        # between supervisor samples. `-D` keeps the empty server attached while
+        # a normal client command creates the initial detached session.
+        self.server = subprocess.Popen(
+            ["tmux", "-D", "-L", self.socket_name, "-f", "/dev/null"],
+            # For workflow children cwd is `.` relative to the OS-held directory
+            # inherited through the supervisor. A private tmux server starts from
+            # that same reference, so neither it nor its shell reopens the approved
+            # absolute pathname after validation.
+            cwd="." if pinned_cwd else None,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
         )
         time.sleep(0.1)
+        if self.server.poll() is not None:
+            detail = self.server.stderr.read().strip() if self.server.stderr else ""
+            raise RuntimeError(f"terminus-2 tmux server failed to start: {detail}")
+        try:
+            subprocess.run(
+                ["tmux", "-L", self.socket_name, "new-session", "-d", "-s", self.name, "-c", cwd, "bash"],
+                check=True,
+                cwd="." if pinned_cwd else None,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except Exception:
+            self.server.terminate()
+            self.server.wait(timeout=2)
+            raise
         self._last_output = self.capture_pane(capture_entire=True)
 
     def capture_pane(self, capture_entire=False):
-        command = ["tmux", "capture-pane", "-pt", self.name]
+        command = ["tmux", "-L", self.socket_name, "capture-pane", "-pt", self.name]
         if capture_entire:
             command.extend(["-S", "-"])
         result = subprocess.run(command, check=True, capture_output=True, text=True)
@@ -54,7 +79,7 @@ class LocalTmuxSession:
 
     def send_keys(self, keystrokes, block=False, min_timeout_sec=1.0):
         if keystrokes in {"C-c", "C-d"}:
-            subprocess.run(["tmux", "send-keys", "-t", self.name, keystrokes], check=True)
+            subprocess.run(["tmux", "-L", self.socket_name, "send-keys", "-t", self.name, keystrokes], check=True)
         else:
             self._send_literal_keystrokes(keystrokes)
         time.sleep(max(0, min(float(min_timeout_sec), 60)))
@@ -63,13 +88,13 @@ class LocalTmuxSession:
         parts = keystrokes.split("\n")
         for index, part in enumerate(parts):
             if part:
-                subprocess.run(["tmux", "send-keys", "-t", self.name, "-l", part], check=True)
+                subprocess.run(["tmux", "-L", self.socket_name, "send-keys", "-t", self.name, "-l", part], check=True)
             if index < len(parts) - 1:
-                subprocess.run(["tmux", "send-keys", "-t", self.name, "Enter"], check=True)
+                subprocess.run(["tmux", "-L", self.socket_name, "send-keys", "-t", self.name, "Enter"], check=True)
 
     def is_session_alive(self):
         result = subprocess.run(
-            ["tmux", "has-session", "-t", self.name],
+            ["tmux", "-L", self.socket_name, "has-session", "-t", self.name],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
@@ -79,21 +104,30 @@ class LocalTmuxSession:
         return time.monotonic() - self.started_at
 
     def stop(self):
-        kill_tmux_session(self.name)
+        try:
+            kill_tmux_session(self.name, self.socket_name)
+        finally:
+            if self.server.poll() is None:
+                self.server.terminate()
+                try:
+                    self.server.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    self.server.kill()
+                    self.server.wait(timeout=2)
 
 
-def kill_tmux_session(name):
+def kill_tmux_session(name, socket_name=None):
     subprocess.run(
-        ["tmux", "kill-session", "-t", name],
+        ["tmux", "-L", socket_name or name, "kill-server"],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
 
 
-def run_terminus_worker(args, instruction, cwd, session_name, result_queue):
+def run_terminus_worker(args, instruction, cwd, session_name, result_queue, pinned_cwd=False):
     session = None
     try:
-        session = LocalTmuxSession(cwd, name=session_name)
+        session = LocalTmuxSession(cwd, name=session_name, pinned_cwd=pinned_cwd)
         result_queue.put({"type": "session", "name": session.name})
 
         from terminal_bench.agents.terminus_2.terminus_2 import Terminus2
@@ -158,14 +192,14 @@ class Terminus2Bridge(AcpBridge):
                 return "end_turn"
             require_python_version("terminus-2 bridge")
 
-            cwd = params.get("cwd") or os.getcwd()
+            cwd = self.session_cwd if self.workflow_child else (params.get("cwd") or os.getcwd())
             self.tool_call("terminus-2", f"Terminus-2: {self.args.model}")
 
             result_queue = multiprocessing.Queue()
             tmux_session_name = f"cc-terminus-2-{uuid.uuid4().hex}"
             process = multiprocessing.Process(
                 target=run_terminus_worker,
-                args=(terminus_args_dict(self.args), instruction, cwd, tmux_session_name, result_queue),
+                args=(terminus_args_dict(self.args), instruction, cwd, tmux_session_name, result_queue, self.workflow_child),
                 daemon=True,
             )
             process.start()
@@ -202,6 +236,8 @@ class Terminus2Bridge(AcpBridge):
                         self.tool_update("terminus-2", "cancelled")
                         return "cancelled"
                     self.tool_update("terminus-2", "completed")
+                    if self.workflow_child:
+                        self.usage_update(message.get("input_tokens"), message.get("output_tokens"))
                     self.agent_text(
                         "Terminus-2 finished.\n"
                         f"Input tokens: {message.get('input_tokens')}\n"

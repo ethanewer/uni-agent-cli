@@ -1,0 +1,67 @@
+name: Dynamic workflows release gate
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - workflows
+
+permissions:
+  contents: read
+
+jobs:
+  disabled-package-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: node scripts/postinstall.mjs
+      - name: Clean tarball install and POSIX bin smoke
+        if: runner.os == 'Linux'
+        run: npm run test:package:install
+      - name: Clean tarball install and Windows cmd shim smoke
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $packed = npm pack --ignore-scripts --json | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $tarball = Join-Path $PWD $packed[0].filename
+          $prefix = Join-Path $env:RUNNER_TEMP "cc-package-windows"
+          npm install --no-audit --no-fund --foreground-scripts --dangerously-allow-all-scripts --prefix $prefix $tarball
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $shim = Join-Path $prefix "node_modules/.bin/cc.cmd"
+          & $shim --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $installed = Join-Path $prefix "node_modules/cc"
+          if (-not (Test-Path (Join-Path $installed "src/workflows/manager.mjs"))) { throw "workflow runtime missing from Windows artifact" }
+          node --check (Join-Path $installed "src/workflows/manager.mjs")
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $piPath = (Resolve-Path (Join-Path $installed "src/pi-harness.mjs")).Path
+          $piUri = ([System.Uri]::new($piPath)).AbsoluteUri
+          node --input-type=module --eval 'const fs=await import("node:fs/promises"); const m=await import(process.argv[1]); if(m.resolveWorkflowMode({workflowMode:"flexible"},{},process.platform)!=="disabled") throw new Error("persisted workflow opt-in was not forced Disabled on Windows"); const source=await fs.readFile(process.argv[2],"utf8"); if(/^import .*\.\/workflows\//mu.test(source)) throw new Error("Disabled startup statically imports workflow components");' $piUri $piPath
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  dynamic-workflows-release:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install tmux
+        run: command -v tmux >/dev/null 2>&1 || brew install tmux
+      - run: npm ci --ignore-scripts
+      - run: node scripts/postinstall.mjs
+      - run: npm run test:release

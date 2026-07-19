@@ -103,6 +103,12 @@ export const OPTIONAL_METHODS = [
 	"listCheckpoints", // checkpoints
 	"rewindCheckpoint", // checkpoints
 	"setRemoteControl", // remoteControl
+	"getWorkflowCapabilities", // optional workflow worker extension
+	"getResolvedModel", // optional workflow worker extension
+	"getWorkflowDefaults", // optional workflow worker extension
+	"applyWorkflowModel", // optional workflow worker extension
+	"applyWorkflowReadOnly", // optional workflow worker extension
+	"applyWorkflowAgentType", // optional workflow worker extension
 ];
 
 /** The set of normalized UI event types an adapter may emit to host.onEvent. */
@@ -138,6 +144,28 @@ export function checkAdapterConformance(adapter) {
 
 	for (const method of REQUIRED_METHODS) {
 		if (typeof adapter[method] !== "function") problems.push(`missing required method ${method}()`);
+	}
+	if (typeof adapter.getWorkflowCapabilities === "function") {
+		const workflow = adapter.getWorkflowCapabilities();
+		if (!workflow || typeof workflow !== "object" || Array.isArray(workflow)) {
+			problems.push("getWorkflowCapabilities() must return an object");
+		} else {
+			for (const key of ["childCwd", "modelOverride", "modelVerification", "usage", "mcpLaunch", "terminalLaunch", "enforcedReadOnly", "agentProfiles"]) {
+				if (typeof workflow[key] !== "boolean") problems.push(`workflow capability ${key} must be boolean`);
+			}
+			if ((workflow.modelOverride || workflow.modelVerification) && typeof adapter.getResolvedModel !== "function") {
+				problems.push("workflow model capability set but getResolvedModel() missing");
+			}
+			if (workflow.modelOverride && typeof adapter.applyWorkflowModel !== "function") {
+				problems.push("workflow modelOverride set but applyWorkflowModel() missing");
+			}
+			if (workflow.enforcedReadOnly && typeof adapter.applyWorkflowReadOnly !== "function") {
+				problems.push("workflow enforcedReadOnly set but applyWorkflowReadOnly() missing");
+			}
+			if (workflow.agentProfiles && typeof adapter.applyWorkflowAgentType !== "function") {
+				problems.push("workflow agentProfiles set but applyWorkflowAgentType() missing");
+			}
+		}
 	}
 
 	const caps = adapter.capabilities;

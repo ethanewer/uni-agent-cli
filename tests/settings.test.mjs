@@ -70,6 +70,7 @@ import {
 assert.equal(singleLineMenuText("first\nsecond\tthird"), "first second third");
 assert.equal(singleLineMenuText("safe\x1b[2J\x1b]0;owned\x07 title"), "safe title");
 assert.equal(singleLineMenuText("\x1b[31msession\nidentifier\x1b[0m"), "session identifier");
+assert.equal(singleLineMenuText("approve \u202edeny\u2066 choice"), "approve \u202edeny\u2066 choice", "ordinary selection rendering remains unchanged while workflows are disabled");
 {
 	let nestedOptionReads = 0;
 	const emptyGroups = Array.from({ length: 10_000 }, () => Object.defineProperty({}, "options", {
@@ -942,6 +943,10 @@ await (async () => {
 		markdownPreloadTimer: undefined,
 		startupConnectTimer: undefined,
 		voiceController: undefined,
+		workflowManager: undefined,
+		workflowBroker: {
+			stop() { events.push("workflow:stop"); },
+		},
 		clearCancelGraceTimer() {},
 		cancelPermissionPrompts() {},
 		reportReplacementProcessFence() {},
@@ -4966,6 +4971,8 @@ if (process.platform !== "win32") {
 // provider before adding --force.
 if (process.platform !== "win32" && spawnSync("sqlite3", ["--version"]).status === 0) {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "cc-codex-native-"));
+	const previousNativeForks = process.env.CC_FORKS;
+	process.env.CC_FORKS = path.join(root, "forks.json");
 	const codexHome = path.join(root, "codex-home");
 	const dbPath = path.join(codexHome, "state_5.sqlite");
 	const executable = path.join(root, "fake-codex");
@@ -5108,6 +5115,8 @@ if (process.platform !== "win32" && spawnSync("sqlite3", ["--version"]).status =
 	]);
 	assert.equal(deleteRecovery.recoveryApp.sessionSwitchInProgress, false);
 	assert.ok(deleteRecovery.failures.some((message) => message.includes("Could not delete session")));
+	if (previousNativeForks === undefined) delete process.env.CC_FORKS;
+	else process.env.CC_FORKS = previousNativeForks;
 	fs.rmSync(root, { recursive: true, force: true });
 }
 
@@ -6278,6 +6287,14 @@ await (async () => {
 		sessionCapabilities: { additionalDirectories: {} },
 		mcpCapabilities: { http: true, sse: false, acp: false },
 	};
+	const originalCwd = process.cwd();
+	process.chdir(root);
+	assert.equal(client.sessionRequestParams().cwd, process.cwd(), "ordinary adapters resolve cwd at each request as before workflows");
+	process.chdir(originalCwd);
+	assert.equal(client.sessionRequestParams().cwd, originalCwd);
+		client.sessionCwd = root;
+		client.workflowChild = true;
+		assert.equal(client.sessionRequestParams().cwd, ".", "a workflow child sends the backend its inherited pinned cwd reference, not a reopenable pathname");
 	const params = client.sessionRequestParams({ sessionId: "s" });
 	assert.deepEqual(params.additionalDirectories, [root]);
 	assert.deepEqual(params.mcpServers, [

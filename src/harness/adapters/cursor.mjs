@@ -9,6 +9,8 @@ import { BaseAcpAdapter } from "../acp-base.mjs";
 import { insertArgsBefore } from "../util.mjs";
 
 export class CursorAdapter extends BaseAcpAdapter {
+	static workflowMcpLaunch = true;
+
 	declaredCapabilities() {
 		return { interactiveRequests: true };
 	}

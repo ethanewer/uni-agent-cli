@@ -1,0 +1,53 @@
+Dynamic workflow runtime portions are adapted from open-dynamic-workflows:
+https://github.com/imsai-sh/open-dynamic-workflows
+
+Source snapshot: commit f6a6be3b50134d66dda281910643d92c4c6d8caa
+Archive SHA-256: a600ebab2de72ce0a6a5f5e60aba7c7d8c49cd3077f431547ba46f9d00d9ae25
+
+MIT License
+
+Copyright (c) 2026 imsai-sh
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+Apache-2.0 components
+---------------------
+
+This distribution contains vendored portions of Pier:
+https://pypi.org/project/datacurve-pier/
+
+Source snapshot: datacurve-pier 0.2.0 sdist
+SHA-256: 13771beac9a7dfddff591dd0d311d6ac181e5ff1d117e57795a2245b3dcb8db6
+
+Pier
+
+Pier includes code derived from Harbor:
+https://github.com/harbor-framework/harbor
+
+Harbor is licensed under the Apache License, Version 2.0.
+Pier contains modifications to the original Harbor code.
+
+This distribution also contains vendored portions of Terminal-Bench:
+https://github.com/harbor-framework/terminal-bench
+
+Source snapshot: commit 1a6ffa9674b571da0ed040c470cb40c4d85f9b9b
+Vendored into cc on 2026-06-03 and subsequently modified for its ACP interface.
+
+Pier and Terminal-Bench are licensed under the Apache License, Version 2.0.
+The complete license is distributed in LICENSE-APACHE-2.0.

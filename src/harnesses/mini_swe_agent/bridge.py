@@ -40,7 +40,7 @@ class MiniSweAgentBridge(AcpBridge):
                 self.agent_text("No task instruction was provided.")
                 return "end_turn"
 
-            cwd = params.get("cwd") or os.getcwd()
+            cwd = self.session_cwd if self.workflow_child else (params.get("cwd") or os.getcwd())
             command = self.command_for_prompt(prompt)
             self.tool_call("mini-swe-agent", "mini-swe-agent")
             if command is None:
@@ -116,6 +116,7 @@ class MiniSweAgentBridge(AcpBridge):
             logs_dir.mkdir(parents=True, exist_ok=True)
             environment = LocalPierEnvironment(
                 cwd=cwd,
+                pinned_cwd=self.workflow_child,
                 logs_dir=logs_dir,
                 mini_command=self.args.mini_command,
                 yolo=self.args.yolo,
@@ -170,6 +171,7 @@ class LocalPierEnvironment:
         self,
         cwd,
         logs_dir,
+        pinned_cwd=False,
         mini_command="mini-swe-agent",
         yolo=True,
         exit_immediately=True,
@@ -177,6 +179,7 @@ class LocalPierEnvironment:
         cancel_event=None,
     ):
         self.cwd = Path(cwd)
+        self.pinned_cwd = pinned_cwd
         self.logs_dir = Path(logs_dir)
         self.agent_dir = self.logs_dir
         self.default_user = None
@@ -198,6 +201,8 @@ class LocalPierEnvironment:
     async def exec(self, command, cwd=None, env=None, timeout_sec=None, user=None):
         if self.cancel_event.is_set():
             raise CancelledRun("mini-swe-agent run cancelled")
+        if self.pinned_cwd and cwd and Path(cwd).is_absolute():
+            raise RuntimeError("workflow mini-swe-agent cannot reopen an absolute working-directory pathname")
         run_cwd = Path(cwd) if cwd else self.cwd
         effective_env = os.environ.copy()
         if env:

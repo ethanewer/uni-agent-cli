@@ -11,6 +11,8 @@
 import { BaseAcpAdapter } from "../acp-base.mjs";
 
 export class PiAdapter extends BaseAcpAdapter {
+	static workflowMcpLaunch = true;
+
 	static defaultAgentConfig = {
 		label: "Pi",
 		transport: "acp",

@@ -2,8 +2,10 @@
 import json
 import os
 import select
+import subprocess
 import sys
 import time
+import uuid
 
 next_client_request_id = 1000
 SLOW_DELAY = float(os.environ.get("FAKE_ACP_SLOW_DELAY", "0.8"))
@@ -12,6 +14,13 @@ COMMANDS_GATE = os.environ.get("FAKE_ACP_COMMANDS_GATE")
 NEW_GATE = os.environ.get("FAKE_ACP_NEW_GATE")
 SESSION_LIST_GATE = os.environ.get("FAKE_ACP_SESSION_LIST_GATE")
 START_LOG = os.environ.get("FAKE_ACP_START_LOG")
+WORKFLOW_E2E = os.environ.get("FAKE_WORKFLOW_E2E") == "1"
+WORKFLOW_E2E_LOG = os.environ.get("FAKE_WORKFLOW_E2E_LOG")
+WORKFLOW_E2E_DELAY = float(os.environ.get("FAKE_WORKFLOW_E2E_DELAY", "1.2"))
+_fake_session_id = os.environ.get("FAKE_ACP_SESSION_ID", "fake-session")
+FAKE_SESSION_ID = str(uuid.uuid4()) if _fake_session_id == "random" else _fake_session_id
+SESSION_CWD = os.getcwd()
+SESSION_MCP_SERVERS = []
 
 
 def record(event):
@@ -80,6 +89,139 @@ CONFIG_OPTIONS = [
         ],
     },
 ]
+CONFIG_VALUES = {option["id"]: option["currentValue"] for option in CONFIG_OPTIONS}
+
+
+def config_snapshot():
+    return [{**option, "currentValue": CONFIG_VALUES.get(option["id"], option["currentValue"])} for option in CONFIG_OPTIONS]
+
+
+def workflow_e2e_record(event, **fields):
+    if not WORKFLOW_E2E_LOG:
+        return
+    record_value = {
+        "event": event,
+        "pid": os.getpid(),
+        "time": time.time(),
+        "cwd": SESSION_CWD,
+        "harness": os.environ.get("FAKE_WORKFLOW_E2E_HARNESS", "unknown"),
+        "model": CONFIG_VALUES.get("model"),
+        "effort": CONFIG_VALUES.get("thought_level"),
+        **fields,
+    }
+    encoded = json.dumps(record_value, sort_keys=True) + "\n"
+    descriptor = os.open(WORKFLOW_E2E_LOG, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(descriptor, encoded.encode("utf-8"))
+    finally:
+        os.close(descriptor)
+
+
+def workflow_mcp_server():
+    for server in SESSION_MCP_SERVERS:
+        if server.get("name") == "cc-dynamic-workflows":
+            return server
+    raise RuntimeError("cc did not inject the dynamic workflow MCP server")
+
+
+def mcp_write(process, message):
+    process.stdin.write(json.dumps(message) + "\n")
+    process.stdin.flush()
+
+
+def mcp_response(process, request_id):
+    while True:
+        raw = process.stdout.readline()
+        if not raw:
+            detail = process.stderr.read().strip()
+            raise RuntimeError(f"workflow MCP server exited before response {request_id}: {detail}")
+        message = json.loads(raw)
+        if message.get("id") != request_id:
+            continue
+        if "error" in message:
+            raise RuntimeError(message["error"].get("message", "workflow MCP request failed"))
+        return message.get("result", {})
+
+
+def call_workflow_mcp(source, max_concurrency):
+    server = workflow_mcp_server()
+    child_env = os.environ.copy()
+    raw_env = server.get("env") or []
+    if isinstance(raw_env, dict):
+        child_env.update({str(key): str(value) for key, value in raw_env.items()})
+    else:
+        child_env.update({str(entry["name"]): str(entry.get("value", "")) for entry in raw_env})
+    process = subprocess.Popen(
+        [server["command"], *(server.get("args") or [])],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        env=child_env,
+    )
+    try:
+        mcp_write(process, {
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "cc-fake-workflow-e2e", "version": "1"},
+            },
+        })
+        mcp_response(process, 1)
+        mcp_write(process, {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
+        mcp_write(process, {
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "Workflow", "arguments": {"script": source, "maxConcurrency": max_concurrency}},
+        })
+        result = mcp_response(process, 2)
+        if result.get("isError"):
+            raise RuntimeError(json.dumps(result.get("content") or result))
+        return result.get("structuredContent") or result
+    finally:
+        if process.stdin:
+            process.stdin.close()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+
+
+def workflow_source_from_prompt(prompt):
+    # E2E_MODEL_WORKFLOW|name|relative/path,...|clone|concurrency
+    parts = prompt.split("|", 4)
+    if len(parts) != 5:
+        raise ValueError("invalid E2E workflow prompt")
+    kind, name, raw_files, routing, concurrency = parts
+    worker_command = "E2E_EDIT|" if kind == "E2E_MODEL_WORKFLOW_EDIT" else "E2E_ANALYZE|"
+    worker_label = "Edit" if kind == "E2E_MODEL_WORKFLOW_EDIT" else "Analyze"
+    files = [entry for entry in raw_files.split(",") if entry]
+    if len(files) not in (4, 6):
+        raise ValueError("E2E workflow must contain four or six parallel tasks")
+    calls = []
+    for index, relative in enumerate(files):
+        options = {"label": f"{worker_label} {relative}", "phase": "Analyze", "isolation": "worktree"}
+        if routing == "flexible":
+            if index % 2 == 0:
+                options.update({"harness": "cursor", "model": "fast", "effort": "high"})
+            else:
+                options.update({"harness": "codex", "model": "deep", "effort": "low"})
+        calls.append(f"() => agent({json.dumps(worker_command + relative)}, {json.dumps(options)})")
+    source = "\n".join([
+        f"export const meta = {{ name: {json.dumps(name)}, description: {json.dumps(f'Analyze {len(files)} independent project modules')}, phases: ['Analyze'] }};",
+        "phase('Analyze');",
+        "const results = await parallel([",
+        "  " + ",\n  ".join(calls),
+        "]);",
+        f"return {{ count: {len(files)}, results }};",
+    ])
+    return source, int(concurrency)
 
 
 def send(message):
@@ -143,6 +285,7 @@ def poll_cancel(duration):
 
 
 def handle_message(message):
+    global SESSION_CWD, SESSION_MCP_SERVERS
     method = message.get("method")
     request_id = message.get("id")
 
@@ -171,9 +314,9 @@ def handle_message(message):
                         "mcpCapabilities": {"http": True, "sse": False, "acp": False},
                     },
                     "agentInfo": {
-                        "name": "fake-acp",
+                        "name": os.environ.get("FAKE_ACP_AGENT_NAME", "fake-acp"),
                         "title": "Fake ACP",
-                        "version": "0.0.0",
+                        "version": os.environ.get("FAKE_ACP_AGENT_VERSION", "0.0.0"),
                     },
                     "authMethods": [],
                 },
@@ -181,6 +324,16 @@ def handle_message(message):
         )
     elif method == "session/new":
         record("session/new")
+        requested_cwd = message.get("params", {}).get("cwd")
+        SESSION_CWD = os.path.abspath(requested_cwd or os.getcwd())
+        SESSION_MCP_SERVERS = list(message.get("params", {}).get("mcpServers") or [])
+        if WORKFLOW_E2E:
+            workflow_e2e_record(
+                "session_new",
+                mcp=[server.get("name") for server in SESSION_MCP_SERVERS],
+                requestedCwd=requested_cwd,
+                workflowChild=os.environ.get("CC_WORKFLOW_CHILD") == "1",
+            )
         wait_for_gate(NEW_GATE)
         if NEW_DELAY > 0:
             poll_cancel(NEW_DELAY)
@@ -189,8 +342,8 @@ def handle_message(message):
                 "jsonrpc": "2.0",
                 "id": request_id,
                 "result": {
-                    "sessionId": "fake-session",
-                    "configOptions": CONFIG_OPTIONS,
+                    "sessionId": FAKE_SESSION_ID,
+                    "configOptions": config_snapshot(),
                     "modes": {
                         "currentModeId": "agent",
                         "availableModes": [
@@ -256,6 +409,15 @@ def handle_message(message):
             }
         )
     elif method == "session/load":
+        SESSION_CWD = os.path.abspath(message.get("params", {}).get("cwd") or os.getcwd())
+        SESSION_MCP_SERVERS = list(message.get("params", {}).get("mcpServers") or [])
+        if WORKFLOW_E2E:
+            modes = []
+            for server in SESSION_MCP_SERVERS:
+                env = {entry.get("name"): entry.get("value") for entry in (server.get("env") or [])}
+                if env.get("CC_WORKFLOW_MODE"):
+                    modes.append(env["CC_WORKFLOW_MODE"])
+            workflow_e2e_record("session_load", mcp=[server.get("name") for server in SESSION_MCP_SERVERS], workflowModes=modes)
         send(
             {
                 "jsonrpc": "2.0",
@@ -286,7 +448,7 @@ def handle_message(message):
             {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "result": {"configOptions": CONFIG_OPTIONS},
+                "result": {"configOptions": config_snapshot()},
             }
         )
     elif method == "session/resume":
@@ -294,7 +456,7 @@ def handle_message(message):
             {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "result": {"configOptions": CONFIG_OPTIONS},
+                "result": {"configOptions": config_snapshot()},
             }
         )
     elif method == "session/fork":
@@ -304,7 +466,7 @@ def handle_message(message):
             {
                 "jsonrpc": "2.0",
                 "id": request_id,
-                "result": {"sessionId": "fake-session", "configOptions": CONFIG_OPTIONS},
+                "result": {"sessionId": "fake-session", "configOptions": config_snapshot()},
             }
         )
     elif method == "session/delete":
@@ -312,13 +474,15 @@ def handle_message(message):
     elif method == "session/set_config_option":
         config_id = message["params"]["configId"]
         value = message["params"].get("value")
-        updated = []
-        for option in CONFIG_OPTIONS:
-            next_option = dict(option)
-            if next_option["id"] == config_id:
-                next_option["currentValue"] = value
-            updated.append(next_option)
-        send({"jsonrpc": "2.0", "id": request_id, "result": {"configOptions": updated}})
+        advertised = next((option for option in CONFIG_OPTIONS if option["id"] == config_id), None)
+        allowed = [entry.get("value") for entry in (advertised or {}).get("options", [])]
+        if not advertised or (allowed and value not in allowed):
+            send({"jsonrpc": "2.0", "id": request_id, "error": {"code": -32602, "message": "unsupported config value"}})
+            return True
+        CONFIG_VALUES[config_id] = value
+        if WORKFLOW_E2E:
+            workflow_e2e_record("config", configId=config_id, value=value)
+        send({"jsonrpc": "2.0", "id": request_id, "result": {"configOptions": config_snapshot()}})
     elif method == "session/prompt":
         handle_prompt(message)
     elif method == "session/cancel":
@@ -339,6 +503,98 @@ def handle_prompt(message):
     request_id = message.get("id")
     prompt_parts = message["params"]["prompt"]
     prompt = prompt_text(prompt_parts)
+    if WORKFLOW_E2E and prompt.startswith(("E2E_MODEL_WORKFLOW|", "E2E_MODEL_WORKFLOW_EDIT|")):
+        source, concurrency = workflow_source_from_prompt(prompt)
+        workflow_e2e_record("orchestrator_workflow_call", source=source, concurrency=concurrency)
+        send({
+            "jsonrpc": "2.0", "method": "session/update",
+            "params": {"sessionId": FAKE_SESSION_ID, "update": {
+                "sessionUpdate": "tool_call", "toolCallId": "workflow-e2e", "status": "pending",
+                "title": "Create dynamic workflow",
+            }},
+        })
+        result = call_workflow_mcp(source, concurrency)
+        workflow_e2e_record("orchestrator_workflow_started", result=result)
+        send({
+            "jsonrpc": "2.0", "method": "session/update",
+            "params": {"sessionId": FAKE_SESSION_ID, "update": {
+                "sessionUpdate": "tool_call_update", "toolCallId": "workflow-e2e", "status": "completed",
+            }},
+        })
+        send({
+            "jsonrpc": "2.0", "method": "session/update",
+            "params": {"sessionId": FAKE_SESSION_ID, "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": f"workflow launched: {result.get('taskId')}"},
+            }},
+        })
+        send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "end_turn", "usage": {"inputTokens": 10, "outputTokens": 5}}})
+        return
+
+    if WORKFLOW_E2E and prompt.startswith(("E2E_ANALYZE|", "E2E_EDIT|")):
+        editing = prompt.startswith("E2E_EDIT|")
+        relative = prompt.split("|", 1)[1]
+        root = os.path.realpath(SESSION_CWD)
+        target = os.path.realpath(os.path.join(root, relative))
+        if os.path.commonpath([root, target]) != root:
+            raise RuntimeError("E2E analysis path escaped the project")
+        workflow_e2e_record("worker_start", prompt=prompt, relative=relative)
+        send({
+            "jsonrpc": "2.0", "method": "session/update",
+            "params": {"sessionId": FAKE_SESSION_ID, "update": {
+                "sessionUpdate": "tool_call", "toolCallId": "analyze-e2e", "status": "pending",
+                "title": f"{'Edit' if editing else 'Analyze'} {relative}",
+            }},
+        })
+        if poll_cancel(WORKFLOW_E2E_DELAY):
+            workflow_e2e_record("worker_cancelled", prompt=prompt, relative=relative)
+            send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "cancelled"}})
+            return
+        with open(target, "r", encoding="utf-8") as source_file:
+            content = source_file.read().strip()
+        if editing:
+            with open(target, "a", encoding="utf-8") as target_file:
+                target_file.write("workflow-applied-change\n")
+            output = f"edited:{relative}"
+        else:
+            output = f"analysis:{relative}:{content}"
+        send({
+            "jsonrpc": "2.0", "method": "session/update",
+            "params": {"sessionId": FAKE_SESSION_ID, "update": {
+                "sessionUpdate": "tool_call_update", "toolCallId": "analyze-e2e", "status": "completed",
+            }},
+        })
+        send({
+            "jsonrpc": "2.0", "method": "session/update",
+            "params": {"sessionId": FAKE_SESSION_ID, "update": {
+                "sessionUpdate": "usage_update", "inputTokens": 12, "outputTokens": 7,
+            }},
+        })
+        send({
+            "jsonrpc": "2.0", "method": "session/update",
+            "params": {"sessionId": FAKE_SESSION_ID, "update": {
+                "sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": output},
+            }},
+        })
+        workflow_e2e_record("worker_end", prompt=prompt, relative=relative, output=output)
+        send({
+            "jsonrpc": "2.0", "id": request_id,
+            "result": {"stopReason": "end_turn", "usage": {"inputTokens": 12, "outputTokens": 7}},
+        })
+        return
+
+    if WORKFLOW_E2E and prompt.startswith("<task-notification"):
+        workflow_e2e_record("orchestrator_completion", prompt=prompt)
+        send({
+            "jsonrpc": "2.0", "method": "session/update",
+            "params": {"sessionId": FAKE_SESSION_ID, "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text", "text": "orchestrator received workflow completion"},
+            }},
+        })
+        send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "end_turn", "usage": {"inputTokens": 8, "outputTokens": 4}}})
+        return
+
     if prompt == "delayed tool":
         if poll_cancel(SLOW_DELAY):
             send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "cancelled"}})

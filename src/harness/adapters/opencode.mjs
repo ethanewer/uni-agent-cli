@@ -11,6 +11,8 @@
 import { BaseAcpAdapter } from "../acp-base.mjs";
 
 export class OpenCodeAdapter extends BaseAcpAdapter {
+	static workflowMcpLaunch = true;
+
 	static defaultAgentConfig = {
 		label: "opencode (ACP)",
 		transport: "acp",

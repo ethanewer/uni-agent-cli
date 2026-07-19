@@ -13,7 +13,7 @@ import {
 
 const packageJson = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8"));
 assert.equal(packageJson.bin.cc, "src/cc.mjs");
-assert.equal(packageJson.engines.node, ">=22", "the package must satisfy claude-agent-acp's Node runtime floor");
+assert.equal(packageJson.engines.node, ">=22", "the package retains its pre-workflow Node runtime floor while workflow opt-in probes stricter sandbox capabilities");
 assert.equal(packageJson.dependencies["@agentclientprotocol/claude-agent-acp"], "0.58.1");
 assert.equal(packageJson.dependencies["@agentclientprotocol/codex-acp"], "1.1.2");
 assert.deepEqual(

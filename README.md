@@ -46,6 +46,9 @@ For side-by-side testing, install commit snapshots instead of using `npm link`:
 npm run install:channels
 ```
 
+On macOS and Linux, channel release verification also requires `python3`; the
+installer checks this prerequisite before parsing the packaged Python bridges.
+
 This resolves `cc` from the local `main` ref and `cc2` from the local
 `ux-0711` ref. Rerun the command after either local ref moves. (`git fetch`
 alone updates `origin/main`, not the local `main` ref.) A specific commit,
@@ -96,6 +99,141 @@ removed.
 
 Use `--root` and `--bin-dir` (or `CC_INSTALL_ROOT` and `CC_BIN_DIR`) to override
 the default locations.
+
+## Dynamic workflows
+
+`cc` supports Claude Code-style dynamic workflows. They are **disabled by
+default**. Run `/workflow-mode` to choose **Disabled**, **Enabled — Clone
+Only**, or **Enabled — Flexible**. The active model receives `Workflow` and
+`WorkflowStatus` tools through cc's private MCP server when workflows are
+enabled before its harness connects and that harness supports stdio MCP. A
+workflow is JavaScript generated at runtime, approved in the TUI, and executed
+in a restricted background process. Humans can run saved workflows with
+`/workflow <name>` and inspect all work with `/workflows`; `/workflows mode`
+opens the same policy selector without replacing the task dashboard.
+
+Dynamic workflow execution currently requires macOS. On Linux and Windows the
+persisted selector is treated as Disabled, `/workflow-mode` refuses enablement
+before any broker or child process starts, and the rest of the CLI remains
+unchanged.
+
+While Disabled, the runtime, broker, saved-workflow registry, history, summary,
+and model-facing tools are not loaded, and cc's own `/workflow` plus
+`/workflows` stay out of the command catalog. Same-named commands advertised by
+a backend remain backend-owned. The ordinary UI, `/status`, and bottom status line
+remain unchanged; only `/workflow-mode` is added as the opt-in control. Once
+enabled, the bottom line shows `workflows clone only` or `workflows flexible`.
+
+| Bundled harness adapter | Worker cwd | Model-facing `Workflow` tool | Explicit model / effort | Enforced read-only | Agent profile |
+| --- | --- | --- | --- | --- | --- |
+| Codex | Yes | When its ACP backend advertises MCP | When the live backend advertises the corresponding writable config option | No | When advertised live |
+| Claude | Yes | When its ACP backend advertises MCP | When advertised live | No | When advertised live |
+| Cursor | Yes | When its ACP backend advertises MCP | When advertised live | No | When advertised live |
+| OpenCode | Yes | When its ACP backend advertises MCP | When advertised live | No | When advertised live |
+| Pi | Yes | When its ACP backend advertises MCP | When advertised live | No | When advertised live |
+| Terminus-2 | Yes | No (worker only) | When advertised live | No | When advertised live |
+| mini-swe-agent | Yes | No (worker only) | When advertised live | No | When advertised live |
+
+This matrix describes cc's adapter capability contract, not the presence or
+authentication of every optional external executable on a given machine. A
+pair is supported for a launch only when the fresh adapter reports and verifies
+the requested model/effort before its first prompt.
+
+Custom configured agents use the adapter selected by their harness key and the
+same live capability checks. Unsupported explicit options fail before the first
+worker prompt; cc never silently substitutes a different model or effort.
+
+```js
+export const meta = {
+  name: "review-and-fix",
+  description: "Review in parallel, then fix verified issues",
+  phases: ["Review", "Fix"],
+};
+
+const reviews = await parallel([
+  () => agent("Review correctness", { label: "correctness", isolation: "worktree" }),
+  () => agent("Review tests", { harness: "codex", model: "gpt-5.3-codex", isolation: "worktree" }),
+]);
+phase("Fix");
+return agent(`Fix these findings:\n${reviews.join("\n")}`);
+```
+
+The script globals are `agent`, `parallel`, `pipeline`, `workflow`, `phase`,
+`log`, `args`, and `budget`. Agent options include `harness`, `model`, `label`,
+`effort`, `phase`, `schema`, `isolation` (`shared` or `worktree`), `readOnly`,
+and `agentType`. (`cache` may only be `"never"`; cc does not replay completed
+model calls during recovery.) In Clone Only mode every worker is forced to the
+parent harness and its verified model and reasoning effort; conflicting script
+options fail before an adapter launches. In Flexible mode, omitting `harness`
+and `model` inherits the parent harness and its verified model, while a
+different harness with no model uses that harness's configured default.
+Explicit models and efforts fail before prompting unless the selected adapter
+can apply and verify the exact value; cc independently checks that the adapter's
+reported model is verified and exactly equal to the request.
+
+Saved workflows live in `.cc/workflows/<name>.js` (project) or beside the active
+settings file under `workflows/<name>.js` (personal; by default
+`~/.config/cc/workflows/<name>.js`); project entries win. `CC_SETTINGS` therefore
+keeps channel/isolated installs and their personal workflows together. A model can
+call a saved workflow by name only after a human `/workflow <name>` launch has
+imported those exact bytes into cc's content-addressed registry for that
+canonical project. Same-named imports in other projects are isolated. The approval
+dialog can remember the exact source, args, policy, limits, project device/inode/root, and saved
+identity. Race-safe project discovery, reads, and saves use packaged POSIX directory-relative
+operations through `python3` and fail closed when that helper is unavailable;
+one launch-wide deadline covers project identity and source access, and imported source is atomically published and fsynced before its index;
+personal saves and workflow execution do not depend on it. In the task view
+use arrows and Enter to navigate runs → phases →
+agents → attempts → detail, `v` for approved source, `p` to pause/resume, `x` to stop, `r`
+to restart an agent, `c` to recover an interrupted run, `s` to choose personal or project save scope, and Escape to go back. Applying retained worktree changes first opens a scrollable changed-file and full patch preview, then requires a separate confirmation.
+The composer and bottom status remain visible. The dashboard has explicit focus
+while its single-letter controls are active; press Tab to move to the composer
+(preserving any draft) and Tab again to return to the dashboard. Recovery reruns every model call
+after a recovery-specific approval; no prior result is silently replayed.
+Completion is queued only to the exact live originating adapter/session
+generation. A temporarily switched session retains the notification until that
+same live adapter reloads it; ambiguous delivery state remains visible in
+`/workflows`.
+
+Workflow source runs behind a probed operating-system sandbox; there is no
+unrestricted fallback. This release enables workflow execution on macOS only,
+using Seatbelt (`sandbox-exec`) as the security boundary with Node permissions
+and `node:vm` as defense in depth. Node 22 remains the Disabled-mode baseline;
+workflow opt-in also requires a Node build whose permission probe succeeds.
+Defaults include 16 active agents globally, 8 per workflow, 1,000
+agents total, depth 4, at most 64 total/8 live sandboxes and 10,000
+total/2,048 pending RPC calls per workflow, a 128 MiB script heap plus a 256 MiB monitored RSS fence, bounded RPC/results/journals, and
+wall-clock/heartbeat termination. `CC_DISABLE_WORKFLOWS=1` or the legacy
+`"disableWorkflows": true` setting force-disables model and human launch
+regardless of the persisted selector. Shared mutating agents are serialized per canonical repository across cc processes; use
+worktree isolation for parallel mutation. cc never auto-merges retained
+worktrees; inspect an agent in `/workflows` and press `a` to preview and
+explicitly apply its patch with Git's three-way safety checks. Preview/apply
+uses one absolute deadline, blocks conflicting working-tree activity, and is
+aborted and awaited during shutdown; Git helpers/filters are tracked by both
+process group and descendant PID tree, then terminated and confirmed gone on cancellation. Nested workflow
+args retain the top-level 64 KiB bound. Complete turn-level `session/prompt`
+usage is summed across initial and correction turns; a final-session snapshot
+may substitute only for a missing single-turn result.
+Otherwise every request and raw
+response event—including schema corrections and text later truncated for
+display—is conservatively estimated from UTF-8 bytes plus a 64 Ki-token
+backend-owned overhead allowance per request.
+
+The JavaScript orchestration program is untrusted and OS-sandboxed; configured
+harness executables are not. Enabling workflows authorizes cc to launch the
+same locally configured harness programs it can launch in the foreground, so
+custom harness commands must be treated as trusted local software. Workflow
+workers are placed behind a parent-pipe supervisor; their process group and
+descendants observed through the process table are retired, but this is lifecycle containment rather than
+a security boundary against a deliberately hostile executable that daemonizes
+outside its inherited process tree.
+
+Optional numeric settings `workflowGlobalConcurrency`,
+`workflowRunConcurrency`, and `workflowHarnessConcurrency` can lower the
+compiled concurrency ceilings. The approval dialog shows both requested and
+effective concurrency; values outside the safe lower-only range fail closed
+when workflows are enabled.
 
 ## Sending messages while the agent is working
 
@@ -217,7 +355,7 @@ reopening the interaction.
 - `/plan [prompt]` — switch to an advertised Plan mode, then optionally submit the inline request. The current Codex ACP adapter does not expose native collaboration mode, so `cc` clearly labels and uses a read-only, prompt-based planning fallback instead.
 - `/permissions [read-only|auto|full-access|show|clear]` — select Codex's advertised sandbox/approval preset while keeping `cc`'s host-side permission gate synchronized, or inspect/clear remembered grants.
 - `/status` — use the backend's richer status command when it advertises one; otherwise show the local session summary.
-- `/cc-status` — always show the `cc`/ACP summary (agent, model, backend mode, cc's resolved `ask`/`auto`/`deny` permission policy, reasoning, fast mode, Remote Control state, context usage, theme, and session id when available). The same resolved permission policy is always visible in the footer, with `⏸` marking manual `ask` mode; an active, disconnected, or failed Remote Control state is shown there without putting its URL in the persistent line.
+- `/cc-status` — always show the `cc`/ACP summary (agent, model, backend mode, cc's resolved `ask`/`auto`/`deny` permission policy, reasoning, fast mode, Remote Control state, enabled workflow policy, context usage, theme, and session id when available). The same resolved permission policy is always visible in the footer, with `⏸` marking manual `ask` mode; an active, disconnected, or failed Remote Control state is shown there without putting its URL in the persistent line. When workflows are enabled, their policy is also shown; Disabled adds no footer segment.
 - `/delete [session-id|name]` — permanently delete the current or supplied session after confirmation. Names are resolved for Codex and ACP backends that advertise `session/list`; other backends require a session id. Codex deletion also removes descendant sessions, and duplicate Codex names must be disambiguated with a UUID.
 - `/login [method]`, `/logout` — run the active backend's advertised ACP authentication flow without leaving `cc`. Choosing Codex's ChatGPT method may let `codex-acp` open the sign-in page directly; URL confirmation prompts in `cc` are used for MCP authorization requests.
 - `/btw <question>` (also `/side`) — ask an **ephemeral side question** in a transient overlay (see below).
@@ -266,7 +404,7 @@ Backend-advertised skills autocomplete with their native `$skill-name` syntax an
 
 The built-in Claude adapter exposes the current maintained ACP surface for models, effort, fast mode, custom agents, skills, plugins, hooks, MCP, memory, subagents, and backend commands. Generic cc extensions cover recent interactive-CLI additions that need host UI: shell history and path completion, `/cd`, `/branch`, `/tasks`, `/todos`, `/rewind`, Remote Control, Claude-compatible keybindings, Option/Alt+Return newlines, persistent permission/Remote Control status, and merged `@agent`/`@file` completion.
 
-The remaining Claude CLI features depend on its private fullscreen application loop or on SDK operations that are not public. cc therefore does not imitate whole-session background/daemon attach, `claude agents`, `/fork <directive>` background-subagent launch, the `/workflows` management dashboard, `/tui`/`/focus` and transcript/Vim visual modes, checkpoint summarization, native plugin/skill management panels, or Remote Control server-mode flags. Backend-executed workflows and subagents still run and render normally when the adapter advertises or invokes them.
+The remaining Claude CLI features depend on its private fullscreen application loop or on SDK operations that are not public. cc therefore does not imitate whole-session background/daemon attach, `claude agents`, `/fork <directive>` background-subagent launch, `/tui`/`/focus` and transcript/Vim visual modes, checkpoint summarization, native plugin/skill management panels, or Remote Control server-mode flags. Dynamic workflows are instead implemented by cc's harness-neutral runtime and `/workflows` page described above.
 
 ### Codex parity and ACP boundaries
 
@@ -301,7 +439,7 @@ Codex's main-pane `/fork` is separate from `/btw`: it uses native `thread/fork`,
 
 - **Typing `ultracode` in a prompt has no special effect** through `cc`. The keyword is forwarded to the backend as plain text, but the app-layer machinery that would normally pick it up never runs over ACP.
 - **`/effort` only offers a reasoning level when `claude-agent-acp` advertises one** as an ACP config option. If it doesn't, `cc` reports "Reasoning selection is not advertised by this agent" — and it currently does not advertise an `ultracode` tier.
-- When a backend *does* run multi-agent **workflows** or sub-agent fan-out, `cc` renders the nested tool calls and plan updates live, and `Esc` cancels the turn. This is generic ACP rendering, not ultracode-specific.
+- Dynamic workflows are available through cc's `Workflow` tool and `/workflows` page, independently of Claude's `ultracode` keyword. Backend-native subagent fan-out still renders through generic ACP events.
 
 ### Cursor
 
@@ -442,7 +580,18 @@ harness-agnostic policy that works for every backend:
 npm test
 ```
 
-This runs syntax/compile checks, settings/queue and Codex feature-parity tests, the permission-engine unit tests (`tests/permissions.test.mjs`), and the tmux-driven TUI smoke tests (resize, scroll-during-streaming, the message queue, slash commands, permission auto-accept, "allow always" persistence + `/yolo`, and the `/btw` / `/diff` / `/copy` commands).
+This runs syntax/compile checks, settings/queue and Codex feature-parity tests,
+the permission-engine unit tests (`tests/permissions.test.mjs`), the dynamic
+workflow runtime/security/package regression suite, and the tmux-driven TUI
+gates available on the current platform. The latter cover resize, streaming scroll, queues, slash commands,
+permission persistence, `/btw` / `/diff` / `/copy`, plus workflow opt-in,
+model-authored launch, 4/6-way execution, routing, lifecycle controls,
+save/overwrite, and hierarchical workflow views. Dynamic workflow execution is
+macOS-only, so its ordinary test invocation reports a skip elsewhere. The
+non-skippable complete release and npm-publish gate is `npm run test:release`;
+it runs the full regression/TUI/channel/package suite plus the mandatory macOS
+workflow E2E. It requires macOS and `tmux`, and the checked-in macOS release job
+runs it on every workflow branch/PR.
 
 ## Notes
 

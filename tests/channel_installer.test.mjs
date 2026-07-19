@@ -6,6 +6,7 @@ import path from "node:path";
 
 import {
 	CHANNEL_ADAPTERS,
+	WORKFLOW_RELEASE_FILES,
 	atomicReplaceLink,
 	betaStateEnvironment,
 	channelPaths,
@@ -656,6 +657,11 @@ function makeReleaseFixture(releaseDir) {
 	fs.writeFileSync(path.join(releaseDir, "package-lock.json"), "{}\n");
 	fs.writeFileSync(path.join(releaseDir, "src", "cc.mjs"), "#!/usr/bin/env node\n");
 	fs.writeFileSync(path.join(releaseDir, "src", "pi-harness.mjs"), "// harness\n");
+	for (const relative of WORKFLOW_RELEASE_FILES) {
+		const file = path.join(releaseDir, relative);
+		fs.mkdirSync(path.dirname(file), { recursive: true });
+		fs.writeFileSync(file, relative.endsWith(".py") ? "# workflow helper\n" : relative.endsWith(".mjs") ? "// workflow module\n" : `${relative}\n`);
+	}
 	for (const adapter of CHANNEL_ADAPTERS) {
 		makeAdapterFixture(releaseDir, adapter, adapter.minimumVersion ?? "0.58.1");
 	}
@@ -726,9 +732,52 @@ function makeDirectoryLink(target, link) {
 			return { status: 0 };
 		});
 		assert.equal(adapters.length, 2);
-		assert.deepEqual(calls.map((call) => call[1].at(-1)), [path.join(root, "src", "cc.mjs"), "--help"]);
+		assert.equal(calls.filter((call) => call[1][0] === "--check").length, 2 + WORKFLOW_RELEASE_FILES.filter((file) => file.endsWith(".mjs")).length);
+		if (process.platform !== "win32") {
+			assert.equal(calls.filter((call) => call[0] === "python3").length, 1 + WORKFLOW_RELEASE_FILES.filter((file) => file.endsWith(".py")).length);
+			assert.throws(
+				() => verifyRelease(root, (command) => {
+					if (command === "python3") throw new Error("ENOENT");
+					return { status: 0 };
+				}),
+				/requires python3/u,
+				"channel verification reports its Python prerequisite before bridge parsing",
+			);
+		}
+		assert.equal(calls.at(-1)[1].at(-1), "--help");
+		const missingWorkflowModule = path.join(root, "src", "workflows", "manager.mjs");
+		fs.rmSync(missingWorkflowModule);
+		assert.throws(() => verifyRelease(root, () => ({ status: 0 })), /release is missing src\/workflows\/manager\.mjs/u);
+		fs.writeFileSync(missingWorkflowModule, "// restored workflow module\n");
+		fs.writeFileSync(path.join(root, "src", "pi-harness.mjs"), "export const = broken;\n");
+		assert.throws(() => verifyRelease(root), /failed/u, "channel verification parses the lazy-loaded host runtime rather than relying on --help");
+		fs.writeFileSync(path.join(root, "src", "pi-harness.mjs"), "// restored harness\n");
+		if (process.platform !== "win32") {
+			const bridge = path.join(root, "src", "harnesses", "acp_bridge.py");
+			fs.writeFileSync(bridge, "def broken(:\n");
+			assert.throws(() => verifyRelease(root), /failed/u, "channel verification parses shipped Python bridges before promotion");
+			fs.writeFileSync(bridge, "# restored bridge\n");
+		}
 		fs.rmSync(path.dirname(payloads.claude.binary), { recursive: true, force: true });
 		assert.throws(() => verifyRelease(root, () => ({ status: 0 })), /native payload is not installed/);
+	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+}
+
+// The current installer must continue to verify and roll back to immutable
+// pre-workflow snapshots. New snapshots advertise the feature by their package
+// manifest or workflow-specific paths and are then held to the complete file
+// manifest; legacy snapshots receive the original baseline verification.
+{
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "cc-channel-legacy-release-"));
+	try {
+		makeReleaseFixture(root);
+		for (const relative of WORKFLOW_RELEASE_FILES) fs.rmSync(path.join(root, relative), { recursive: true, force: true });
+		fs.rmSync(path.join(root, "src", "workflows"), { recursive: true, force: true });
+		assert.doesNotThrow(() => verifyRelease(root, () => ({ status: 0 })), "pre-workflow channel snapshots remain valid rollback targets");
+		fs.mkdirSync(path.join(root, "src", "workflows"), { recursive: true });
+		assert.throws(() => verifyRelease(root, () => ({ status: 0 })), /release is missing LICENSE/u, "a snapshot that starts shipping workflow paths must include the complete release manifest");
 	} finally {
 		fs.rmSync(root, { recursive: true, force: true });
 	}

@@ -467,6 +467,17 @@ assert.equal(
 	const catalog = new BackendCommandCatalog(config.agents, { cwd: process.cwd() });
 	const app = new HarnessApp(config, "codex", "acp", { backendCommandCatalog: catalog });
 	app.ui.requestRender = () => {};
+	assert.equal(app.workflowsDisabled, true);
+	assert.equal(app.workflowManager, undefined);
+	assert.equal(app.workflowRegistry, undefined);
+	assert.equal(app.workflowBroker, undefined);
+	assert.equal(app.workflowSummary, undefined);
+	const disabledAdapter = app.createRuntimeAdapter("codex", codexAgent);
+	assert.equal(Object.hasOwn(disabledAdapter, "ccRuntimeAdapterId"), false, "disabled adapters keep their pre-workflow shape");
+	assert.equal(Object.hasOwn(disabledAdapter, "ccWorkflowLaunchInjected"), false);
+	assert.equal(disabledAdapter.launchSpec.env?.CC_WORKFLOW_CHILD, undefined);
+	const workflowWorkerAdapter = app.createRuntimeAdapter("codex", codexAgent, { workflowChild: true });
+	assert.equal(workflowWorkerAdapter.launchSpec.env.CC_WORKFLOW_CHILD, "1", "only opted-in workflow workers receive bridge behavior changes");
 	const names = app.displayCommandCatalog().map((command) => command.name);
 	assert.ok(names.includes("goal"));
 	assert.ok(!names.includes("logout"), "logout waits for the live capability so cc owns its full auth lifecycle");
@@ -475,6 +486,8 @@ assert.equal(
 	assert.equal(app.commandsLoaded.has("codex"), false);
 	assert.equal(app.slashCommandRoute("goal", "finish the migration"), "backend");
 	assert.equal(app.slashCommandRoute("goal", "view"), "local");
+	assert.equal(localSlashCommands(app).some((command) => command.name === "workflow-mode"), true);
+	assert.equal(localSlashCommands(app).some((command) => command.name === "workflow"), false);
 
 	const suggestions = await app.editor.autocompleteProvider.getSuggestions(
 		["/g"],

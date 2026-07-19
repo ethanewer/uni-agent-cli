@@ -102,6 +102,19 @@ assert.equal(
 	"cursor · composer-2 · /tmp/project",
 	"a harness may expose a model without a reasoning-effort option",
 );
+assert.equal(
+	statusLineText({ agent: "codex", transport: "acp", workflowMode: "disabled" }, "/tmp/project"),
+	"codex acp · /tmp/project",
+	"the default disabled policy leaves the pre-workflow footer unchanged",
+);
+assert.equal(
+	statusLineText({ agent: "codex", transport: "acp", workflowMode: "clone-only" }, "/tmp/project"),
+	"codex acp · workflows clone only · /tmp/project",
+);
+assert.equal(
+	statusLineText({ agent: "claude", transport: "acp", workflowMode: "flexible" }, "/tmp/project"),
+	"claude acp · workflows flexible · /tmp/project",
+);
 {
 	const app = Object.create(HarnessApp.prototype);
 	app.activeKey = "codex";

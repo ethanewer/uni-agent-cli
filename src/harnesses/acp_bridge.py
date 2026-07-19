@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import json
+import os
+import stat
 import sys
 import threading
 import traceback
@@ -25,6 +27,9 @@ class AcpBridge:
         self.session_id = f"{name}-{uuid.uuid4().hex}"
         self._send_lock = threading.Lock()
         self._cancel_current = None
+        self.workflow_child = os.environ.get("CC_WORKFLOW_CHILD") == "1"
+        self.session_cwd = None
+        self.session_mcp_servers = []
 
     def run(self):
         for raw in sys.stdin:
@@ -59,16 +64,46 @@ class AcpBridge:
 
         if method == "session/new":
             self.session_id = params.get("sessionId") or f"{self.name}-{uuid.uuid4().hex}"
+            if self.workflow_child:
+                requested_cwd = os.path.abspath(params.get("cwd") or os.getcwd())
+                requested = os.lstat(requested_cwd)
+                inherited = os.stat(".")
+                if (
+                    not stat.S_ISDIR(requested.st_mode)
+                    or requested.st_dev != inherited.st_dev
+                    or requested.st_ino != inherited.st_ino
+                ):
+                    raise RuntimeError("workflow session cwd does not match the supervisor-pinned directory")
+                # Never reopen the caller-controlled absolute pathname after this
+                # identity check. Workflow descendants inherit the supervisor's
+                # kernel-held cwd reference and resolve `.` from that reference.
+                self.session_cwd = "."
+                self.session_mcp_servers = list(params.get("mcpServers") or [])
+            result = {
+                "sessionId": self.session_id,
+                "modes": {
+                    "currentModeId": "agent",
+                    "availableModes": [{"id": "agent", "name": "Agent"}],
+                },
+            }
+            if self.workflow_child:
+                result["configOptions"] = self.config_options()
             self.reply(
                 request_id,
-                {
-                    "sessionId": self.session_id,
-                    "modes": {
-                        "currentModeId": "agent",
-                        "availableModes": [{"id": "agent", "name": "Agent"}],
-                    },
-                },
+                result,
             )
+            return
+
+        if method == "session/set_config_option" and self.workflow_child:
+            if params.get("sessionId") != self.session_id:
+                self.error(request_id, -32602, "unknown session")
+                return
+            try:
+                self.set_config_option(params.get("configId"), params.get("value"))
+            except (TypeError, ValueError) as error:
+                self.error(request_id, -32602, str(error))
+                return
+            self.reply(request_id, {"configOptions": self.config_options()})
             return
 
         if method == "session/prompt":
@@ -108,6 +143,40 @@ class AcpBridge:
     def make_prompt_runner(self, params):
         raise NotImplementedError
 
+    def config_options(self):
+        model = self.current_model()
+        if not model:
+            return []
+        return [
+            {
+                "id": "model",
+                "category": "model",
+                "name": "Model",
+                "type": "select",
+                "currentValue": model,
+                "options": [{"value": model, "name": model}],
+            }
+        ]
+
+    def current_model(self):
+        args = getattr(self, "args", None)
+        return getattr(args, "model", None)
+
+    def set_config_option(self, config_id, value):
+        if config_id != "model":
+            raise ValueError(f"unsupported config option: {config_id}")
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError("model must be a non-empty string")
+        requested = value.strip()
+        args = getattr(self, "args", None)
+        if args is None or not hasattr(args, "model"):
+            raise ValueError("this harness has no configurable model")
+        # These bridges cannot enumerate provider-specific model catalogs. Keep
+        # their configured model verifiable, but fail closed on arbitrary IDs
+        # rather than claiming an unvalidated model was applied before prompting.
+        if requested != self.current_model():
+            raise ValueError(f"unsupported model: {requested}")
+
     def prompt_text(self, params):
         chunks = []
         for part in params.get("prompt") or []:
@@ -145,6 +214,14 @@ class AcpBridge:
         }
         if title:
             update["title"] = title
+        self.session_update(update)
+
+    def usage_update(self, input_tokens=None, output_tokens=None):
+        update = {"sessionUpdate": "usage_update"}
+        if isinstance(input_tokens, (int, float)):
+            update["inputTokens"] = max(0, int(input_tokens))
+        if isinstance(output_tokens, (int, float)):
+            update["outputTokens"] = max(0, int(output_tokens))
         self.session_update(update)
 
     def session_update(self, update):
