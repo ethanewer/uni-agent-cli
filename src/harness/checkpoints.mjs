@@ -14,6 +14,27 @@ export const CHECKPOINT_PATH_MAX_BYTES = 4_096;
 export const CHECKPOINT_FILE_CHANGE_LIMIT = 1_000;
 export const CHECKPOINT_REWIND_MODES = Object.freeze(["code", "conversation", "both"]);
 
+export function normalizeCheckpointModes(value, fallback = []) {
+	const source = Array.isArray(value) ? value : fallback;
+	const modes = [];
+	for (const mode of source) {
+		if (CHECKPOINT_REWIND_MODES.includes(mode) && !modes.includes(mode)) modes.push(mode);
+	}
+	return modes;
+}
+
+export function checkpointModesForCapabilities(capabilities) {
+	if (capabilities?.checkpoints !== true) return [];
+	return normalizeCheckpointModes(capabilities.checkpointModes, CHECKPOINT_REWIND_MODES);
+}
+
+export function assertCheckpointModeSupported(capabilities, mode) {
+	if (!checkpointModesForCapabilities(capabilities).includes(mode)) {
+		throw new Error(`this harness does not support ${mode} checkpoint rewind`);
+	}
+	return mode;
+}
+
 export function parseCheckpointListParams(value) {
 	const sessionId = safeId(value?.sessionId, "sessionId");
 	const limit = value?.limit === undefined ? CHECKPOINT_LIMIT : value.limit;
@@ -40,7 +61,7 @@ export function normalizeCheckpointListResponse(value) {
 			if (!isRecord(entry)) throw new Error("checkpoint list returned an invalid checkpoint");
 			return {
 				id: safeId(entry.id, "checkpoint id"),
-				summary: cleanSummary(entry.summary) || "User message",
+				summary: checkpointSummary(entry.summary) || "User message",
 			};
 		}),
 	};
@@ -107,7 +128,7 @@ export function checkpointsFromSessionMessages(messages, options = {}) {
 			continue;
 		}
 		const raw = sessionMessageText(message.message);
-		const summary = cleanSummary(raw);
+		const summary = checkpointSummary(raw);
 		if (!summary && isLocalCommandTranscript(raw)) continue;
 		checkpoints.push({ id, summary: summary || "User message" });
 	}
@@ -125,7 +146,7 @@ export function sessionMessageText(message) {
 		.join("\n");
 }
 
-function cleanSummary(value) {
+export function checkpointSummary(value) {
 	const clean = sanitizeShellOutput(value)
 		.replace(/<command-(?:name|message|args)>[\s\S]*?<\/command-(?:name|message|args)>/gu, " ")
 		.replace(/<local-command-(?:stdout|stderr)>[\s\S]*?<\/local-command-(?:stdout|stderr)>/gu, " ")

@@ -69,6 +69,12 @@ class FakeConnection {
 		this.calls = [];
 	}
 	async initialize(options = {}) {
+		const command = this.agent.acp ?? this.agent;
+		this.launchInvocation = {
+			executable: command.command,
+			prefixArgs: [],
+			commandArgs: [...(command.args ?? [])],
+		};
 		this.capabilities = this.profile.capabilities ?? {};
 		this.agentInfo = this.profile.agentInfo ?? {};
 		this.authMethods = this.profile.authMethods ?? [];
@@ -165,7 +171,7 @@ function factoryFor(profile) {
 // Simulated wire capabilities per harness (mirrors the audit's findings).
 const PROFILES = {
 	codex: {
-		agentInfo: { name: "@agentclientprotocol/codex-acp" },
+		agentInfo: { name: "@agentclientprotocol/codex-acp", version: "1.1.4" },
 		sessionId: () => randomUUID(),
 		capabilities: { loadSession: true, sessionCapabilities: { list: {}, resume: {}, delete: {} }, promptCapabilities: { image: false } },
 		configOptions: [{ id: "model", category: "model" }, { id: "mode", category: "mode" }, { id: "thought_level", category: "thought_level" }],
@@ -195,7 +201,7 @@ const PROFILES = {
 		configOptions: [],
 	},
 	opencode: {
-		agentInfo: { name: "opencode" },
+		agentInfo: { name: "OpenCode", version: "1.18.3" },
 		capabilities: {
 			loadSession: true,
 			sessionCapabilities: { list: {}, resume: {}, fork: {} },
@@ -210,7 +216,7 @@ const PROFILES = {
 		// research, so /mode binds and /effort stays dark. The PiAdapter is fully
 		// wire-derived: if pi-acp instead advertised a `thought_level` configOption,
 		// reasoningEffort would light up automatically with no adapter change.
-		agentInfo: { name: "pi-acp" },
+		agentInfo: { name: "pi-acp", version: "0.0.31" },
 		capabilities: { loadSession: true, sessionCapabilities: { list: {}, resume: {} }, promptCapabilities: { image: true } },
 		configOptions: [{ id: "model", category: "model" }, { id: "mode", category: "mode" }],
 		modes: { availableModes: [{ id: "off" }, { id: "high" }] },
@@ -1929,18 +1935,22 @@ async function main() {
 		// boundary as well as in the production registry defaults.
 		const claude = createAdapter("claude", undefined, noopHost(), { connectionFactory: factoryFor(PROFILES.claude) });
 		assert.equal(claude.launchSpec._requiredAgentName, "@agentclientprotocol/claude-agent-acp");
-		assert.equal(claude.launchSpec._minimumAgentVersion, "0.58.1");
+		assert.equal(claude.launchSpec._minimumAgentVersion, "0.59.0");
 		assert.equal(claude.launchSpec._packageLocalAcpCommand, "claude-agent-acp");
-		assert.equal(claude.launchSpec._packageLocalAcpVersion, "0.58.1");
+		assert.equal(claude.launchSpec._packageLocalAcpVersion, "0.59.0");
 		ok("adapter-default:claude-identity-version");
 
 		// opencode/pi resolve from their own defaultAgentConfig (no DEFAULT_CONFIG edit).
 		const oc = createAdapter("opencode", undefined, noopHost(), { connectionFactory: factoryFor(PROFILES.opencode) });
 		assertAdapterConformance(oc);
 		assert.deepEqual(oc.launchSpec.acp, { command: "opencode", args: ["acp"] });
+		assert.equal(oc.launchSpec._requiredAgentName, "OpenCode");
+		assert.equal(oc.launchSpec._packageLocalAcpPackageName, "opencode-ai");
+		assert.equal(oc.launchSpec._packageLocalAcpVersion, "1.18.3");
 		await oc.connect();
 		assert.equal(oc.capabilities.fork, "native");
 		assert.equal(oc.capabilities.mcp, true);
+		assert.deepEqual(oc.capabilities.checkpointModes, ["both", "conversation", "code"]);
 		ok("addability:opencode");
 
 		const pi = createAdapter("pi", undefined, noopHost(), { connectionFactory: factoryFor(PROFILES.pi) });
@@ -1948,14 +1958,8 @@ async function main() {
 		await pi.connect();
 		assert.equal(pi.capabilities.fork, false); // pi-acp advertises no fork -> /btw dark
 		assert.equal(pi.capabilities.models, true);
+		assert.deepEqual(pi.capabilities.checkpointModes, ["conversation"]);
 		ok("addability:pi");
-
-		// opencode/pi are *thin*: zero overridden prototype methods beyond constructor.
-		for (const adapter of [oc, pi]) {
-			const overrides = Object.getOwnPropertyNames(Object.getPrototypeOf(adapter).constructor.prototype).filter((n) => n !== "constructor");
-			assert.deepEqual(overrides, [], `${adapter.key} adapter should override nothing`);
-		}
-		ok("addability:thin-adapters");
 
 		// a brand-new harness registered at runtime — no interface/base/cc edit.
 		class AcmeAdapter extends BaseAcpAdapter {

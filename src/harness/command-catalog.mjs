@@ -364,20 +364,18 @@ function resolveLaunchTargetIdentities(command, args, cwd) {
 }
 
 function packageLocalLaunchIdentities(agent, launch) {
-	const contract = Object.values(BUNDLED_ACP_ADAPTERS).find((entry) =>
-		agent?._requiredAgentName === entry.packageName &&
-		agent?._packageLocalAcpCommand === entry.bin &&
-		launch?.command === entry.bin,
-	);
-	if (!contract) return [];
-	const packageRoot = path.join(PACKAGE_ROOT, "node_modules", ...contract.packageName.split("/"));
+	const packageName = agent?._packageLocalAcpPackageName ?? agent?._requiredAgentName;
+	const bin = agent?._packageLocalAcpCommand;
+	const version = agent?._packageLocalAcpVersion;
+	if (typeof packageName !== "string" || !packageName || typeof bin !== "string" || !bin || launch?.command !== bin) return [];
+	const packageRoot = path.join(PACKAGE_ROOT, "node_modules", ...packageName.split("/"));
 	const packageJson = path.join(packageRoot, "package.json");
 	try {
 		const metadata = JSON.parse(fs.readFileSync(packageJson, "utf8"));
-		if (metadata?.name !== contract.packageName || metadata.version !== contract.version) {
+		if (metadata?.name !== packageName || (version && metadata.version !== version)) {
 			return [];
 		}
-		const relative = typeof metadata.bin === "string" ? metadata.bin : metadata.bin?.[contract.bin];
+		const relative = typeof metadata.bin === "string" ? metadata.bin : metadata.bin?.[bin];
 		if (typeof relative !== "string" || !relative) return [];
 		return [dataFileIdentity(packageJson), dataFileIdentity(path.resolve(packageRoot, relative))].filter(Boolean);
 	} catch {

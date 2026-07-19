@@ -598,7 +598,7 @@ await (async () => {
 	client.agent = {
 		label: "Codex",
 		_requiredAgentName: "@agentclientprotocol/codex-acp",
-		_minimumAgentVersion: "1.1.2",
+		_minimumAgentVersion: "1.1.4",
 	};
 	client.start = () => {};
 	client.stop = () => (stopped = true);
@@ -608,7 +608,7 @@ await (async () => {
 		agentCapabilities: {},
 		authMethods: [],
 	});
-	await assert.rejects(client.initialize(), /Codex ACP adapter 1\.1\.1 is too old.*1\.1\.2.*Reinstall cc/);
+	await assert.rejects(client.initialize(), /Codex ACP adapter 1\.1\.1 is too old.*1\.1\.4.*Reinstall cc/);
 	assert.equal(stopped, true);
 	assert.equal(sessionCreated, false);
 })();
@@ -619,13 +619,13 @@ await (async () => {
 	client.agent = {
 		label: "Claude Code",
 		_requiredAgentName: "@agentclientprotocol/claude-agent-acp",
-		_minimumAgentVersion: "0.58.1",
+		_minimumAgentVersion: "0.59.0",
 	};
 	client.start = () => {};
 	client.stop = () => (stopped = true);
 	client.newSession = async () => assert.fail("identity must be checked before session/new");
 	client.request = async () => ({
-		agentInfo: { name: "claude-agent-acp", version: "0.58.1" },
+		agentInfo: { name: "claude-agent-acp", version: "0.59.0" },
 		agentCapabilities: {},
 		authMethods: [],
 	});
@@ -3787,12 +3787,12 @@ else process.env.CC_SETTINGS = previousDefaultCcSettings;
 assert.ok(defaultConfig.agents["terminus-2"]);
 assert.ok(defaultConfig.agents["mini-swe-agent"]);
 assert.equal(defaultConfig.agents.claude._requiredAgentName, "@agentclientprotocol/claude-agent-acp");
-assert.equal(defaultConfig.agents.claude._minimumAgentVersion, "0.58.1");
-assert.equal(defaultConfig.agents.claude._packageLocalAcpVersion, "0.58.1");
+assert.equal(defaultConfig.agents.claude._minimumAgentVersion, "0.59.0");
+assert.equal(defaultConfig.agents.claude._packageLocalAcpVersion, "0.59.0");
 assert.match(defaultConfig.agents.claude._packageLocalAcpBridge, /harness[/\\]claude-acp-bridge\.mjs$/u);
 assert.equal(defaultConfig.agents.codex._requiredAgentName, "@agentclientprotocol/codex-acp");
-assert.equal(defaultConfig.agents.codex._minimumAgentVersion, "1.1.2");
-assert.equal(defaultConfig.agents.codex._packageLocalAcpVersion, "1.1.2");
+assert.equal(defaultConfig.agents.codex._minimumAgentVersion, "1.1.4");
+assert.equal(defaultConfig.agents.codex._packageLocalAcpVersion, "1.1.4");
 for (const key of ["claude", "codex"]) {
 	const launch = resolveAgentAcpExecutable(defaultConfig.agents[key], process.cwd(), { PATH: "" });
 	assert.equal(launch.executable, process.execPath, `${key} must use cc's Node runtime for its package-local adapter`);
@@ -4724,9 +4724,9 @@ assert.deepEqual(newSessionOrder, ["before replay", "fresh welcome"]);
 {
 	const bundled = resolveCodexInvocation({
 		_requiredAgentName: "@agentclientprotocol/codex-acp",
-		_minimumAgentVersion: "1.1.2",
+		_minimumAgentVersion: "1.1.4",
 		_packageLocalAcpCommand: "codex-acp",
-		_packageLocalAcpVersion: "1.1.2",
+		_packageLocalAcpVersion: "1.1.4",
 		acp: { command: "codex-acp", args: [] },
 		env: { PATH: "" },
 	});
@@ -4750,7 +4750,7 @@ assert.deepEqual(newSessionOrder, ["before replay", "fresh welcome"]);
 		fs.mkdirSync(adapterRoot, { recursive: true });
 		fs.writeFileSync(path.join(adapterRoot, "package.json"), JSON.stringify({
 			name: "@agentclientprotocol/codex-acp",
-			version: "1.1.2",
+			version: "1.1.4",
 		}));
 		writePackage(bundledRoot, "@openai/codex", { codex: "bin/codex.js" });
 		fs.mkdirSync(path.dirname(adapterJs), { recursive: true });
@@ -4870,7 +4870,7 @@ assert.deepEqual(newSessionOrder, ["before replay", "fresh welcome"]);
 		fs.symlinkSync(path.relative(outdatedBin, outdatedAdapter), path.join(outdatedBin, "codex-acp"));
 		assert.deepEqual(
 			resolveCodexInvocation({
-				_minimumAgentVersion: "1.1.2",
+				_minimumAgentVersion: "1.1.4",
 				acp: { command: "codex-acp" },
 				env: { PATH: [outdatedBin, standaloneBin].join(path.delimiter) },
 			}),
@@ -4892,15 +4892,15 @@ assert.deepEqual(newSessionOrder, ["before replay", "fresh welcome"]);
 		fs.mkdirSync(path.dirname(entrypoint), { recursive: true });
 		fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({
 			name: "@agentclientprotocol/claude-agent-acp",
-			version: "0.58.1",
+			version: "0.59.0",
 			bin: { "claude-agent-acp": "dist/index.js" },
 		}));
 		fs.writeFileSync(entrypoint, "// package-local adapter\n");
 		const agent = {
 			_requiredAgentName: "@agentclientprotocol/claude-agent-acp",
-			_minimumAgentVersion: "0.58.1",
+			_minimumAgentVersion: "0.59.0",
 			_packageLocalAcpCommand: "claude-agent-acp",
-			_packageLocalAcpVersion: "0.58.1",
+			_packageLocalAcpVersion: "0.59.0",
 			acp: { command: "claude-agent-acp", args: [] },
 		};
 		assert.deepEqual(resolvePackageLocalAcpExecutable(agent, root), {
@@ -4923,6 +4923,34 @@ assert.deepEqual(newSessionOrder, ["before replay", "fresh welcome"]);
 	}
 }
 
+// An ACP protocol identity can differ from the npm package that owns its
+// executable (OpenCode reports `OpenCode`, while the package is `opencode-ai`).
+{
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "cc-package-local-opencode-"));
+	try {
+		const packageRoot = path.join(root, "node_modules", "opencode-ai");
+		const entrypoint = path.join(packageRoot, "bin", "opencode");
+		fs.mkdirSync(path.dirname(entrypoint), { recursive: true });
+		fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({
+			name: "opencode-ai",
+			version: "1.18.3",
+			bin: { opencode: "bin/opencode" },
+		}));
+		fs.writeFileSync(entrypoint, "native executable\n");
+		const agent = {
+			_requiredAgentName: "OpenCode",
+			_minimumAgentVersion: "1.18.3",
+			_packageLocalAcpPackageName: "opencode-ai",
+			_packageLocalAcpCommand: "opencode",
+			_packageLocalAcpVersion: "1.18.3",
+			acp: { command: "opencode", args: ["acp"] },
+		};
+		assert.deepEqual(resolvePackageLocalAcpExecutable(agent, root), { executable: entrypoint, prefixArgs: [] });
+	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+}
+
 if (process.platform !== "win32") {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "cc-acp-prefix-shadow-"));
 	try {
@@ -4940,11 +4968,11 @@ if (process.platform !== "win32") {
 			return shim;
 		};
 		const legacy = makeAdapter(path.join(root, "old"), "@zed-industries/codex-acp", "0.8.0");
-		const maintained = makeAdapter(path.join(root, "current"), "@agentclientprotocol/codex-acp", "1.1.2");
+		const maintained = makeAdapter(path.join(root, "current"), "@agentclientprotocol/codex-acp", "1.1.4");
 		const pathValue = [path.dirname(legacy), path.dirname(maintained)].join(path.delimiter);
 		const launch = resolveAgentAcpExecutable({
 			_requiredAgentName: "@agentclientprotocol/codex-acp",
-			_minimumAgentVersion: "1.1.2",
+			_minimumAgentVersion: "1.1.4",
 			acp: { command: "codex-acp", args: [] },
 		}, process.cwd(), { PATH: pathValue });
 		assert.equal(launch.executable, process.execPath);
@@ -4965,7 +4993,7 @@ if (process.platform !== "win32") {
 		fs.mkdirSync(path.dirname(entrypoint), { recursive: true });
 		fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({
 			name: "@agentclientprotocol/codex-acp",
-			version: "1.1.2",
+			version: "1.1.4",
 		}));
 		fs.writeFileSync(entrypoint, "// maintained adapter\n");
 		fs.writeFileSync(path.join(prefix, "codex-acp.exe"), "foreign executable");
@@ -4975,7 +5003,7 @@ if (process.platform !== "win32") {
 		);
 		const launch = resolveAgentAcpExecutable({
 			_requiredAgentName: "@agentclientprotocol/codex-acp",
-			_minimumAgentVersion: "1.1.2",
+			_minimumAgentVersion: "1.1.4",
 			acp: { command: "codex-acp", args: [] },
 		}, process.cwd(), { Path: prefix }, "win32");
 		assert.equal(launch.executable, process.execPath);
@@ -7474,13 +7502,13 @@ await (async () => {
 				return { prefix, shim, entrypoint };
 			};
 			const oldAdapter = makeAdapter("old", "1.0.0");
-			const currentAdapter = makeAdapter("current", "1.1.2");
+			const currentAdapter = makeAdapter("current", "1.1.4");
 			let authLaunch;
 			const authChild = new EventEmitter();
 			await runTerminalAuthentication(
 				{
 					_requiredAgentName: "@agentclientprotocol/codex-acp",
-					_minimumAgentVersion: "1.1.2",
+					_minimumAgentVersion: "1.1.4",
 					acp: { command: "codex-acp", args: [] },
 				},
 				{ type: "terminal", id: "login", name: "Login", args: ["login"] },

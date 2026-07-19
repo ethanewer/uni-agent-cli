@@ -8,8 +8,21 @@ import fs from "node:fs";
 import path from "node:path";
 import { BaseAcpAdapter, REVIEW_PRESET } from "../acp-base.mjs";
 import { mergeEnvironments } from "../acp-runtime.mjs";
+import { adapterVersionAtLeast, BUNDLED_ACP_ADAPTERS } from "../bundled-adapters.mjs";
+import {
+	assertCheckpointModeSupported,
+	normalizeCheckpointRewindResponse,
+} from "../checkpoints.mjs";
+import {
+	assertCodexCheckpointTurnRemoved,
+	codexCheckpointForkParams,
+	codexCheckpointReadParams,
+	codexCheckpointRollbackPlan,
+	codexCheckpointsFromThreadRead,
+} from "../codex-checkpoints.mjs";
+import { codexPersistentForkSession } from "../codex-thread.mjs";
 
-const CODEX_ACP_AGENT_NAME = "@agentclientprotocol/codex-acp";
+const CODEX_ACP_AGENT_NAME = BUNDLED_ACP_ADAPTERS.codex.packageName;
 
 function parseCodexConfig(value) {
 	try {
@@ -29,7 +42,13 @@ export class CodexAdapter extends BaseAcpAdapter {
 	}
 
 	declaredCapabilities() {
-		return { fork: "copy", retractPrompt: true, commandPresets: ["review"] };
+		return {
+			fork: "copy",
+			retractPrompt: true,
+			commandPresets: ["review"],
+			checkpoints: true,
+			checkpointModes: ["conversation"],
+		};
 	}
 
 	// Unsend is only safe against the maintained Codex ACP backend. Narrow only
@@ -38,7 +57,16 @@ export class CodexAdapter extends BaseAcpAdapter {
 	// expose the declared subset). Pointing the codex key at another bridge then keeps
 	// unsend off rather than advertising a feature that backend can't honor.
 	refineCapabilities(caps) {
-		if (this.connection) caps.retractPrompt = this.connection.agentInfo?.name === CODEX_ACP_AGENT_NAME;
+		if (this.connection) {
+			const maintained = this.connection.agentInfo?.name === CODEX_ACP_AGENT_NAME;
+			const checkpointCompatible = maintained && adapterVersionAtLeast(
+				this.connection.agentInfo?.version,
+				BUNDLED_ACP_ADAPTERS.codex.minimumVersion,
+			);
+			caps.retractPrompt = maintained;
+			caps.checkpoints = checkpointCompatible;
+			caps.checkpointModes = checkpointCompatible ? ["conversation"] : [];
+		}
 		return caps;
 	}
 
@@ -206,28 +234,123 @@ export class CodexAdapter extends BaseAcpAdapter {
 		}
 	}
 
+	async listCheckpoints(options = {}) {
+		if (!this.capabilities.checkpoints || !this.sessionId) {
+			throw new Error("Codex checkpoint history is not available");
+		}
+		const resolveInvocation = this.codexService("resolveCodexInvocation");
+		const runRequests = this.codexService("runCodexAppServerRequests");
+		const invocation = resolveInvocation(this.launchSpec);
+		if (!invocation) throw new Error("a compatible Codex CLI is required for rollback");
+		const [response] = await runRequests(
+			invocation,
+			[{ method: "thread/read", params: codexCheckpointReadParams(this.sessionId) }],
+			this.launchSpec,
+		);
+		return codexCheckpointsFromThreadRead(response, options);
+	}
+
 	async rewindCheckpoint(checkpointId, mode, options = {}) {
-		if (mode === "code") return await super.rewindCheckpoint(checkpointId, mode, options);
+		assertCheckpointModeSupported(this.capabilities, mode);
 		const releaseOperation = await this.acquireLeaseOperation(`rewind Codex checkpoint ${checkpointId}`);
 		const connection = this.connection;
-		const previousSessionId = this.canonicalSessionId(connection?.sessionId);
+		const sourceSessionId = this.canonicalSessionId(connection?.sessionId);
+		let forked;
+		let invocation;
+		let runRequests;
+		let handoffPromise;
 		let promoted = false;
 		try {
-			const beforeReplay = options.beforeReplay;
-			const result = await super.rewindCheckpoint(checkpointId, mode, {
-				...options,
-				beforeReplay: async (response) => {
-					this.promoteLiveLease(connection?.sessionId, connection);
-					promoted = true;
-					await beforeReplay?.(response);
-				},
+			if (!sourceSessionId) throw new Error("Codex session is not ready");
+			const resolveInvocation = this.codexService("resolveCodexInvocation");
+			runRequests = this.codexService("runCodexAppServerRequests");
+			invocation = resolveInvocation(this.launchSpec);
+			if (!invocation) throw new Error("a compatible Codex CLI is required for rollback");
+			const [readResponse] = await runRequests(
+				invocation,
+				[{ method: "thread/read", params: codexCheckpointReadParams(sourceSessionId) }],
+				this.launchSpec,
+			);
+			const rollbackPlan = codexCheckpointRollbackPlan(readResponse, checkpointId, {
+				readLocalImage: (filePath) => fs.readFileSync(filePath),
 			});
-			if (!promoted) this.promoteLiveLease(result?.sessionId ?? connection?.sessionId, connection);
-			return result;
+			await runRequests(
+				invocation,
+				[
+					{ method: "thread/fork", params: codexCheckpointForkParams(sourceSessionId, rollbackPlan.turnId) },
+					(results) => {
+						forked = codexPersistentForkSession(results[0], sourceSessionId);
+						return { method: "thread/rollback", params: { threadId: forked.sessionId, numTurns: 1 } };
+					},
+					(results) => {
+						assertCodexCheckpointTurnRemoved(results[1], rollbackPlan);
+						return {
+							method: "thread/inject_items",
+							params: { threadId: forked.sessionId, items: rollbackPlan.injectionItems },
+						};
+					},
+				],
+				this.launchSpec,
+				{
+					// The persistent zero-turn fork exists only while this app-server owns
+					// it. session/load is therefore the commit boundary: its successful
+					// return proves the independent live ACP backend adopted the rolled-back
+					// history, including injected input, before this temporary owner exits.
+					// After that transfer the live backend, rather than this process's final
+					// storage flush, is authoritative for the child session.
+					acceptForcedTeardownAfterResponse: true,
+					beforeTeardown: () => {
+						handoffPromise = (async () => {
+							this.codexService("recordForkId")(forked.sessionId, sourceSessionId, { required: true });
+							this.acquireLiveLease(forked.sessionId, connection);
+							const beforeReplay = options.beforeReplay;
+							await super.loadSession(forked.sessionId, {
+								...options,
+								beforeReplay: async (response) => {
+									this.promoteLiveLease(forked.sessionId, connection);
+									promoted = true;
+									await beforeReplay?.(response);
+								},
+							});
+							if (!promoted) this.promoteLiveLease(forked.sessionId, connection);
+						})();
+						return handoffPromise;
+					},
+				},
+			);
+			for (const text of rollbackPlan.replayText) this.host.onEvent?.({ type: "user_text", text });
+			return normalizeCheckpointRewindResponse({ ok: true, mode, sessionId: forked.sessionId });
 		} catch (error) {
+			// Third-party host services may not use cc's transaction helper. Preserve
+			// the same no-race contract at the adapter boundary before deciding whether
+			// the child committed or is still disposable.
+			if (handoffPromise) {
+				try { await handoffPromise; }
+				catch (handoffError) { error.checkpointHandoffError ??= handoffError; }
+			}
 			const currentSessionId = this.canonicalSessionId(connection?.sessionId);
-			if (!promoted && currentSessionId && currentSessionId !== previousSessionId) {
+			if (!promoted && currentSessionId && currentSessionId !== sourceSessionId) {
 				this.promoteLiveLease(currentSessionId, connection);
+			} else if (forked && (!currentSessionId || currentSessionId === sourceSessionId)) {
+				this.releaseLiveLease(forked.sessionId);
+				const cleanupErrors = [];
+				try {
+					if (!invocation || !runRequests) throw new Error("Codex rollback cleanup lost its app-server invocation");
+					await runRequests(invocation, [{ method: "thread/delete", params: { threadId: forked.sessionId } }], this.launchSpec);
+				} catch (cleanupError) {
+					cleanupErrors.push(cleanupError);
+				}
+				try {
+					// A zero-turn native fork may disappear when its app-server exits, so
+					// registry cleanup is independent of whether thread/delete still finds it.
+					this.codexService("forgetForkIds")(forked.sessionId, { required: true });
+				} catch (cleanupError) {
+					cleanupErrors.push(cleanupError);
+				}
+				if (cleanupErrors.length === 1) error.checkpointForkCleanupError = cleanupErrors[0];
+				else if (cleanupErrors.length > 1) {
+					error.checkpointForkCleanupError = new AggregateError(cleanupErrors, "Codex rollback cleanup failed");
+				}
 			}
 			throw error;
 		} finally {

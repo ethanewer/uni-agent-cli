@@ -13,26 +13,32 @@ import {
 
 const packageJson = JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8"));
 assert.equal(packageJson.bin.cc, "src/cc.mjs");
-assert.equal(packageJson.engines.node, ">=22", "the package must satisfy claude-agent-acp's Node runtime floor");
-assert.equal(packageJson.dependencies["@agentclientprotocol/claude-agent-acp"], "0.58.1");
-assert.equal(packageJson.dependencies["@agentclientprotocol/codex-acp"], "1.1.2");
+assert.equal(packageJson.engines.node, ">=22.19.0", "the package must satisfy every bundled harness runtime floor");
+assert.equal(packageJson.optionalDependencies["opencode-ai"], "1.18.3", "the platform-specific OpenCode CLI must remain optional");
+assert.equal(packageJson.dependencies["opencode-ai"], undefined, "the platform-specific OpenCode CLI must not block other harnesses");
+assert.equal(packageJson.dependencies["@agentclientprotocol/claude-agent-acp"], "0.59.0");
+assert.equal(packageJson.dependencies["@agentclientprotocol/codex-acp"], "1.1.4");
+assert.equal(packageJson.dependencies["@anthropic-ai/claude-agent-sdk"], "0.3.214");
+assert.equal(packageJson.dependencies["@openai/codex"], "0.144.6");
+assert.equal(packageJson.dependencies["@earendil-works/pi-coding-agent"], "0.80.10");
+assert.equal(packageJson.dependencies["pi-acp"], "0.0.31");
 assert.deepEqual(
 	REQUIRED_LOCAL_ADAPTERS.map(({ packageName, version }) => [packageName, version]),
 	[
-		["@agentclientprotocol/claude-agent-acp", "0.58.1"],
-		["@agentclientprotocol/codex-acp", "1.1.2"],
+		["@agentclientprotocol/claude-agent-acp", "0.59.0"],
+		["@agentclientprotocol/codex-acp", "1.1.4"],
+		["pi-acp", "0.0.31"],
 	],
 );
 
 const launcher = fs.readFileSync(new URL(`../${packageJson.bin.cc}`, import.meta.url), "utf8");
 assert.match(launcher.split(/\r?\n/, 1)[0], /^#!\/usr\/bin\/env node$/u);
-assert.match(launcher, /nodeMajorVersion < 22/u);
-assert.match(launcher, /requires Node\.js 22 or newer/u);
+assert.match(launcher, /Node\.js 22\.19\.0 or newer/u);
 
 // The checked-out installation itself has both exact, usable package-local
 // adapters. PATH and globally installed package ownership are irrelevant.
 const installed = inspectLocalAdapters();
-assert.equal(installed.length, 2);
+assert.equal(installed.length, 3);
 assert.ok(installed.every((result) => result.ok), JSON.stringify(installed));
 const installedNative = inspectLocalNativePayloads();
 assert.equal(installedNative.length, 2);
@@ -58,7 +64,7 @@ try {
 		version: "0.0.0",
 		bin: { [adapter.bin]: "dist/index.js" },
 	}));
-	assert.match(inspectLocalAdapter(adapter, root).reason, /expected 1\.1\.2, found 0\.0\.0/u);
+	assert.match(inspectLocalAdapter(adapter, root).reason, /expected 1\.1\.4, found 0\.0\.0/u);
 
 	fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({
 		name: "@zed-industries/codex-acp",

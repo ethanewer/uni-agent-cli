@@ -122,12 +122,14 @@ import {
 import {
 	CHECKPOINTS_LIST_METHOD,
 	CHECKPOINT_REWIND_METHOD,
+	checkpointModesForCapabilities,
 	formatCheckpointRewindResult,
 	normalizeCheckpointListResponse,
 	normalizeCheckpointRewindResponse,
 	parseCheckpointListParams,
 	parseCheckpointRewindParams,
 } from "./harness/checkpoints.mjs";
+import { withOpenCodeClient } from "./harness/opencode-checkpoints.mjs";
 import {
 	REMOTE_CONTROL_METHOD,
 	formatRemoteControlResult,
@@ -2714,6 +2716,15 @@ export class AcpClient {
 		// bare package command, prefer a later compatible maintained adapter over an
 		// older package that happens to shadow it earlier on PATH.
 		const { executable, prefixArgs } = resolveAgentAcpExecutable(this.agent, cwd, env);
+		// Retain the exact shell-free invocation selected for this live backend.
+		// Harness extensions that need a sibling process (for example OpenCode's
+		// local server API) must use the same compatible executable rather than
+		// independently resolving a package that may be optional or PATH-provided.
+		this.launchInvocation = Object.freeze({
+			executable,
+			prefixArgs: Object.freeze([...prefixArgs]),
+			commandArgs: Object.freeze([...(command.args ?? [])]),
+		});
 		this.childClosed = false;
 		this.childExitObserved = false;
 		this.processGroupConfirmedGone = false;
@@ -3945,7 +3956,7 @@ export function createAcpConnection(agent, onEvent, options) {
 	return new AcpClient(agent, onEvent, options);
 }
 
-function harnessAdapterServices() {
+function harnessAdapterServices(app) {
 	return {
 		codex: {
 			acquireForkOperationLock,
@@ -3957,6 +3968,13 @@ function harnessAdapterServices() {
 			liveSessionLeaseIsActive: codexLiveSessionLeaseIsActive,
 			readCodexThreadState,
 			recordForkId,
+			resolveCodexInvocation,
+			runCodexAppServerRequests: (...args) => app.runFencedCodexAppServerRequests(...args),
+		},
+		openCode: {
+			withClient: (directory, operation, options = {}) => app.runFencedCodexNativeOperation(() =>
+				withOpenCodeClient(directory, operation, app.trackedNativeProcessOptions(options)),
+			),
 		},
 	};
 }
@@ -4600,7 +4618,7 @@ export class HarnessApp {
 			globalPermissions: this.config.settings?.permissions,
 			grants: this.permissionGrants,
 			connectionFactory: createAcpConnection,
-			services: harnessAdapterServices(),
+			services: harnessAdapterServices(this),
 		});
 		const runtimeMode = this.runtimePermissionMode?.get(key);
 		if (runtimeMode) adapter.setRuntimePermissionMode(runtimeMode);
@@ -7533,6 +7551,10 @@ export class HarnessApp {
 			return false;
 		}
 		this.addCommandMessage(displayText);
+		if (this.replacementProcessFence) {
+			this.reportReplacementProcessFence();
+			return false;
+		}
 		if (argument.trim()) {
 			this.addNotice(`usage: /${commandName}`);
 			return false;
@@ -7631,6 +7653,7 @@ export class HarnessApp {
 
 	openCheckpointModeSelection(context, sourceSessionId, checkpoint, displayText = "/rewind") {
 		if (!this.isCheckpointContextActive(context, sourceSessionId)) return false;
+		const availableModes = checkpointModesForCapabilities(context.client?.capabilities);
 		const entries = [
 			{
 				value: "both",
@@ -7647,7 +7670,11 @@ export class HarnessApp {
 				label: "Code only",
 				description: "Restore files while keeping the full conversation",
 			},
-		];
+		].filter((entry) => availableModes.includes(entry.value));
+		if (entries.length === 0) {
+			this.addNotice("This agent does not advertise a usable checkpoint rewind mode");
+			return false;
+		}
 		this.openSelection("What should be rewound?", entries, async (entry) => {
 			this.closeMenu();
 			if (!entry || !this.isCheckpointContextActive(context, sourceSessionId)) return;
@@ -8435,7 +8462,7 @@ export class HarnessApp {
 
 	// Flip the active harness's permission mode at runtime, harness-agnostically.
 	// `/yolo` toggles auto<->ask; `/yolo ask|auto|deny` sets it explicitly.
-		toggleAutoApprove(name, argument) {
+	toggleAutoApprove(name, argument) {
 		this.addCommandMessage(slashCommandText(name, argument));
 		const agentKey = this.activeKey;
 		const agent = this.client?.launchSpec ?? this.config.agents[agentKey];
@@ -8463,9 +8490,12 @@ export class HarnessApp {
 		// for them — don't warn there. Be honest: only re-launching with the mode in
 		// settings re-spawns a native-bypass backend in a prompting configuration.
 		const backendContext = this.runtimePermissionBackendContext?.get(agentKey);
-		const hasCurrentBackendMode =
-			backendContext?.client === this.client &&
-			backendContext?.sessionId === this.client?.sessionId;
+		const hasCurrentBackendMode = Boolean(
+			backendContext &&
+			this.client &&
+			backendContext.client === this.client &&
+			backendContext.sessionId === this.client.sessionId,
+		);
 		const liveFullAccess = hasCurrentBackendMode && backendContext.mode === "agent-full-access";
 		// Once the live adapter has reported a mode for this exact client/session,
 		// that state supersedes the launch-time bypass flag. For example, changing
@@ -16901,7 +16931,7 @@ function packageLocalAcpPackageRoot(agent, packageRoot = PACKAGE_ROOT) {
 	const command = agent?.acp ?? agent;
 	const defaultCommand = agent?._packageLocalAcpCommand;
 	if (!defaultCommand || command?.command !== defaultCommand) return undefined;
-	const packageName = agent?._requiredAgentName;
+	const packageName = agent?._packageLocalAcpPackageName ?? agent?._requiredAgentName;
 	const segments = packageNameSegments(packageName);
 	if (!segments) return undefined;
 	// Project-local and npx installs hoist cc's dependencies into an ancestor
@@ -16936,7 +16966,7 @@ export function resolveAgentAcpExecutable(agent, cwd = process.cwd(), env = merg
 	if (agent?._requiredAgentName) {
 		const compatible = compatibleNodePackageExecutableOnPath(
 			executable,
-			agent._requiredAgentName,
+			agent._packageLocalAcpPackageName ?? agent._requiredAgentName,
 			agent._minimumAgentVersion,
 			env,
 			platform,
@@ -17021,7 +17051,7 @@ export function resolveCodexInvocation(agent = {}) {
 	const acpPath = compatibleNodePackageExecutableOnPath(
 		acpCommand,
 		"@agentclientprotocol/codex-acp",
-		agent?._minimumAgentVersion ?? "1.1.2",
+		agent?._minimumAgentVersion ?? "1.1.4",
 		env,
 	);
 	if (acpPath) {
@@ -17225,7 +17255,10 @@ export async function runCodexCommand(invocation, args, agent = {}, options = {}
 
 export async function runCodexAppServerRequests(invocation, requests, agent = {}, options = {}) {
 	if (!invocation?.command) throw new Error("no compatible Codex CLI invocation was found");
-	if (!Array.isArray(requests) || requests.some((request) => typeof request?.method !== "string" || !request.method)) {
+	if (
+		!Array.isArray(requests) ||
+		requests.some((request) => typeof request !== "function" && (typeof request?.method !== "string" || !request.method))
+	) {
 		throw new Error("invalid Codex app-server request list");
 	}
 	if (
@@ -17245,6 +17278,9 @@ export async function runCodexAppServerRequests(invocation, requests, agent = {}
 	) {
 		throw new Error("invalid Codex app-server completion matcher");
 	}
+	if (options.beforeTeardown !== undefined && typeof options.beforeTeardown !== "function") {
+		throw new Error("invalid Codex app-server pre-teardown hook");
+	}
 	let realCommand = invocation.command;
 	try {
 		realCommand = fs.realpathSync(invocation.command);
@@ -17261,7 +17297,8 @@ export async function runCodexAppServerRequests(invocation, requests, agent = {}
 		"externalAgentConfig/import/readHistories",
 	]);
 	const hasStateChangingRequest = requests.some(
-		(request) => !/\/(?:read|get|list)$/.test(request.method) && !extraReadOnlyMethods.has(request.method),
+		(request) => typeof request === "function" ||
+			(!/\/(?:read|get|list)$/.test(request.method) && !extraReadOnlyMethods.has(request.method)),
 	);
 	return await new Promise((resolve, reject) => {
 		options.processTracker?.assertOpen();
@@ -17286,9 +17323,11 @@ export async function runCodexAppServerRequests(invocation, requests, agent = {}
 		let requestsCompleted = false;
 		let teardownStarted = false;
 		let teardownPromise;
+		let beforeTeardownPromise;
 		let directChildClosed = false;
 		let activeId = 1;
 		let requestIndex = -1;
+		let activeRequest;
 		const results = [];
 		const pendingCompletionNotifications = [];
 		let pendingCompletionNotificationBytes = 0;
@@ -17317,6 +17356,17 @@ export async function runCodexAppServerRequests(invocation, requests, agent = {}
 			if (error) reject(error);
 			else resolve(results);
 		};
+		const errorAfterHandoff = async (inputError = undefined) => {
+			let error = inputError;
+			if (beforeTeardownPromise) {
+				try {
+					await beforeTeardownPromise;
+				} catch (handoffError) {
+					error ??= handoffError;
+				}
+			}
+			return error;
+		};
 		const teardownAndFinish = (inputError = undefined) => {
 			if (settled) return Promise.resolve();
 			if (teardownPromise) return teardownPromise;
@@ -17334,13 +17384,33 @@ export async function runCodexAppServerRequests(invocation, requests, agent = {}
 				// a state-changing app-server caller does not mistake forceful teardown for
 				// an ordinary, fully settled completion.
 				const initialSignal = "SIGTERM";
-				let termination = terminateChild(child, initialSignal, { includeExitedGroup: true });
-				let treeExited = await waitForProcessTreeExit(
-					child,
-					() => directChildClosed,
-					terminationGraceMs,
-					termination,
-				);
+				let termination = emptyTerminationResult();
+				// A successful app-server response can precede its durable storage flush.
+				// Closing stdin asks the server to finish that flush and exit naturally;
+				// give it one grace interval before signalling the tree. On POSIX the
+				// detached group proves every descendant is gone. On Windows the bundled
+				// launcher does not exit until its native child exits, so a natural root
+				// close is the corresponding graceful completion boundary.
+				let treeExited = false;
+				if (!error) {
+					treeExited = process.platform === "win32"
+						? await waitForDirectChildExit(() => directChildClosed, terminationGraceMs)
+						: await waitForProcessTreeExit(
+							child,
+							() => directChildClosed,
+							terminationGraceMs,
+							termination,
+						);
+				}
+				if (!treeExited) {
+					termination = terminateChild(child, initialSignal, { includeExitedGroup: true });
+					treeExited = await waitForProcessTreeExit(
+						child,
+						() => directChildClosed,
+						terminationGraceMs,
+						termination,
+					);
+				}
 				if (!treeExited) {
 					termination = mergeTerminationResults(
 						termination,
@@ -17355,9 +17425,17 @@ export async function runCodexAppServerRequests(invocation, requests, agent = {}
 				}
 				if (!treeExited) {
 					const prefix = error?.message ? `${error.message}; ` : "";
-					finish(processTreeTerminationError(`${prefix}Codex app-server process tree did not exit after SIGKILL`));
+					error = await errorAfterHandoff(
+						processTreeTerminationError(`${prefix}Codex app-server process tree did not exit after SIGKILL`),
+					);
+					finish(error);
 					return;
 				}
+				// A pre-teardown hook may be handing a newly forked thread to the live
+				// ACP backend. Never expose this helper's failure until that handoff has
+				// settled; otherwise the caller can delete the fork while session/load is
+				// still capable of committing it.
+				error = await errorAfterHandoff(error);
 				if (
 					!error &&
 					termination.forceSignalled &&
@@ -17403,7 +17481,7 @@ export async function runCodexAppServerRequests(invocation, requests, agent = {}
 			complete();
 			return true;
 		};
-		const finishRequests = () => {
+		const finalizeRequests = () => {
 			requestsCompleted = true;
 			if (!options.waitForNotification) {
 				complete();
@@ -17414,6 +17492,21 @@ export async function runCodexAppServerRequests(invocation, requests, agent = {}
 			}
 			pendingCompletionNotifications.length = 0;
 			pendingCompletionNotificationBytes = 0;
+		};
+		const finishRequests = () => {
+			if (typeof options.beforeTeardown !== "function") {
+				finalizeRequests();
+				return;
+			}
+			// The RPC transaction itself is complete. This hook can establish an
+			// independent owner for transient mutation state before stdin EOF (Codex
+			// zero-turn forks require exactly that ordering). ACP session/load can also
+			// replay a large history for longer than the one-shot command timeout, just
+			// like /resume and /branch; processTracker still owns shutdown cancellation.
+			clearTimeout(timer);
+			beforeTeardownPromise = Promise.resolve().then(() => options.beforeTeardown([...results]));
+			beforeTeardownPromise
+				.then(finalizeRequests, (error) => teardownAndFinish(error));
 		};
 		const write = (message) => {
 			if (settled) return;
@@ -17430,8 +17523,21 @@ export async function runCodexAppServerRequests(invocation, requests, agent = {}
 				return;
 			}
 			activeId += 1;
-			const request = requests[requestIndex];
-			write({ id: activeId, method: request.method, ...(request.params !== undefined ? { params: request.params } : {}) });
+			try {
+				const requestSpec = requests[requestIndex];
+				activeRequest = typeof requestSpec === "function" ? requestSpec([...results]) : requestSpec;
+				if (typeof activeRequest?.method !== "string" || !activeRequest.method) {
+					throw new Error("a Codex app-server transaction produced an invalid request");
+				}
+			} catch (error) {
+				void teardownAndFinish(error);
+				return;
+			}
+			write({
+				id: activeId,
+				method: activeRequest.method,
+				...(activeRequest.params !== undefined ? { params: activeRequest.params } : {}),
+			});
 		};
 		const handleLine = (line) => {
 			if (!line.trim() || settled) return;
@@ -17471,7 +17577,7 @@ export async function runCodexAppServerRequests(invocation, requests, agent = {}
 			if (message?.id !== activeId) return;
 			if (message.error) {
 				const detail = message.error.message ?? JSON.stringify(message.error);
-				const method = requestIndex < 0 ? "initialize" : requests[requestIndex]?.method;
+				const method = requestIndex < 0 ? "initialize" : activeRequest?.method;
 				void teardownAndFinish(new Error(`${method} failed${message.error.code === undefined ? "" : ` (${message.error.code})`}: ${detail}`));
 				return;
 			}
@@ -17533,7 +17639,7 @@ export async function runCodexAppServerRequests(invocation, requests, agent = {}
 				// taskkill /T is issued while the root is live on Windows. A normal root
 				// close is the only safe signal available there; on POSIX, the stable
 				// detached group id lets us also sweep a stray descendant after close.
-				if (process.platform === "win32") finish();
+				if (process.platform === "win32") void errorAfterHandoff().then(finish);
 				else void teardownAndFinish();
 				return;
 			}
@@ -17542,7 +17648,7 @@ export async function runCodexAppServerRequests(invocation, requests, agent = {}
 				"Codex accepted the request, but exited before confirming completion",
 				new Error(`Codex app-server exited ${signal ?? code ?? "without a status"}${detail ? `: ${detail}` : ""}`),
 			);
-			if (process.platform === "win32") finish(error);
+			if (process.platform === "win32") void errorAfterHandoff(error).then(finish);
 			else void teardownAndFinish(error);
 		});
 		timer = setTimeout(() => {

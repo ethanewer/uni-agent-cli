@@ -14,7 +14,7 @@ const codexAgent = {
 	label: "Codex",
 	transport: "acp",
 	_requiredAgentName: "@agentclientprotocol/codex-acp",
-	_minimumAgentVersion: "1.1.2",
+	_minimumAgentVersion: "1.1.4",
 	acp: { command: "codex-acp", args: [] },
 };
 
@@ -22,9 +22,9 @@ const claudeAgent = {
 	label: "Claude",
 	transport: "acp",
 	_requiredAgentName: "@agentclientprotocol/claude-agent-acp",
-	_minimumAgentVersion: "0.58.1",
+	_minimumAgentVersion: "0.59.0",
 	_packageLocalAcpCommand: "claude-agent-acp",
-	_packageLocalAcpVersion: "0.58.1",
+	_packageLocalAcpVersion: "0.59.0",
 	acp: { command: "claude-agent-acp", args: [] },
 };
 const uncataloguedClaudeAgent = {
@@ -149,7 +149,7 @@ try {
 	assert.deepEqual(second.commandsFor("claude"), [], "an adapter identity change invalidates stale cached hints");
 
 	second.remember("codex", [{ name: "$dynamic-skill", description: "Dynamic" }], {
-		agentInfo: { name: "@agentclientprotocol/codex-acp", version: "1.1.2" },
+		agentInfo: { name: "@agentclientprotocol/codex-acp", version: "1.1.4" },
 	});
 	assert.deepEqual(
 		second.commandsFor("codex").map((command) => command.name),

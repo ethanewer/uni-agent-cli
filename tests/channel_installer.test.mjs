@@ -657,7 +657,7 @@ function makeReleaseFixture(releaseDir) {
 	fs.writeFileSync(path.join(releaseDir, "src", "cc.mjs"), "#!/usr/bin/env node\n");
 	fs.writeFileSync(path.join(releaseDir, "src", "pi-harness.mjs"), "// harness\n");
 	for (const adapter of CHANNEL_ADAPTERS) {
-		makeAdapterFixture(releaseDir, adapter, adapter.minimumVersion ?? "0.58.1");
+		makeAdapterFixture(releaseDir, adapter, adapter.minimumVersion ?? "0.59.0");
 	}
 	const linuxMusl = process.platform === "linux" && !process.report?.getReport?.()?.header?.glibcVersionRuntime;
 	const claudeSuffix = linuxMusl ? `linux-${process.arch}-musl` : `${process.platform}-${process.arch}`;
@@ -725,7 +725,7 @@ function makeDirectoryLink(target, link) {
 			calls.push([command, args]);
 			return { status: 0 };
 		});
-		assert.equal(adapters.length, 2);
+		assert.equal(adapters.length, 3);
 		assert.deepEqual(calls.map((call) => call[1].at(-1)), [path.join(root, "src", "cc.mjs"), "--help"]);
 		fs.rmSync(path.dirname(payloads.claude.binary), { recursive: true, force: true });
 		assert.throws(() => verifyRelease(root, () => ({ status: 0 })), /native payload is not installed/);
@@ -760,7 +760,8 @@ function makeDirectoryLink(target, link) {
 			JSON.parse(fs.readFileSync(path.join(root, ".cc-adapters", "package.json"), "utf8")).dependencies,
 			{
 				"@agentclientprotocol/claude-agent-acp": "0.39.0",
-				"@agentclientprotocol/codex-acp": "1.1.2",
+				"@agentclientprotocol/codex-acp": "1.1.4",
+				"pi-acp": "0.0.31",
 			},
 		);
 

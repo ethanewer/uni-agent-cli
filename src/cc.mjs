@@ -101,8 +101,16 @@ function beginStartupInputGuard(enabled) {
 	return guard;
 }
 
-const nodeMajorVersion = Number.parseInt(process.versions.node.split(".")[0], 10);
-if (!Number.isFinite(nodeMajorVersion) || nodeMajorVersion < 22) {
+const nodeVersionParts = process.versions.node.split(".").slice(0, 3).map((part) => Number.parseInt(part, 10));
+const [nodeMajorVersion, nodeMinorVersion, nodePatchVersion] = nodeVersionParts;
+const supportedNodeVersion =
+	nodeVersionParts.length === 3 &&
+	nodeVersionParts.every(Number.isFinite) &&
+	(nodeMajorVersion > 22 || (
+		nodeMajorVersion === 22 &&
+		(nodeMinorVersion > 19 || nodeMinorVersion === 19 && nodePatchVersion >= 0)
+	));
+if (!supportedNodeVersion) {
 	restoreInheritedTerminalMode();
 	if (process.env.CC_PREPAINTED === "1") {
 		// The shell launcher has already drawn a placeholder and hidden the cursor.
@@ -111,7 +119,7 @@ if (!Number.isFinite(nodeMajorVersion) || nodeMajorVersion < 22) {
 		process.stdout.write("\x1b8\x1b[J\x1b[?25h");
 	}
 	console.error(
-		`cc requires Node.js 22 or newer (found ${process.versions.node}). Upgrade Node.js, then reinstall cc.`,
+		`cc requires Node.js 22.19.0 or newer (found ${process.versions.node}). Upgrade Node.js, then reinstall cc.`,
 	);
 	process.exit(1);
 }

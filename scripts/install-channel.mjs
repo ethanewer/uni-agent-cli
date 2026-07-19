@@ -22,17 +22,20 @@ export const CHANNELS = Object.freeze({
 
 export const CHANNEL_ADAPTERS = Object.freeze([
 	Object.freeze({ package: "@agentclientprotocol/claude-agent-acp", bin: "claude-agent-acp" }),
-	Object.freeze({ package: "@agentclientprotocol/codex-acp", bin: "codex-acp", minimumVersion: "1.1.2" }),
+	Object.freeze({ package: "@agentclientprotocol/codex-acp", bin: "codex-acp", minimumVersion: "1.1.4" }),
+	Object.freeze({ package: "pi-acp", bin: "pi-acp", minimumVersion: "0.0.31" }),
 ]);
 
 const ADAPTER_FALLBACK_VERSIONS = Object.freeze({
 	stable: Object.freeze({
 		"@agentclientprotocol/claude-agent-acp": "0.39.0",
-		"@agentclientprotocol/codex-acp": "1.1.2",
+		"@agentclientprotocol/codex-acp": "1.1.4",
+		"pi-acp": "0.0.31",
 	}),
 	beta: Object.freeze({
-		"@agentclientprotocol/claude-agent-acp": "0.58.1",
-		"@agentclientprotocol/codex-acp": "1.1.2",
+		"@agentclientprotocol/claude-agent-acp": "0.59.0",
+		"@agentclientprotocol/codex-acp": "1.1.4",
+		"pi-acp": "0.0.31",
 	}),
 });
 

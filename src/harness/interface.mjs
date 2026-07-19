@@ -8,6 +8,8 @@
 // conformance checker, and the wire -> capability derivation. It has no
 // dependency on any specific harness.
 
+import { CHECKPOINT_REWIND_MODES, normalizeCheckpointModes } from "./checkpoints.mjs";
+
 /** Capability keys. Every one is optional; defaults are "off". */
 export const CAPABILITY_KEYS = [
 	"fork", // false | "native" | "copy"
@@ -32,6 +34,7 @@ export const CAPABILITY_KEYS = [
 	"appendContext", // bool — append user context without starting a model turn
 	"backgroundTasks", // bool — negotiated lifecycle list/stop/background extension
 	"checkpoints", // bool — negotiated checkpoint list/rewind extension
+	"checkpointModes", // ("code" | "conversation" | "both")[]
 	"remoteControl", // bool — negotiated existing-session remote-control toggle
 	"namedFork", // bool — fork accepts a branch name and reports whether it was applied
 ];
@@ -61,6 +64,7 @@ export function emptyCapabilities() {
 		appendContext: false,
 		backgroundTasks: false,
 		checkpoints: false,
+		checkpointModes: [],
 		remoteControl: false,
 		namedFork: false,
 	};
@@ -151,6 +155,17 @@ export function checkAdapterConformance(adapter) {
 			problems.push("`fork` must be false | 'native' | 'copy'");
 		}
 		if (!Array.isArray(caps.commandPresets)) problems.push("`commandPresets` must be an array");
+		const checkpointModes = caps.checkpoints === true && !Object.hasOwn(caps, "checkpointModes")
+			? CHECKPOINT_REWIND_MODES
+			: caps.checkpointModes;
+		if (
+			!Array.isArray(checkpointModes) ||
+			checkpointModes.some((mode) => !CHECKPOINT_REWIND_MODES.includes(mode)) ||
+			new Set(checkpointModes).size !== checkpointModes.length
+		) problems.push("`checkpointModes` must contain unique supported checkpoint modes");
+		if (caps.checkpoints !== (Array.isArray(checkpointModes) && checkpointModes.length > 0)) {
+			problems.push("`checkpoints` must match whether `checkpointModes` is non-empty");
+		}
 
 		// Capability -> required method invariants.
 		if (caps.fork && typeof adapter.fork !== "function") problems.push("capability fork set but fork() missing");
@@ -229,6 +244,10 @@ export function capabilitiesFromWire(sessionInfo = {}) {
 		(sessionInfo.modes?.availableModes?.length ?? 0) || (categories.has("mode") ? 1 : 0);
 
 	const resume = Boolean(acp.loadSession || sessionCaps.resume);
+	const checkpointMeta = acp._meta?.cc?.checkpoints;
+	const checkpointModes = checkpointMeta === true
+		? [...CHECKPOINT_REWIND_MODES]
+		: normalizeCheckpointModes(checkpointMeta?.modes);
 	return {
 		fork: sessionCaps.fork ? "native" : false,
 		resume,
@@ -250,7 +269,8 @@ export function capabilitiesFromWire(sessionInfo = {}) {
 		changeWorkingDirectory: acp._meta?.cc?.changeWorkingDirectory === true,
 		appendContext: acp._meta?.cc?.appendContext === true,
 		backgroundTasks: acp._meta?.cc?.backgroundTasks === true,
-		checkpoints: acp._meta?.cc?.checkpoints === true,
+		checkpoints: checkpointModes.length > 0,
+		checkpointModes,
 		remoteControl: acp._meta?.cc?.remoteControl === true,
 		namedFork: acp._meta?.cc?.namedFork === true,
 	};

@@ -469,7 +469,12 @@ assert_visible_contains_count "Space to record" 1
 
 tmux resize-window -t "$SESSION" -x 74 -y 12
 wait_for_text "Space to record"
+: > "$WRITE_LOG"
 tmux resize-window -t "$SESSION" -x 110 -y 32
+# capture-pane can still contain the frame drawn before tmux finished resizing
+# its PTY. Wait for cc itself to emit a fresh post-resize frame before testing
+# input, otherwise tmux may discard send-keys bytes during the resize operation.
+wait_for_write_log_text "Space to record"
 wait_for_text "Space to record"
 tmux send-keys -t "$SESSION" / t h e m e Enter
 wait_for_text "Palette:"
