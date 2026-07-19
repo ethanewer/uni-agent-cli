@@ -663,7 +663,7 @@ function makeReleaseFixture(releaseDir) {
 		fs.writeFileSync(file, relative.endsWith(".py") ? "# workflow helper\n" : relative.endsWith(".mjs") ? "// workflow module\n" : `${relative}\n`);
 	}
 	for (const adapter of CHANNEL_ADAPTERS) {
-		makeAdapterFixture(releaseDir, adapter, adapter.minimumVersion ?? "0.58.1");
+		makeAdapterFixture(releaseDir, adapter, adapter.minimumVersion ?? "0.59.0");
 	}
 	const linuxMusl = process.platform === "linux" && !process.report?.getReport?.()?.header?.glibcVersionRuntime;
 	const claudeSuffix = linuxMusl ? `linux-${process.arch}-musl` : `${process.platform}-${process.arch}`;
@@ -731,10 +731,16 @@ function makeDirectoryLink(target, link) {
 			calls.push([command, args]);
 			return { status: 0 };
 		});
-		assert.equal(adapters.length, 2);
-		assert.equal(calls.filter((call) => call[1][0] === "--check").length, 2 + WORKFLOW_RELEASE_FILES.filter((file) => file.endsWith(".mjs")).length);
+		assert.equal(adapters.length, 3);
+		const syntaxChecked = new Set(calls.filter((call) => call[1][0] === "--check").map((call) => call[1].at(-1)));
+		for (const relative of WORKFLOW_RELEASE_FILES.filter((file) => file.endsWith(".mjs"))) {
+			assert.equal(syntaxChecked.has(path.join(root, relative)), true, `channel verification syntax-checks ${relative}`);
+		}
 		if (process.platform !== "win32") {
-			assert.equal(calls.filter((call) => call[0] === "python3").length, 1 + WORKFLOW_RELEASE_FILES.filter((file) => file.endsWith(".py")).length);
+			const parsedPython = new Set(calls.filter((call) => call[0] === "python3" && call[1].at(-1)?.endsWith(".py")).map((call) => call[1].at(-1)));
+			for (const relative of WORKFLOW_RELEASE_FILES.filter((file) => file.endsWith(".py"))) {
+				assert.equal(parsedPython.has(path.join(root, relative)), true, `channel verification parses ${relative}`);
+			}
 			assert.throws(
 				() => verifyRelease(root, (command) => {
 					if (command === "python3") throw new Error("ENOENT");
@@ -809,7 +815,8 @@ function makeDirectoryLink(target, link) {
 			JSON.parse(fs.readFileSync(path.join(root, ".cc-adapters", "package.json"), "utf8")).dependencies,
 			{
 				"@agentclientprotocol/claude-agent-acp": "0.39.0",
-				"@agentclientprotocol/codex-acp": "1.1.2",
+				"@agentclientprotocol/codex-acp": "1.1.4",
+				"pi-acp": "0.0.31",
 			},
 		);
 

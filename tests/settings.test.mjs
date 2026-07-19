@@ -131,6 +131,73 @@ assert.equal(singleLineMenuText("approve \u202edeny\u2066 choice"), "approve \u2
 	}
 }
 {
+	// Input captured before the heavyweight TUI import is handed to Pi exactly
+	// once after its parser exists. Preserve UTF-8 characters split across raw
+	// chunks and restore the terminal mode that preceded the startup guard.
+	const originalStart = ProcessTerminal.prototype.start;
+	const originalStop = ProcessTerminal.prototype.stop;
+	const originalWrite = ProcessTerminal.prototype.write;
+	const startupGuardKey = Symbol.for("cc.startup-input-guard");
+	const encoded = Buffer.from("early € input", "utf8");
+	const replayed = [];
+	let restores = 0;
+	ProcessTerminal.prototype.start = function () {
+		this.wasRaw = true;
+		this.stdinBuffer = { process: (data) => replayed.push(data) };
+	};
+	ProcessTerminal.prototype.stop = () => {};
+	ProcessTerminal.prototype.write = () => {};
+	globalThis[startupGuardKey] = {
+		originalRaw: false,
+		handoff: () => [encoded.subarray(0, 8), encoded.subarray(8, 9), encoded.subarray(9)],
+		restore: () => { restores += 1; },
+	};
+	try {
+		const terminal = createHarnessTerminal();
+		terminal.start(() => {}, () => {});
+		assert.deepEqual(replayed, ["early € input"]);
+		assert.equal(terminal.wasRaw, false);
+		terminal.stop();
+		assert.equal(restores, 1);
+		assert.equal(globalThis[startupGuardKey], undefined);
+	} finally {
+		delete globalThis[startupGuardKey];
+		ProcessTerminal.prototype.start = originalStart;
+		ProcessTerminal.prototype.stop = originalStop;
+		ProcessTerminal.prototype.write = originalWrite;
+	}
+}
+{
+	// VS Code (including tmux panes launched from its terminal) must stay in the
+	// normal buffer so the terminal retains transcript scrollback. /btw may still
+	// opt into its temporary, app-scrolled alternate-screen page view.
+	const originalStart = ProcessTerminal.prototype.start;
+	const originalStop = ProcessTerminal.prototype.stop;
+	const originalWrite = ProcessTerminal.prototype.write;
+	const originalTermProgram = process.env.TERM_PROGRAM;
+	const writes = [];
+	ProcessTerminal.prototype.start = () => {};
+	ProcessTerminal.prototype.stop = () => {};
+	ProcessTerminal.prototype.write = (data) => writes.push(data);
+	process.env.TERM_PROGRAM = "vscode";
+	try {
+		const terminal = createHarnessTerminal();
+		terminal.start(() => {}, () => {});
+		assert.equal(writes.join("").includes("\x1b[?1049h"), false);
+		terminal.enterAlternateScreen();
+		terminal.exitAlternateScreen();
+		terminal.stop();
+		assert.equal(writes.filter((data) => data.includes("\x1b[?1049h")).length, 1);
+		assert.equal(writes.filter((data) => data.includes("\x1b[?1049l")).length, 1);
+	} finally {
+		if (originalTermProgram === undefined) delete process.env.TERM_PROGRAM;
+		else process.env.TERM_PROGRAM = originalTermProgram;
+		ProcessTerminal.prototype.start = originalStart;
+		ProcessTerminal.prototype.stop = originalStop;
+		ProcessTerminal.prototype.write = originalWrite;
+	}
+}
+{
 	const panel = new SelectionPanel("Resume\nsession", [{ label: "first\nsecond", description: "date\npath" }], () => {});
 	const lines = panel.render(80);
 	assert.ok(lines.every((line) => !line.includes("\n") && !line.includes("\r")));
@@ -532,7 +599,7 @@ await (async () => {
 	client.agent = {
 		label: "Codex",
 		_requiredAgentName: "@agentclientprotocol/codex-acp",
-		_minimumAgentVersion: "1.1.2",
+		_minimumAgentVersion: "1.1.4",
 	};
 	client.start = () => {};
 	client.stop = () => (stopped = true);
@@ -542,7 +609,7 @@ await (async () => {
 		agentCapabilities: {},
 		authMethods: [],
 	});
-	await assert.rejects(client.initialize(), /Codex ACP adapter 1\.1\.1 is too old.*1\.1\.2.*Reinstall cc/);
+	await assert.rejects(client.initialize(), /Codex ACP adapter 1\.1\.1 is too old.*1\.1\.4.*Reinstall cc/);
 	assert.equal(stopped, true);
 	assert.equal(sessionCreated, false);
 })();
@@ -553,13 +620,13 @@ await (async () => {
 	client.agent = {
 		label: "Claude Code",
 		_requiredAgentName: "@agentclientprotocol/claude-agent-acp",
-		_minimumAgentVersion: "0.58.1",
+		_minimumAgentVersion: "0.59.0",
 	};
 	client.start = () => {};
 	client.stop = () => (stopped = true);
 	client.newSession = async () => assert.fail("identity must be checked before session/new");
 	client.request = async () => ({
-		agentInfo: { name: "claude-agent-acp", version: "0.58.1" },
+		agentInfo: { name: "claude-agent-acp", version: "0.59.0" },
 		agentCapabilities: {},
 		authMethods: [],
 	});
@@ -2449,9 +2516,9 @@ await (async () => {
 	assert.deepEqual(applied, [["model", "Model", "gpt-next", "model", { targetThread: undefined }]]);
 })();
 
-// /btw snapshots a rollout, so it must wait for the active main turn to settle.
-// Its prompt-bearing form reserves staged images before that wait and forwards
-// the structured parts to the fork instead of orphaning the attachment.
+// /btw owns an independent backend and must start immediately while the main
+// turn is active. Its prompt-bearing form still reserves and forwards staged
+// images instead of orphaning the attachment.
 await (async () => {
 	const forwarded = [];
 	const app = Object.create(HarnessApp.prototype);
@@ -2474,13 +2541,54 @@ await (async () => {
 	});
 	await app.runLocalSlashCommand("btw", "inspect [Image 4]");
 	assert.equal(app.clipboardImages.length, 0);
-	assert.equal(app.deferredLocalSlashCommands.length, 1);
-	assert.equal(app.deferredLocalSlashCommands[0].promptParts.find((part) => part.type === "image")?.data, "aW1hZ2U0");
-	app.busy = false;
-	await app.flushDeferredLocalSlashCommands();
+	assert.equal(app.deferredLocalSlashCommands.length, 0);
 	assert.equal(forwarded.length, 1);
 	assert.equal(forwarded[0].question, "inspect [Image 4]");
 	assert.equal(forwarded[0].promptParts.find((part) => part.type === "image")?.data, "aW1hZ2U0");
+})();
+
+// A backend crash with committed prompts already waiting must reconnect and
+// wake the queue without requiring an unrelated extra submit.
+await (async () => {
+	const oldClient = { exited: true };
+	const replacementClient = { exited: false };
+	let reconnects = 0;
+	let drains = 0;
+	const app = Object.create(HarnessApp.prototype);
+	Object.assign(app, {
+		client: oldClient,
+		ready: true,
+		busy: true,
+		cancelRequested: false,
+		afterToolCancelPending: false,
+		promptQueue: [{ text: "do not lose me", timing: "afterTurn" }],
+		permissionQueue: [],
+		activeInteractiveRequest: undefined,
+		activeKey: "fake",
+		availableCommands: new Map(),
+		commandsLoaded: new Set(),
+		statusState: "working",
+		pendingUnsendPrompt: undefined,
+		clearCancelGraceTimer() {},
+		updateSpinner() {},
+		updateAutocomplete() {},
+		armPromptQueueWatchdog() {},
+		schedulePromptQueueDrain() { drains += 1; },
+		async ensureConnected(options) {
+			assert.deepEqual(options, { statusState: "connecting", preserveDeferredCommands: true });
+			reconnects += 1;
+			this.client = replacementClient;
+			this.ready = true;
+			return true;
+		},
+		ui: { requestRender() {} },
+	});
+	app.handleBackendEvent({ type: "backend_exit" });
+	await Promise.resolve();
+	await Promise.resolve();
+	assert.equal(reconnects, 1);
+	assert.equal(drains, 1);
+	assert.deepEqual(app.promptQueue.map((entry) => entry.text), ["do not lose me"]);
 })();
 
 // Prompts typed on a focused /btw during a transition wait for its outcome:
@@ -2785,7 +2893,10 @@ await (async () => {
 	app.promptQueueDrainScheduled = false;
 	app.promptQueue = [{ text: "after model", timing: "afterTurn" }];
 	let drains = 0;
-	app.flushPromptQueue = async () => { drains += 1; };
+	app.flushPromptQueue = async () => {
+		drains += 1;
+		app.promptQueue.shift();
+	};
 	app.schedulePromptQueueDrain();
 	assert.equal(app.promptQueueDrainScheduled, false);
 	app.sessionSwitchInProgress = false;
@@ -3681,12 +3792,12 @@ else process.env.CC_SETTINGS = previousDefaultCcSettings;
 assert.ok(defaultConfig.agents["terminus-2"]);
 assert.ok(defaultConfig.agents["mini-swe-agent"]);
 assert.equal(defaultConfig.agents.claude._requiredAgentName, "@agentclientprotocol/claude-agent-acp");
-assert.equal(defaultConfig.agents.claude._minimumAgentVersion, "0.58.1");
-assert.equal(defaultConfig.agents.claude._packageLocalAcpVersion, "0.58.1");
+assert.equal(defaultConfig.agents.claude._minimumAgentVersion, "0.59.0");
+assert.equal(defaultConfig.agents.claude._packageLocalAcpVersion, "0.59.0");
 assert.match(defaultConfig.agents.claude._packageLocalAcpBridge, /harness[/\\]claude-acp-bridge\.mjs$/u);
 assert.equal(defaultConfig.agents.codex._requiredAgentName, "@agentclientprotocol/codex-acp");
-assert.equal(defaultConfig.agents.codex._minimumAgentVersion, "1.1.2");
-assert.equal(defaultConfig.agents.codex._packageLocalAcpVersion, "1.1.2");
+assert.equal(defaultConfig.agents.codex._minimumAgentVersion, "1.1.4");
+assert.equal(defaultConfig.agents.codex._packageLocalAcpVersion, "1.1.4");
 for (const key of ["claude", "codex"]) {
 	const launch = resolveAgentAcpExecutable(defaultConfig.agents[key], process.cwd(), { PATH: "" });
 	assert.equal(launch.executable, process.execPath, `${key} must use cc's Node runtime for its package-local adapter`);
@@ -4618,9 +4729,9 @@ assert.deepEqual(newSessionOrder, ["before replay", "fresh welcome"]);
 {
 	const bundled = resolveCodexInvocation({
 		_requiredAgentName: "@agentclientprotocol/codex-acp",
-		_minimumAgentVersion: "1.1.2",
+		_minimumAgentVersion: "1.1.4",
 		_packageLocalAcpCommand: "codex-acp",
-		_packageLocalAcpVersion: "1.1.2",
+		_packageLocalAcpVersion: "1.1.4",
 		acp: { command: "codex-acp", args: [] },
 		env: { PATH: "" },
 	});
@@ -4644,7 +4755,7 @@ assert.deepEqual(newSessionOrder, ["before replay", "fresh welcome"]);
 		fs.mkdirSync(adapterRoot, { recursive: true });
 		fs.writeFileSync(path.join(adapterRoot, "package.json"), JSON.stringify({
 			name: "@agentclientprotocol/codex-acp",
-			version: "1.1.2",
+			version: "1.1.4",
 		}));
 		writePackage(bundledRoot, "@openai/codex", { codex: "bin/codex.js" });
 		fs.mkdirSync(path.dirname(adapterJs), { recursive: true });
@@ -4764,7 +4875,7 @@ assert.deepEqual(newSessionOrder, ["before replay", "fresh welcome"]);
 		fs.symlinkSync(path.relative(outdatedBin, outdatedAdapter), path.join(outdatedBin, "codex-acp"));
 		assert.deepEqual(
 			resolveCodexInvocation({
-				_minimumAgentVersion: "1.1.2",
+				_minimumAgentVersion: "1.1.4",
 				acp: { command: "codex-acp" },
 				env: { PATH: [outdatedBin, standaloneBin].join(path.delimiter) },
 			}),
@@ -4786,15 +4897,15 @@ assert.deepEqual(newSessionOrder, ["before replay", "fresh welcome"]);
 		fs.mkdirSync(path.dirname(entrypoint), { recursive: true });
 		fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({
 			name: "@agentclientprotocol/claude-agent-acp",
-			version: "0.58.1",
+			version: "0.59.0",
 			bin: { "claude-agent-acp": "dist/index.js" },
 		}));
 		fs.writeFileSync(entrypoint, "// package-local adapter\n");
 		const agent = {
 			_requiredAgentName: "@agentclientprotocol/claude-agent-acp",
-			_minimumAgentVersion: "0.58.1",
+			_minimumAgentVersion: "0.59.0",
 			_packageLocalAcpCommand: "claude-agent-acp",
-			_packageLocalAcpVersion: "0.58.1",
+			_packageLocalAcpVersion: "0.59.0",
 			acp: { command: "claude-agent-acp", args: [] },
 		};
 		assert.deepEqual(resolvePackageLocalAcpExecutable(agent, root), {
@@ -4817,6 +4928,34 @@ assert.deepEqual(newSessionOrder, ["before replay", "fresh welcome"]);
 	}
 }
 
+// An ACP protocol identity can differ from the npm package that owns its
+// executable (OpenCode reports `OpenCode`, while the package is `opencode-ai`).
+{
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "cc-package-local-opencode-"));
+	try {
+		const packageRoot = path.join(root, "node_modules", "opencode-ai");
+		const entrypoint = path.join(packageRoot, "bin", "opencode");
+		fs.mkdirSync(path.dirname(entrypoint), { recursive: true });
+		fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({
+			name: "opencode-ai",
+			version: "1.18.3",
+			bin: { opencode: "bin/opencode" },
+		}));
+		fs.writeFileSync(entrypoint, "native executable\n");
+		const agent = {
+			_requiredAgentName: "OpenCode",
+			_minimumAgentVersion: "1.18.3",
+			_packageLocalAcpPackageName: "opencode-ai",
+			_packageLocalAcpCommand: "opencode",
+			_packageLocalAcpVersion: "1.18.3",
+			acp: { command: "opencode", args: ["acp"] },
+		};
+		assert.deepEqual(resolvePackageLocalAcpExecutable(agent, root), { executable: entrypoint, prefixArgs: [] });
+	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+}
+
 if (process.platform !== "win32") {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "cc-acp-prefix-shadow-"));
 	try {
@@ -4834,11 +4973,11 @@ if (process.platform !== "win32") {
 			return shim;
 		};
 		const legacy = makeAdapter(path.join(root, "old"), "@zed-industries/codex-acp", "0.8.0");
-		const maintained = makeAdapter(path.join(root, "current"), "@agentclientprotocol/codex-acp", "1.1.2");
+		const maintained = makeAdapter(path.join(root, "current"), "@agentclientprotocol/codex-acp", "1.1.4");
 		const pathValue = [path.dirname(legacy), path.dirname(maintained)].join(path.delimiter);
 		const launch = resolveAgentAcpExecutable({
 			_requiredAgentName: "@agentclientprotocol/codex-acp",
-			_minimumAgentVersion: "1.1.2",
+			_minimumAgentVersion: "1.1.4",
 			acp: { command: "codex-acp", args: [] },
 		}, process.cwd(), { PATH: pathValue });
 		assert.equal(launch.executable, process.execPath);
@@ -4859,7 +4998,7 @@ if (process.platform !== "win32") {
 		fs.mkdirSync(path.dirname(entrypoint), { recursive: true });
 		fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({
 			name: "@agentclientprotocol/codex-acp",
-			version: "1.1.2",
+			version: "1.1.4",
 		}));
 		fs.writeFileSync(entrypoint, "// maintained adapter\n");
 		fs.writeFileSync(path.join(prefix, "codex-acp.exe"), "foreign executable");
@@ -4869,7 +5008,7 @@ if (process.platform !== "win32") {
 		);
 		const launch = resolveAgentAcpExecutable({
 			_requiredAgentName: "@agentclientprotocol/codex-acp",
-			_minimumAgentVersion: "1.1.2",
+			_minimumAgentVersion: "1.1.4",
 			acp: { command: "codex-acp", args: [] },
 		}, process.cwd(), { Path: prefix }, "win32");
 		assert.equal(launch.executable, process.execPath);
@@ -5064,6 +5203,11 @@ if (process.platform !== "win32" && spawnSync("sqlite3", ["--version"]).status =
 		recoveryApp.addCommandMessage = () => {};
 		recoveryApp.addNotice = () => {};
 		recoveryApp.addError = (message) => failures.push(message);
+		recoveryApp.runFencedCodexAppServerRequests = async (_invocation, requests) => {
+			assert.equal(requests[0].method, "thread/list");
+			assert.equal(requests[0].params.ancestorThreadId, targetId);
+			return [{ data: [], nextCursor: null }];
+		};
 		recoveryApp.resetConversationView = () => calls.push(["reset"]);
 		recoveryApp.switchAgent = async (key, transport, options) => {
 			calls.push(["switch", key, transport, {
@@ -7375,13 +7519,13 @@ await (async () => {
 				return { prefix, shim, entrypoint };
 			};
 			const oldAdapter = makeAdapter("old", "1.0.0");
-			const currentAdapter = makeAdapter("current", "1.1.2");
+			const currentAdapter = makeAdapter("current", "1.1.4");
 			let authLaunch;
 			const authChild = new EventEmitter();
 			await runTerminalAuthentication(
 				{
 					_requiredAgentName: "@agentclientprotocol/codex-acp",
-					_minimumAgentVersion: "1.1.2",
+					_minimumAgentVersion: "1.1.4",
 					acp: { command: "codex-acp", args: [] },
 				},
 				{ type: "terminal", id: "login", name: "Login", args: ["login"] },

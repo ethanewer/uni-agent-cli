@@ -2,9 +2,116 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 
-const nodeMajorVersion = Number.parseInt(process.versions.node.split(".")[0], 10);
-if (!Number.isFinite(nodeMajorVersion) || nodeMajorVersion < 22) {
+const STARTUP_INPUT_GUARD = Symbol.for("cc.startup-input-guard");
+
+function restoreTerminalMode(state) {
+	if (!state) return true;
+	try {
+		const restored = spawnSync("stty", [state], {
+			stdio: ["inherit", "ignore", "ignore"],
+			timeout: 1_000,
+		});
+		if (restored.status !== 0) return false;
+	} catch {
+		// Best effort only; setRawMode(false) below still restores ordinary launches.
+		return false;
+	}
+	return true;
+}
+
+function restoreInheritedTerminalMode() {
+	const state = process.env.CC_STARTUP_STTY_STATE;
+	if (!restoreTerminalMode(state)) return false;
+	delete process.env.CC_STARTUP_STTY_STATE;
+	return true;
+}
+
+function beginStartupInputGuard(enabled) {
+	if (!enabled || !process.stdin.isTTY || typeof process.stdin.setRawMode !== "function") return undefined;
+	const chunks = [];
+	const originalRaw = process.stdin.isRaw === true;
+	const inheritedTerminalMode = process.env.CC_STARTUP_STTY_STATE;
+	let listening = true;
+	let restored = false;
+	let terminating = false;
+	const startupSignalHandlers = new Map();
+	const releaseSignalHandlers = () => {
+		for (const [signal, handler] of startupSignalHandlers) process.removeListener(signal, handler);
+		startupSignalHandlers.clear();
+	};
+	const onData = (data) => chunks.push(Buffer.isBuffer(data) ? Buffer.from(data) : String(data));
+	process.stdin.on("data", onData);
+	try {
+		// The shell launcher enters cbreak/no-echo before doing any prepaint work.
+		// Once this listener owns all pending bytes, restore the exact prior mode
+		// synchronously and let Node enter raw mode from that clean baseline. Pi can
+		// then restore normally without carrying an stty operation into shutdown.
+		restoreInheritedTerminalMode();
+		process.stdin.setRawMode(true);
+		process.stdin.resume();
+	} catch {
+		process.stdin.removeListener("data", onData);
+		restoreInheritedTerminalMode();
+		return undefined;
+	}
+	const guard = {
+		originalRaw,
+		releaseSignalHandlers,
+		handoff() {
+			releaseSignalHandlers();
+			if (listening) process.stdin.removeListener("data", onData);
+			listening = false;
+			return chunks.splice(0);
+		},
+		restore() {
+			if (restored) return;
+			restored = true;
+			releaseSignalHandlers();
+			if (listening) process.stdin.removeListener("data", onData);
+			listening = false;
+			try {
+				process.stdin.setRawMode(originalRaw);
+			} catch {
+				// The terminal may already have disappeared.
+			}
+			// libuv may have initialized its TTY handle while the shell launcher's
+			// cbreak guard was active. Restore the shell's exact termios snapshot as
+			// the final authority instead of assuming setRawMode(false) is equivalent.
+			restoreTerminalMode(inheritedTerminalMode);
+		},
+	};
+	globalThis[STARTUP_INPUT_GUARD] = guard;
+	for (const signal of ["SIGINT", "SIGTERM"]) {
+		const handler = () => {
+			if (terminating) return;
+			terminating = true;
+			guard.restore();
+			try {
+				// Preserve ordinary signal exit semantics after restoring terminal ownership.
+				process.kill(process.pid, signal);
+			} catch {
+				process.exit(signal === "SIGINT" ? 130 : 143);
+			}
+		};
+		startupSignalHandlers.set(signal, handler);
+		process.once(signal, handler);
+	}
+	return guard;
+}
+
+const nodeVersionParts = process.versions.node.split(".").slice(0, 3).map((part) => Number.parseInt(part, 10));
+const [nodeMajorVersion, nodeMinorVersion, nodePatchVersion] = nodeVersionParts;
+const supportedNodeVersion =
+	nodeVersionParts.length === 3 &&
+	nodeVersionParts.every(Number.isFinite) &&
+	(nodeMajorVersion > 22 || (
+		nodeMajorVersion === 22 &&
+		(nodeMinorVersion > 19 || nodeMinorVersion === 19 && nodePatchVersion >= 0)
+	));
+if (!supportedNodeVersion) {
+	restoreInheritedTerminalMode();
 	if (process.env.CC_PREPAINTED === "1") {
 		// The shell launcher has already drawn a placeholder and hidden the cursor.
 		// Tear it down before exiting so an unsupported Node version cannot leave
@@ -12,19 +119,22 @@ if (!Number.isFinite(nodeMajorVersion) || nodeMajorVersion < 22) {
 		process.stdout.write("\x1b8\x1b[J\x1b[?25h");
 	}
 	console.error(
-		`cc requires Node.js 22 or newer (found ${process.versions.node}). Upgrade Node.js, then reinstall cc.`,
+		`cc requires Node.js 22.19.0 or newer (found ${process.versions.node}). Upgrade Node.js, then reinstall cc.`,
 	);
 	process.exit(1);
 }
 
 const args = process.argv.slice(2);
-const shouldPrepaint =
-	process.env.CC_PREPAINTED !== "1" &&
-	!isVsCodeTerminal() &&
+const startsInteractiveTui =
 	process.stdout.isTTY &&
 	!args.includes("--help") &&
 	!args.includes("-h") &&
 	!args.includes("--list");
+const shouldPrepaint =
+	process.env.CC_PREPAINTED !== "1" &&
+	!isVsCodeTerminal() &&
+	startsInteractiveTui;
+const startupInputGuard = beginStartupInputGuard(startsInteractiveTui);
 
 function prepaint(args) {
 	const width = process.stdout.columns || Number(process.env.COLUMNS) || 80;
@@ -46,7 +156,7 @@ function prepaint(args) {
 	const voice = `${styles.accent("○")}   ${styles.muted("Space to record · Ctrl+Space for text")}`;
 	const status = styles.muted(`${modelDetails ? `${agent} · ${modelDetails}` : `${agent} acp`} · ${cwd}`);
 	process.stdout.write(
-		`\x1b7\x1b[?2026h${styles.primary(rule)}\n${truncateEllipsis(voice, width)}\n${styles.primary(rule)}\n${truncateVisual(status, width)}\x1b[?2026l\x1b[?25l`,
+		`\x1b7\x1b[?2026h${styles.primary(rule)}\r\n${truncateEllipsis(voice, width)}\r\n${styles.primary(rule)}\r\n${truncateVisual(status, width)}\x1b[?2026l\x1b[?25l`,
 	);
 }
 
@@ -255,10 +365,16 @@ if (shouldPrepaint) {
 	prepaint(args);
 }
 
+const testImportDelay = Number(process.env.CC_TEST_STARTUP_IMPORT_DELAY_MS);
+if (Number.isFinite(testImportDelay) && testImportDelay > 0) {
+	await new Promise((resolve) => setTimeout(resolve, Math.min(testImportDelay, 10_000)));
+}
+
 try {
 	const { runCli } = await import("./pi-harness.mjs");
 	await runCli(args);
 } catch (error) {
+	startupInputGuard?.restore();
 	if (shouldPrepaint) process.stdout.write("\x1b8\x1b[J\x1b[?25h");
 	console.error(`cc: ${error?.message ?? error}`);
 	process.exit(1);

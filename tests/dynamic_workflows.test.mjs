@@ -3393,6 +3393,11 @@ assert.throws(
 	/worker process trees could not be confirmed stopped/u,
 	"force-killing only a workflow supervisor never confirms its separately-grouped backend descendants",
 );
+assert.equal(forceKilledSupervisorExecutor.retainedMutationFences.size, 1, "a force-killed supervisor retains its shared-cwd mutation fence");
+// Production intentionally has no release path for this fence. Release only
+// the synthetic test closure so the following cases can reuse gitProject.
+for (const release of forceKilledSupervisorExecutor.retainedMutationFences) await release();
+forceKilledSupervisorExecutor.retainedMutationFences.clear();
 
 // A teardown failure replaces the adapter result, but it must retain the
 // completed turn's usage so the run budget cannot be bypassed by a bad stop.
@@ -3425,6 +3430,9 @@ await assert.rejects(teardownUsageExecutor.execute({
 	return true;
 });
 assert.deepEqual(teardownReleaseRecord.error.workflowUsage, { totalTokens: 30 }, "manager budget settlement receives usage from a teardown-replaced outcome");
+assert.equal(teardownUsageExecutor.retainedMutationFences.size, 1, "a teardown-replaced outcome retains its shared-cwd mutation fence");
+for (const release of teardownUsageExecutor.retainedMutationFences) await release();
+teardownUsageExecutor.retainedMutationFences.clear();
 
 // Fallback usage observes raw model events before their bounded TUI/journal
 // projection, including multibyte output larger than a single event bound.
@@ -3672,6 +3680,8 @@ await assert.rejects(
 await assert.rejects(fencedManager.stopAll(), /could not be confirmed stopped/u);
 await fencedRun.releaseLease();
 fencedRun.releaseLease = undefined;
+for (const release of fencedManager.executor.retainedMutationFences) await release();
+fencedManager.executor.retainedMutationFences.clear();
 const admissionManager = new WorkflowManager({
 	harnesses: { one: {} }, stateRoot: path.join(temporary, "admission-manager"), registry,
 	approve: async () => true, createAdapter: () => { throw new Error("admission test supplies its executor"); },

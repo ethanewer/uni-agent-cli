@@ -8,6 +8,7 @@
 import { fileURLToPath } from "node:url";
 import { BaseAcpAdapter } from "../acp-base.mjs";
 import { BUNDLED_ACP_ADAPTERS } from "../bundled-adapters.mjs";
+import { capabilitiesFromWire } from "../interface.mjs";
 import { deepMerge, isPlainObject } from "../util.mjs";
 
 export const CLAUDE_ACP_AGENT_NAME = BUNDLED_ACP_ADAPTERS.claude.packageName;
@@ -41,19 +42,28 @@ export class ClaudeAdapter extends BaseAcpAdapter {
 
 	declaredCapabilities() {
 		return this.usesBuiltInBridge()
-			? { fork: "native", changeWorkingDirectory: true, backgroundTasks: true, checkpoints: true, remoteControl: true }
+			? {
+				fork: "native",
+				changeWorkingDirectory: true,
+				backgroundTasks: true,
+				checkpoints: true,
+				checkpointModes: ["both", "conversation", "code"],
+				remoteControl: true,
+			}
 			: {};
 	}
 
 	refineCapabilities(capabilities, sessionInfo = {}) {
 		if (!this.connection) return capabilities;
 		const wire = sessionInfo.capabilities ?? {};
+		const negotiated = capabilitiesFromWire(sessionInfo);
 		return {
 			...capabilities,
 			fork: wire.sessionCapabilities?.fork ? "native" : false,
 			changeWorkingDirectory: wire._meta?.cc?.changeWorkingDirectory === true,
 			backgroundTasks: wire._meta?.cc?.backgroundTasks === true,
-			checkpoints: wire._meta?.cc?.checkpoints === true,
+			checkpoints: negotiated.checkpoints,
+			checkpointModes: negotiated.checkpointModes,
 			remoteControl: wire._meta?.cc?.remoteControl === true,
 		};
 	}

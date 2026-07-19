@@ -31,7 +31,7 @@ export function parseRemoteControlParams(value) {
 export function normalizeClaudeRemoteControlResponse(value, enabled) {
 	if (!enabled) return { enabled: false, status: "disconnected" };
 	if (!isRecord(value)) throw new Error("Remote Control returned an invalid response");
-	// SDK 0.3.205 returns `sessionUrl`; retain `url` as a forward-compatible
+	// SDK 0.3.214 returns `sessionUrl`; retain `url` as a forward-compatible
 	// spelling while keeping the normalized interface stable.
 	const url = safeRemoteUrl(value.sessionUrl ?? value.url);
 	return { enabled: true, status: "available", url };

@@ -1,11 +1,13 @@
 #!/bin/sh
 
 skip_prepaint=0
+skip_tui=0
 agent=codex
 for arg do
 	case "$arg" in
 		--help|-h|--list)
 			skip_prepaint=1
+			skip_tui=1
 			break
 			;;
 		-*)
@@ -19,6 +21,22 @@ done
 
 if [ "${TERM_PROGRAM:-}" = "vscode" ] || [ -n "${VSCODE_PID:-}" ] || [ -n "${VSCODE_INJECTION:-}" ]; then
 	skip_prepaint=1
+fi
+
+# Claim terminal input before config parsing and prepainting. Without this
+# cbreak/no-echo guard, text typed while Node imports the full TUI is echoed by
+# the terminal at the bottom status row and may remain trapped in canonical
+# input. cc.mjs upgrades this to raw mode, buffers every byte, and restores this
+# exact state when the TUI exits or startup fails.
+if [ "$skip_tui" -eq 0 ] && [ -t 0 ] && [ -t 1 ]; then
+	startup_stty_state=$(stty -g 2>/dev/null)
+	if [ -n "$startup_stty_state" ] && stty -echo -icanon -isig min 1 time 0 2>/dev/null; then
+		export CC_STARTUP_STTY_STATE=$startup_stty_state
+		restore_startup_stty() {
+			stty "$startup_stty_state" 2>/dev/null || true
+		}
+		trap restore_startup_stty EXIT
+	fi
 fi
 
 json_path_value() {

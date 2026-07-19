@@ -6,6 +6,22 @@ This branch is an intentionally in-progress checkpoint of the dynamic
 workflows implementation. It is not yet release-certified and should not be
 promoted to a release channel until the remaining work below is complete.
 
+## Upstream integration
+
+`origin/main` through `2927076` has been merged into this branch. That upstream
+range adds self-healing main and `/btw` prompt queues, startup input capture,
+terminal scrollback/state preservation, and rollback support for Codex,
+OpenCode, Pi, and Claude. The queue changes were combined with workflow
+delivery journaling so internal completions retain their durable
+queued/sending/delivered/ambiguous states, while ordinary queued input uses the
+new reconnect and watchdog behavior. The rollback service wiring is also
+passed into workflow-created adapters, and conversation-changing rewinds rotate
+workflow origin authority while code-only rewinds retain it.
+
+Upstream now requires Node 22.19 or newer. The workflow plan and package
+metadata follow that baseline; the earlier WIP promise that Disabled mode would
+continue to support Node 22.0–22.18 no longer applies.
+
 ## User-visible scope implemented
 
 - Workflows default to `Disabled`. The dormant path dynamically imports no
@@ -104,16 +120,22 @@ Confirmed before the latest iteration-21 hardening:
   workflow. Those results predate the latest handshake/recovery/fencing changes
   and are not final release evidence.
 
-After the latest hardening:
+After the latest hardening and the `origin/main` merge:
 
-- JavaScript syntax checks, shell syntax checks, and `git diff --check` passed.
-- The focused suite initially found a test bookkeeping error where an isolated
-  failure retained a no-op placeholder in addition to its real Git lock. That
-  was fixed by making the shared mutation release optional.
-- A subsequent focused-suite run progressed beyond that assertion but was
-  interrupted before completion. No focused test process remains running.
+- JavaScript/Python syntax checks and `git diff --check` passed.
+- `dynamic_workflows.test.mjs` completed successfully. The run exposed three
+  synthetic termination-failure fixtures that correctly retained production
+  repository fences but failed to release their test-only closures before
+  later cases reused the same repository. Those fixtures now perform the same
+  explicit test cleanup as the adjacent retained-fence cases; production has
+  no voluntary release path.
+- Upstream queue reliability, rollback-harness, real Codex/OpenCode/Pi
+  rollback, checkpoint, settings, adapter, command-catalog, harness-feature,
+  postinstall, channel-installer, and TUI smoke tests passed against the merged
+  tree.
 - The supplied-tarball package smoke has not been rerun since adding the commit
-  marker, complete tarball enumeration, and live evidence output.
+  marker, complete tarball enumeration, live evidence output, and upstream
+  rollback dependencies.
 
 Therefore this branch has no claim of a fully green current test run.
 
@@ -121,10 +143,9 @@ Therefore this branch has no claim of a fully green current test run.
 
 Complete these in order:
 
-1. Run `node tests/dynamic_workflows.test.mjs` to completion. Fix any failure.
-2. Pack one candidate artifact and run
+1. Pack one candidate artifact and run
    `CC_WORKFLOW_E2E_TARBALL=/absolute/path/cc-0.1.0.tgz bash tests/package_install_smoke.sh`.
-3. Run review iteration 22 with three parallel GPT-5.6 High Codex CLI reviews.
+2. Run review iteration 22 with three parallel GPT-5.6 High Codex CLI reviews.
    The security review must target commit-marker crash races, asynchronous
    commit/rollback/stop interleavings, ambiguous final-ACK errors, and retained
    mutation fences. The release review must inspect exact-artifact enumeration,
@@ -132,26 +153,26 @@ Complete these in order:
    must recheck Disabled dormancy, mode enforcement, footer behavior, and TUI
    controls. Repeat review iterations until clean or until reviewers stop
    producing valid findings.
-4. After a clean review, run the deterministic installed-artifact gate:
+3. After a clean review, run the deterministic installed-artifact gate:
    `CC_WORKFLOW_E2E_TARBALL=/absolute/path/cc-0.1.0.tgz CC_WORKFLOW_E2E_REQUIRED=1 bash tests/dynamic_workflows_e2e.sh`.
    It must pass the Disabled baseline, exact four-worker Clone Only route,
    exact six-worker Flexible route, real overlap, TUI navigation/actions,
    completion delivery, mode transitions, worktree behavior, and manager-only
    crash cleanup.
-5. Run the complete release suite with `npm run test:release`. All ordinary
+4. Run the complete release suite with `npm run test:release`. All ordinary
    pre-existing tests must remain green.
-6. Run `npm run test:workflows:e2e:live` with real GPT-5.6 High against the same
+5. Run `npm run test:workflows:e2e:live` with real GPT-5.6 High against the same
    retained tarball. Confirm two workers become ready before either completes,
    exact model/effort routing, expected outputs, TUI projection, and delivery to
    the originating orchestrator. Retain the result JSON and package digest.
-7. Inspect `git diff --check`, package contents, process table, and worktree for
+6. Inspect `git diff --check`, package contents, process table, and worktree for
    leaks or accidental files.
-8. Update `docs/dynamic-workflows-plan.md` from its current iteration-21 wording
+7. Update `docs/dynamic-workflows-plan.md` from its current iteration-21 wording
    to the final clean review and test status.
-9. Install the resulting build into the intended local channel and verify the
+8. Install the resulting build into the intended local channel and verify the
    installed `cc` shim. No workflow-enabled local build has been installed from
    this snapshot yet.
-10. Commit any final fixes and publish the release-ready branch. Do not treat
+9. Commit any final fixes and publish the release-ready branch. Do not treat
     this WIP snapshot commit as the final release commit.
 
 ## Known areas needing special scrutiny

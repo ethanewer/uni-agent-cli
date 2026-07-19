@@ -3,12 +3,14 @@ import assert from "node:assert/strict";
 import {
 	CHECKPOINT_FILE_CHANGE_LIMIT,
 	CHECKPOINT_PATH_MAX_BYTES,
+	checkpointModesForCapabilities,
 	checkpointsFromSessionMessages,
 	formatCheckpointRewindResult,
 	normalizeCheckpointListResponse,
 	normalizeCheckpointRewindResponse,
 	parseCheckpointListParams,
 	parseCheckpointRewindParams,
+	normalizeCheckpointModes,
 	sessionMessageText,
 } from "../src/harness/checkpoints.mjs";
 import {
@@ -27,6 +29,9 @@ assert.deepEqual(parseCheckpointRewindParams({ sessionId: "session", checkpointI
 	mode: "both",
 });
 assert.throws(() => parseCheckpointRewindParams({ sessionId: "session", checkpointId: "message", mode: "erase" }), /mode/u);
+assert.deepEqual(normalizeCheckpointModes(["conversation", "conversation", "invalid", "code"]), ["conversation", "code"]);
+assert.deepEqual(checkpointModesForCapabilities({ checkpoints: true, checkpointModes: ["conversation"] }), ["conversation"]);
+assert.deepEqual(checkpointModesForCapabilities({ checkpoints: false, checkpointModes: ["conversation"] }), []);
 assert.equal(sessionMessageText({ content: [{ type: "text", text: "one" }, { type: "image" }, { type: "text", text: "two" }] }), "one\ntwo");
 
 const messages = [
@@ -194,6 +199,8 @@ await assert.rejects(() => performClaudeCheckpointRewind({
 
 const checkpointWire = { capabilities: { _meta: { cc: { checkpoints: true } } } };
 assert.equal(capabilitiesFromWire(checkpointWire).checkpoints, true);
+assert.deepEqual(capabilitiesFromWire(checkpointWire).checkpointModes, ["code", "conversation", "both"]);
+assert.deepEqual(capabilitiesFromWire({ capabilities: { _meta: { cc: { checkpoints: { modes: ["conversation"] } } } } }).checkpointModes, ["conversation"]);
 assert.equal(capabilitiesFromWire({ capabilities: {} }).checkpoints, false);
 
 const adapterCalls = [];
@@ -218,6 +225,17 @@ assert.deepEqual(adapterCalls, [
 	["rewind", "checkpoint-1", "code", { marker: true }],
 ]);
 await adapter.stopAndWait();
+class LegacyCheckpointAdapter extends BaseAcpAdapter {
+	declaredCapabilities() { return { checkpoints: true }; }
+}
+const legacyCheckpointAdapter = new LegacyCheckpointAdapter("legacy", { label: "Legacy", acp: { command: "legacy" } }, {});
+assert.deepEqual(legacyCheckpointAdapter.capabilities.checkpointModes, ["code", "conversation", "both"]);
+assert.equal(checkAdapterConformance(legacyCheckpointAdapter).ok, true);
+const legacyCapabilityShape = Object.create(legacyCheckpointAdapter);
+legacyCapabilityShape.capabilities = { ...legacyCheckpointAdapter.capabilities };
+delete legacyCapabilityShape.capabilities.checkpointModes;
+assert.equal(checkAdapterConformance(legacyCapabilityShape).ok, true);
+assert.deepEqual(checkpointModesForCapabilities({ checkpoints: true }), ["code", "conversation", "both"]);
 const declaredClaude = new ClaudeAdapter("claude", ClaudeAdapter.defaultAgentConfig, {}, {
 	connectionFactory: () => fakeConnection,
 });
@@ -225,8 +243,17 @@ assert.equal(declaredClaude.capabilities.checkpoints, true);
 const customClaude = new ClaudeAdapter("claude", {
 	...ClaudeAdapter.defaultAgentConfig,
 	acp: { command: "/custom/claude-acp", args: [] },
-}, {}, { connectionFactory: () => fakeConnection });
+}, {}, { connectionFactory: () => ({
+	...fakeConnection,
+	getSessionInfo() {
+		return { capabilities: { _meta: { cc: { checkpoints: { modes: ["conversation"] } } } } };
+	},
+}) });
 assert.equal(customClaude.capabilities.checkpoints, false);
+await customClaude.connect({ createSession: false });
+assert.equal(customClaude.capabilities.checkpoints, true);
+assert.deepEqual(customClaude.capabilities.checkpointModes, ["conversation"]);
+await customClaude.stopAndWait();
 
 // Code-only rewind owns the session-transition gate for the entire filesystem
 // mutation. Session commands are deferred and harness replacement is rejected
@@ -398,11 +425,18 @@ Object.assign(pickerApp, {
 	closeMenu() {},
 	applyCheckpointRewind: async (_context, _sessionId, _checkpoint, mode) => { selectedMode = mode; },
 });
-assert.equal(pickerApp.openCheckpointModeSelection({ client: {} }, "source", { id: "checkpoint-1", summary: "Start" }), true);
+assert.equal(pickerApp.openCheckpointModeSelection({
+	client: { capabilities: { checkpoints: true, checkpointModes: ["both", "conversation", "code"] } },
+}, "source", { id: "checkpoint-1", summary: "Start" }), true);
 assert.equal(picker.title, "What should be rewound?");
 assert.deepEqual(picker.entries.map((entry) => entry.value), ["both", "conversation", "code"]);
 await picker.onSelect(picker.entries[1]);
 assert.equal(selectedMode, "conversation");
+
+assert.equal(pickerApp.openCheckpointModeSelection({
+	client: { capabilities: { checkpoints: true, checkpointModes: ["conversation"] } },
+}, "source", { id: "checkpoint-1", summary: "Start" }), true);
+assert.deepEqual(picker.entries.map((entry) => entry.value), ["conversation"]);
 
 const firstPickerClient = {
 	capabilities: { checkpoints: true },

@@ -595,6 +595,23 @@ def handle_prompt(message):
         send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "end_turn", "usage": {"inputTokens": 8, "outputTokens": 4}}})
         return
 
+    if prompt == "crash turn":
+        send(
+            {
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "fake-session",
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "crash turn started"},
+                    },
+                },
+            }
+        )
+        time.sleep(0.6)
+        os._exit(23)
+
     if prompt == "delayed tool":
         if poll_cancel(SLOW_DELAY):
             send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "cancelled"}})

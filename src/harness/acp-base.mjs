@@ -23,6 +23,7 @@ import {
 	stripFlags,
 } from "./permissions.mjs";
 import { clonePlain, isPlainObject, stringArray } from "./util.mjs";
+import { assertCheckpointModeSupported, CHECKPOINT_REWIND_MODES } from "./checkpoints.mjs";
 
 /** Fail clearly when an embedding host forgets to supply its ACP transport. */
 export function defaultConnectionFactory() {
@@ -129,6 +130,13 @@ export class BaseAcpAdapter {
 		const declared = this.declaredCapabilities() ?? {};
 		const base = emptyCapabilities();
 		const merged = { ...base, ...wire, ...declared };
+		// Before checkpointModes existed, extension adapters declared only
+		// `checkpoints: true` and implicitly supported all three portable modes.
+		// Preserve that contract even though emptyCapabilities() supplies an empty
+		// array before the declaration is merged.
+		if (declared.checkpoints === true && !Object.hasOwn(declared, "checkpointModes")) {
+			merged.checkpointModes = [...CHECKPOINT_REWIND_MODES];
+		}
 		// fork: prefer a native wire fork; otherwise honor a declared copy-fork.
 		merged.fork = wire.fork || declared.fork || false;
 		merged.autoApprove = this.autoApprove;
@@ -650,6 +658,7 @@ export class BaseAcpAdapter {
 		if (!this.capabilities.checkpoints) {
 			throw new Error("this harness does not advertise checkpoint support");
 		}
+		assertCheckpointModeSupported(this.capabilities, mode);
 		return this.connection.rewindCheckpoint(checkpointId, mode, options);
 	}
 

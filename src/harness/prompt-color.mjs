@@ -3,7 +3,7 @@
 // Keep parsing and palette data outside the TUI; the host applies the returned
 // color to whichever editor implementation it owns.
 //
-// Claude Agent SDK 0.3.205 declares an internal `set_color` control-message
+// Claude Agent SDK 0.3.214 declares an internal `set_color` control-message
 // shape, but its public Query interface/runtime exposes no `setColor()` method.
 // Do not reach through the adapter with Query.request(): `/color` remains local
 // until the pinned SDK provides a supported live-session color mutation.

@@ -12,7 +12,7 @@ One command (requires Node 22+ and `git`):
 npm install -g github:ethanewer/uni-agent-cli
 ```
 
-`cc` carries its ACP adapters as exact runtime dependencies: `@agentclientprotocol/claude-agent-acp` 0.58.1 and `@agentclientprotocol/codex-acp` 1.1.2. The built-in Claude and Codex harnesses launch those package-local copies, so an unrelated global adapter on `PATH` cannot silently change the protocol. A custom `agents.<name>.acp.command` remains an explicit override and must identify itself as the expected adapter at startup. Post-install only verifies those local dependencies; it never installs, removes, or migrates global adapter packages.
+`cc` carries exact runtime versions of its maintained harness components: Claude ACP 0.59.0 with Agent SDK 0.3.214, Codex ACP 1.1.4 with Codex CLI 0.144.6, OpenCode 1.18.3, and Pi 0.80.10 with `pi-acp` 0.0.31. Built-in adapters use package-local copies where ACP identity negotiation is available, so an unrelated global adapter on `PATH` cannot silently change the protocol. A custom `agents.<name>.acp.command` remains an explicit override and must identify itself as the expected adapter at startup. Post-install only verifies local dependencies; it never installs, removes, or migrates global packages.
 
 Then run:
 
@@ -253,7 +253,7 @@ including the CSI-u and modifyOtherKeys encodings used by modern terminals and t
 | **Esc** (nothing queued) | Interrupt the current turn. A second Esc force-settles a stuck cancel. |
 | **↑** (empty input) | Pull the last queued message back into the editor. |
 
-Queued messages are shown above the input box (`after tool: …` / `queued: …`). If the backend crashes while messages are queued, they are preserved and re-sent against a fresh connection on your next submit — never silently dropped.
+Queued messages are shown above the input box (`after tool: …` / `queued: …`). A queue-owned progress check prevents completed menus, config changes, session transitions, or other temporary blockers from stranding them. If the main backend crashes, queued messages are preserved and re-sent automatically against a fresh connection. If a `/btw` backend crashes, its queued input is returned to the composer in original order because that ephemeral fork cannot be resumed safely.
 
 ## Custom keybindings
 
@@ -361,12 +361,12 @@ reopening the interaction.
 - `/btw <question>` (also `/side`) — ask an **ephemeral side question** in a transient overlay (see below).
 - `/diff` — show tracked and untracked working-tree changes; pass explicit git arguments such as `/diff --staged` when needed.
 - `/copy [N|picker]` — copy the focused thread's Nth-latest assistant response. Plain responses copy immediately; responses with fenced code open a picker with the full response first and each code block after it. Press **Enter** to copy, or **w** with an empty filter to choose a file; existing files are replaced only after confirmation. Choosing **Always copy full response** stores a cc-only preference and skips future pickers; `/copy picker` disables that preference.
-- `/color [red|blue|green|yellow|purple|orange|pink|cyan|default]` — recolor the editor border for this `cc` session. With no argument, `/color` chooses a random palette color. This remains host-local: the pinned Claude Agent SDK 0.3.205 declares an internal `set_color` control message but exposes no supported `Query.setColor()` mutation, so cc does not call the SDK's private request API to imitate Remote Control accent synchronization.
+- `/color [red|blue|green|yellow|purple|orange|pink|cyan|default]` — recolor the editor border for this `cc` session. With no argument, `/color` chooses a random palette color. This remains host-local: the pinned Claude Agent SDK 0.3.214 declares an internal `set_color` control message but exposes no supported `Query.setColor()` mutation, so cc does not call the SDK's private request API to imitate Remote Control accent synchronization.
 - `/cd <path>` — move a capable live session and cc itself to another working directory without rebuilding context; trust and permission rules remain backend-enforced.
 - `/branch [name]` — fork the active main conversation and continue on the new branch while leaving the source resumable. A name is applied only when the harness advertises named forks; close `/btw` first.
 - `/tasks [stop <task-id>|background [tool-use-id]]` — list a capable harness's live foreground/background tasks, stop one by id, or move blocking work into the background. Claude task lifecycle events are normalized and bounded by its per-harness bridge; raw SDK frames never enter the shared TUI.
 - `/todos` — open the focused main or `/btw` session's live checklist. Standard ACP plan updates, Claude TodoWrite/Task snapshots, and Cursor todo snapshots are normalized into the same bounded state. Press **Ctrl+T** to toggle this surface without adding a transcript message. This is separate from `/tasks`, which controls running background work.
-- `/rewind` (also `/checkpoint` and `/undo`) — choose an earlier user message, then restore **code and conversation**, **conversation only**, or **code only** when the harness advertises checkpoints. Immediately after `/clear`, the picker also offers `/resume <id> (previous session)` until another resume commits or cc exits. All three names are reserved locally and report unsupported capability instead of being forwarded with backend-specific semantics. The built-in Claude bridge enables Agent SDK file checkpointing; conversation rewind creates and atomically loads a new branch, leaving the original session resumable. Claude Code's **Summarize from here** and **Summarize up to here** choices are not shown because the pinned public Agent SDK has no safe summarization-at-checkpoint control; `cc` does not imitate them with a prompt.
+- `/rewind` (also `/checkpoint` and `/undo`) — choose an earlier user message, then select only the rollback modes the active harness can safely provide. Claude and OpenCode offer **code and conversation**, **conversation only**, and **code only**; Codex and Pi offer source-preserving **conversation only** rollback. Immediately after `/clear`, the picker also offers `/resume <id> (previous session)` until another resume commits or cc exits. All three command names are reserved locally and never leak to backend-specific undo commands. Conversation rollback creates and atomically loads a distinct branch, leaving the source history intact. Claude Code's checkpoint summarization choices are not shown because the public Agent SDK has no safe summarization-at-checkpoint control.
 - `/remote-control [name|off]` (also `/rc`) — make the existing main session available at a validated `claude.ai/code` URL through the built-in Claude bridge, optionally give it a name, or disconnect it with `off`. This calls the pinned public Agent SDK's existing-session control; it does not start Claude's separate server mode and accepts no server flags. The normalized state belongs to the exact adapter connection and session: switching sessions updates the indicator, and switching harnesses cannot retain or expose the previous harness's URL. The local `cc` process must remain running. Availability still depends on Claude's account, organization, region, and authentication requirements; [Claude's Remote Control documentation](https://code.claude.com/docs/en/remote-control) says API-key authentication is unsupported.
 - `/voice` — return the empty input box to voice mode.
 - `/theme` — pick a color theme (persisted).
@@ -414,6 +414,12 @@ Most current Codex workflows are reachable through either an advertised backend 
 - ACP does not expose native child-agent/thread navigation. `/fork [last-turn-id]` bridges durable main-session forks through the stable app-server storage API, while `/btw` remains the independent side-thread UI.
 - `/approve`, background-terminal `/ps`/`/stop`, and per-session personality require live-thread app-server methods that the maintained adapter does not yet expose. Starting a competing app-server turn would bypass `cc`'s approvals and event stream, so `cc` does not do that.
 - `cc` supports ACP URL and form elicitation. Form requests are bounded and validated before rendering, support text and constrained numeric/boolean/single- or multi-select fields, mask secret-like fields, and never print submitted values into the transcript.
+
+### Scrolling
+
+The main conversation stays in the terminal's normal buffer, including in VS Code and in tmux panes launched from VS Code, so completed output remains in native scrollback while a turn is running. Use the VS Code terminal scrollbar, mouse wheel, or trackpad normally. In tmux, use copy mode (`Ctrl+B`, then `[`) and scroll with PgUp/PgDn, arrows, or the mouse when tmux mouse support is enabled; press `q` to return to the prompt.
+
+`/btw` temporarily uses its own fixed-height page view. Its per-thread scrolling keys are listed below.
 
 ### `/btw` — forked side thread (page view)
 

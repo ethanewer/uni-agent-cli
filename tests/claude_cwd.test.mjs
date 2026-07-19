@@ -354,7 +354,7 @@ try {
 	const bridgeClient = new AcpClient({
 		label: "Claude Code",
 		_requiredAgentName: "@agentclientprotocol/claude-agent-acp",
-		_minimumAgentVersion: "0.58.1",
+		_minimumAgentVersion: "0.59.0",
 		acp: {
 			command: process.execPath,
 			args: [path.join(process.cwd(), "src", "harness", "claude-acp-bridge.mjs")],
@@ -826,15 +826,15 @@ try {
 	fs.mkdirSync(path.dirname(bridge), { recursive: true });
 	fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({
 		name: "@agentclientprotocol/claude-agent-acp",
-		version: "0.58.1",
+		version: "0.59.0",
 		bin: { "claude-agent-acp": "dist/index.js" },
 	}));
 	fs.writeFileSync(entrypoint, "// adapter\n");
 	fs.writeFileSync(bridge, "// bridge\n");
 	const packageAgent = {
 		_requiredAgentName: "@agentclientprotocol/claude-agent-acp",
-		_minimumAgentVersion: "0.58.1",
-		_packageLocalAcpVersion: "0.58.1",
+		_minimumAgentVersion: "0.59.0",
+		_packageLocalAcpVersion: "0.59.0",
 		_packageLocalAcpCommand: "claude-agent-acp",
 		_packageLocalAcpBridge: bridge,
 		acp: { command: "claude-agent-acp", args: [] },

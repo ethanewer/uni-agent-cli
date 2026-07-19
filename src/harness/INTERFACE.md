@@ -97,6 +97,7 @@ degrades gracefully. Flags are either **declared** by the adapter (static) or
 | `appendContext` | bool | negotiated cc extension | context-only shell results |
 | `backgroundTasks` | bool | negotiated cc extension | `/tasks` lifecycle list/stop/background |
 | `checkpoints` | bool | negotiated cc extension | `/rewind`, `/checkpoint`, `/undo` list/restore |
+| `checkpointModes` | string[] | declared or negotiated cc extension | the exact subset of `code`, `conversation`, and `both` offered by the picker |
 | `remoteControl` | bool | negotiated cc extension | `/remote-control [name\|off]`, `/rc` |
 | `namedFork` | bool | negotiated cc extension | optional branch name in `/branch [name]` |
 

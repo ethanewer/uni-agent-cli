@@ -961,6 +961,14 @@ await (async () => {
 // new gate is effective.
 {
 	const { app, notices } = appHarness();
+	app.client = undefined;
+	app.runtimePermissionBackendContext = undefined;
+	app.toggleAutoApprove("yolo", "auto");
+	assert.ok(notices.some((message) => message.includes("auto-approve ON")), "startup /yolo works before a backend context exists");
+}
+
+{
+	const { app, notices } = appHarness();
 	app.runtimePermissionBackendContext = new Map([[
 		"codex",
 		{ client: app.client, sessionId: app.client.sessionId, mode: "agent-full-access" },
@@ -2996,6 +3004,77 @@ rl.on("line", (line) => {
 				},
 			),
 			(error) => error?.code === "CODEX_COMPLETION_UNCONFIRMED" && /accepted.*completion/i.test(error.message),
+		);
+	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+})();
+
+// A rollback handoff is a continuation of the completed RPC transaction, not a
+// second one-shot command. It may legitimately replay for longer than the app-
+// server request deadline. If the server dies during that replay, rejection must
+// still wait for the handoff to settle so callers cannot race cleanup against a
+// late session/load commit.
+await (async () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "cc-app-server-handoff-"));
+	const cli = path.join(root, "codex.mjs");
+	try {
+		fs.writeFileSync(cli, `
+import readline from "node:readline";
+const rl = readline.createInterface({ input: process.stdin });
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+rl.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.method === "initialize") { send({ id: message.id, result: {} }); return; }
+  if (message.method === "initialized") return;
+  send({ id: message.id, result: { ok: true } });
+  if (process.env.CC_TEST_MODE === "crash-during-handoff") {
+    setTimeout(() => process.exit(9), 50);
+  }
+});
+`);
+		fs.chmodSync(cli, 0o755);
+		const invocation = { command: process.execPath, args: [cli] };
+		let slowHandoffSettled = false;
+		const [result] = await runCodexAppServerRequests(
+			invocation,
+			[{ method: "thread/inject_items", params: { threadId: "child", items: [] } }],
+			{},
+			{
+				timeoutMs: 500,
+				terminationGraceMs: 500,
+				beforeTeardown: async () => {
+					await new Promise((resolve) => setTimeout(resolve, 800));
+					slowHandoffSettled = true;
+				},
+			},
+		);
+		assert.deepEqual(result, { ok: true });
+		assert.equal(slowHandoffSettled, true, "the RPC deadline is disarmed throughout a slow handoff");
+
+		let crashedHandoffSettled = false;
+		await assert.rejects(
+			() => runCodexAppServerRequests(
+				invocation,
+				[{ method: "thread/inject_items", params: { threadId: "child", items: [] } }],
+				{ env: { CC_TEST_MODE: "crash-during-handoff" } },
+				{
+					timeoutMs: 2_000,
+					terminationGraceMs: 500,
+					beforeTeardown: async () => {
+						await new Promise((resolve) => setTimeout(resolve, 250));
+						crashedHandoffSettled = true;
+					},
+				},
+			),
+			(error) => {
+				assert.equal(
+					crashedHandoffSettled,
+					true,
+					"an app-server crash is not exposed until the in-flight handoff settles",
+				);
+				return /exited|completion/i.test(error.message);
+			},
 		);
 	} finally {
 		fs.rmSync(root, { recursive: true, force: true });
