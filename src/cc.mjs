@@ -2,23 +2,63 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
 const STARTUP_INPUT_GUARD = Symbol.for("cc.startup-input-guard");
+const TERMINAL_RESTORE_MONITOR = Symbol.for("cc.terminal-restore-monitor");
+
+function startTerminalRestoreMonitor(state) {
+	if (!state || !process.stdin.isTTY || process.platform === "win32") return undefined;
+	try {
+		const monitor = spawn(process.execPath, [fileURLToPath(new URL("./terminal-restore.mjs", import.meta.url)), state], {
+			detached: true,
+			env: {},
+			stdio: ["pipe", "ignore", "ignore", process.stdin],
+			windowsHide: true,
+		});
+		monitor.on("error", () => {});
+		monitor.unref();
+		monitor.stdin.unref?.();
+		globalThis[TERMINAL_RESTORE_MONITOR] = monitor;
+		return monitor;
+	} catch {
+		return undefined;
+	}
+}
 
 function restoreTerminalMode(state) {
 	if (!state) return true;
+	let tty;
 	try {
+		if (process.platform !== "win32") tty = fs.openSync("/dev/tty", "r+");
 		const restored = spawnSync("stty", [state], {
-			stdio: ["inherit", "ignore", "ignore"],
+			stdio: [tty ?? "inherit", "ignore", "ignore"],
 			timeout: 1_000,
 		});
 		if (restored.status !== 0) return false;
 	} catch {
 		// Best effort only; setRawMode(false) below still restores ordinary launches.
 		return false;
-	}
+	} finally { if (tty !== undefined) try { fs.closeSync(tty); } catch {} }
 	return true;
+}
+
+function captureTerminalMode() {
+	if (!process.stdin.isTTY || process.platform === "win32") return undefined;
+	let tty;
+	try {
+		tty = fs.openSync("/dev/tty", "r+");
+		const captured = spawnSync("stty", ["-g"], {
+			encoding: "utf8",
+			stdio: [tty, "pipe", "ignore"],
+			timeout: 1_000,
+		});
+		const state = String(captured.stdout ?? "").trim();
+		return captured.status === 0 && state.length > 0 && state.length <= 4_096 && !/[\r\n\0]/u.test(state) ? state : undefined;
+	} catch {
+		return undefined;
+	} finally { if (tty !== undefined) try { fs.closeSync(tty); } catch {} }
 }
 
 function restoreInheritedTerminalMode() {
@@ -28,11 +68,28 @@ function restoreInheritedTerminalMode() {
 	return true;
 }
 
+const expectedLauncherPid = Number(process.env.CC_LAUNCHER_PID);
+const hasExpectedLauncher = Number.isSafeInteger(expectedLauncherPid) && expectedLauncherPid > 1;
+const terminateAfterLauncherLoss = () => {
+	if (!hasExpectedLauncher || process.ppid === expectedLauncherPid) return;
+	const guard = globalThis[STARTUP_INPUT_GUARD];
+	if (guard?.terminate) guard.terminate(143);
+	else {
+		restoreInheritedTerminalMode();
+		process.exit(143);
+	}
+};
+if (hasExpectedLauncher && process.ppid !== expectedLauncherPid) terminateAfterLauncherLoss();
+const launcherLifetimeMonitor = hasExpectedLauncher ? setInterval(terminateAfterLauncherLoss, 50) : undefined;
+launcherLifetimeMonitor?.unref();
+
 function beginStartupInputGuard(enabled) {
 	if (!enabled || !process.stdin.isTTY || typeof process.stdin.setRawMode !== "function") return undefined;
 	const chunks = [];
 	const originalRaw = process.stdin.isRaw === true;
 	const inheritedTerminalMode = process.env.CC_STARTUP_STTY_STATE;
+	const startupTerminalMode = inheritedTerminalMode ?? captureTerminalMode();
+	startTerminalRestoreMonitor(startupTerminalMode);
 	let listening = true;
 	let restored = false;
 	let terminating = false;
@@ -79,7 +136,26 @@ function beginStartupInputGuard(enabled) {
 			// libuv may have initialized its TTY handle while the shell launcher's
 			// cbreak guard was active. Restore the shell's exact termios snapshot as
 			// the final authority instead of assuming setRawMode(false) is equivalent.
-			restoreTerminalMode(inheritedTerminalMode);
+			restoreTerminalMode(startupTerminalMode);
+		},
+		terminate(exitCode) {
+			if (restored) return;
+			restored = true;
+			releaseSignalHandlers();
+			if (listening) process.stdin.removeListener("data", onData);
+			listening = false;
+			try { process.stdin.setRawMode(originalRaw); } catch {}
+			process.stdin.pause();
+			let finished = false;
+			const finish = () => {
+				if (finished) return;
+				finished = true;
+				restoreTerminalMode(startupTerminalMode);
+				process.exit(exitCode);
+			};
+			process.stdin.once("close", finish);
+			try { process.stdin.destroy(); } catch {}
+			setTimeout(finish, 50);
 		},
 	};
 	globalThis[STARTUP_INPUT_GUARD] = guard;
@@ -87,13 +163,12 @@ function beginStartupInputGuard(enabled) {
 		const handler = () => {
 			if (terminating) return;
 			terminating = true;
-			guard.restore();
-			try {
-				// Preserve ordinary signal exit semantics after restoring terminal ownership.
-				process.kill(process.pid, signal);
-			} catch {
-				process.exit(signal === "SIGINT" ? 130 : 143);
-			}
+			guard.terminate(signal === "SIGINT" ? 130 : 143);
+			// Re-signalling from inside a one-shot libuv signal callback can be
+			// swallowed while the old watcher is being removed (observed on Node 24),
+			// leaving startup alive in raw mode. Shell-visible signal exit semantics
+			// are the conventional 128 + signal number codes.
+			return;
 		};
 		startupSignalHandlers.set(signal, handler);
 		process.once(signal, handler);

@@ -11,6 +11,10 @@ const token = process.env.CC_WORKFLOW_BROKER_TOKEN;
 const workflowMode = process.env.CC_WORKFLOW_MODE ?? "flexible";
 if (!endpoint || !token) throw new Error("cc workflow broker configuration is missing");
 
+const COMMIT_RECONCILIATION_REQUEST_TIMEOUT_MS = 1000;
+const COMMIT_RECONCILIATION_POLL_MS = 25;
+const COMMIT_RECONCILIATION_DEADLINE_MS = 30_000;
+
 function call(method, params, signal) {
 	return new Promise((resolve, reject) => {
 		let request;
@@ -44,17 +48,44 @@ function call(method, params, signal) {
 		};
 		const onAbort = () => {
 			const error = signal.reason ?? new Error("workflow tool call cancelled");
-			socket.destroy();
-			finish(error);
+			if (!reconcileCommittedLaunch(error)) finish(error);
 		};
-		const reconcileCommittedLaunch = (transportError) => {
-			if (reconciling || method !== "Workflow" || !confirmationAcknowledged || typeof acceptedResponse?.value?.taskId !== "string") return false;
-			reconciling = true;
-			socket.destroy();
-			void call("WorkflowStatus", { taskId: acceptedResponse.value.taskId, action: "status", requireCommitted: true }, signal).then(
-				() => finish(undefined, acceptedResponse.value),
-				() => finish(transportError),
-			);
+			const reconcileCommittedLaunch = (transportError) => {
+				if (reconciling) return true;
+				if (method !== "Workflow" || !confirmationAcknowledged || typeof acceptedResponse?.value?.taskId !== "string") return false;
+				const unresolved = (cause) => Object.assign(new Error(
+					`Workflow launch ${acceptedResponse.value.taskId} was acknowledged but its durable commit could not be reconciled; inspect that task after restarting cc`,
+					{ cause },
+				), { code: "WORKFLOW_COMMIT_RECONCILIATION_UNRESOLVED", taskId: acceptedResponse.value.taskId });
+				reconciling = true;
+				socket.destroy();
+				void (async () => {
+					const deadline = Date.now() + COMMIT_RECONCILIATION_DEADLINE_MS;
+					for (;;) {
+						const controller = new AbortController();
+					const timeoutError = Object.assign(new Error("workflow commit reconciliation request timed out"), { code: "WORKFLOW_COMMIT_RECONCILIATION_TIMEOUT" });
+					const timer = setTimeout(() => controller.abort(timeoutError), COMMIT_RECONCILIATION_REQUEST_TIMEOUT_MS);
+					timer.unref?.();
+					try {
+						await call("WorkflowStatus", {
+							taskId: acceptedResponse.value.taskId,
+							action: "status",
+							requireCommitted: true,
+						}, controller.signal);
+						return finish(undefined, acceptedResponse.value);
+						} catch (error) {
+							// Losing the final frame of a successful, idempotent status query is
+							// itself a transport failure. Retry it rather than reporting launch
+							// failure and inviting a duplicate mutating workflow.
+							const retryable = ["WORKFLOW_LAUNCH_NOT_COMMITTED", "WORKFLOW_COMMIT_RECONCILIATION_TIMEOUT"].includes(error?.code) || error?.brokerResponse !== true;
+								if (!retryable) return finish(unresolved(error));
+						} finally { clearTimeout(timer); }
+						if (Date.now() >= deadline) {
+								return finish(unresolved(transportError));
+						}
+						await new Promise((resolve) => setTimeout(resolve, COMMIT_RECONCILIATION_POLL_MS));
+				}
+			})();
 			return true;
 		};
 		signal?.addEventListener("abort", onAbort, { once: true });
@@ -70,7 +101,10 @@ function call(method, params, signal) {
 				if (!frame) continue;
 				try {
 					const response = JSON.parse(frame);
-					if (!response.ok) throw Object.assign(new Error(response.error?.message ?? "workflow broker failed"), { code: response.error?.code });
+					if (!response.ok) throw Object.assign(new Error(response.error?.message ?? "workflow broker failed"), {
+						code: response.error?.code,
+						brokerResponse: true,
+					});
 					if (!acceptedResponse) {
 						if (typeof response.ack !== "string" || !response.ack) throw new Error("workflow broker response acknowledgement is missing");
 						acceptedResponse = { token: response.ack, value: response.value };

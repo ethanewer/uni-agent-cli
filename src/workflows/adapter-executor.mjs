@@ -363,10 +363,14 @@ export class AdapterWorkflowExecutor {
 					timeout.close();
 					// If teardown could not confirm the mutating backend tree is gone,
 					// retain both the in-process queue and cross-process ownership files
-					// until this cc process exits. A restarted process reclaims them only
-					// after the dead-owner supervisor grace fence.
+					// for this process lifetime. The owner-death marker was durably armed
+					// before launch, so a restarted process requires manual recovery even
+					// if this cc process is killed before reaching this finally block.
 					try {
-						if (releaseMutation && this.terminationFailures.length > terminationFailureCount) this.retainedMutationFences.add(releaseMutation);
+						if (releaseMutation && this.terminationFailures.length > terminationFailureCount) {
+							await releaseMutation.poison?.();
+							this.retainedMutationFences.add(releaseMutation);
+						}
 						else await releaseMutation?.();
 					} finally { releaseSchedule(); }
 				}
@@ -646,7 +650,7 @@ export class AdapterWorkflowExecutor {
 					: `identity\0${stat.dev}\0${stat.ino}`;
 				const lockRoot = await workflowRepositoryLockRoot();
 				const lockFile = path.join(lockRoot, `${createHash("sha256").update(identity).digest("hex")}.lock`);
-				releaseProcessLock = await acquireOwnershipLock(lockFile, { signal });
+				releaseProcessLock = await acquireOwnershipLock(lockFile, { signal, ownerDeathFence: true });
 			} catch (error) {
 				release();
 				if (this.mutationTails.get(queueKey) === tail) this.mutationTails.delete(queueKey);
@@ -654,7 +658,7 @@ export class AdapterWorkflowExecutor {
 			}
 			let done = false;
 			let releasePromise;
-			const releaseMutation = async () => {
+				const releaseMutation = async () => {
 				if (done) return;
 				if (!releasePromise) releasePromise = (async () => {
 					await releaseProcessLock();
@@ -670,8 +674,9 @@ export class AdapterWorkflowExecutor {
 					try { this.onRestartRequired(error); } catch { /* the held queue/lock remain authoritative */ }
 					throw error;
 				}
-			};
-			return releaseMutation;
+				};
+				releaseMutation.poison = () => releaseProcessLock.poison?.();
+				return releaseMutation;
 		}, (error) => {
 			release();
 			// The cancelled tail must remain visible until `previous` settles or a
@@ -718,11 +723,17 @@ export class AdapterWorkflowExecutor {
 			if (releaseErrors.length) throw new AggregateError([error, ...releaseErrors], "workflow repository identity changed and its mutation locks could not be released");
 			throw error;
 		}
-		return async () => {
-			const settled = await Promise.allSettled([...releases].reverse().map((release) => release()));
-			const errors = settled.filter((result) => result.status === "rejected").map((result) => result.reason);
-			if (errors.length) throw new AggregateError(errors, "workflow repository mutation locks could not be released");
-		};
+			const releaseRepositoryMutation = async () => {
+				const settled = await Promise.allSettled([...releases].reverse().map((release) => release()));
+				const errors = settled.filter((result) => result.status === "rejected").map((result) => result.reason);
+				if (errors.length) throw new AggregateError(errors, "workflow repository mutation locks could not be released");
+			};
+			releaseRepositoryMutation.poison = async () => {
+				const settled = await Promise.allSettled(releases.map((release) => release.poison?.()));
+				const errors = settled.filter((result) => result.status === "rejected").map((result) => result.reason);
+				if (errors.length) throw new AggregateError(errors, "workflow repository mutation locks could not be persistently fenced");
+			};
+			return releaseRepositoryMutation;
 	}
 
 	async withRepositoryMutation(cwd, signal, operation) {
@@ -737,7 +748,10 @@ export class AdapterWorkflowExecutor {
 			throw error;
 		}
 		finally {
-			if (retainFence) this.retainedMutationFences.add(release);
+			if (retainFence) {
+				await release.poison?.();
+				this.retainedMutationFences.add(release);
+			}
 			else await release();
 		}
 	}

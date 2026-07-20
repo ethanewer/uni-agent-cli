@@ -35,6 +35,8 @@ PERMS_FILE="$(mktemp -t cc-tui-perms.XXXXXX)"
 rm -f "$PERMS_FILE"
 STTY_RESULT="$(mktemp -t cc-tui-stty-result.XXXXXX)"
 rm -f "$STTY_RESULT"
+DIRECT_STTY_BEFORE="$(mktemp -t cc-tui-direct-stty-before.XXXXXX)"
+DIRECT_STTY_AFTER="$(mktemp -t cc-tui-direct-stty-after.XXXXXX)"
 printf '%s\n' '{"agents":{"fake":{"sessionDefaults":{"model":"fast","effort":"high"}}}}' > "$SETTINGS_FILE"
 ROOT_Q="$(printf "%q" "$ROOT")"
 WRITE_LOG_Q="$(printf "%q" "$WRITE_LOG")"
@@ -139,7 +141,7 @@ stop_session() {
 cleanup() {
 	force_stop_session
 	tmux kill-server >/dev/null 2>&1 || true
-	rm -f "$WRITE_LOG" "$SETTINGS_FILE" "$CONFIG_SETTINGS_THEME_FILE" "$CONFIG_TOP_THEME_FILE" "$COMMANDS_GATE" "$NEW_GATE" "$SESSION_LIST_GATE" "$START_LOG" "$COMMAND_CACHE" "$PERMS_FILE" "$STTY_RESULT"
+	rm -f "$WRITE_LOG" "$SETTINGS_FILE" "$CONFIG_SETTINGS_THEME_FILE" "$CONFIG_TOP_THEME_FILE" "$COMMANDS_GATE" "$NEW_GATE" "$SESSION_LIST_GATE" "$START_LOG" "$COMMAND_CACHE" "$PERMS_FILE" "$STTY_RESULT" "$DIRECT_STTY_BEFORE" "$DIRECT_STTY_AFTER"
 }
 trap cleanup EXIT
 
@@ -249,13 +251,14 @@ assert_next_line_blank() {
 assert_next_line_rule() {
 	local needle="$1"
 	if ! capture | awk -v needle="$needle" '
-		$0 == needle {
-			found = 1
-			if (getline next_line <= 0) exit 1
-			gsub(/[[:space:]]/, "", next_line)
-			exit next_line ~ /^─+$/ ? 0 : 1
+		BEGIN { compact_needle = needle; gsub(/[[:space:]]/, "", compact_needle) }
+		{
+			current = $0
+			gsub(/[[:space:]]/, "", current)
+			if (previous_was_needle && length(current) > 10 && current !~ /[[:alnum:]\/]/) found = 1
+			previous_was_needle = (current == compact_needle)
 		}
-		END { if (!found) exit 1 }
+		END { exit found ? 0 : 1 }
 	'; then
 		echo "Expected horizontal rule after: $needle" >&2
 		capture >&2
@@ -355,9 +358,13 @@ for startup_signal in INT TERM; do
 		wait_for_text "Space to record"
 	fi
 	startup_shell_pid="$(tmux display-message -p -t "$SESSION" '#{pane_pid}')"
-	startup_node_pid="$(ps -axo ppid=,pid=,command= | awk -v parent="$startup_shell_pid" '$1 == parent && /node .*src\/cc\.mjs/ { print $2; exit }')"
+	startup_node_pid="$(ps -axo ppid=,pid=,command= | awk -v parent="$startup_shell_pid" '
+		$1 == parent { children[$2] = 1 }
+		/node .*src\/cc\.mjs/ { count += 1; node_ppid[count] = $1; node_pid[count] = $2 }
+		END { for (i = 1; i <= count; i += 1) if (node_ppid[i] == parent || children[node_ppid[i]]) { print node_pid[i]; exit } }
+	')"
 	if [ -z "$startup_node_pid" ]; then
-		echo "Could not find cc Node process during startup SIG$startup_signal test" >&2
+		echo "Could not find visible cc Node process during startup SIG$startup_signal test" >&2
 		capture >&2
 		exit 1
 	fi
@@ -391,6 +398,60 @@ for startup_signal in INT TERM; do
 	stop_session
 	: > "$WRITE_LOG"
 done
+
+# Even SIGKILL cannot be forwarded by the visible prepaint wrapper. The Node
+# process watches that exact parent identity and must terminate before it could
+# leave workflow workers orphaned.
+tmux new-session -d -s "$SESSION" -x 100 -y 30 "cd $ROOT_Q && exec sh"
+tmux send-keys -l -t "$SESSION" "$PANE_ENV CC_CONFIG=tests/fake_config.json CC_SETTINGS=$SETTINGS_FILE_Q CC_BACKGROUND_CONNECT_DELAY_MS=0 CC_TEST_STARTUP_IMPORT_DELAY_MS=5000 ./src/cc fake; stty sane"
+tmux send-keys -t "$SESSION" Enter
+wait_for_text "Space to record"
+owner_shell_pid="$(tmux display-message -p -t "$SESSION" '#{pane_pid}')"
+wrapper_pid="$(ps -axo ppid=,pid=,command= | awk -v parent="$owner_shell_pid" '$1 == parent && /(^|[[:space:]])(\.\/)?src\/cc([[:space:]]|$)/ { print $2; exit }')"
+orphan_candidate_pid="$(ps -axo ppid=,pid=,command= | awk -v parent="$wrapper_pid" '$1 == parent && /node .*src\/cc\.mjs/ { print $2; exit }')"
+if [ -z "$wrapper_pid" ] || [ -z "$orphan_candidate_pid" ]; then
+	echo "Could not find wrapper ownership chain for SIGKILL test" >&2
+	exit 1
+fi
+kill -KILL "$wrapper_pid"
+for _ in {1..50}; do
+	if ! kill -0 "$orphan_candidate_pid" 2>/dev/null; then break; fi
+	sleep 0.1
+done
+if kill -0 "$orphan_candidate_pid" 2>/dev/null; then
+	echo "Killing the visible cc wrapper left its Node process alive" >&2
+	exit 1
+fi
+stop_session
+: > "$WRITE_LOG"
+
+# npm's generated POSIX bin invokes cc.mjs directly. A direct launcher therefore
+# has to capture its own exact termios snapshot before raw mode so its detached
+# monitor can restore the parent shell even when the Node manager is SIGKILLed.
+DIRECT_STTY_BEFORE_Q="$(printf '%q' "$DIRECT_STTY_BEFORE")"
+DIRECT_STTY_AFTER_Q="$(printf '%q' "$DIRECT_STTY_AFTER")"
+tmux new-session -d -s "$SESSION" -x 100 -y 30 "cd $ROOT_Q && exec sh"
+tmux send-keys -l -t "$SESSION" "stty -g > $DIRECT_STTY_BEFORE_Q; $PANE_ENV CC_CONFIG=tests/fake_config.json CC_SETTINGS=$SETTINGS_FILE_Q CC_BACKGROUND_CONNECT_DELAY_MS=0 CC_TEST_STARTUP_IMPORT_DELAY_MS=5000 node src/cc.mjs fake; for attempt in \$(seq 1 50); do stty -g > $DIRECT_STTY_AFTER_Q; cmp -s $DIRECT_STTY_BEFORE_Q $DIRECT_STTY_AFTER_Q && break; sleep 0.02; done"
+tmux send-keys -t "$SESSION" Enter
+wait_for_text "Space to record"
+direct_owner_shell_pid="$(tmux display-message -p -t "$SESSION" '#{pane_pid}')"
+direct_manager_pid="$(ps -axo ppid=,pid=,command= | awk -v parent="$direct_owner_shell_pid" '$1 == parent && /node .*src\/cc\.mjs/ { print $2; exit }')"
+if [ -z "$direct_manager_pid" ]; then
+	echo "Could not find direct cc.mjs manager for SIGKILL restoration test" >&2
+	exit 1
+fi
+kill -KILL "$direct_manager_pid"
+for _ in {1..100}; do
+	if [ -s "$DIRECT_STTY_AFTER" ] && cmp -s "$DIRECT_STTY_BEFORE" "$DIRECT_STTY_AFTER"; then break; fi
+	sleep 0.05
+done
+if ! cmp -s "$DIRECT_STTY_BEFORE" "$DIRECT_STTY_AFTER"; then
+	echo "SIGKILL of the direct npm-bin cc.mjs path did not restore exact terminal state" >&2
+	diff -u "$DIRECT_STTY_BEFORE" "$DIRECT_STTY_AFTER" >&2 || true
+	exit 1
+fi
+stop_session
+: > "$WRITE_LOG"
 
 # Backend commands arrive after the editor is already usable. Typing /r during
 # that cold-start window must refresh in place when command discovery finishes;
@@ -705,7 +766,9 @@ wait_without_text "slow done"
 
 tmux send-keys -t "$SESSION" / m o d e l Enter
 wait_for_text "Model"
-tmux send-keys -t "$SESSION" Down Enter
+tmux send-keys -t "$SESSION" Down
+wait_for_text "›   Deep"
+tmux send-keys -t "$SESSION" Enter
 wait_for_text "/model (Deep)"
 wait_without_text "Model:"
 
@@ -717,7 +780,9 @@ wait_without_text "Reasoning Effort:"
 
 tmux send-keys -t "$SESSION" / m o d e Enter
 wait_for_text "Mode"
-tmux send-keys -t "$SESSION" Down Enter
+tmux send-keys -t "$SESSION" Down
+wait_for_text "›   Plan"
+tmux send-keys -t "$SESSION" Enter
 wait_for_text "/mode (Plan)"
 wait_without_text "Mode:"
 
@@ -748,7 +813,9 @@ wait_without_text "/model (Deep)"
 tmux send-keys -t "$SESSION" / r e v i e w Enter
 wait_for_text "Select a review preset"
 wait_for_text "Review against a base branch"
-tmux send-keys -t "$SESSION" Down Enter
+tmux send-keys -t "$SESSION" Down
+wait_for_text "›   Review uncommitted changes"
+tmux send-keys -t "$SESSION" Enter
 wait_for_text "/review (Review uncommitted changes)"
 wait_for_text "review prompt: /review"
 
@@ -770,7 +837,9 @@ tmux send-keys -t "$SESSION" / p e r m i s s i o n - t e s t Enter
 wait_for_text "Permission: Permission Test"
 wait_for_text "Reject"
 wait_for_text "Allow"
-tmux send-keys -t "$SESSION" Down Enter
+tmux send-keys -t "$SESSION" Down
+wait_for_text "›   Allow"
+tmux send-keys -t "$SESSION" Enter
 wait_for_text '"optionId": "allow"'
 
 tmux send-keys -t "$SESSION" / c l e a r Enter
@@ -778,9 +847,13 @@ wait_without_text '"optionId": "allow"'
 
 tmux send-keys -t "$SESSION" / p e r m i s s i o n - o v e r l a p Enter
 wait_for_text "Permission: Permission One"
-tmux send-keys -t "$SESSION" Down Enter
+tmux send-keys -t "$SESSION" Down
+wait_for_text "›   Allow"
+tmux send-keys -t "$SESSION" Enter
 wait_for_text "Permission: Permission Two"
-tmux send-keys -t "$SESSION" Down Enter
+tmux send-keys -t "$SESSION" Down
+wait_for_text "›   Allow"
+tmux send-keys -t "$SESSION" Enter
 wait_for_text '"optionId": "allow-one"'
 wait_for_text '"optionId": "allow-two"'
 

@@ -310,4 +310,9 @@ while [ -L "$script" ]; do
 	esac
 done
 
-exec node "$(dirname "$script")/cc.mjs" "$@"
+# Keep the prepaint shell as the final terminal-state authority. cc.mjs watches
+# this exact parent identity, so killing the visible wrapper cannot orphan Node
+# or any workflow workers even for signals the shell cannot forward while it
+# waits for the foreground application.
+CC_LAUNCHER_PID=$$ node "$(dirname "$script")/cc.mjs" "$@"
+exit $?

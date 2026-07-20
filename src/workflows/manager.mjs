@@ -211,11 +211,18 @@ function replayInterruptedSnapshot(meta, records, fallbackName) {
 		if (!event || typeof event !== "object") continue;
 		runUsage = replayRunUsage(event.runUsage) ?? runUsage;
 		if (event.type === "run_completed") {
-			terminal = { status: "completed", result: event.result, error: undefined, finishedAt: event.at };
+			// A durable user stop is monotonic. Cancellation-insensitive workflow
+			// code can return after stop intent was recorded; a crash before the
+			// final stopped record must not resurrect that run as completed.
+			if (terminal?.status !== "stopped") terminal = { status: "completed", result: event.result, error: undefined, finishedAt: event.at };
+			continue;
+		}
+		if (event.type === "run_stop_requested") {
+			terminal = { status: "stopped", result: undefined, error: event.error, finishedAt: event.at };
 			continue;
 		}
 		if (event.type === "run_failed") {
-			terminal = {
+			if (terminal?.status !== "stopped") terminal = {
 				status: event.status === "stopped" ? "stopped" : "failed",
 				result: undefined, error: event.error, finishedAt: event.at,
 			};
@@ -322,6 +329,7 @@ export class WorkflowManager {
 		this.createAdapter = options.createAdapter;
 		this.registry = options.registry;
 		this.stateRoot = options.stateRoot;
+		this.writeLaunchCommit = options.writeLaunchCommit ?? writeWorkflowLaunchCommit;
 		this.approve = options.approve ?? (async () => false);
 		this.onChange = options.onChange ?? (() => {});
 		this.onComplete = options.onComplete ?? (() => {});
@@ -382,7 +390,7 @@ export class WorkflowManager {
 		});
 		for (const run of this.runs.values()) {
 			if (!run.abortController.signal.aborted) run.abortController.abort(reason);
-			for (const sandbox of run.sandboxes) sandbox.stop();
+			for (const sandbox of run.sandboxes ?? []) sandbox.stop();
 			this.scheduler.cancelRun(run.id, reason.message);
 		}
 	}
@@ -390,13 +398,28 @@ export class WorkflowManager {
 	#requireRestart(error) {
 		if (this.restartRequiredFailure) return;
 		this.restartRequiredFailure = error;
+		const reason = Object.assign(new Error("The workflow subsystem requires a restart; no workflow work may continue", { cause: error }), {
+			code: "WORKFLOW_RESTART_REQUIRED",
+		});
+		for (const pending of this.pendingApprovals) pending.controller.abort(reason);
+		for (const run of this.runs.values()) {
+			if (run.completionCommitted || ["completed", "failed", "stopped"].includes(run.status)) continue;
+			if (!run.abortController.signal.aborted) run.abortController.abort(reason);
+			for (const sandbox of run.sandboxes) sandbox.stop();
+			this.scheduler.cancelRun(run.id, reason.message);
+		}
 		try { this.onRestartRequired(error); } catch { /* the manager fence remains authoritative */ }
 	}
 
 	async #cleanupUncommittedRun(run) {
 		this.failedStartCleanups.add(run);
 		try {
-			await run.journal.close().catch(() => {});
+			try { await run.journal.close(); }
+			catch (error) {
+				// A final sync failure is irrelevant when deleting an uncommitted
+				// journal, but an unclosed descriptor makes cleanup untrustworthy.
+				if (error?.journalHandleClosed !== true) throw error;
+			}
 			// Index publication may have renamed successfully before reporting a
 			// post-commit fsync error. Removal is idempotent, so always issue it.
 			await run.journal.removeFromIndex(run.createdAt);
@@ -405,7 +428,6 @@ export class WorkflowManager {
 			await run.releaseLease?.();
 			run.releaseLease = undefined;
 			this.failedStartCleanups.delete(run);
-			if (this.failedStartCleanups.size === 0 && !this.terminationFailure) this.restartRequiredFailure = undefined;
 		} catch (error) {
 			this.#requireRestart(error);
 			throw error;
@@ -551,10 +573,13 @@ export class WorkflowManager {
 				if (["pending", "running", "paused", "stopping"].includes(snapshot.status)) snapshot.status = "interrupted";
 				const deliveryInterrupted = ["not-ready", "pending", "queued", "waiting-for-session", "sending"].includes(snapshot.delivery?.state);
 				if (deliveryInterrupted && candidate.state !== "archived") {
+					const sendWasPossible = snapshot.delivery?.state === "sending";
 					const delivery = {
 						...snapshot.delivery,
-						state: "not-delivered-after-restart",
-						message: "cc restarted before delivery could be confirmed",
+						state: sendWasPossible ? "ambiguous" : "not-delivered-after-restart",
+						message: sendWasPossible
+							? "cc restarted after delivery began but before it could be confirmed"
+							: "cc restarted before delivery could be sent",
 						updatedAt: now(),
 					};
 					snapshot = { ...snapshot, delivery };
@@ -586,17 +611,27 @@ export class WorkflowManager {
 					}
 					if (fallback?.id === candidate.name) {
 						if (fallback.launchCommitRequired === true) {
-							const commit = await readWorkflowLaunchCommit(path.join(root, candidate.name), candidate.name);
-							bytes = Math.min(this.historyReadBudget, bytes + commit.bytes);
-							if (!commit.committed) {
-								const persisted = new WorkflowJournal(root, candidate.name);
-								await persisted.removeFromIndex(candidate.createdAt);
-								await fs.rm(path.join(root, candidate.name), { recursive: true, force: true });
-								await syncDirectory(root);
-								this.deferredRecoveryRuns.delete(candidate.name);
-								continue;
+							try {
+								const commit = await readWorkflowLaunchCommit(path.join(root, candidate.name), candidate.name);
+								bytes = Math.min(this.historyReadBudget, bytes + commit.bytes);
+								if (!commit.committed) {
+									const persisted = new WorkflowJournal(root, candidate.name);
+									await persisted.removeFromIndex(candidate.createdAt);
+									await fs.rm(path.join(root, candidate.name), { recursive: true, force: true });
+									await syncDirectory(root);
+									this.deferredRecoveryRuns.delete(candidate.name);
+									continue;
+								}
+							} catch (commitError) {
+								bytes = Math.min(this.historyReadBudget, bytes + Math.max(0, Number(commitError?.workflowReadBytes) || 0));
+								error = commitError;
+								fallback = undefined;
+								fallbackExact = false;
+								fallbackFailure = commitError;
 							}
 						}
+					}
+					if (fallback?.id === candidate.name) {
 					this.deferredRecoveryRuns.delete(candidate.name);
 					if (leaseAcquired && candidate.state !== "archived" && fallbackExact) {
 						// recovery.json may have reached disk immediately before a crash in
@@ -617,13 +652,7 @@ export class WorkflowManager {
 					this.history.set(candidate.name, Object.freeze(visibleFallback));
 					continue;
 				}
-				if (leaseAcquired && candidate.state !== "archived") {
-						// A corrupt/absent capsule can be replaced and retired. A capsule that
-						// merely did not fit remains indexed as recovery-critical live history;
-						// after newer successful candidates become archived, the next startup
-						// prioritizes and loads this exact capsule before ordinary journals.
-					const persisted = new WorkflowJournal(root, candidate.name);
-					const interrupted = Object.freeze({
+				const interrupted = Object.freeze({
 						id: candidate.name, name: "Interrupted workflow", saveName: candidate.name,
 						description: "Workflow history could not be read safely during startup recovery",
 						phases: ["Recovery"], currentPhase: "Recovery", status: "interrupted",
@@ -633,6 +662,12 @@ export class WorkflowManager {
 						delivery: { state: "origin-retired" }, result: undefined,
 						error: publicError(error), agents: [],
 					});
+				if (leaseAcquired && candidate.state !== "archived") {
+						// A corrupt/absent capsule can be replaced and retired. A capsule that
+						// merely did not fit remains indexed as recovery-critical live history;
+						// after newer successful candidates become archived, the next startup
+						// prioritizes and loads this exact capsule before ordinary journals.
+					const persisted = new WorkflowJournal(root, candidate.name);
 						// Budget exhaustion means the exact capsule was not inspected, not that
 						// it was invalid. Preserve it on disk for a later bounded startup.
 						if (fallbackFailure?.code !== "WORKFLOW_HISTORY_BUDGET") {
@@ -641,8 +676,8 @@ export class WorkflowManager {
 						if (fallbackFailure?.code !== "WORKFLOW_HISTORY_BUDGET") {
 							await persisted.markArchived(candidate.createdAt);
 						} else this.deferredRecoveryRuns.add(candidate.name);
-					this.history.set(candidate.name, interrupted);
 				}
+				if (fallbackFailure?.code !== "WORKFLOW_HISTORY_BUDGET") this.history.set(candidate.name, interrupted);
 			}
 		}
 		const knownWorktrees = new Set();
@@ -948,6 +983,11 @@ export class WorkflowManager {
 		this.pendingApprovals.add(pending);
 		const ensureLaunchActive = () => {
 			if (approvalController.signal.aborted) throw approvalController.signal.reason;
+			if (this.restartRequiredFailure || this.failedStartCleanups.size > 0) {
+				throw Object.assign(new Error("The workflow subsystem has unresolved cleanup state; restart cc before launching more workflows", { cause: this.restartRequiredFailure }), {
+					code: "WORKFLOW_RESTART_REQUIRED",
+				});
+			}
 			if (this.stopping) throw Object.assign(new Error("Dynamic workflow manager is stopping"), { code: "WORKFLOW_STOPPING" });
 		};
 		let run;
@@ -996,7 +1036,7 @@ export class WorkflowManager {
 				rpcCount: 0, pendingRpcCount: 0, hostEventCount: 0, hostEventBytes: 0,
 					abortController: new AbortController(), sandboxes: new Set(), agentExecutions: new Set(), sandboxExecutions: new Set(),
 					journal: new WorkflowJournal(path.join(this.stateRoot, "workflow-runs"), id), releaseLease, metadataTail: Promise.resolve(),
-					responseAcceptanceState: options.deferExecution === true ? "awaiting" : "accepted", commitPromise: undefined,
+					responseAcceptanceState: options.deferExecution === true ? "awaiting" : "accepted", commitPromise: undefined, rollbackPromise: undefined,
 				};
 					await run.journal.initialize({
 						id, meta, saveName: run.saveName, sourceHash, source, args: launch.args, origin: run.origin, projectIdentity: run.projectIdentity, status: run.status,
@@ -1024,7 +1064,12 @@ export class WorkflowManager {
 				void run.execution?.catch(() => {});
 			return { taskId: id, status: run.status, name: meta.name, phases: meta.phases };
 		} catch (error) {
-			if (run && !run.execution) {
+			if (error?.code === "WORKFLOW_PROJECT_HELPER_TERMINATION_UNCONFIRMED") this.#requireRestart(error);
+			// A marker that was renamed before a directory-fsync failure is visible
+			// durable state with an uncertain crash outcome. Keep its journal, lease,
+			// and marker intact for restart recovery instead of treating it like an
+			// allocation that never crossed the publication boundary.
+			if (run && !run.execution && run.responseAcceptanceState !== "commit-ambiguous") {
 				this.scheduler.closeRun(run.id);
 				this.runs.delete(run.id);
 				try { await this.#cleanupUncommittedRun(run); }
@@ -1046,6 +1091,9 @@ export class WorkflowManager {
 		if (!run || run.responseAcceptanceState !== "awaiting" || run.execution) {
 			throw Object.assign(new Error("Workflow launch is no longer awaiting response acceptance"), { code: "WORKFLOW_LAUNCH_NOT_PENDING" });
 		}
+		if (this.restartRequiredFailure || this.failedStartCleanups.size > 0) {
+			throw Object.assign(new Error("The workflow subsystem requires a restart before this launch can be accepted", { cause: this.restartRequiredFailure }), { code: "WORKFLOW_RESTART_REQUIRED" });
+		}
 		if (this.stopping || run.abortController.signal.aborted) {
 			throw Object.assign(new Error("Workflow launch was cancelled before its response was accepted"), { code: "WORKFLOW_LAUNCH_CANCELLED" });
 		}
@@ -1058,20 +1106,48 @@ export class WorkflowManager {
 		if (!run || run.responseAcceptanceState !== "accepted" || run.execution) {
 			throw Object.assign(new Error("Workflow launch response was not accepted before commit"), { code: "WORKFLOW_LAUNCH_NOT_ACCEPTED" });
 		}
+		if (this.restartRequiredFailure || this.failedStartCleanups.size > 0 || run.abortController.signal.aborted) {
+			throw Object.assign(new Error("Workflow launch cannot commit because the subsystem requires restart", { cause: this.restartRequiredFailure ?? run.abortController.signal.reason }), { code: "WORKFLOW_RESTART_REQUIRED" });
+		}
 		run.responseAcceptanceState = "committing";
-		const commit = (async () => {
-			await writeWorkflowLaunchCommit(run.journal.directory, run.id, run.journal.directoryIdentity);
-			if (run.responseAcceptanceState !== "committing" || this.stopping || run.abortController.signal.aborted) {
-				throw Object.assign(new Error("Workflow launch was cancelled before its durable commit boundary"), { code: "WORKFLOW_LAUNCH_CANCELLED" });
-			}
+		let markerPublished = false;
+		const releaseCommittedExecution = () => {
 			run.responseAcceptanceState = "committed";
-			run.execution = this.#executeRun(run);
+			run.execution ??= this.#executeRun(run);
 			void run.execution.catch(() => {});
+		};
+		const commit = (async () => {
+			await this.writeLaunchCommit(run.journal.directory, run.id, run.journal.directoryIdentity, {
+				onPublished: () => {
+					// The atomic rename is the irreversible launch boundary. Cancellation
+					// racing the subsequent directory fsync must await this transaction; it
+					// can no longer clean a visible marker as an uncommitted allocation.
+					markerPublished = true;
+					if (run.responseAcceptanceState === "committing") run.responseAcceptanceState = "published";
+				},
+			});
+			if (!markerPublished) throw new Error("Workflow launch commit marker was not published");
+			// A sticky restart fence can arrive while the marker write is awaiting I/O.
+			// The marker is now durable and must remain reconcilable, but source must
+			// not execute: publish the committed state with an already-aborted signal.
+			if (this.restartRequiredFailure && !run.abortController.signal.aborted) {
+				run.abortController.abort(Object.assign(new Error("Workflow launch cancelled because the subsystem requires restart", { cause: this.restartRequiredFailure }), { code: "WORKFLOW_RESTART_REQUIRED" }));
+			}
+			releaseCommittedExecution();
 			return true;
 		})();
 		run.commitPromise = commit;
 		try { return await commit; }
 		catch (error) {
+			if (markerPublished) {
+				const ambiguous = Object.assign(new Error("Workflow launch marker was renamed but its directory durability could not be confirmed; restart cc", { cause: error }), {
+					code: "WORKFLOW_LAUNCH_COMMIT_AMBIGUOUS",
+				});
+				run.responseAcceptanceState = "commit-ambiguous";
+				run.commitAmbiguousError = ambiguous;
+				this.#requireRestart(ambiguous);
+				throw ambiguous;
+			}
 			if (run.responseAcceptanceState === "committing") run.responseAcceptanceState = "accepted";
 			throw error;
 		} finally {
@@ -1082,22 +1158,33 @@ export class WorkflowManager {
 	async rollbackStart(id) {
 		const run = this.runs.get(id);
 		if (!run) return false;
-		if (run.responseAcceptanceState === "committing") {
-			run.responseAcceptanceState = "commit-cancelled";
-			run.abortController.abort(Object.assign(new Error("Workflow launch cancelled during commit"), { code: "WORKFLOW_LAUNCH_CANCELLED" }));
-			await run.commitPromise?.catch(() => {});
-		}
-		if (run.responseAcceptanceState === "committed" || run.execution) return this.stop(id);
-		run.responseAcceptanceState = "rolled-back";
-		this.runs.delete(id);
-		this.scheduler.closeRun(id);
-		await this.#cleanupUncommittedRun(run);
-		return true;
+		if (run.rollbackPromise) return run.rollbackPromise;
+		const rollback = (async () => {
+			if (run.responseAcceptanceState === "commit-ambiguous") throw run.commitAmbiguousError;
+			if (["committing", "published", "commit-cancelled"].includes(run.responseAcceptanceState)) {
+				run.responseAcceptanceState = "commit-cancelled";
+				if (!run.abortController.signal.aborted) run.abortController.abort(Object.assign(new Error("Workflow launch cancelled during commit"), { code: "WORKFLOW_LAUNCH_CANCELLED" }));
+				await run.commitPromise?.catch(() => {});
+				// commitStart can discover a post-rename durability failure while this
+				// rollback is waiting. Re-check the terminal ambiguity before any cleanup.
+				if (run.responseAcceptanceState === "commit-ambiguous") throw run.commitAmbiguousError;
+			}
+			if (run.responseAcceptanceState === "committed" || run.execution) return this.stop(id);
+			run.responseAcceptanceState = "rolled-back";
+			this.scheduler.closeRun(id);
+			await this.#cleanupUncommittedRun(run);
+			this.runs.delete(id);
+			return true;
+		})();
+		run.rollbackPromise = rollback;
+		try { return await rollback; }
+		finally { if (run.rollbackPromise === rollback) run.rollbackPromise = undefined; }
 	}
 
 	async #executeRun(run) {
 		let finalStatus = "failed";
 		try {
+			if (run.abortController.signal.aborted) throw run.abortController.signal.reason;
 			run.status = "running";
 			run.startedAt = now();
 			await this.#record(run, { type: "run_started" }, true);
@@ -1537,7 +1624,7 @@ export class WorkflowManager {
 	}
 	get(id) { const run = this.runs.get(id); return run ? snapshotRun(run) : this.history.get(id); }
 	getSource(id) { return this.runs.get(id)?.source ?? this.historySources.get(id); }
-	async recover(id, origin) {
+	async recover(id, origin, options = {}) {
 		const archived = this.history.get(id);
 		if (!archived || archived.status !== "interrupted") throw new Error("Only an interrupted persisted workflow can be recovered");
 		const source = this.historySources.get(id);
@@ -1547,7 +1634,7 @@ export class WorkflowManager {
 			args: archived.args ?? null,
 			tokenBudget: archived.tokenBudget ?? null,
 			maxConcurrency: archived.requestedConcurrency ?? archived.maxConcurrency,
-		}, origin, { recoveryOf: id });
+		}, origin, { recoveryOf: id, signal: options.signal });
 	}
 
 	async markDelivery(id, state, fields = {}) {
@@ -1556,7 +1643,14 @@ export class WorkflowManager {
 		const release = await this.#acquireRunMetadata(run);
 		try {
 			if (this.runs.get(id) !== run) return false;
-			const delivery = { ...run.delivery, state, ...fields, updatedAt: now() };
+			const { confirmedNotSent = false, ...deliveryFields } = fields;
+			// A generic retirement must never overwrite `sending`: at that point a
+			// backend may already have consumed the prompt, so only delivered or
+			// ambiguous is safe. The two pre-send revalidation sites opt in after
+			// proving the exact target changed before prompt() was called.
+			if (run.delivery?.state === "sending" && state === "origin-retired" && confirmedNotSent !== true) return false;
+			if (["delivered", "ambiguous"].includes(run.delivery?.state) && state !== run.delivery.state) return false;
+			const delivery = { ...run.delivery, state, ...deliveryFields, updatedAt: now() };
 			await run.journal.updateMeta({ delivery, snapshot: { ...snapshotRun(run), delivery } });
 			run.delivery = delivery;
 			this.#changed(run);
@@ -1798,7 +1892,10 @@ export class WorkflowManager {
 		} else if (action === "resume") {
 			if (run.status !== "paused") throw new Error("only a paused workflow can be resumed");
 			run.status = "running"; this.scheduler.resume(id); this.#recordDetached(run, { type: "run_resumed" }, true);
-		} else if (action === "stop") this.stop(id);
+		} else if (action === "stop") {
+			const stopping = this.stop(id);
+			if (stopping && typeof stopping.then === "function") return stopping.then(() => snapshotRun(run));
+		}
 		else if (action !== "status") throw new Error(`unknown workflow action: ${action}`);
 		return snapshotRun(run);
 	}
@@ -1809,10 +1906,18 @@ export class WorkflowManager {
 		return this.history.has(id);
 	}
 
+	isStartCommitAmbiguous(id) {
+		return this.runs.get(id)?.responseAcceptanceState === "commit-ambiguous";
+	}
+
 	stop(id) {
 		const run = this.runs.get(id);
 		if (!run || run.completionCommitted || !["pending", "running", "paused"].includes(run.status)) return false;
-		if (!run.execution && ["awaiting", "accepted", "committing", "commit-cancelled"].includes(run.responseAcceptanceState)) {
+		if (run.responseAcceptanceState === "commit-ambiguous") {
+			this.#requireRestart(run.commitAmbiguousError);
+			return false;
+		}
+		if (!run.execution && ["awaiting", "accepted", "committing", "published", "commit-cancelled"].includes(run.responseAcceptanceState)) {
 			void this.rollbackStart(id).catch((error) => this.#requireRestart(error));
 			return true;
 		}
@@ -1830,7 +1935,13 @@ export class WorkflowManager {
 		for (const sandbox of run.sandboxes) sandbox.stop();
 		this.scheduler.cancelRun(id, "Workflow stopped");
 		this.#changed(run);
-		return true;
+		return this.#record(run, { type: "run_stop_requested", status: "stopped" }, true).then(
+			() => true,
+			(error) => {
+				this.#requireRestart(error);
+				throw error;
+			},
+		);
 	}
 
 	restartAgent(runId, agentId) {
@@ -1858,46 +1969,75 @@ export class WorkflowManager {
 		return true;
 	}
 
-	async stopAll() {
+	async stopAll(options = {}) {
 		this.stopping = true;
 		const worktreeOperations = [...this.worktreeOperations];
 		this.abortWorktreeOperations();
 		const pendingApprovals = [...this.pendingApprovals];
 		for (const pending of pendingApprovals) pending.controller.abort(Object.assign(new Error("Workflow launch cancelled during shutdown"), { code: "WORKFLOW_STOPPING" }));
-		const unacceptedRuns = [...this.runs.values()].filter((run) => ["awaiting", "accepted", "committing", "commit-cancelled"].includes(run.responseAcceptanceState) && !run.execution);
+		const unacceptedRuns = [...this.runs.values()].filter((run) => ["awaiting", "accepted", "committing", "published", "commit-cancelled", "commit-ambiguous"].includes(run.responseAcceptanceState) && !run.execution);
 		const unacceptedRollbacks = await Promise.allSettled(unacceptedRuns.map((run) => this.rollbackStart(run.id)));
-		for (const run of this.runs.values()) this.stop(run.id);
+		const stopRequests = [...this.runs.values()].map((run) => Promise.resolve(this.stop(run.id)));
 		await Promise.allSettled(pendingApprovals.map((pending) => pending.settled));
 		while (this.pendingStarts > 0) await new Promise((resolve) => setTimeout(resolve, 20));
-		const failedStartCleanupResults = await Promise.allSettled([...this.failedStartCleanups].map((run) => this.#cleanupUncommittedRun(run)));
-		const settlingRuns = [...this.runs.values()];
+		const failedStartCleanupRuns = [...this.failedStartCleanups];
+		const failedStartCleanupResults = await Promise.allSettled(failedStartCleanupRuns.map((run) => this.#cleanupUncommittedRun(run)));
+		for (let index = 0; index < failedStartCleanupResults.length; index += 1) {
+			const run = failedStartCleanupRuns[index];
+			if (failedStartCleanupResults[index].status === "fulfilled" && !run.execution && run.responseAcceptanceState === "rolled-back") {
+				this.scheduler.closeRun(run.id);
+				if (this.runs.get(run.id) === run) this.runs.delete(run.id);
+			}
+		}
+		const settlingRuns = [...this.runs.values()].filter((run) =>
+			run.responseAcceptanceState !== "commit-ambiguous" && Boolean(run.execution));
 		const runSettlements = await Promise.allSettled(settlingRuns.map(async (run) => {
 			while (!RUN_STATES.slice(4).includes(run.status)) await new Promise((resolve) => setTimeout(resolve, 20));
 			await run.execution;
 		}));
+		const stopRequestResults = await Promise.allSettled(stopRequests);
 		await Promise.allSettled(worktreeOperations.map((operation) => operation.settled));
-		await this.executor.retryMutationReleases?.();
-		await retryOwnershipLockReleases();
-		const archiveRetryResults = await Promise.allSettled([...this.runs.values()].map((run) => this.#archiveIfSettled(run)));
-		this.executor.assertTerminationConfirmed?.();
-		if (this.sandboxTerminationFailures.length > 0) {
-			throw new AggregateError(
-				[...this.sandboxTerminationFailures],
-				"one or more workflow sandbox process trees could not be confirmed stopped",
-			);
+		// Archiving may itself discover a transient lease-release failure. Alternate
+		// archive and global release retries until an entire pass is clean, and only
+		// report the final unresolved state rather than stale earlier failures.
+		let archiveRetryResults = [];
+		let releaseRetryResults = [];
+		for (let attempt = 0; attempt < 3; attempt += 1) {
+			archiveRetryResults = await Promise.allSettled([...this.runs.values()].map((run) => this.#archiveIfSettled(run)));
+			releaseRetryResults = await Promise.allSettled([
+				Promise.resolve().then(() => this.executor.retryMutationReleases?.()),
+				Promise.resolve().then(() => retryOwnershipLockReleases()),
+			]);
+			if (archiveRetryResults.every((result) => result.status === "fulfilled" && (options.requireArchived === false || result.value !== false)) &&
+				releaseRetryResults.every((result) => result.status === "fulfilled")) break;
 		}
-		const failedStartCleanupErrors = unacceptedRollbacks.concat(failedStartCleanupResults).filter((result) => result.status === "rejected").map((result) => result.reason);
-		if (failedStartCleanupErrors.length > 0) {
-			throw Object.assign(new AggregateError(failedStartCleanupErrors, "workflow shutdown could not clean failed launch state"), {
-				code: "WORKFLOW_START_CLEANUP_INCOMPLETE",
-			});
-		}
+		const convergenceErrors = releaseRetryResults.filter((result) => result.status === "rejected").map((result) => result.reason);
+		try { this.executor.assertTerminationConfirmed?.(); }
+		catch (error) { convergenceErrors.push(error); }
+		convergenceErrors.push(...this.sandboxTerminationFailures);
+		const failedStartCleanupErrors = unacceptedRollbacks
+			.flatMap((result, index) => result.status === "rejected" && (
+				this.failedStartCleanups.has(unacceptedRuns[index]) ||
+				unacceptedRuns[index]?.responseAcceptanceState === "commit-ambiguous"
+			) ? [result.reason] : [])
+			.concat(failedStartCleanupResults.filter((result) => result.status === "rejected").map((result) => result.reason));
 		const archiveRetryErrors = archiveRetryResults.filter((result) => result.status === "rejected").map((result) => result.reason);
-		const failures = runSettlements
+		if (options.requireArchived !== false && this.runs.size > 0) {
+			archiveRetryErrors.push(new Error(`workflow shutdown retained ${this.runs.size} unarchived run(s) after delivery convergence`));
+		}
+		const failures = failedStartCleanupErrors.concat(runSettlements
 			.flatMap((result, index) => result.status === "rejected" && this.runs.has(settlingRuns[index].id) ? [result.reason] : [])
-			.concat(archiveRetryErrors);
+			.concat(stopRequestResults.filter((result) => result.status === "rejected").map((result) => result.reason), archiveRetryErrors, convergenceErrors));
 		if (failures.length > 0) {
-			throw Object.assign(new AggregateError(failures, "workflow shutdown could not durably archive every terminal run"), {
+			if (failedStartCleanupErrors.length > 0) {
+				throw Object.assign(new AggregateError(failures, "workflow shutdown could not clean failed launch state or complete every concurrent shutdown phase"), {
+					code: "WORKFLOW_START_CLEANUP_INCOMPLETE",
+				});
+			}
+			const convergenceOnly = archiveRetryErrors.length === 0 && runSettlements.every((result) => result.status === "fulfilled") && stopRequestResults.every((result) => result.status === "fulfilled");
+			throw Object.assign(new AggregateError(failures, convergenceOnly
+				? "workflow shutdown could not be confirmed stopped or release every ownership fence"
+				: "workflow shutdown could not durably archive every terminal run"), {
 				code: "WORKFLOW_ARCHIVE_INCOMPLETE",
 			});
 		}

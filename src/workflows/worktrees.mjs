@@ -9,6 +9,7 @@ import { boundedWorkflowText, WORKFLOW_LIMITS } from "./types.mjs";
 import { readBoundedHandle, syncDirectory } from "./durability.mjs";
 import { acquireOwnershipLock, acquireWorkflowRunLease } from "./ownership-lock.mjs";
 import { ensureWorkflowPrivateDirectory } from "./state-root.mjs";
+import { trustedExecutableOnPath, userControlledPathRoots } from "./trusted-executable.mjs";
 
 const GIT_OUTPUT_LIMIT = 32 * 1024 * 1024;
 const WORKER_TRACKING_FAILURE_EXIT = 86;
@@ -19,6 +20,41 @@ const ORPHAN_DISCOVERY_MAX_ENTRIES = 50_000;
 const APPLY_PATH_LIMIT = 10_000;
 const DISABLED_HOOKS_PATH = process.platform === "win32" ? "NUL" : "/dev/null";
 const WORKFLOW_WORKER_SUPERVISOR = fileURLToPath(new URL("./worker-supervisor.mjs", import.meta.url));
+
+function credentialBearingUrl(value) {
+	if (typeof value !== "string" || !value.includes("://")) return false;
+	try {
+		const parsed = new URL(value);
+		return Boolean(parsed.username || parsed.password || parsed.search || parsed.hash);
+	} catch { return true; }
+}
+
+function credentialFreeGitEnvironment(environment = process.env) {
+	const scrubbed = {};
+	for (const [name, value] of Object.entries(environment)) {
+		if (/^GIT_/iu.test(name) || /(?:key|token|secret|password|credential|auth)/iu.test(name) ||
+			/(?:^|_)pat(?:_|$)/iu.test(name) || /^npm_config_.*(?:auth|token|userconfig|globalconfig)/iu.test(name) ||
+			/[\r\n]/u.test(String(value ?? "")) || credentialBearingUrl(value)) continue;
+		scrubbed[name] = value;
+	}
+	scrubbed.PATH = "/usr/bin:/bin";
+	scrubbed.LANG = "C";
+	scrubbed.LC_ALL = "C";
+	scrubbed.GIT_NO_REPLACE_OBJECTS = "1";
+	scrubbed.GIT_TERMINAL_PROMPT = "0";
+	return scrubbed;
+}
+
+let trustedWorkflowGit;
+function workflowGitExecutable() {
+	if (trustedWorkflowGit) return trustedWorkflowGit;
+	const resolutionEnvironment = credentialFreeGitEnvironment();
+	resolutionEnvironment.PATH = [process.env.PATH, "/usr/bin", "/bin"].filter(Boolean).join(path.delimiter);
+	trustedWorkflowGit = trustedExecutableOnPath("git", resolutionEnvironment, userControlledPathRoots(process.cwd()), {
+		requireRootOwnership: true,
+	});
+	return trustedWorkflowGit;
+}
 
 function boundedLexicalCandidate(heap, candidate, limit) {
 	const greater = (left, right) => left.key > right.key;
@@ -105,7 +141,9 @@ export function probeWorkflowGitSupport(options = {}) {
 	if (process.platform === "win32") {
 		return { ok: false, message: "Dynamic workflows currently require macOS or Linux." };
 	}
-	const gitPath = options.gitPath ?? "git";
+	let gitPath;
+	try { gitPath = options.gitPath ?? workflowGitExecutable(); }
+	catch { return { ok: false, message: "Dynamic workflows require a trusted executable Git installation." }; }
 	const gitProbe = spawnSync(gitPath, ["--version"], {
 		encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], shell: false, windowsHide: true, timeout: 2000,
 	});
@@ -182,6 +220,11 @@ async function git(cwd, args, options = {}) {
 		throw Object.assign(new Error("workflow Git descendant tracking is unavailable"), { code: "WORKFLOW_GIT_TREE_TRACKING_FAILED" });
 	}
 	const deadline = options.deadline ?? Date.now() + WORKFLOW_LIMITS.gitTimeoutMs;
+	let gitPath;
+	try { gitPath = options.gitPath ?? workflowGitExecutable(); }
+	catch (error) {
+		throw Object.assign(new Error(`workflow Git executable is not trusted: ${error.message}`), { code: "WORKFLOW_GIT_UNTRUSTED" });
+	}
 	let remaining = deadline - Date.now();
 	if (remaining <= 0) throw Object.assign(new Error("workflow Git operation timed out"), { code: "WORKFLOW_GIT_TIMEOUT" });
 	let filterArguments = Array.isArray(options.filterArguments) ? options.filterArguments : [];
@@ -210,7 +253,8 @@ async function git(cwd, args, options = {}) {
 			WORKFLOW_WORKER_SUPERVISOR,
 			"--preserve-exit",
 			"--owner-stdin",
-			"--child-env-fd", "3",
+			"--status-fd", "3",
+			"--child-env-fd", "4",
 			...(options.cwdIdentity
 				? ["--cwd-identity", Buffer.from(JSON.stringify(options.cwdIdentity)).toString("base64url")]
 				: []),
@@ -220,9 +264,15 @@ async function git(cwd, args, options = {}) {
 			...(options.gitDirectoryIdentity
 				? ["--git-dir-identity", Buffer.from(JSON.stringify(options.gitDirectoryIdentity)).toString("base64url")]
 				: []),
-			"git", ...gitArguments,
+			gitPath, ...gitArguments,
 		];
-		const childEnvironment = { ...process.env, ...(options.env ?? {}), LANG: "C", LC_ALL: "C" };
+		const childEnvironment = credentialFreeGitEnvironment();
+		for (const [name, value] of Object.entries(options.env ?? {})) {
+			if (name !== "GIT_INDEX_FILE" || typeof value !== "string" || !path.isAbsolute(value) || /[\r\n]/u.test(value)) {
+				throw Object.assign(new Error("workflow Git received an unsupported child environment override"), { code: "WORKFLOW_GIT_ENVIRONMENT_UNSAFE" });
+			}
+			childEnvironment.GIT_INDEX_FILE = value;
+		}
 		const serializedChildEnvironment = JSON.stringify(childEnvironment);
 		if (Buffer.byteLength(serializedChildEnvironment, "utf8") > CHILD_ENVIRONMENT_MAX_BYTES) {
 			reject(Object.assign(new Error("workflow Git child environment exceeds 1 MiB"), { code: "WORKFLOW_GIT_ENVIRONMENT_TOO_LARGE" }));
@@ -232,11 +282,22 @@ async function git(cwd, args, options = {}) {
 			cwd: options.cwdIdentity ? os.tmpdir() : cwd,
 			detached: process.platform !== "win32",
 			env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C", TZ: "UTC" },
-			stdio: ["pipe", "pipe", "pipe", "pipe"], shell: false, windowsHide: true,
+			stdio: ["pipe", "pipe", "pipe", "pipe", "pipe"], shell: false, windowsHide: true,
 		});
 		child.stdin.on("error", () => {});
-		child.stdio[3].on("error", () => {});
-		child.stdio[3].end(serializedChildEnvironment);
+		let statusBuffer = "";
+		let statusOverflow = false;
+		child.stdio[3].setEncoding("utf8");
+		child.stdio[3].on("error", () => { statusOverflow = true; });
+		child.stdio[3].on("data", (chunk) => {
+			statusBuffer += chunk;
+			if (Buffer.byteLength(statusBuffer, "utf8") > 1024) {
+				statusOverflow = true;
+				child.stdio[3].destroy();
+			}
+		});
+		child.stdio[4].on("error", () => {});
+		child.stdio[4].end(serializedChildEnvironment);
 		const stdout = [];
 		const stderr = [];
 		let stdoutBytes = 0;
@@ -292,16 +353,32 @@ async function git(cwd, args, options = {}) {
 				}));
 				return;
 			}
-			if (terminationReason) { reject(terminationReason); return; }
-			if (spawnError) { reject(spawnError); return; }
-			if (code === 127 && /spawn git ENOENT/u.test(errorOutput)) {
-				reject(Object.assign(new Error(errorOutput.trim()), { code: "ENOENT" }));
+			let backendStatus;
+			if (code === 85 && !signal && !statusOverflow) {
+				try {
+					const parsed = JSON.parse(statusBuffer.trim());
+					if ((!Number.isInteger(parsed?.code) && parsed?.code !== null) ||
+						(parsed?.signal !== null && typeof parsed?.signal !== "string") ||
+						(parsed?.errorCode !== undefined && !/^[A-Z][A-Z0-9_]{0,63}$/u.test(parsed.errorCode))) throw new Error("invalid status");
+					backendStatus = { code: parsed.code, signal: parsed.signal, errorCode: parsed.errorCode };
+				} catch { /* handled by the containment failure below */ }
+			}
+			if (!backendStatus) {
+				reject(Object.assign(new Error(
+					errorOutput.trim() || `workflow Git supervisor exited without confirmed backend-tree status (${signal ?? code})`,
+				), { code: "WORKFLOW_GIT_TREE_TERMINATION_FAILED" }));
 				return;
 			}
-			if (code === 0 || options.acceptedExitCodes?.includes(code)) { resolve(output); return; }
-			const error = new Error(`git ${args[0] ?? "operation"} failed${signal ? ` (${signal})` : ""}: ${errorOutput.trim() || `exit ${code}`}`);
-			error.code = code;
-			error.signal = signal;
+			if (terminationReason) { reject(terminationReason); return; }
+			if (spawnError) { reject(spawnError); return; }
+			if (backendStatus.errorCode) {
+				reject(Object.assign(new Error(errorOutput.trim() || `workflow Git failed to spawn (${backendStatus.errorCode})`), { code: backendStatus.errorCode }));
+				return;
+			}
+			if (backendStatus.code === 0 || options.acceptedExitCodes?.includes(backendStatus.code)) { resolve(output); return; }
+			const error = new Error(`git ${args[0] ?? "operation"} failed${backendStatus.signal ? ` (${backendStatus.signal})` : ""}: ${errorOutput.trim() || `exit ${backendStatus.code}`}`);
+			error.code = backendStatus.code;
+			error.signal = backendStatus.signal;
 			error.killed = false;
 			error.stdout = output;
 			error.stderr = errorOutput;
@@ -386,12 +463,14 @@ function isUnconfirmedGitTreeFailure(error) {
 }
 
 export class WorkflowWorktrees {
-	constructor(root) {
+	constructor(root, options = {}) {
 		this.root = path.resolve(root);
+		this.gitPath = options.gitPath;
 		this.retained = new Set();
 	}
 
 	async repositoryIdentity(cwd, options = {}) {
+		if (this.gitPath && !options.gitPath) options = { ...options, gitPath: this.gitPath };
 		const realCwd = await fs.realpath(cwd);
 		let pinnedOptions = options;
 		if (!options.cwdIdentity) {
@@ -408,6 +487,7 @@ export class WorkflowWorktrees {
 	}
 
 	async repositoryLockIdentity(cwd, options = {}) {
+		if (this.gitPath && !options.gitPath) options = { ...options, gitPath: this.gitPath };
 		const realCwd = await fs.realpath(cwd);
 		let pinnedOptions = options;
 		if (!options.cwdIdentity) {
@@ -425,6 +505,7 @@ export class WorkflowWorktrees {
 	}
 
 	async repositoryFingerprint(cwd, options = {}) {
+		if (this.gitPath && !options.gitPath) options = { ...options, gitPath: this.gitPath };
 		const canonicalRoot = await this.repositoryIdentity(cwd, options);
 		const rootStat = await fs.lstat(canonicalRoot, { bigint: true });
 		if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw new Error("workflow repository root must be a real directory");
@@ -461,8 +542,8 @@ export class WorkflowWorktrees {
 			throw Object.assign(new Error("Dynamic workflows currently require macOS or Linux"), { code: "WORKFLOW_PLATFORM_UNSUPPORTED" });
 		}
 		cwd = await fs.realpath(cwd);
-		const operation = operationOptions({ signal });
-		const pinnedOperation = operationOptions({ signal, cwdIdentity: expectedProjectIdentity });
+		const operation = operationOptions({ signal, ...(this.gitPath ? { gitPath: this.gitPath } : {}) });
+		const pinnedOperation = operationOptions({ signal, cwdIdentity: expectedProjectIdentity, ...(this.gitPath ? { gitPath: this.gitPath } : {}) });
 		await assertProjectDirectoryIdentity(cwd, expectedProjectIdentity);
 		const top = await this.repositoryIdentity(cwd, pinnedOperation);
 		const topStat = await fs.lstat(top, { bigint: true });
@@ -547,11 +628,12 @@ export class WorkflowWorktrees {
 		const committed = headMoved
 			? (await git(record.directory, ["diff", "--no-textconv", "--name-status", record.base, "HEAD", "--", "."], checkoutOperation)).trim()
 			: "";
-		const changedFiles = [
+		const allChangedFiles = [
 			...(porcelain ? porcelain.split("\n") : []),
 			...(committed ? committed.split("\n") : []),
-		].slice(0, 1000);
-		return { dirty: Boolean(porcelain), head, headMoved, changedFiles };
+		];
+		const changedFiles = allChangedFiles.slice(0, 1000);
+		return { dirty: Boolean(porcelain), head, headMoved, changedFiles, changedFilesTruncated: allChangedFiles.length > changedFiles.length };
 	}
 
 	async #diff(record, options = {}, includeFullPatch = false) {
@@ -565,7 +647,8 @@ export class WorkflowWorktrees {
 		if (bytes === 0) throw new Error("retained workflow worktree has no changes to apply");
 		const stat = (await git(record.directory, ["diff", "--no-textconv", "--stat", record.base, "--", "."], checkoutOperation)).trim();
 		const target = await this.#targetState(repository, repositoryOperation);
-		const changedFiles = (await this.status(record, operation)).changedFiles;
+		const status = await this.status(record, operation);
+		const { changedFiles, changedFilesTruncated } = status;
 		const patchHash = createHash("sha256").update(patchText).digest("hex");
 		let patch = patchText;
 		let patchTruncated = false;
@@ -573,7 +656,7 @@ export class WorkflowWorktrees {
 			patch = boundedWorkflowText(patchText, WORKFLOW_LIMITS.maxTraceBytes);
 			patchTruncated = true;
 		}
-		return { patch, stat, bytes, patchTruncated, changedFiles, target: { ...target, patchHash, divergedFromBase: target.head !== record.base } };
+		return { patch, stat, bytes, patchTruncated, changedFiles, changedFilesTruncated, target: { ...target, patchHash, divergedFromBase: target.head !== record.base } };
 	}
 
 	async diff(record, options = {}) {

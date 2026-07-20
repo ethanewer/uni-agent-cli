@@ -1,6 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+shopt -s nocasematch
+while IFS= read -r environment_name; do
+	environment_value="${!environment_name-}"
+	case "$environment_name" in *KEY*|*TOKEN*|*SECRET*|*PASSWORD*|*CREDENTIAL*|*AUTH*|PAT|PAT_*|*_PAT|*_PAT_*) unset "$environment_name" ;; esac
+	case "$environment_name" in [Nn][Pp][Mm]_[Cc][Oo][Nn][Ff][Ii][Gg]_[Uu][Ss][Ee][Rr][Cc][Oo][Nn][Ff][Ii][Gg]|[Nn][Pp][Mm]_[Cc][Oo][Nn][Ff][Ii][Gg]_[Gg][Ll][Oo][Bb][Aa][Ll][Cc][Oo][Nn][Ff][Ii][Gg]) unset "$environment_name" ;; esac
+	case "$environment_value" in *://*@*|*://*[?#]*) unset "$environment_name" ;; esac
+	case "$environment_value" in *$'\r'*|*$'\n'*) unset "$environment_name" ;; esac
+done < <(compgen -e)
+shopt -u nocasematch
+
+release_npm() {
+	if [ -n "${CC_RELEASE_NPM_CLI:-}" ] || [ -n "${CC_RELEASE_NODE:-}" ]; then
+		if [ -z "${CC_RELEASE_NPM_CLI:-}" ] || [ -z "${CC_RELEASE_NODE:-}" ] ||
+			[ "${CC_RELEASE_NPM_CLI#/}" = "$CC_RELEASE_NPM_CLI" ] || [ ! -f "$CC_RELEASE_NPM_CLI" ] ||
+			[ "${CC_RELEASE_NODE#/}" = "$CC_RELEASE_NODE" ] || [ ! -x "$CC_RELEASE_NODE" ]; then
+			echo "release npm requires absolute CC_RELEASE_NODE and CC_RELEASE_NPM_CLI files" >&2
+			exit 1
+		fi
+		"$CC_RELEASE_NODE" "$CC_RELEASE_NPM_CLI" "$@"
+	else
+		command npm "$@"
+	fi
+}
 if [ "$(uname -s)" != "Darwin" ]; then
 	if [ "${CC_WORKFLOW_E2E_REQUIRED:-0}" = "1" ]; then
 		echo "dynamic workflows E2E: macOS sandbox-exec is required for the release gate" >&2
@@ -17,20 +40,13 @@ fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRATCH="$(mktemp -d -t cc-workflow-e2e.XXXXXX)"
+(umask 077; : > "$SCRATCH/user.npmrc"; : > "$SCRATCH/global.npmrc")
+export npm_config_userconfig="$SCRATCH/user.npmrc"
+export npm_config_globalconfig="$SCRATCH/global.npmrc"
+unset npm_config_omit NPM_CONFIG_OMIT
 TMUX_SOCKET="cc-workflow-e2e-$PPID-$$"
 SESSION=""
 CC_LAUNCH="$(printf '%q %q' node "$ROOT/src/cc.mjs")"
-
-if [ -n "${CC_WORKFLOW_E2E_TARBALL:-}" ]; then
-	if [ "${CC_WORKFLOW_E2E_TARBALL#/}" = "$CC_WORKFLOW_E2E_TARBALL" ] || [ ! -f "$CC_WORKFLOW_E2E_TARBALL" ]; then
-		echo "CC_WORKFLOW_E2E_TARBALL must name an absolute regular tarball" >&2
-		exit 1
-	fi
-	mkdir -p "$SCRATCH/artifact-prefix"
-	npm install --ignore-scripts --no-audit --no-fund --prefix "$SCRATCH/artifact-prefix" "$CC_WORKFLOW_E2E_TARBALL" >/dev/null
-	node "$SCRATCH/artifact-prefix/node_modules/cc/scripts/postinstall.mjs" >/dev/null
-	CC_LAUNCH="$(printf '%q' "$SCRATCH/artifact-prefix/node_modules/.bin/cc")"
-fi
 
 tmux_e2e() {
 	command tmux -L "$TMUX_SOCKET" "$@"
@@ -46,6 +62,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
+if [ -n "${CC_WORKFLOW_E2E_TARBALL:-}" ]; then
+	if [ "${CC_WORKFLOW_E2E_TARBALL#/}" = "$CC_WORKFLOW_E2E_TARBALL" ] || [ ! -f "$CC_WORKFLOW_E2E_TARBALL" ]; then
+		echo "CC_WORKFLOW_E2E_TARBALL must name an absolute regular tarball" >&2
+		exit 1
+	fi
+	mkdir -p "$SCRATCH/artifact-prefix"
+	release_npm install --include=optional --ignore-scripts --no-audit --no-fund --prefix "$SCRATCH/artifact-prefix" "$CC_WORKFLOW_E2E_TARBALL" >/dev/null
+	node "$SCRATCH/artifact-prefix/node_modules/cc/scripts/postinstall.mjs" >/dev/null
+	CC_LAUNCH="$(printf '%q' "$SCRATCH/artifact-prefix/node_modules/.bin/cc")"
+fi
+
 capture() {
 	tmux_e2e capture-pane -pt "$SESSION"
 }
@@ -58,7 +85,9 @@ wait_for_text() {
 	done
 	echo "Timed out waiting for TUI text: $needle" >&2
 	capture >&2
-	find "$SCRATCH" -name '*-events.jsonl' -type f -maxdepth 2 -exec sh -c 'echo "event log: $1" >&2; cat "$1" >&2' _ {} \;
+	for event_log in "$SCRATCH"/*-events.jsonl "$SCRATCH"/*/*-events.jsonl; do
+		if [ -f "$event_log" ]; then printf 'event log: %s\n' "$event_log" >&2; cat "$event_log" >&2; fi
+	done
 	exit 1
 }
 
@@ -143,47 +172,103 @@ import os, signal, subprocess, sys, time
 root = int(sys.argv[1])
 if root <= 1 or root == os.getpid():
     raise SystemExit(f"unsafe crash-test root pid: {root}")
-rows = []
-for line in subprocess.check_output(["ps", "-axo", "pid=,ppid=,command="], text=True).splitlines():
-    fields = line.strip().split(None, 2)
-    if len(fields) < 2:
-        continue
-    pid, ppid = map(int, fields[:2])
-    rows.append((pid, ppid, fields[2] if len(fields) > 2 else ""))
+def snapshot():
+    rows = []
+    for line in subprocess.check_output(["ps", "-axo", "pid=,ppid=,lstart=,command="], text=True).splitlines():
+        fields = line.strip().split(None, 7)
+        if len(fields) < 8:
+            continue
+        pid, ppid = map(int, fields[:2])
+        started = " ".join(fields[2:7])
+        rows.append((pid, ppid, started, fields[7] if len(fields) > 7 else ""))
+    return rows
+rows = snapshot()
 descendants = []
 parents = {root}
 changed = True
 while changed:
     changed = False
-    for pid, ppid, _command in rows:
+    for pid, ppid, _started, _command in rows:
         if pid not in parents and ppid in parents:
             parents.add(pid)
             descendants.append(pid)
             changed = True
-commands = {pid: command for pid, _ppid, command in rows}
-managers = [pid for pid in descendants if "src/cc.mjs" in commands.get(pid, "")]
+commands = {pid: command for pid, _ppid, _started, command in rows}
+identities = {pid: started for pid, _ppid, started, _command in rows}
+managers = [pid for pid in descendants if (
+    "cc-owner:" in commands.get(pid, "") or
+    ("node " in commands.get(pid, "") and (
+        "src/cc.mjs" in commands.get(pid, "") or "/node_modules/.bin/cc" in commands.get(pid, "")
+    ))
+)]
 if len(managers) != 1:
     raise SystemExit(f"expected one cc manager below tmux pane, found {[(pid, commands.get(pid)) for pid in managers]}")
 manager = managers[0]
-os.kill(manager, signal.SIGKILL)
-owned = [pid for pid in descendants if pid != manager]
+manager_identity = identities[manager]
+def signal_if_same(pid, started, sig):
+    current = {row[0]: row[2] for row in snapshot()}
+    if current.get(pid) != started:
+        return False
+    try:
+        os.kill(pid, sig)
+        return True
+    except ProcessLookupError:
+        return False
+# Freeze the manager first, then converge on and freeze its complete descendant
+# tree. No process in that tree can create an unobserved child between the final
+# snapshot and the manager-only crash.
+if not signal_if_same(manager, manager_identity, signal.SIGSTOP):
+    raise SystemExit("cc manager disappeared before the crash fixture could freeze it")
+owned = {}
+stable = 0
+while stable < 3:
+    current = snapshot()
+    current_identities = {pid: started for pid, _ppid, started, _command in current}
+    discovered = {pid: started for pid, started in owned.items() if current_identities.get(pid) == started}
+    parents = {manager, *discovered}
+    changed = True
+    while changed:
+        changed = False
+        for pid, ppid, started, _command in current:
+            if pid != manager and pid not in discovered and ppid in parents:
+                discovered[pid] = started
+                parents.add(pid)
+                changed = True
+    new = set(discovered) - set(owned)
+    for pid in new:
+        signal_if_same(pid, discovered[pid], signal.SIGSTOP)
+    if new:
+        owned = discovered
+        stable = 0
+    else:
+        stable += 1
+    time.sleep(0.05)
+if not signal_if_same(manager, manager_identity, signal.SIGKILL):
+    raise SystemExit("cc manager identity changed before the crash fixture could kill it")
+for pid, started in owned.items():
+    signal_if_same(pid, started, signal.SIGCONT)
 deadline = time.time() + 10
 while owned and time.time() < deadline:
-    live = []
-    for pid in owned:
-        try:
-            os.kill(pid, 0)
-            live.append(pid)
-        except ProcessLookupError:
-            pass
+    current = snapshot()
+    current_identities = {pid: started for pid, _ppid, started, _command in current}
+    live = {pid: started for pid, started in owned.items() if current_identities.get(pid) == started}
+    # Continue following the known ownership tree while supervisors process
+    # owner-pipe EOF; this catches descendants created during teardown itself.
+    changed = True
+    while changed:
+        changed = False
+        for pid, ppid, started, _command in current:
+            if pid not in live and ppid in live:
+                live[pid] = started
+                changed = True
     owned = live
     if owned:
         time.sleep(0.05)
 if owned:
-    details = [(pid, commands.get(pid, "")) for pid in owned]
-    for pid in owned:
-        try: os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError: pass
+    latest = {pid: command for pid, _ppid, _started, command in snapshot()}
+    details = [(pid, latest.get(pid, commands.get(pid, ""))) for pid in owned]
+    for pid, started in owned.items():
+        signal_if_same(pid, started, signal.SIGKILL)
     raise SystemExit(f"workflow descendants survived manager-only crash: {details}")
 PY
 	tmux_e2e kill-session -t "$prior" >/dev/null 2>&1 || true
@@ -300,7 +385,9 @@ wait_for_text "workflows clone only"
 send_text "E2E_MODEL_WORKFLOW|four-way-project|modules/auth.txt,modules/billing.txt,modules/catalog.txt,modules/search.txt|clone|2"
 wait_for_text "Run workflow"
 wait_for_text "four-way-project"
-tmux_e2e send-keys -t "$SESSION" Down Down Enter
+tmux_e2e send-keys -t "$SESSION" Down Down
+wait_for_text "›   Review details and source"
+tmux_e2e send-keys -t "$SESSION" Enter
 wait_for_text "Exact approval identity"
 wait_for_text "Source SHA-256"
 tmux_e2e send-keys -t "$SESSION" PageDown PageDown
@@ -424,6 +511,7 @@ wait_for_text "Worktree apply preview"
 wait_for_text "workflow-applied-change"
 tmux_e2e send-keys -t "$SESSION" a
 wait_for_text "Apply retained changes"
+wait_for_text "modules/auth.txt"
 tmux_e2e send-keys -t "$SESSION" Enter
 for _ in {1..300}; do
 	if grep -Fq "workflow-applied-change" "$FOUR_PROJECT/modules/auth.txt"; then break; fi
@@ -447,7 +535,9 @@ tmux_e2e send-keys -t "$SESSION" Escape
 wait_for_text "enter phases"
 tmux_e2e send-keys -t "$SESSION" s
 wait_for_text "Save workflow"
-tmux_e2e send-keys -t "$SESSION" Down Enter
+tmux_e2e send-keys -t "$SESSION" Down
+wait_for_text "›   Project"
+tmux_e2e send-keys -t "$SESSION" Enter
 for _ in {1..300}; do
 	if [ -f "$FOUR_PROJECT/.cc/workflows/edit-way-project.js" ]; then break; fi
 	sleep 0.1
@@ -491,8 +581,10 @@ tmux_e2e send-keys -t "$SESSION" Enter
 wait_for_text "workflows clone only"
 wait_for_log_count "$FOUR_LOG" session_load "$((mode_loads_before + 2))"
 send_text "/workflow-mode disabled"
-# The first Enter accepts the exact argument completion; the second submits it.
-sleep 0.2
+# The command submits the exact argument; confirm only after the destructive
+# picker has rendered both its disclosed active-run count and selected action.
+wait_for_text "Stop 0 active workflows and disable workflows?"
+wait_for_text "›   Stop and disable"
 tmux_e2e send-keys -t "$SESSION" Enter
 wait_for_text "Workflows are disabled"
 wait_for_log_count "$FOUR_LOG" session_load "$((mode_loads_before + 3))"

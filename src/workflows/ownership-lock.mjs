@@ -1,16 +1,18 @@
 import { execFile } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import { constants, existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { readBoundedHandle } from "./durability.mjs";
+import { readBoundedHandle, syncDirectory } from "./durability.mjs";
 import { ensureWorkflowPrivateDirectory } from "./state-root.mjs";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 const PROCESS_STARTED_AT = new Date(Date.now() - Math.floor(process.uptime() * 1000)).toISOString();
 const PS_PATH = process.platform === "win32" ? undefined : existsSync("/bin/ps") ? "/bin/ps" : "/usr/bin/ps";
+const PROCESS_INSTANCE_MARKER = process.platform === "darwin" ? randomUUID().replaceAll("-", "").slice(0, 20) : undefined;
+if (PROCESS_INSTANCE_MARKER) process.title = `cc-owner:${PROCESS_INSTANCE_MARKER}`;
 const RECLAIM_MISSING_OWNER_GRACE_MS = 5000;
 // A worker supervisor detects manager-pipe EOF and has a 3.5s bounded
 // TERM/KILL/descendant-confirmation window. Never let a restarted cc reclaim
@@ -77,6 +79,20 @@ async function processStartMarker(pid, signal) {
 			return undefined;
 		}
 	}
+	if (process.platform === "linux") {
+		try {
+			const [stat, bootId] = await Promise.all([
+				fs.readFile(`/proc/${pid}/stat`, "utf8"),
+				fs.readFile("/proc/sys/kernel/random/boot_id", "utf8"),
+			]);
+			const close = stat.lastIndexOf(")");
+			const fields = close >= 0 ? stat.slice(close + 2).trim().split(/\s+/u) : [];
+			return fields[19] && bootId.trim() ? `linux:${bootId.trim()}:${fields[19]}` : undefined;
+		} catch {
+			if (signal?.aborted) throw abortError(signal.reason);
+			return undefined;
+		}
+	}
 	if (!PS_PATH) return undefined;
 	try {
 		const { stdout } = await execFileAsync(PS_PATH, ["-o", "lstart=", "-p", String(pid)], {
@@ -84,6 +100,20 @@ async function processStartMarker(pid, signal) {
 			env: { ...process.env, LC_ALL: "C", LANG: "C", TZ: "UTC" }, signal,
 		});
 		return stdout.trim() || undefined;
+	} catch {
+		if (signal?.aborted) throw abortError(signal.reason);
+		return undefined;
+	}
+}
+
+async function processCarriesInstanceMarker(pid, marker, signal) {
+	if (process.platform !== "darwin" || !PS_PATH || !marker) return undefined;
+	try {
+		const { stdout } = await execFileAsync(PS_PATH, ["-o", "command=", "-p", String(pid)], {
+			encoding: "utf8", timeout: 2000, killSignal: "SIGKILL", windowsHide: true,
+			env: { ...process.env, LC_ALL: "C", LANG: "C", TZ: "UTC" }, signal,
+		});
+		return stdout.includes(`cc-owner:${marker}`);
 	} catch {
 		if (signal?.aborted) throw abortError(signal.reason);
 		return undefined;
@@ -106,7 +136,12 @@ async function ownerIsDemonstrablyDead(owner, stat, signal) {
 	}
 	if (!owner.processStartMarker) return false;
 	const liveMarker = await processStartMarker(owner.pid, signal);
-	return Boolean(liveMarker && liveMarker !== owner.processStartMarker);
+	if (liveMarker && liveMarker !== owner.processStartMarker) return true;
+	if (owner.processInstanceMarker) {
+		const sameInstance = await processCarriesInstanceMarker(owner.pid, owner.processInstanceMarker, signal);
+		if (sameInstance === false) return true;
+	}
+	return false;
 }
 
 async function readLockOwner(lockFile) {
@@ -122,6 +157,34 @@ async function readLockOwner(lockFile) {
 
 async function sameFile(left, right) {
 	return left.dev === right.dev && left.ino === right.ino;
+}
+
+function persistentFencePath(lockFile, token) {
+	const identity = createHash("sha256").update(String(token ?? "")).digest("hex");
+	return `${lockFile}.unconfirmed-${identity}`;
+}
+
+async function hasPersistentFence(lockFile, token) {
+	try {
+		await fs.lstat(persistentFencePath(lockFile, token));
+		return true;
+	} catch (error) {
+		if (error?.code === "ENOENT") return false;
+		throw error;
+	}
+}
+
+async function publishPersistentFence(lockFile, token) {
+	const fence = persistentFencePath(lockFile, token);
+	let handle;
+	try {
+		handle = await fs.open(fence, "wx", 0o600);
+		await handle.writeFile(`${JSON.stringify({ version: 1, token })}\n`);
+		await handle.sync();
+	} catch (error) {
+		if (error?.code !== "EEXIST") throw error;
+	} finally { await handle?.close(); }
+	await syncDirectory(path.dirname(lockFile));
 }
 
 async function cleanupOrphanClaims(lockFile, { deadline, signal } = {}) {
@@ -212,7 +275,23 @@ async function acquireReclaimGate(directory, owner, deadline, signal) {
 					const stillRecoverable = latest.owner
 						? sameOwner && await ownerIsDemonstrablyDead(latest.owner, latest.directoryStat)
 						: Date.now() - latest.directoryStat.mtimeMs >= RECLAIM_MISSING_OWNER_GRACE_MS;
-					if (sameGate && stillRecoverable) await fs.rm(directory, { recursive: true, force: true });
+					if (sameGate && stillRecoverable) {
+						const retired = `${directory}.stale.${process.pid}.${owner.token}`;
+						try { await fs.rename(directory, retired); }
+						catch (renameError) {
+							if (renameError?.code === "ENOENT") continue;
+							throw renameError;
+						}
+						const moved = await readReclaimOwner(retired);
+						const movedSameGate = await sameFile(moved.directoryStat, latest.directoryStat);
+						const movedSameOwner = moved.owner?.token === latest.owner?.token;
+						if (!movedSameGate || !movedSameOwner) {
+							try { await fs.rename(retired, directory); }
+							catch (restoreError) { throw new Error("workflow reclaim gate changed during stale retirement", { cause: restoreError }); }
+							continue;
+						}
+						await fs.rm(retired, { recursive: true, force: true });
+					}
 					continue;
 				}
 				if (Date.now() >= deadline) throw Object.assign(new Error("timed out acquiring workflow ownership lock"), { code: "WORKFLOW_LOCK_TIMEOUT" });
@@ -221,12 +300,22 @@ async function acquireReclaimGate(directory, owner, deadline, signal) {
 		}
 		let released = false;
 		let releasePromise;
+		let retiredDirectory;
 		return async () => {
 			if (released) return;
 			if (!releasePromise) releasePromise = (async () => {
-				const occupied = await readReclaimOwner(directory);
-				if (occupied.owner?.token !== owner.token) throw new Error("workflow reclaim gate changed before release");
-				await fs.rm(directory, { recursive: true });
+				if (!retiredDirectory) {
+					const occupied = await readReclaimOwner(directory);
+					if (occupied.owner?.token !== owner.token) throw new Error("workflow reclaim gate changed before release");
+					// Vacate the well-known name atomically before recursive cleanup. A
+					// waiting reclaimer may publish its candidate immediately; deleting the
+					// directory in place would race that rename and intermittently fail with
+					// ENOTEMPTY after the new owner.json appeared.
+					const retired = `${directory}.released.${process.pid}.${owner.token}`;
+					await fs.rename(directory, retired);
+					retiredDirectory = retired;
+				}
+				await fs.rm(retiredDirectory, { recursive: true });
 				released = true;
 			})();
 			try { await releasePromise; }
@@ -264,6 +353,7 @@ export async function acquireOwnershipLock(lockFile, options = {}) {
 	const owner = {
 		version: 1, token, pid: process.pid, processStartedAt: PROCESS_STARTED_AT,
 		processStartMarker: await ownStartMarker(), createdAt: new Date().toISOString(),
+		...(PROCESS_INSTANCE_MARKER ? { processInstanceMarker: PROCESS_INSTANCE_MARKER } : {}),
 	};
 	let claimHandle;
 	try {
@@ -272,6 +362,7 @@ export async function acquireOwnershipLock(lockFile, options = {}) {
 		await claimHandle.sync();
 	} finally { await claimHandle?.close(); }
 	const claimStat = await fs.lstat(claim);
+	let published = false;
 	try {
 		let attempted = false;
 		while (true) {
@@ -282,12 +373,18 @@ export async function acquireOwnershipLock(lockFile, options = {}) {
 			attempted = true;
 			try {
 				await fs.link(claim, resolved);
+				published = true;
 				break;
 			} catch (error) {
 				if (error?.code !== "EEXIST") throw error;
 				try {
 					const occupied = await readLockOwner(resolved);
 					if (await ownerIsDemonstrablyDead(occupied.owner, occupied.stat)) {
+						if (await hasPersistentFence(resolved, occupied.owner?.token)) {
+							throw Object.assign(new Error(
+								`workflow ownership lock has an unconfirmed surviving process fence and requires manual recovery: ${resolved}`,
+							), { code: "WORKFLOW_LOCK_UNCONFIRMED" });
+						}
 						const reclaimDirectory = `${resolved}.reclaim`;
 						const releaseReclaim = await acquireReclaimGate(reclaimDirectory, owner, deadline, options.signal);
 						try {
@@ -324,33 +421,67 @@ export async function acquireOwnershipLock(lockFile, options = {}) {
 				await delay(25, options.signal);
 			}
 		}
+		// Repository mutation locks are armed before their caller can launch a
+		// mutating process. If the owning cc process is killed, this durable marker
+		// already exists and forces manual recovery; no in-process finally block or
+		// surviving supervisor needs a chance to publish it. Normal, confirmed
+		// teardown removes the marker together with the ownership lock.
+		if (options.ownerDeathFence === true) await publishPersistentFence(resolved, token);
 		let released = false;
+		let publishedLockRemoved = false;
 		let releasePromise;
 		const releaseOwnership = async () => {
 			if (released) return;
 			if (!releasePromise) releasePromise = (async () => {
-				const occupied = await readLockOwner(resolved);
-				if (occupied.owner?.token !== token || !(await sameFile(occupied.stat, claimStat))) {
-					throw new Error("workflow ownership lock changed before release");
+				if (!publishedLockRemoved) {
+					const occupied = await readLockOwner(resolved);
+					if (occupied.owner?.token !== token || !(await sameFile(occupied.stat, claimStat))) {
+						throw new Error("workflow ownership lock changed before release");
+					}
+					await fs.unlink(resolved);
+					publishedLockRemoved = true;
 				}
-				await fs.unlink(resolved);
+				await fs.unlink(persistentFencePath(resolved, token)).catch((error) => { if (error?.code !== "ENOENT") throw error; });
+				await syncDirectory(path.dirname(resolved));
+				await fs.unlink(claim).catch(() => {});
 				released = true;
 				pendingOwnershipReleases.delete(releaseOwnership);
-				await fs.unlink(claim).catch(() => {});
 			})();
 			try { await releasePromise; }
 			catch (error) {
-				// Keep both the published lock and its claim retryable after transient
-				// validation/unlink failures. Once the published unlink succeeds,
-				// `released` is authoritative and claim cleanup is best-effort.
+				// Keep every incomplete release phase retryable. Once the published lock
+				// is gone, retries resume with fence removal and directory durability
+				// instead of trying to validate a path that was already unlinked.
 				releasePromise = undefined;
 				pendingOwnershipReleases.add(releaseOwnership);
 				throw error;
 			}
 		};
+		releaseOwnership.poison = async () => {
+			if (released) throw new Error("cannot fence an ownership lock after release");
+			const occupied = await readLockOwner(resolved);
+			if (occupied.owner?.token !== token || !(await sameFile(occupied.stat, claimStat))) {
+				throw new Error("workflow ownership lock changed before persistent fencing");
+			}
+			await publishPersistentFence(resolved, token);
+		};
 		return releaseOwnership;
 	} catch (error) {
-		await fs.unlink(claim).catch(() => {});
+		let cleanupError;
+		if (published) {
+			try {
+				const occupied = await readLockOwner(resolved);
+				if (occupied.owner?.token !== token || !(await sameFile(occupied.stat, claimStat))) {
+					throw new Error("workflow ownership lock changed while rolling back a failed fence arm");
+				}
+				await fs.unlink(resolved);
+				await fs.unlink(persistentFencePath(resolved, token)).catch((unlinkError) => {
+					if (unlinkError?.code !== "ENOENT") throw unlinkError;
+				});
+			} catch (rollbackError) { cleanupError = rollbackError; }
+		}
+		if (!published || !cleanupError) await fs.unlink(claim).catch(() => {});
+		if (cleanupError) throw new AggregateError([error, cleanupError], "failed to arm and roll back workflow ownership fence");
 		throw error;
 	}
 }

@@ -1,9 +1,39 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+shopt -s nocasematch
+while IFS= read -r environment_name; do
+	environment_value="${!environment_name-}"
+	case "$environment_name" in *KEY*|*TOKEN*|*SECRET*|*PASSWORD*|*CREDENTIAL*|*AUTH*|PAT|PAT_*|*_PAT|*_PAT_*) unset "$environment_name" ;; esac
+	case "$environment_name" in [Nn][Pp][Mm]_[Cc][Oo][Nn][Ff][Ii][Gg]_[Uu][Ss][Ee][Rr][Cc][Oo][Nn][Ff][Ii][Gg]|[Nn][Pp][Mm]_[Cc][Oo][Nn][Ff][Ii][Gg]_[Gg][Ll][Oo][Bb][Aa][Ll][Cc][Oo][Nn][Ff][Ii][Gg]) unset "$environment_name" ;; esac
+	case "$environment_value" in *://*@*|*://*[?#]*) unset "$environment_name" ;; esac
+	case "$environment_value" in *$'\r'*|*$'\n'*) unset "$environment_name" ;; esac
+done < <(compgen -e)
+shopt -u nocasematch
+
+release_npm() {
+	if [ -n "${CC_RELEASE_NPM_CLI:-}" ] || [ -n "${CC_RELEASE_NODE:-}" ]; then
+		if [ -z "${CC_RELEASE_NPM_CLI:-}" ] || [ -z "${CC_RELEASE_NODE:-}" ] ||
+			[ "${CC_RELEASE_NPM_CLI#/}" = "$CC_RELEASE_NPM_CLI" ] || [ ! -f "$CC_RELEASE_NPM_CLI" ] ||
+			[ "${CC_RELEASE_NODE#/}" = "$CC_RELEASE_NODE" ] || [ ! -x "$CC_RELEASE_NODE" ]; then
+			echo "release npm requires absolute CC_RELEASE_NODE and CC_RELEASE_NPM_CLI files" >&2
+			exit 1
+		fi
+		"$CC_RELEASE_NODE" "$CC_RELEASE_NPM_CLI" "$@"
+	else
+		command npm "$@"
+	fi
+}
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRATCH="$(mktemp -d -t cc-package-install.XXXXXX)"
+(umask 077; : > "$SCRATCH/user.npmrc"; : > "$SCRATCH/global.npmrc")
+export npm_config_userconfig="$SCRATCH/user.npmrc"
+export npm_config_globalconfig="$SCRATCH/global.npmrc"
+unset npm_config_omit NPM_CONFIG_OMIT
+TMUX_SOCKET="cc-package-install-$PPID-$$"
+TMUX_SESSION="cc-package-install-$PPID-$$"
 cleanup() {
+	if command -v tmux >/dev/null 2>&1; then tmux -L "$TMUX_SOCKET" kill-server >/dev/null 2>&1 || true; fi
 	case "$SCRATCH" in
 		/var/folders/*/cc-package-install.*|/tmp/cc-package-install.*) rm -rf -- "$SCRATCH" ;;
 		*) echo "Refusing to clean unexpected package smoke path: $SCRATCH" >&2 ;;
@@ -18,7 +48,7 @@ if [ -n "${CC_WORKFLOW_E2E_TARBALL:-}" ]; then
 		exit 1
 	fi
 else
-	npm pack --ignore-scripts --pack-destination "$SCRATCH" "$ROOT" >/dev/null
+	release_npm pack --ignore-scripts --pack-destination "$SCRATCH" "$ROOT" >/dev/null
 	tarball="$(find "$SCRATCH" -maxdepth 1 -name '*.tgz' -type f -print -quit)"
 	if [ -z "$tarball" ]; then
 		echo "npm pack did not create a tarball" >&2
@@ -28,7 +58,7 @@ fi
 
 archive_listing="$SCRATCH/archive-files.txt"
 tar -tzf "$tarball" > "$archive_listing"
-for required in LICENSE LICENSE-APACHE-2.0 NOTICE package.json; do
+for required in LICENSE LICENSE-APACHE-2.0 NOTICE package.json npm-shrinkwrap.json; do
 	grep -Fx "package/$required" "$archive_listing" >/dev/null || {
 		echo "candidate tarball is missing package/$required" >&2
 		exit 1
@@ -43,7 +73,7 @@ while IFS= read -r workflow_file; do
 done < <(find "$ROOT/src/workflows" -type f \( -name '*.mjs' -o -name '*.py' \) -print | sort)
 
 mkdir -p "$SCRATCH/prefix" "$SCRATCH/empty-cwd"
-npm install --no-audit --no-fund --foreground-scripts --dangerously-allow-all-scripts --prefix "$SCRATCH/prefix" "$tarball" >"$SCRATCH/install.log" 2>&1
+release_npm install --include=optional --no-audit --no-fund --foreground-scripts --dangerously-allow-all-scripts --prefix "$SCRATCH/prefix" "$tarball" >"$SCRATCH/install.log" 2>&1
 grep -F "node scripts/postinstall.mjs" "$SCRATCH/install.log" >/dev/null
 installed="$SCRATCH/prefix/node_modules/cc"
 test -f "$installed/src/workflows/manager.mjs"
@@ -91,6 +121,57 @@ NODE
 
 cd "$SCRATCH/empty-cwd"
 "$SCRATCH/prefix/node_modules/.bin/cc" --help >/dev/null
+if command -v tmux >/dev/null 2>&1 && [ "$(uname -s)" != "MINGW" ]; then
+	before="$SCRATCH/installed-stty-before"
+	after="$SCRATCH/installed-stty-after"
+	settings="$SCRATCH/installed-settings.json"
+	printf '{}\n' > "$settings"
+	root_q="$(printf '%q' "$ROOT")"
+	bin_q="$(printf '%q' "$SCRATCH/prefix/node_modules/.bin/cc")"
+	before_q="$(printf '%q' "$before")"
+	after_q="$(printf '%q' "$after")"
+	settings_q="$(printf '%q' "$settings")"
+	tmux -L "$TMUX_SOCKET" new-session -d -s "$TMUX_SESSION" -x 100 -y 30 "cd $root_q && exec sh"
+	tmux -L "$TMUX_SOCKET" send-keys -l -t "$TMUX_SESSION" "stty -g > $before_q; env CC_CONFIG=tests/fake_config.json CC_SETTINGS=$settings_q CC_BACKGROUND_CONNECT_DELAY_MS=0 CC_TEST_STARTUP_IMPORT_DELAY_MS=5000 $bin_q fake; for attempt in \$(seq 1 50); do stty -g > $after_q; cmp -s $before_q $after_q && break; sleep 0.02; done"
+	tmux -L "$TMUX_SOCKET" send-keys -t "$TMUX_SESSION" Enter
+	manager_pid=""
+	for _ in {1..100}; do
+		pane_pid="$(tmux -L "$TMUX_SOCKET" display-message -pt "$TMUX_SESSION" '#{pane_pid}')"
+		manager_pid="$(ps -axo ppid=,pid=,command= | awk -v parent="$pane_pid" '$1 == parent && /node .*node_modules\/\.bin\/cc/ { print $2; exit }')"
+		if [ -n "$manager_pid" ]; then break; fi
+		sleep 0.05
+	done
+	if [ -z "$manager_pid" ]; then
+		echo "could not find installed npm-bin cc manager for SIGKILL restoration smoke" >&2
+		exit 1
+	fi
+	pane_tty="$(tmux -L "$TMUX_SOCKET" display-message -pt "$TMUX_SESSION" '#{pane_tty}')"
+	entered_raw=0
+	for _ in {1..100}; do
+		if tmux -L "$TMUX_SOCKET" capture-pane -pt "$TMUX_SESSION" | grep -Fq "Space to record"; then
+			current_stty="$(stty -g < "$pane_tty" 2>/dev/null || true)"
+			if [ -n "$current_stty" ] && [ "$current_stty" != "$(cat "$before")" ]; then
+				entered_raw=1
+				break
+			fi
+		fi
+		sleep 0.05
+	done
+	if [ "$entered_raw" -ne 1 ]; then
+		echo "installed npm-bin cc did not demonstrably enter raw mode before SIGKILL smoke" >&2
+		exit 1
+	fi
+	kill -KILL "$manager_pid"
+	for _ in {1..100}; do
+		if [ -s "$after" ] && cmp -s "$before" "$after"; then break; fi
+		sleep 0.05
+	done
+	cmp -s "$before" "$after" || {
+		echo "installed npm-bin cc failed to restore exact terminal state after SIGKILL" >&2
+		exit 1
+	}
+	tmux -L "$TMUX_SOCKET" kill-session -t "$TMUX_SESSION" >/dev/null 2>&1 || true
+fi
 while IFS= read -r module; do node --check "$module"; done < <(find "$installed/src" "$installed/scripts" -type f -name '*.mjs' -print | sort)
 python3 - "$installed" <<'PY'
 import pathlib, sys

@@ -9,9 +9,20 @@ import { acquireOwnershipLock } from "./ownership-lock.mjs";
 import { readBoundedHandle, syncDirectory } from "./durability.mjs";
 import { ensureWorkflowPrivateDirectory } from "./state-root.mjs";
 import { WORKFLOW_LIMITS } from "./types.mjs";
+import { trustedExecutableOnPath, userControlledPathRoots } from "./trusted-executable.mjs";
 
 const PROJECT_SAVE_HELPER = fileURLToPath(new URL("./project-save-helper.py", import.meta.url));
 const PERSONAL_WORKFLOW_HELPER = fileURLToPath(new URL("./personal-workflow-helper.mjs", import.meta.url));
+const RELEASE_ROOT = fileURLToPath(new URL("../..", import.meta.url));
+let PROJECT_PYTHON;
+if (process.platform !== "win32") {
+	try {
+		PROJECT_PYTHON = trustedExecutableOnPath("python3", process.env, [
+			RELEASE_ROOT,
+			...userControlledPathRoots(process.cwd()),
+		]);
+	} catch { /* Project workflow I/O reports unavailability; personal/inline workflows remain usable. */ }
+}
 const WORKFLOW_IMPORT_INDEX_BYTES = 4 * 1024 * 1024;
 
 function workflowName(value) {
@@ -101,10 +112,13 @@ async function runProjectHelper(operation, projectRoot, name, options = {}) {
 	return await new Promise((resolve, reject) => {
 		const baseOperation = operation.startsWith("personal-") ? operation.slice("personal-".length) : operation;
 		const personal = operation.startsWith("personal-");
+		if (!personal && !PROJECT_PYTHON) throw new Error("race-safe project workflow I/O is unavailable on this platform");
+		const helperEnvironment = { PATH: PROJECT_PYTHON ? path.dirname(PROJECT_PYTHON) : "", LANG: "C", LC_ALL: "C" };
+		const helperExecutable = personal ? process.execPath : PROJECT_PYTHON;
 		const maximumOutput = WORKFLOW_LIMITS.maxSourceBytes + (baseOperation === "read-identity" ? 1024 : 0);
 		const stdout = [];
 		let stdoutBytes = 0;
-		const child = spawn(personal ? process.execPath : "python3", [
+		const child = spawn(helperExecutable, [
 			...(personal ? [] : ["-I", "-S"]),
 			personal ? PERSONAL_WORKFLOW_HELPER : PROJECT_SAVE_HELPER,
 			baseOperation, path.resolve(projectRoot),
@@ -113,17 +127,19 @@ async function runProjectHelper(operation, projectRoot, name, options = {}) {
 		], {
 			stdio: [baseOperation === "save" ? "pipe" : "ignore", ["read", "read-identity", "list", "identity"].includes(baseOperation) ? "pipe" : "ignore", "pipe"],
 			shell: false, detached: process.platform !== "win32", windowsHide: true,
-			...(personal ? {} : { env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" } }),
+			...(personal ? {} : { env: helperEnvironment }),
 		});
 		let stderr = "";
 		let terminationError;
 		let killTimer;
+		let terminationConfirmationTimer;
 		let settled = false;
 		const finish = (error, value) => {
 			if (settled) return;
 			settled = true;
 			clearTimeout(timeout);
 			clearTimeout(killTimer);
+			clearTimeout(terminationConfirmationTimer);
 			options.signal?.removeEventListener("abort", onAbort);
 			if (error) reject(error); else resolve(value);
 		};
@@ -131,7 +147,16 @@ async function runProjectHelper(operation, projectRoot, name, options = {}) {
 			if (terminationError || settled) return;
 			terminationError = error;
 			killProcessTree(child, "SIGTERM");
-			killTimer = setTimeout(() => killProcessTree(child, "SIGKILL"), 1000);
+			killTimer = setTimeout(() => {
+				killProcessTree(child, "SIGKILL");
+				terminationConfirmationTimer = setTimeout(() => {
+					const unconfirmed = Object.assign(new Error("project workflow helper termination could not be confirmed; restart cc", { cause: terminationError }), {
+						code: "WORKFLOW_PROJECT_HELPER_TERMINATION_UNCONFIRMED",
+					});
+					try { options.onTerminationUnconfirmed?.(unconfirmed); } catch { /* the sticky registry fence remains authoritative */ }
+					finish(unconfirmed);
+				}, 1000);
+			}, 1000);
 		};
 		const onAbort = () => terminate(abortError(options.signal.reason));
 		options.signal?.addEventListener("abort", onAbort, { once: true });
@@ -145,7 +170,8 @@ async function runProjectHelper(operation, projectRoot, name, options = {}) {
 		child.once("error", (error) => {
 			const wrapped = new Error(`race-safe project workflow I/O helper could not start: ${error.message ?? error}`);
 			wrapped.code = "WORKFLOW_PROJECT_IO_UNAVAILABLE";
-			finish(wrapped);
+			if (child.pid) terminate(wrapped);
+			else finish(wrapped);
 		});
 		// `close` fires only after the helper's stdout/stderr pipes have closed,
 		// so a successful helper cannot return a truncated final chunk.
@@ -266,6 +292,22 @@ export class WorkflowRegistry {
 		this.contentDirectory = path.join(this.stateRoot, "workflow-registry");
 		this.indexFile = path.join(this.contentDirectory, "index.json");
 		this.indexWriteTail = Promise.resolve();
+		this.projectHelperTerminationFailure = undefined;
+	}
+
+	#fencedOptions(options = {}) {
+		if (this.projectHelperTerminationFailure) {
+			throw Object.assign(new Error("Workflow registry filesystem ownership is unresolved; restart cc before continuing", { cause: this.projectHelperTerminationFailure }), {
+				code: "WORKFLOW_RESTART_REQUIRED",
+			});
+		}
+		return {
+			...options,
+			onTerminationUnconfirmed: (error) => {
+				this.projectHelperTerminationFailure ??= error;
+				options.onTerminationUnconfirmed?.(error);
+			},
+		};
 	}
 
 	#project(options = {}) {
@@ -323,7 +365,7 @@ export class WorkflowRegistry {
 	}
 
 	async #importNamespace(projectRoot, options = {}) {
-		const identity = await projectRootIdentity(path.resolve(projectRoot), options);
+		const identity = await projectRootIdentity(path.resolve(projectRoot), this.#fencedOptions(options));
 		const value = `${identity.canonicalRoot}\0${identity.device}\0${identity.inode}`;
 		return {
 			key: createHash("sha256").update(value).digest("hex"),
@@ -332,6 +374,7 @@ export class WorkflowRegistry {
 	}
 
 	async projectIdentity(projectRoot, options = {}) {
+		options = this.#fencedOptions(options);
 		const identity = await projectRootIdentity(path.resolve(projectRoot), {
 			...options,
 			deadline: options.deadline ?? Date.now() + 10_000,
@@ -340,11 +383,12 @@ export class WorkflowRegistry {
 	}
 
 	async approvalProjectIdentity(projectRoot, options = {}) {
+		options = this.#fencedOptions(options);
 		return Object.freeze(await portableProjectIdentity(path.resolve(projectRoot), options));
 	}
 
 	async list(options = {}) {
-		options = { ...options, deadline: options.deadline ?? Date.now() + 10_000 };
+		options = this.#fencedOptions({ ...options, deadline: options.deadline ?? Date.now() + 10_000 });
 		const entries = new Map();
 		const comparisonKey = (name) => ["darwin", "win32"].includes(process.platform) ? name.toLocaleLowerCase("en-US") : name;
 		const project = this.#project(options);
@@ -372,7 +416,7 @@ export class WorkflowRegistry {
 	}
 
 	async resolve(nameValue, options = {}) {
-		options = { ...options, deadline: options.deadline ?? Date.now() + 10_000 };
+		options = this.#fencedOptions({ ...options, deadline: options.deadline ?? Date.now() + 10_000 });
 		const name = workflowName(nameValue);
 		if (options.requireImported === true) {
 			if (typeof options.projectRoot !== "string" || !options.projectRoot) {
@@ -420,6 +464,7 @@ export class WorkflowRegistry {
 	}
 
 	async importResolved(resolved, projectRoot, options = {}) {
+		options = this.#fencedOptions(options);
 		if (!resolved || typeof resolved.name !== "string" || typeof resolved.source !== "string" ||
 			!["project", "personal"].includes(resolved.scope)) {
 			throw new Error("invalid resolved workflow import");
@@ -480,7 +525,7 @@ export class WorkflowRegistry {
 	}
 
 	async save(nameValue, source, options = {}) {
-		options = { ...options, deadline: options.deadline ?? Date.now() + 10_000 };
+		options = this.#fencedOptions({ ...options, deadline: options.deadline ?? Date.now() + 10_000 });
 		const name = workflowName(nameValue);
 		if (typeof source !== "string" || Buffer.byteLength(source, "utf8") > WORKFLOW_LIMITS.maxSourceBytes) {
 			throw new Error("workflow source must be a bounded string");

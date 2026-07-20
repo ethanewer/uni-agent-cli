@@ -496,9 +496,22 @@ assert.match(normalizeCcKeyStroke("++").error, /empty key or modifier/);
 		label: option.name,
 	})), (entry) => selections.push(entry?.value?.optionId), { keybindingContext: "Confirmation" });
 	assert.equal(app.executeCcKeybindingAction("cc.confirm.yes"), true);
+	assert.deepEqual(selections, [], "a confirmation shortcut cannot act before its exact choice has rendered");
+	app.menuHandle.render(80, 10);
+	assert.equal(app.executeCcKeybindingAction("cc.confirm.yes"), true);
 	app.menuHandle.onSelect = (entry) => selections.push(entry?.value?.optionId);
 	assert.equal(app.executeCcKeybindingAction("cc.confirm.no"), true);
+	assert.deepEqual(selections, ["once"], "changing the shortcut target requires a render before confirmation");
+	app.menuHandle.render(80, 10);
+	assert.equal(app.executeCcKeybindingAction("cc.confirm.no"), true);
 	assert.deepEqual(selections, ["once", "no"], "y/n pick the narrowest allow/deny options");
+	const hiddenSelections = [];
+	app.menuHandle = new SelectionPanel("Allow tool?", options.map((option) => ({ value: option, label: option.name })),
+		(entry) => hiddenSelections.push(entry?.value?.optionId), { keybindingContext: "Confirmation" });
+	app.menuHandle.handleInput("Don't");
+	app.menuHandle.render(80, 10);
+	assert.equal(app.executeCcKeybindingAction("cc.confirm.yes"), true);
+	assert.deepEqual(hiddenSelections, [], "a confirmation shortcut cannot select an allow choice hidden by the filter");
 }
 
 {

@@ -32,6 +32,10 @@ function readJson(file) {
 	}
 }
 
+function pinnedRuntimeDependency(packageName) {
+	return readJson(path.join(PACKAGE_ROOT, "package.json"))?.dependencies?.[packageName];
+}
+
 function packageDirectory(nodeModules, packageName) {
 	return path.join(nodeModules, ...packageName.split("/"));
 }
@@ -58,12 +62,29 @@ function resolvePackageDirectory(nodeModules, packageName) {
 }
 
 function installedDependencyDirectory(nodeModules, packageName, owners = []) {
-	const candidates = [
-		packageDirectory(nodeModules, packageName),
-		...owners.filter(Boolean).map((owner) => packageDirectory(path.join(owner, "node_modules"), packageName)),
-	];
-	return candidates.find((candidate) => Boolean(readJson(path.join(candidate, "package.json"))))
-		?? hoistedPackageDirectory(nodeModules, packageName);
+	// Prefer the dependency resolved from cc itself. Some adapters pin an older
+	// copy of a package that cc also uses directly; choosing the adapter's nested
+	// SDK and cc's hoisted native payload can otherwise manufacture a version
+	// mismatch even though npm installed both complete dependency trees.
+	const direct = packageDirectory(nodeModules, packageName);
+	if (readJson(path.join(direct, "package.json"))) return direct;
+	const hoisted = hoistedPackageDirectory(nodeModules, packageName);
+	if (hoisted) return hoisted;
+	return owners
+		.filter(Boolean)
+		.map((owner) => dependencyDirectoryFromOwner(owner, packageName))
+		.find((candidate) => candidate && Boolean(readJson(path.join(candidate, "package.json"))));
+}
+
+function dependencyDirectoryFromOwner(owner, packageName) {
+	let cursor = path.resolve(owner);
+	for (;;) {
+		const candidate = packageDirectory(path.join(cursor, "node_modules"), packageName);
+		if (readJson(path.join(candidate, "package.json"))) return candidate;
+		const parent = path.dirname(cursor);
+		if (parent === cursor) return undefined;
+		cursor = parent;
+	}
 }
 
 function nativePlatformPackageNames(options = {}) {
@@ -126,6 +147,7 @@ export function inspectLocalNativePayloads(nodeModules = LOCAL_NODE_MODULES, opt
 	if (names.error) {
 		return [
 			nativeFailure("claude", "@anthropic-ai/claude-agent-sdk", names.error),
+			nativeFailure("claude-acp", "@anthropic-ai/claude-agent-sdk", names.error),
 			nativeFailure("codex", "@openai/codex", names.error),
 		];
 	}
@@ -143,10 +165,14 @@ export function inspectLocalNativePayloads(nodeModules = LOCAL_NODE_MODULES, opt
 		results.push(nativeFailure("claude", names.claude, "@anthropic-ai/claude-agent-sdk is missing"));
 	} else {
 		const manifest = readJson(path.join(claudeSdk, "package.json"));
-		if (!Object.hasOwn(manifest?.optionalDependencies ?? {}, names.claude)) {
+		const expectedVersion = pinnedRuntimeDependency("@anthropic-ai/claude-agent-sdk");
+		if (manifest?.name !== "@anthropic-ai/claude-agent-sdk" || manifest?.version !== expectedVersion) {
+			results.push(nativeFailure("claude", names.claude, `Claude Agent SDK identity/version mismatch (expected @anthropic-ai/claude-agent-sdk@${expectedVersion}, found ${manifest?.name ?? "unknown"}@${manifest?.version ?? "unknown"})`));
+		} else if (!Object.hasOwn(manifest?.optionalDependencies ?? {}, names.claude)) {
 			results.push(nativeFailure("claude", names.claude, "the Claude Agent SDK does not declare this platform payload"));
 		} else {
-			const packageDir = installedDependencyDirectory(nodeModules, names.claude, [claudeSdk]);
+			const packageDir = dependencyDirectoryFromOwner(claudeSdk, names.claude)
+				?? installedDependencyDirectory(nodeModules, names.claude);
 			const mismatch = nativePackageMismatch(
 				packageDir,
 				names.claude,
@@ -159,14 +185,46 @@ export function inspectLocalNativePayloads(nodeModules = LOCAL_NODE_MODULES, opt
 		}
 	}
 
+	// The bundled Claude ACP adapter pins its own Agent SDK patch release. npm
+	// keeps that SDK/native pair nested when cc's direct bridge uses a newer SDK;
+	// verify the exact tree the adapter will resolve, not only cc's direct tree.
+	const claudeAdapterManifest = claudeAdapter && readJson(path.join(claudeAdapter, "package.json"));
+	const adapterSdkVersion = claudeAdapterManifest?.dependencies?.["@anthropic-ai/claude-agent-sdk"];
+	const nestedAdapterSdk = claudeAdapter && packageDirectory(path.join(claudeAdapter, "node_modules"), "@anthropic-ai/claude-agent-sdk");
+	const nestedAdapterManifest = nestedAdapterSdk && readJson(path.join(nestedAdapterSdk, "package.json"));
+	const adapterSdk = nestedAdapterManifest ? nestedAdapterSdk
+		: claudeSdk && readJson(path.join(claudeSdk, "package.json"))?.version === adapterSdkVersion ? claudeSdk : undefined;
+	if (!adapterSdk || typeof adapterSdkVersion !== "string") {
+		results.push(nativeFailure("claude-acp", names.claude, "the Claude ACP adapter's pinned Agent SDK is missing"));
+	} else {
+		const manifest = readJson(path.join(adapterSdk, "package.json"));
+		if (manifest?.name !== "@anthropic-ai/claude-agent-sdk" || manifest?.version !== adapterSdkVersion) {
+			results.push(nativeFailure("claude-acp", names.claude, `Claude ACP Agent SDK identity/version mismatch (expected @anthropic-ai/claude-agent-sdk@${adapterSdkVersion}, found ${manifest?.name ?? "unknown"}@${manifest?.version ?? "unknown"})`));
+		} else if (!Object.hasOwn(manifest?.optionalDependencies ?? {}, names.claude)) {
+			results.push(nativeFailure("claude-acp", names.claude, "the Claude ACP Agent SDK does not declare this platform payload"));
+		} else {
+			const packageDir = dependencyDirectoryFromOwner(adapterSdk, names.claude)
+				?? installedDependencyDirectory(nodeModules, names.claude);
+			const mismatch = nativePackageMismatch(packageDir, names.claude, manifest.optionalDependencies[names.claude]);
+			const binary = packageDir && path.join(packageDir, names.platform === "win32" ? "claude.exe" : "claude");
+			results.push(!mismatch && binary && executableFile(binary, names.platform)
+				? { key: "claude-acp", kind: "native-payload", packageName: names.claude, ok: true, packageDir, binary }
+				: nativeFailure("claude-acp", names.claude, mismatch ?? "optional native package or executable is missing"));
+		}
+	}
+
 	if (!codexCli) {
 		results.push(nativeFailure("codex", names.codex, "@openai/codex is missing"));
 	} else {
 		const manifest = readJson(path.join(codexCli, "package.json"));
-		if (!Object.hasOwn(manifest?.optionalDependencies ?? {}, names.codex)) {
+		const expectedVersion = pinnedRuntimeDependency("@openai/codex");
+		if (manifest?.name !== "@openai/codex" || manifest?.version !== expectedVersion) {
+			results.push(nativeFailure("codex", names.codex, `Codex CLI identity/version mismatch (expected @openai/codex@${expectedVersion}, found ${manifest?.name ?? "unknown"}@${manifest?.version ?? "unknown"})`));
+		} else if (!Object.hasOwn(manifest?.optionalDependencies ?? {}, names.codex)) {
 			results.push(nativeFailure("codex", names.codex, "the Codex CLI does not declare this platform payload"));
 		} else {
-			const packageDir = installedDependencyDirectory(nodeModules, names.codex, [codexCli]);
+			const packageDir = dependencyDirectoryFromOwner(codexCli, names.codex)
+				?? installedDependencyDirectory(nodeModules, names.codex);
 			const mismatch = nativePackageMismatch(
 				packageDir,
 				names.codex,
@@ -253,7 +311,7 @@ export function verifyPostinstall(options = {}) {
 		const globalValue = String(environment.npm_config_global ?? environment.NPM_CONFIG_GLOBAL ?? "").toLowerCase();
 		const globalInstall = globalValue === "true" || globalValue === "1";
 		const reinstall = globalInstall
-			? "Re-run the original global cc install command with `--include=optional` (for a registry install, `npm install -g cc --include=optional`). "
+			? "Re-run the exact original tarball or local-channel install command with `--include=optional`; this private package is not installed from public npm. "
 			: "From the cc package/project directory, run `npm install --include=optional`, or re-run the original install command with that flag. ";
 		console.warn(
 			`cc: this installation is missing a required package-local ACP component:\n${details}\n` +

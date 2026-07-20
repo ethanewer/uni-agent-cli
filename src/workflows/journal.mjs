@@ -361,7 +361,7 @@ export async function readWorkflowRecoveryFallback(directory, options = {}) {
 	} catch (error) { throw readFailure(error, read.bytes); }
 }
 
-export async function writeWorkflowLaunchCommit(directory, runId, expectedDirectoryIdentity) {
+export async function writeWorkflowLaunchCommit(directory, runId, expectedDirectoryIdentity, options = {}) {
 	const id = safeRunId(runId);
 	const resolved = path.resolve(directory);
 	await ensureWorkflowPrivateDirectory(resolved);
@@ -370,7 +370,7 @@ export async function writeWorkflowLaunchCommit(directory, runId, expectedDirect
 		version: WORKFLOW_LAUNCH_COMMIT_VERSION,
 		id,
 		runDirectoryIdentity: identity,
-	});
+	}, { onPublished: options.onPublished });
 }
 
 export async function readWorkflowLaunchCommit(directory, runId) {
@@ -539,9 +539,20 @@ export class WorkflowJournal {
 	async close() {
 		await this.tail;
 		if (!this.handle) return;
-		await this.handle.sync();
-		await this.handle.close();
-		this.handle = undefined;
+		const handle = this.handle;
+		let syncError;
+		try { await handle.sync(); }
+		catch (error) { syncError = error; }
+		try { await handle.close(); }
+		catch (closeError) {
+			if (syncError) throw new AggregateError([syncError, closeError], "Workflow journal sync and close both failed");
+			throw closeError;
+		}
+		if (this.handle === handle) this.handle = undefined;
+		if (syncError) {
+			try { Object.defineProperty(syncError, "journalHandleClosed", { value: true }); } catch {}
+			throw syncError;
+		}
 	}
 }
 

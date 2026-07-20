@@ -61,7 +61,9 @@ wait_for_text "$BASELINE_SESSION" "Space to record"
 sleep 0.5
 tmux send-keys -t "$BASELINE_SESSION" / p e r m i s s i o n - t e s t Enter
 wait_for_text "$BASELINE_SESSION" "Permission: Permission Test"
-tmux send-keys -t "$BASELINE_SESSION" Down Enter
+tmux send-keys -t "$BASELINE_SESSION" Down
+wait_for_text "$BASELINE_SESSION" "›   Allow"
+tmux send-keys -t "$BASELINE_SESSION" Enter
 wait_for_text "$BASELINE_SESSION" '"optionId": "allow"'
 
 tmux new-session -d -s "$DANGER_SESSION" -c "$ROOT" -x 100 -y 30 \

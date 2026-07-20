@@ -6,10 +6,19 @@ A fast, low-latency `cc` CLI for driving **Claude Code**, **Codex**, and **Curso
 
 ## Install
 
-One command (requires Node 22+ and `git`):
+Install a protected, validated release candidate (requires Node 22.19.0+ with
+npm 10.9.3 installed beside that Node runtime, plus `git`). Download the
+`dynamic-workflows-live-release-<sha>` artifact retained by the protected run,
+check out that full SHA, and promote the exact tarball named by its validation
+evidence:
 
 ```sh
-npm install -g github:ethanewer/uni-agent-cli
+git clone https://github.com/ethanewer/uni-agent-cli.git
+export CC_RELEASE_COMMIT=<reviewed-full-commit-sha>
+git -C uni-agent-cli checkout --detach "$CC_RELEASE_COMMIT"
+node uni-agent-cli/scripts/install-channel.mjs stable \
+  --repo uni-agent-cli --candidate-dir /absolute/path/to/downloaded-release-artifact \
+  --expected-commit "$CC_RELEASE_COMMIT"
 ```
 
 `cc` carries exact runtime versions of its maintained harness components: Claude ACP 0.59.0 with Agent SDK 0.3.214, Codex ACP 1.1.4 with Codex CLI 0.144.6, OpenCode 1.18.3, and Pi 0.80.10 with `pi-acp` 0.0.31. Built-in adapters use package-local copies where ACP identity negotiation is available, so an unrelated global adapter on `PATH` cannot silently change the protocol. A custom `agents.<name>.acp.command` remains an explicit override and must identify itself as the expected adapter at startup. Post-install only verifies local dependencies; it never installs, removes, or migrates global packages.
@@ -40,18 +49,32 @@ npm link
 
 ### Stable `cc` and beta `cc2` channels
 
-For side-by-side testing, install commit snapshots instead of using `npm link`:
+For ordinary development, install the current stable and beta refs side by side
+instead of using `npm link`:
 
 ```sh
 npm run install:channels
 ```
 
-On macOS and Linux, channel release verification also requires `python3`; the
-installer checks this prerequisite before parsing the packaged Python bridges.
+That convenience command follows development refs and is not a release
+promotion command. Install a reviewed release candidate into beta from the
+protected artifact that contains its tarball, checksum, pack metadata,
+candidate provenance, and `dynamic-workflows-validated.json`:
 
-This resolves `cc` from the local `main` ref and `cc2` from the local
-`ux-0711` ref. Rerun the command after either local ref moves. (`git fetch`
-alone updates `origin/main`, not the local `main` ref.) A specific commit,
+```sh
+export CC_RELEASE_COMMIT=<reviewed-full-commit-sha>
+node scripts/install-channel.mjs beta \
+  --candidate-dir /absolute/path/to/dynamic-workflows-live-release-$CC_RELEASE_COMMIT \
+  --expected-commit "$CC_RELEASE_COMMIT"
+```
+
+Channel promotion never selects an unrelated `npm` from `PATH`. On macOS and
+Linux, channel release verification also requires `python3`; the installer
+checks this prerequisite before parsing the packaged Python bridges.
+
+This resolves `cc` from the local `main` ref and `cc2` from the remote-tracking
+`origin/ux-0711` ref. Rerun the command after either ref moves. (`git fetch`
+updates the remote-tracking ref but not local `main`.) A specific commit,
 remote-tracking ref, or branch can be selected for one channel with, for
 example:
 
@@ -60,14 +83,17 @@ node scripts/install-channel.mjs beta --ref HEAD
 node scripts/install-channel.mjs stable --ref origin/main
 ```
 
-The installer archives the selected commit, so uncommitted working-tree changes
-are never included. It builds and smoke-tests the complete release before an
-atomic channel switch. Releases and their private `node_modules`/ACP adapters
+Development-ref installs archive the selected commit, so uncommitted
+working-tree changes are never included. Release promotion instead verifies
+and extracts the exact protected tarball, then builds and smoke-tests the
+complete release before an atomic channel switch. Releases and their private `node_modules`/ACP adapters
 live under `~/.local/share/cc/channels/<channel>/releases/<commit>`; the launchers
 are `~/.local/bin/cc` and `~/.local/bin/cc2`. Add `~/.local/bin` to `PATH` if it
-is not already there. On Windows the launchers use the corresponding `cc.cmd`
-and `cc2.cmd` names. The installer never runs `npm link` or changes npm's
-global prefix.
+is not already there. Ordinary Windows package installs expose `cc.cmd`, but
+channel promotion currently fails closed on Windows: portable Node cannot
+independently authenticate the ACL and PID-creation evidence needed by the
+installer's destructive leases. The installer never runs `npm link` or changes
+npm's global prefix.
 
 Stable `cc` continues to use the normal `~/.config/cc` state. Beta `cc2` keeps
 its config, settings, permission grants, and autocomplete cache under
@@ -184,11 +210,12 @@ operations through `python3` and fail closed when that helper is unavailable;
 one launch-wide deadline covers project identity and source access, and imported source is atomically published and fsynced before its index;
 personal saves and workflow execution do not depend on it. In the task view
 use arrows and Enter to navigate runs → phases →
-agents → attempts → detail, `v` for approved source, `p` to pause/resume, `x` to stop, `r`
-to restart an agent, `c` to recover an interrupted run, `s` to choose personal or project save scope, and Escape to go back. Applying retained worktree changes first opens a scrollable changed-file and full patch preview, then requires a separate confirmation.
+agents → attempts → detail, `v` for approved source, `p` to pause/resume, `x` to stop from action views, `r`
+to restart an agent, `c` to recover an interrupted run, `s` to choose personal or project save scope, and Escape to go back. Applying retained worktree changes first opens a scrollable changed-file and bounded patch preview, then requires a separate confirmation. A patch beyond the preview limit remains in its retained worktree for manual inspection and cannot be applied from cc.
 The composer and bottom status remain visible. The dashboard has explicit focus
 while its single-letter controls are active; press Tab to move to the composer
-(preserving any draft) and Tab again to return to the dashboard. Recovery reruns every model call
+(preserving any draft) and Tab again to return to the dashboard. Tab remains
+captured while the separate worktree apply preview is open. Recovery reruns every model call
 after a recovery-specific approval; no prior result is silently replayed.
 Completion is queued only to the exact live originating adapter/session
 generation. A temporarily switched session retains the notification until that
@@ -198,7 +225,7 @@ same live adapter reloads it; ambiguous delivery state remains visible in
 Workflow source runs behind a probed operating-system sandbox; there is no
 unrestricted fallback. This release enables workflow execution on macOS only,
 using Seatbelt (`sandbox-exec`) as the security boundary with Node permissions
-and `node:vm` as defense in depth. Node 22 remains the Disabled-mode baseline;
+and `node:vm` as defense in depth. Node 22.19.0 is the minimum in every mode;
 workflow opt-in also requires a Node build whose permission probe succeeds.
 Defaults include 16 active agents globally, 8 per workflow, 1,000
 agents total, depth 4, at most 64 total/8 live sandboxes and 10,000
@@ -589,15 +616,27 @@ npm test
 This runs syntax/compile checks, settings/queue and Codex feature-parity tests,
 the permission-engine unit tests (`tests/permissions.test.mjs`), the dynamic
 workflow runtime/security/package regression suite, and the tmux-driven TUI
-gates available on the current platform. The latter cover resize, streaming scroll, queues, slash commands,
-permission persistence, `/btw` / `/diff` / `/copy`, plus workflow opt-in,
-model-authored launch, 4/6-way execution, routing, lifecycle controls,
-save/overwrite, and hierarchical workflow views. Dynamic workflow execution is
-macOS-only, so its ordinary test invocation reports a skip elsewhere. The
-non-skippable complete release and npm-publish gate is `npm run test:release`;
+gates available on the current platform. Those cover resize, streaming scroll,
+queues, slash commands, permission persistence, `/btw` / `/diff` / `/copy`,
+workflow opt-in controls, save/overwrite, and hierarchical workflow views.
+Model-authored launch and 4/6-way execution run in the separate macOS release
+E2E. The non-skippable complete release and package-promotion gate is `npm run test:release`;
 it runs the full regression/TUI/channel/package suite plus the mandatory macOS
 workflow E2E. It requires macOS and `tmux`, and the checked-in macOS release job
 runs it on every workflow branch/PR.
+
+For an authenticated local release, choose an empty evidence directory outside
+the checkout and retain the candidate, digest, provenance, deterministic result,
+and live result together:
+
+```sh
+CC_WORKFLOW_RELEASE_DIR=/absolute/path/to/release-evidence \
+  npm run release:workflows
+```
+
+If the directory is omitted, the command creates a persistent directory under
+the system temporary directory and prints its path. It never deletes a release
+candidate after successful gates.
 
 ## Notes
 

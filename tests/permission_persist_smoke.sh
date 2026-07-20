@@ -82,7 +82,9 @@ sleep 0.5
 tmux send-keys -t "$PERSIST_SESSION" / p e r m i s s i o n - a l w a y s Enter
 wait_for_text "$PERSIST_SESSION" "Permission: Always Test"
 # entries: Reject, Allow once, Allow always -> Down Down lands on "Allow always"
-tmux send-keys -t "$PERSIST_SESSION" Down Down Enter
+tmux send-keys -t "$PERSIST_SESSION" Down Down
+wait_for_text "$PERSIST_SESSION" "›   Allow always"
+tmux send-keys -t "$PERSIST_SESSION" Enter
 # cc OWNS the "always": it records its own grant but replies to the backend with the
 # narrowest allow (allow-once), NOT allow-always — so the backend doesn't also
 # persist it and /permissions clear can fully revoke.
@@ -97,7 +99,9 @@ wait_for_file_text "Always Test"
 tmux send-keys -t "$PERSIST_SESSION" / p e r m i s s i o n - o n l y - a l w a y s Enter
 wait_for_text "$PERSIST_SESSION" "Permission: Only Always Test"
 # entries: Reject, Allow always -> Down lands on "Allow always"
-tmux send-keys -t "$PERSIST_SESSION" Down Enter
+tmux send-keys -t "$PERSIST_SESSION" Down
+wait_for_text "$PERSIST_SESSION" "›   Allow always"
+tmux send-keys -t "$PERSIST_SESSION" Enter
 # Forwarded as-is (no narrower option exists), and NOT recorded by cc.
 wait_for_text "$PERSIST_SESSION" '"optionId": "allow-always"'
 assert_without_file_text "$PERMS_FILE" "Only Always Test"
@@ -123,7 +127,9 @@ tmux send-keys -t "$REMEMBER_OFF_SESSION" / p e r m i s s i o n - a l w a y s En
 wait_for_text "$REMEMBER_OFF_SESSION" "Permission: Always Test"
 # Pick "Allow always" with remember:false -> backend gets the one-time option and
 # cc records NOTHING (persistence disabled).
-tmux send-keys -t "$REMEMBER_OFF_SESSION" Down Down Enter
+tmux send-keys -t "$REMEMBER_OFF_SESSION" Down Down
+wait_for_text "$REMEMBER_OFF_SESSION" "›   Allow always"
+tmux send-keys -t "$REMEMBER_OFF_SESSION" Enter
 wait_for_text "$REMEMBER_OFF_SESSION" '"optionId": "allow-once"'
 assert_without_text "$REMEMBER_OFF_SESSION" '"optionId": "allow-always"'
 assert_without_file_text "$REMEMBER_OFF_PERMS" "Always Test"

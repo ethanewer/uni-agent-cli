@@ -204,6 +204,66 @@ assert.equal(singleLineMenuText("approve \u202edeny\u2066 choice"), "approve \u2
 	assert.ok(lines.some((line) => line.includes("first second") && line.includes("date path")));
 	const narrow = new SelectionPanel("Resume session", [{ label: "x".repeat(1_000), description: "y".repeat(1_000) }], () => {});
 	assert.ok(narrow.render(40).every((line) => singleLineMenuText(line).length <= 39));
+	const short = new SelectionPanel("Short picker", Array.from({ length: 12 }, (_, index) => ({ label: `item ${index}`, value: index })), () => {});
+	for (let index = 0; index < 8; index += 1) short.handleInput("\x1b[B");
+	const shortLines = short.render(80, 4).map(singleLineMenuText);
+	assert.equal(shortLines.length, 4);
+	assert.ok(shortLines.some((line) => line.includes("item 8")), "height-bounded selection panels keep the active row visible");
+	assert.ok(shortLines.some((line) => line.includes("enter select")), "height-bounded selection panels retain their controls");
+	let tinySelected = false;
+	const tiny = new SelectionPanel("Confirm exact workflow target", [{ label: "Apply changes" }], () => { tinySelected = true; });
+	tiny.handleInput("\r");
+	assert.equal(tinySelected, false, "a picker fails closed before its first bounded render");
+	assert.match(tiny.render(80, 1).map(singleLineMenuText)[0], /disabled/u, "a one-row picker exposes its disabled state");
+	tiny.handleInput("\r");
+	assert.equal(tinySelected, false, "a picker cannot confirm when the viewport cannot show both title and selected action");
+	tiny.render(1, 2);
+	tiny.handleInput("\r");
+	assert.equal(tinySelected, false, "a picker cannot confirm when its width cannot disclose target context");
+	let disclosedSelected = false;
+	const disclosureBlocks = [];
+	const disclosed = new SelectionPanel(
+		`Apply retained changes to feature/${"branch".repeat(20)}@${"a".repeat(40)}?`,
+		[{ label: "Apply changes", description: "Re-check the exact target above" }],
+		() => { disclosedSelected = true; },
+		{ wrapTitle: true, requireFullDisclosure: true, onBlocked: (message) => disclosureBlocks.push(message) },
+	);
+	const blockedDisclosure = disclosed.render(30, 4).map(singleLineMenuText).join("\n");
+	assert.match(blockedDisclosure, /enter disabled/u, "a blocked picker advertises its disabled confirmation state");
+	disclosed.handleInput("\r");
+	assert.equal(disclosedSelected, false, "a destructive picker cannot confirm while its wrapped identity is outside the viewport");
+	assert.match(disclosureBlocks.at(-1), /Resize.*Enter is disabled/iu, "blocked Enter surfaces actionable disclosure feedback");
+	disclosed.render(120, 20);
+	disclosed.handleInput("\r");
+	assert.equal(disclosedSelected, true, "a destructive picker enables confirmation once its complete identity and action are visible");
+	let compactDisclosureSelected = false;
+	const compactDisclosure = new SelectionPanel("Choose a fully visible action", [
+		{ label: "First action", description: "complete selected action" },
+		...Array.from({ length: 11 }, (_, index) => ({ label: `Unselected action ${index + 2}` })),
+	], () => { compactDisclosureSelected = true; }, { requireFullDisclosure: true });
+	const compactLines = compactDisclosure.render(80, 4).map(singleLineMenuText);
+	assert.ok(compactLines.some((line) => line.includes("First action")));
+	assert.ok(compactLines.some((line) => line.includes("enter select")));
+	compactDisclosure.handleInput("\r");
+	assert.equal(compactDisclosureSelected, true, "unselected and decorative picker rows do not disable a fully disclosed decision");
+	let wrappedDisclosureSelected = false;
+	const wrappedDisclosure = new SelectionPanel("Confirm a destructive operation", [{
+		label: "Apply changes", description: `Re-check ${"long-target-segment/".repeat(8)} before applying`,
+	}], () => { wrappedDisclosureSelected = true; }, { wrapTitle: true, requireFullDisclosure: true });
+	const wrappedDisclosureLines = wrappedDisclosure.render(30, 30).map(singleLineMenuText);
+	assert.ok(wrappedDisclosureLines.some((line) => line.includes("before")) && wrappedDisclosureLines.some((line) => line.includes("applying")), "the complete wrapped selected action is rendered even when ordinary rows fit vertically");
+	wrappedDisclosure.handleInput("\r");
+	assert.equal(wrappedDisclosureSelected, true);
+	const narrowDisclosure = new SelectionPanel("Confirm action", [{ label: "Apply" }], () => {}, { requireFullDisclosure: true });
+	const narrowDisclosureLines = narrowDisclosure.render(21, 10).map(singleLineMenuText);
+	assert.equal(narrowDisclosure.selectionAcceptable, true);
+	assert.ok(narrowDisclosureLines.some((line) => line.includes("enter select")) && narrowDisclosureLines.some((line) => line.includes("esc cancel")), "enabled destructive controls are fully visible even when they wrap");
+	const widthBlockedDisclosure = new SelectionPanel("Confirm", [
+		{ label: "Apply", description: "Do it" }, ...Array.from({ length: 11 }, (_, index) => ({ label: `Other ${index}` })),
+	], () => {}, { requireFullDisclosure: true });
+	const widthBlockedLines = widthBlockedDisclosure.render(19, 10).map(singleLineMenuText);
+	assert.equal(widthBlockedDisclosure.selectionAcceptable, false);
+	assert.ok(widthBlockedLines.some((line) => line.includes("enter disabled")) && !widthBlockedLines.some((line) => line.includes("enter select")), "a width-blocked destructive picker advertises its disabled state");
 
 	const filter = new SelectionPanel("Resume session", [
 		{ label: "Needle Session", value: "019f-test-session" },
@@ -218,6 +278,22 @@ assert.equal(singleLineMenuText("approve \u202edeny\u2066 choice"), "approve \u2
 	filter.handleInput("\x15");
 	filter.handleInput("Needle\nSession");
 	assert.equal(filter.query, "Needle Session");
+
+	let ordinarySelection;
+	const ordinary = new SelectionPanel("Choose", [
+		{ label: "First", value: "first" },
+		{ label: "Second", value: "second" },
+	], (entry) => { ordinarySelection = entry.value; });
+	ordinary.render(80, 10);
+	ordinary.handleInput("\x1b[B");
+	ordinary.handleInput("\r");
+	assert.equal(ordinarySelection, undefined, "ordinary picker navigation invalidates confirmation until repaint");
+	ordinary.render(80, 10);
+	ordinary.handleInput("\r");
+	assert.equal(ordinarySelection, "second");
+	ordinary.handleInput("F");
+	ordinary.handleInput("\r");
+	assert.equal(ordinarySelection, "second", "ordinary picker filtering cannot confirm a newly hidden selection before repaint");
 }
 
 function clipboardReplayHarness() {
@@ -1090,6 +1166,77 @@ await (async () => {
 	releaseMain();
 	await exiting;
 	assert.deepEqual(events.slice(-3), ["side:end", "main:end", "exit:0"]);
+})();
+
+// A failed /btw stop keeps its exact client handle until final process shutdown
+// can force and confirm the tree again.
+await (async () => {
+	let stopAttempts = 0;
+	let forced = 0;
+	const exits = [];
+	const sideClient = {
+		async stopAndWait() {
+			stopAttempts += 1;
+			if (stopAttempts === 1) throw new Error("simulated unconfirmed side tree");
+		},
+		forceStop() { forced += 1; },
+	};
+	const app = Object.create(HarnessApp.prototype);
+	Object.assign(app, {
+		stopping: false,
+		btwThread: undefined,
+		btwShutdownTail: undefined,
+		btwShutdownClients: new WeakMap(),
+		activeBtwShutdownClients: new Set(),
+		failedBtwShutdownClients: new Set(),
+		backendCommandCacheTimers: new Map(),
+		clearCancelGraceTimer() {},
+		cancelPermissionPrompts() {},
+		recordReplacementProcessFence() { return true; },
+		reportReplacementProcessFence() {},
+		addError() {},
+		ui: { stop() {} },
+	});
+	await app.trackBtwShutdown(sideClient);
+	assert.equal(app.failedBtwShutdownClients.has(sideClient), true);
+	assert.equal(app.activeBtwShutdownClients.has(sideClient), true, "an unconfirmed side client remains reachable for final shutdown");
+	await app.stopAndExit({ skipUiStop: true, exit: (code) => exits.push(code) });
+	assert.equal(stopAttempts, 2, "final shutdown retries the retained side process tree");
+	assert.ok(forced >= 1);
+	assert.equal(app.failedBtwShutdownClients.size, 0);
+	assert.deepEqual(exits, [0]);
+})();
+
+// Native command retirements that already failed remain reachable and receive
+// a fresh bounded stop confirmation during final shutdown.
+await (async () => {
+	let stopAttempts = 0;
+	let forced = 0;
+	const exits = [];
+	const retiredClient = {
+		async stopAndWait() { stopAttempts += 1; },
+		forceStop() { forced += 1; },
+	};
+	const app = Object.create(HarnessApp.prototype);
+	Object.assign(app, {
+		stopping: false,
+		activeRetiredClientShutdowns: new Set(),
+		btwThread: undefined,
+		btwShutdownTail: undefined,
+		agentSwitchTail: undefined,
+		backendCommandCacheTimers: new Map(),
+		clearCancelGraceTimer() {},
+		cancelPermissionPrompts() {},
+		ui: { stop() {} },
+	});
+	const original = Promise.reject(new Error("simulated failed native retirement"));
+	void app.trackRetiredClientShutdown([retiredClient], original).catch(() => {});
+	await new Promise((resolve) => setImmediate(resolve));
+	await app.stopAndExit({ skipUiStop: true, exit: (code) => exits.push(code) });
+	assert.equal(stopAttempts, 1, "final shutdown performs a fresh stopAndWait after the original retirement rejected");
+	assert.ok(forced >= 1);
+	assert.equal(app.activeRetiredClientShutdowns.size, 0);
+	assert.deepEqual(exits, [0]);
 })();
 
 // Shutdown owns every rejection and waits for all cleanup before reporting a

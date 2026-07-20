@@ -1,48 +1,78 @@
 name: Dynamic workflows authenticated release
 
 on:
-  workflow_dispatch:
-  push:
-    branches:
-      - workflows
+  workflow_call: {}
 
 permissions:
   contents: read
 
 jobs:
   authenticated-release:
+    if: >-
+      github.ref == 'refs/heads/main' || github.ref == 'refs/heads/workflows' || github.ref == 'refs/heads/workflows-wip-2026-07-19'
     runs-on: macos-15
-    timeout-minutes: 60
+    timeout-minutes: 30
     environment: dynamic-workflows-release
-    env:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Bootstrap digest-pinned Node/npm
+        shell: bash
+        run: bash scripts/bootstrap-release-node.sh
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          node-version: 22
-          cache: npm
-      - name: Install tmux
-        run: command -v tmux >/dev/null 2>&1 || brew install tmux
-      - run: npm ci --ignore-scripts
+          name: dynamic-workflows-candidate-${{ github.sha }}
+          path: ${{ runner.temp }}/cc-candidate
+      - name: Verify exact release toolchain
+        run: |
+          NPM_CLI="$(node -e 'const fs=require("fs"); const path=require("path"); const node=fs.realpathSync(process.execPath); const cli=path.join(path.dirname(path.dirname(node)),"lib/node_modules/npm/bin/npm-cli.js"); if(!fs.statSync(cli).isFile()) throw new Error("npm is not installed beside Node"); process.stdout.write(fs.realpathSync(cli))')"
+          echo "CC_RELEASE_NPM_CLI=$NPM_CLI" >> "$GITHUB_ENV"
+          node scripts/release-workflows.mjs verify-toolchain
+          TOOLCHAIN="$(node -e 'const cp=require("child_process"); const fs=require("fs"); const npmCli=fs.realpathSync(process.argv[1]); process.stdout.write(JSON.stringify({nodeVersion:process.versions.node,npmVersion:cp.execFileSync(process.execPath,[npmCli,"--version"],{encoding:"utf8"}).trim(),npmInstallationSha256:"930c1fa35e5525e3b60c584fc3709c7cf71d62134d66fdc88a6e0fe8fc72dc6d"}))' "$NPM_CLI")"
+          echo "CC_EXPECTED_RELEASE_TOOLCHAIN=$TOOLCHAIN" >> "$GITHUB_ENV"
+      - name: Verify and select exact candidate
+        run: |
+          TARBALL="$(node scripts/verify-release-candidate.mjs "$RUNNER_TEMP/cc-candidate" "$GITHUB_SHA")"
+          echo "CC_WORKFLOW_E2E_TARBALL=$TARBALL" >> "$GITHUB_ENV"
+      - name: Build digest-pinned tmux
+        run: bash scripts/install-pinned-tmux.sh
+      - run: node "$CC_RELEASE_NPM_CLI" ci --include=optional --ignore-scripts
       - run: node scripts/postinstall.mjs
-      - name: Deterministic release gates and authenticated installed-artifact E2E
+      - name: Authenticated installed-artifact GPT-5.6 High E2E
+        id: live_gate
         env:
+          # Keep the model credential out of checkout, setup, install, and upload.
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           CC_WORKFLOW_E2E_RESULT_PATH: ${{ github.workspace }}/dynamic-workflows-live-result.json
         run: |
-          set -o pipefail
-          npm pack --ignore-scripts --json > dynamic-workflows-pack.json
-          TARBALL="$(node -e 'const fs=require("fs"); console.log(JSON.parse(fs.readFileSync("dynamic-workflows-pack.json","utf8"))[0].filename)')"
-          shasum -a 256 "$TARBALL" > "$TARBALL.sha256"
-          CC_WORKFLOW_E2E_TARBALL="$PWD/$TARBALL" npm run release:workflows 2>&1 | tee dynamic-workflows-live-release.log
-      - uses: actions/upload-artifact@v4
+          node "$CC_RELEASE_NPM_CLI" run test:workflows:e2e:live
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        if: always()
+        with:
+          name: dynamic-workflows-candidate-${{ github.sha }}
+          path: ${{ runner.temp }}/cc-candidate-retained
+      - name: Ensure retained failure evidence exists
+        if: always()
+        env:
+          RELEASE_GATE_OUTCOME: ${{ steps.live_gate.outcome }}
+        run: |
+          node -e 'const fs=require("fs"); let raw={}; try { raw=JSON.parse(fs.readFileSync("dynamic-workflows-live-result.json","utf8")); } catch {} const oneOf=(value,allowed,fallback)=>allowed.includes(value)?value:fallback; const count=(value)=>Number.isSafeInteger(value)&&value>=0&&value<=10000?value:0; const truth=(value)=>value===true; const safe={version:1,exitStatus:oneOf(raw.exitStatus,[0,1],1),stage:oneOf(raw.stage,["preflight","artifact-installed","workflow-started","workflow-completed","routing-validated","delivery-confirmed","passed"],"release-workflow"),status:oneOf(raw.status,["pending","running","paused","completed","failed","cancelled","interrupted"],null),deliveryState:oneOf(raw.deliveryState,["not-ready","pending","queued","waiting-for-session","sending","delivered","ambiguous","failed-to-queue","failed-to-persist","origin-retired","not-delivered-after-restart"],null),agentReadyCount:count(raw.agentReadyCount),agentCompletedCount:count(raw.agentCompletedCount),runCompletedCount:count(raw.runCompletedCount),modelRoutingValidated:truth(raw.modelRoutingValidated),parallelRoutingValidated:truth(raw.parallelRoutingValidated),expectedOutputsValidated:truth(raw.expectedOutputsValidated),deliveryValidated:truth(raw.deliveryValidated),parseErrors:count(raw.parseErrors)}; if(process.env.RELEASE_GATE_OUTCOME!=="success") safe.evidenceError="live E2E did not complete successfully"; fs.writeFileSync("dynamic-workflows-live-result.json.tmp",JSON.stringify(safe,null,2)+"\n"); fs.renameSync("dynamic-workflows-live-result.json.tmp","dynamic-workflows-live-result.json"); fs.writeFileSync("dynamic-workflows-live.log",Object.entries(safe).filter(([,value])=>value!==null&&value!==undefined).map(([key,value])=>key+"="+String(value)).join("\n")+"\n")'
+          TARBALL="$(node scripts/verify-release-candidate.mjs "$RUNNER_TEMP/cc-candidate-retained" "$GITHUB_SHA")"
+          node -e 'const fs=require("fs"); const path=require("path"); const root=path.dirname(process.argv[1]); const tarball=path.basename(process.argv[1]); for(const name of ["dynamic-workflows-pack.json","dynamic-workflows-candidate.json",tarball,tarball+".sha256"]) fs.copyFileSync(path.join(root,name),name,fs.constants.COPYFILE_EXCL)' "$TARBALL"
+      - name: Mark the protected candidate validated
+        if: steps.live_gate.outcome == 'success'
+        run: |
+          node -e 'const cp=require("child_process"); const fs=require("fs"); const evidence=JSON.parse(fs.readFileSync("dynamic-workflows-live-result.json","utf8")); const valid=evidence.exitStatus===0&&evidence.stage==="passed"&&evidence.status==="completed"&&evidence.deliveryState==="delivered"&&evidence.agentReadyCount===2&&evidence.agentCompletedCount===2&&evidence.runCompletedCount===1&&evidence.modelRoutingValidated===true&&evidence.parallelRoutingValidated===true&&evidence.expectedOutputsValidated===true&&evidence.deliveryValidated===true&&evidence.parseErrors===0&&!evidence.evidenceError; if(!valid) throw new Error("authenticated live evidence is incomplete or contradictory"); const candidate=JSON.parse(fs.readFileSync("dynamic-workflows-candidate.json","utf8")); const npmCli=fs.realpathSync(process.env.CC_RELEASE_NPM_CLI); const validationToolchain={nodeVersion:process.versions.node,npmVersion:cp.execFileSync(process.execPath,[npmCli,"--version"],{encoding:"utf8"}).trim(),npmInstallationSha256:"930c1fa35e5525e3b60c584fc3709c7cf71d62134d66fdc88a6e0fe8fc72dc6d"}; if(JSON.stringify(candidate.toolchain)!==JSON.stringify(validationToolchain)) throw new Error("authenticated validation toolchain differs from candidate provenance"); const validationTools={tmuxVersion:process.env.CC_RELEASE_TMUX_VERSION,tmuxSourceSha256:process.env.CC_RELEASE_TMUX_SHA256,libeventVersion:process.env.CC_RELEASE_LIBEVENT_VERSION,libeventSourceSha256:process.env.CC_RELEASE_LIBEVENT_SHA256,runnerImageVersion:process.env.CC_RELEASE_RUNNER_IMAGE_VERSION,runnerOsVersion:process.env.CC_RELEASE_RUNNER_OS_VERSION}; if(validationTools.tmuxVersion!=="3.5a"||validationTools.tmuxSourceSha256!=="16216bd0877170dfcc64157085ba9013610b12b082548c7c9542cc0103198951"||validationTools.libeventVersion!=="2.1.12-stable"||validationTools.libeventSourceSha256!=="92e6de1be9ec176428fd2367677e61ceffc2ee1cb119035037a27d346b0403bb") throw new Error("authenticated validation tools differ from pinned sources"); fs.writeFileSync("dynamic-workflows-validated.json",JSON.stringify({...candidate,validationToolchain,validationTools,validated:true,gates:["disabled-package-smoke","dynamic-workflows-release","authenticated-live-release"]},null,2)+"\n")'
+      - uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
         if: always()
         with:
           name: dynamic-workflows-live-release-${{ github.sha }}
           path: |
-            dynamic-workflows-live-release.log
-            dynamic-workflows-pack.json
             dynamic-workflows-live-result.json
+            dynamic-workflows-live.log
+            dynamic-workflows-pack.json
+            dynamic-workflows-candidate.json
+            dynamic-workflows-validated.json
             cc-*.tgz
             cc-*.tgz.sha256
           if-no-files-found: error
+          retention-days: 30

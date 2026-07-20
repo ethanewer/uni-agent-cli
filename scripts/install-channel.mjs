@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Install cc from immutable git snapshots without touching npm's global prefix.
+// Install cc from immutable validated candidates or development Git snapshots
+// without touching npm's global prefix.
 //
 // Layout (overridable with --root / CC_INSTALL_ROOT):
 //   ~/.local/share/cc/channels/{stable,beta}/releases/<commit>
@@ -9,15 +10,27 @@
 // Each release owns its node_modules and ACP adapters. A release is fully built
 // and smoke-tested before the channel's `current` link is replaced atomically.
 import { spawnSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import { gunzipSync } from "node:zlib";
+import {
+	assertPinnedNpmInstallation,
+	RELEASE_NODE_VERSION,
+	RELEASE_NPM_INSTALLATION_SHA256,
+	RELEASE_NPM_VERSION,
+	releaseNpmInstallationSha256,
+} from "./release-toolchain.mjs";
+import { validateShrinkwrapProvenance } from "./shrinkwrap-policy.mjs";
+import { verifyReleaseCandidate } from "./verify-release-candidate.mjs";
+import { trustedExecutableOnPath, userControlledPathRoots, windowsTrustedExecutableRoots } from "../src/workflows/trusted-executable.mjs";
 
 export const CHANNELS = Object.freeze({
 	stable: Object.freeze({ command: "cc", defaultRef: "main", isolateState: false }),
-	beta: Object.freeze({ command: "cc2", defaultRef: "ux-0711", isolateState: true }),
+	beta: Object.freeze({ command: "cc2", defaultRef: "origin/ux-0711", isolateState: true }),
 });
 
 export const CHANNEL_ADAPTERS = Object.freeze([
@@ -26,13 +39,22 @@ export const CHANNEL_ADAPTERS = Object.freeze([
 	Object.freeze({ package: "pi-acp", bin: "pi-acp", minimumVersion: "0.0.31" }),
 ]);
 
+// Snapshots predating dynamic workflows shipped only these two adapters. Keep
+// their historical floor so an already-installed immutable release remains a
+// valid rollback target after the installer itself is upgraded.
+const LEGACY_CHANNEL_ADAPTERS = Object.freeze([
+	Object.freeze({ package: "@agentclientprotocol/claude-agent-acp", bin: "claude-agent-acp" }),
+	Object.freeze({ package: "@agentclientprotocol/codex-acp", bin: "codex-acp", minimumVersion: "1.1.2" }),
+]);
+
 export const WORKFLOW_RELEASE_FILES = Object.freeze([
-	"LICENSE", "LICENSE-APACHE-2.0", "NOTICE", "src/harness/terminal-safety.mjs",
+	"LICENSE", "LICENSE-APACHE-2.0", "NOTICE", "src/terminal-restore.mjs", "src/harness/terminal-safety.mjs",
 	"src/harness/acp-base.mjs", "src/harness/interface.mjs", "src/harness/adapters/claude.mjs",
 	"src/harness/adapters/codex.mjs", "src/harness/adapters/cursor.mjs", "src/harness/adapters/opencode.mjs",
 	"src/harness/adapters/pi.mjs", "src/harnesses/acp_bridge.py", "src/harnesses/mini_swe_agent/bridge.py",
 	"src/harnesses/terminus_2/bridge.py",
 	"src/workflows/adapter-executor.mjs", "src/workflows/broker.mjs", "src/workflows/durability.mjs",
+	"src/workflows/trusted-executable.mjs",
 	"src/workflows/journal.mjs", "src/workflows/manager.mjs", "src/workflows/mcp-server.mjs",
 	"src/workflows/meta.mjs", "src/workflows/ownership-lock.mjs", "src/workflows/personal-workflow-helper.mjs",
 	"src/workflows/project-save-helper.py", "src/workflows/registry.mjs", "src/workflows/sandbox-child.mjs",
@@ -55,35 +77,27 @@ function runtimeSourceFiles(root) {
 	return files.sort();
 }
 
-const ADAPTER_FALLBACK_VERSIONS = Object.freeze({
-	stable: Object.freeze({
-		"@agentclientprotocol/claude-agent-acp": "0.39.0",
-		"@agentclientprotocol/codex-acp": "1.1.4",
-		"pi-acp": "0.0.31",
-	}),
-	beta: Object.freeze({
-		"@agentclientprotocol/claude-agent-acp": "0.59.0",
-		"@agentclientprotocol/codex-acp": "1.1.4",
-		"pi-acp": "0.0.31",
-	}),
-});
-
 const MANAGED_RELEASE_NAME = /^[0-9a-f]{40,64}$/u;
 const MANAGED_TOMBSTONE_NAME = /^\.([0-9a-f]{40,64})\.gc-[0-9]+-[0-9]+$/u;
 const GUARDED_LAUNCHER_MARKER = "cc-channel-runner-protocol: 1";
 const UNGUARDED_MIGRATION_MARKER = ".cc-unguarded-launch";
+const ROLLBACK_TRANSACTION_FILE = ".rollback-transaction.json";
 const LAUNCH_LEASE_GRACE_MS = 60_000;
 const RUNTIME_LOCK_WAIT_MS = 30_000;
 
 function usage() {
-	return `Install stable and beta cc channels from immutable git snapshots.
+	return `Install stable and beta cc channels from immutable reviewed candidates.
 
 Usage:
   node scripts/install-channel.mjs <stable|beta|all> [options]
   node scripts/install-channel.mjs <stable|beta> --rollback [options]
 
 Options:
-  --ref <git-ref>   Override main (stable) or ux-0711 (beta)
+  --ref <git-ref>   Override main (stable) or origin/ux-0711 (beta)
+  --candidate-dir <path>
+                     Promote the protected validated candidate in this directory
+  --expected-commit <sha>
+                     Independently anchor --candidate-dir to this reviewed commit
   --repo <path>     Source git repository (default: repository containing this script)
   --root <path>     Install root (default: ~/.local/share/cc)
   --bin-dir <path>  Launcher directory (default: ~/.local/bin)
@@ -94,7 +108,7 @@ Environment overrides: CC_INSTALL_ROOT and CC_BIN_DIR.`;
 }
 
 export function parseArgs(argv) {
-	const options = { target: undefined, ref: undefined, repo: undefined, root: undefined, binDir: undefined, rollback: false };
+	const options = { target: undefined, ref: undefined, candidateDir: undefined, expectedCommit: undefined, repo: undefined, root: undefined, binDir: undefined, rollback: false };
 	for (let index = 0; index < argv.length; index += 1) {
 		const value = argv[index];
 		if (value === "-h" || value === "--help") return { ...options, help: true };
@@ -102,11 +116,13 @@ export function parseArgs(argv) {
 			options.rollback = true;
 			continue;
 		}
-		if (["--ref", "--repo", "--root", "--bin-dir"].includes(value)) {
+		if (["--ref", "--candidate-dir", "--expected-commit", "--repo", "--root", "--bin-dir"].includes(value)) {
 			const next = argv[index + 1];
 			if (!next || next.startsWith("--")) throw new Error(`${value} requires a value`);
 			index += 1;
 			if (value === "--ref") options.ref = next;
+			else if (value === "--candidate-dir") options.candidateDir = path.resolve(next);
+			else if (value === "--expected-commit") options.expectedCommit = next.toLowerCase();
 			else if (value === "--repo") options.repo = next;
 			else if (value === "--root") options.root = next;
 			else options.binDir = next;
@@ -119,7 +135,13 @@ export function parseArgs(argv) {
 	if (!options.target) throw new Error("choose a channel: stable, beta, or all");
 	if (![...Object.keys(CHANNELS), "all"].includes(options.target)) throw new Error(`unknown channel: ${options.target}`);
 	if (options.target === "all" && options.ref) throw new Error("--ref cannot be used with all; install each channel separately");
+	if (options.target === "all" && options.candidateDir) throw new Error("--candidate-dir requires one channel");
+	if (options.target === "all" && options.expectedCommit) throw new Error("--expected-commit requires one channel");
 	if (options.target === "all" && options.rollback) throw new Error("--rollback requires one channel");
+	if (options.rollback && options.candidateDir) throw new Error("--candidate-dir cannot be combined with --rollback");
+	if (options.ref && options.candidateDir) throw new Error("--candidate-dir cannot be combined with --ref");
+	if (options.candidateDir && !/^[0-9a-f]{40}$/u.test(options.expectedCommit ?? "")) throw new Error("--candidate-dir requires --expected-commit with a full reviewed Git SHA");
+	if (options.expectedCommit && !options.candidateDir) throw new Error("--expected-commit requires --candidate-dir");
 	return options;
 }
 
@@ -178,27 +200,268 @@ function run(command, args, options = {}) {
 	return result;
 }
 
+function credentialFreeEnvironment(environment = process.env, platform = process.platform) {
+	const scrubbed = { ...environment };
+	for (const [name, value] of Object.entries(scrubbed)) {
+		if (/^GIT_/iu.test(name) || /(?:key|token|secret|password|credential|auth)/iu.test(name) || /(?:^|_)pat(?:_|$)/iu.test(name) ||
+			/^npm_config_.*(?:auth|token|userconfig|globalconfig)/iu.test(name) || /[\r\n]/u.test(String(value ?? "")) || credentialBearingUrl(value)) delete scrubbed[name];
+	}
+	const configs = emptyNpmConfigFiles();
+	scrubbed.npm_config_userconfig = configs.user;
+	scrubbed.npm_config_globalconfig = configs.global;
+	return scrubbed;
+}
+
+let emptyNpmConfigs;
+function emptyNpmConfigFiles() {
+	if (emptyNpmConfigs) return emptyNpmConfigs;
+	const directory = fs.mkdtempSync(path.join(os.tmpdir(), "cc-empty-npm-config-"));
+	const user = path.join(directory, "user.npmrc");
+	const global = path.join(directory, "global.npmrc");
+	fs.writeFileSync(user, "", { mode: 0o600 });
+	fs.writeFileSync(global, "", { mode: 0o600 });
+	emptyNpmConfigs = { user, global };
+	process.once("exit", () => { try { fs.rmSync(directory, { recursive: true, force: true }); } catch {} });
+	return emptyNpmConfigs;
+}
+
+function credentialBearingUrl(value) {
+	if (typeof value !== "string" || !value.includes("://")) return false;
+	if (/[\r\n]/u.test(value) || /[a-z][a-z0-9+.-]*:\/\/[^\s/@]+@/iu.test(value) ||
+		/[a-z][a-z0-9+.-]*:\/\/[^\s]*[?#]/iu.test(value)) return true;
+	try {
+		const parsed = new URL(value);
+		// Query strings and fragments are opaque enough that a token cannot be
+		// distinguished reliably from ordinary data. Child install/verification
+		// processes do not need such URLs, so exclude them conservatively.
+		return Boolean(parsed.username || parsed.password || parsed.search || parsed.hash);
+	} catch { return false; }
+}
+
 export function resolveCommit(repo, ref, runCommand = run) {
-	const result = runCommand("git", ["rev-parse", "--verify", `${ref}^{commit}`], { cwd: repo, encoding: "utf8" });
+	repo = path.resolve(repo);
+	const environment = credentialFreeEnvironment();
+	environment.GIT_NO_REPLACE_OBJECTS = "1";
+	const windowsTrustedRoots = process.platform === "win32" ? windowsTrustedExecutableRoots() : [];
+	const git = runCommand === run
+		? trustedExecutableOnPath("git", environment, [repo, ...userControlledPathRoots(process.cwd())], {
+			platform: process.platform, requireRootOwnership: process.platform !== "win32", allowedRoots: windowsTrustedRoots, windowsRoots: windowsTrustedRoots,
+		})
+		: "git";
+	const result = runCommand(git, ["--no-replace-objects", "-C", repo, "rev-parse", "--verify", `${ref}^{commit}`], {
+		cwd: repo,
+		encoding: "utf8",
+		env: environment,
+	});
 	const commit = String(result.stdout ?? "").trim().toLowerCase();
 	if (!/^[0-9a-f]{40,64}$/.test(commit)) throw new Error(`git returned an invalid commit for ${ref}`);
 	return commit;
 }
 
-function archiveRepository(repo, commit, destination, runCommand = run) {
-	const archive = runCommand("git", ["archive", "--format=tar", commit], {
+export function archiveRepository(repo, commit, destination, runCommand = run) {
+	repo = path.resolve(repo);
+	const env = credentialFreeEnvironment();
+	env.GIT_NO_REPLACE_OBJECTS = "1";
+	const excludedRoots = [repo, destination, ...userControlledPathRoots(process.cwd())];
+	const trustOptions = {
+		platform: process.platform,
+		requireRootOwnership: process.platform !== "win32",
+		allowedRoots: process.platform === "win32" ? windowsTrustedExecutableRoots() : [],
+	};
+	trustOptions.windowsRoots = trustOptions.allowedRoots;
+	const git = runCommand === run ? trustedExecutableOnPath("git", env, excludedRoots, trustOptions) : "git";
+	const tar = runCommand === run ? trustedExecutableOnPath("tar", env, excludedRoots, trustOptions) : "tar";
+	const archive = runCommand(git, ["--no-replace-objects", "-C", repo, "archive", "--format=tar", commit], {
 		cwd: repo,
 		encoding: null,
+		env,
 		stdio: ["ignore", "pipe", "pipe"],
 	});
-	runCommand("tar", ["-x", "-f", "-", "-C", destination], {
+	runCommand(tar, ["-x", "-f", "-", "-C", destination], {
 		input: archive.stdout,
+		env,
 		stdio: ["pipe", "inherit", "inherit"],
 	});
 }
 
+const MAX_CANDIDATE_BYTES = 64 * 1024 * 1024;
+const MAX_CANDIDATE_UNPACKED_BYTES = 64 * 1024 * 1024;
+const MAX_CANDIDATE_ENTRY_BYTES = 16 * 1024 * 1024;
+const MAX_CANDIDATE_ENTRIES = 4096;
+const MAX_CANDIDATE_PATH_BYTES = 512;
+
+export function snapshotCandidateTarball(candidate, destination) {
+	const snapshot = path.join(destination, `.candidate-${randomUUID()}.tgz`);
+	const sourceFlags = fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0);
+	let source;
+	let target;
+	try {
+		source = fs.openSync(candidate.tarball, sourceFlags);
+		const before = fs.fstatSync(source, { bigint: true });
+		if (!before.isFile() || before.size > BigInt(MAX_CANDIDATE_BYTES)) {
+			throw new Error("protected candidate tarball is not a bounded regular file");
+		}
+		target = fs.openSync(snapshot, "wx", 0o600);
+		const digest = createHash("sha256");
+		const buffer = Buffer.allocUnsafe(1024 * 1024);
+		let total = 0;
+		for (;;) {
+			const count = fs.readSync(source, buffer, 0, buffer.length, null);
+			if (count === 0) break;
+			total += count;
+			if (total > MAX_CANDIDATE_BYTES) throw new Error("protected candidate tarball exceeds the size limit");
+			digest.update(buffer.subarray(0, count));
+			let offset = 0;
+			while (offset < count) offset += fs.writeSync(target, buffer, offset, count - offset);
+		}
+		fs.fsyncSync(target);
+		const after = fs.fstatSync(source, { bigint: true });
+		if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || BigInt(total) !== before.size ||
+			digest.digest("hex") !== candidate.provenance.sha256) {
+			throw new Error("protected candidate changed while it was being pinned for extraction");
+		}
+		return snapshot;
+	} catch (error) {
+		fs.rmSync(snapshot, { force: true });
+		throw error;
+	} finally {
+		if (target !== undefined) fs.closeSync(target);
+		if (source !== undefined) fs.closeSync(source);
+	}
+}
+
+function tarString(field) {
+	const end = field.indexOf(0);
+	const value = field.subarray(0, end < 0 ? field.length : end).toString("utf8");
+	if (value.includes("\ufffd")) throw new Error("validated candidate archive contains an invalid UTF-8 path");
+	return value;
+}
+
+function tarOctal(field, label) {
+	if ((field[0] & 0x80) !== 0) throw new Error(`validated candidate archive uses unsupported base-256 ${label}`);
+	const value = tarString(field).trim();
+	if (!/^[0-7]+$/u.test(value)) throw new Error(`validated candidate archive has invalid ${label}`);
+	const number = Number.parseInt(value, 8);
+	if (!Number.isSafeInteger(number) || number < 0) throw new Error(`validated candidate archive has unbounded ${label}`);
+	return number;
+}
+
+function assertSafeCandidateArchive(tarball) {
+	let archive;
+	try {
+		archive = gunzipSync(fs.readFileSync(tarball), { maxOutputLength: MAX_CANDIDATE_UNPACKED_BYTES });
+	} catch (error) {
+		throw new Error("validated candidate archive exceeds its expanded-size limit or is not valid gzip", { cause: error });
+	}
+	let offset = 0;
+	let entries = 0;
+	let totalBytes = 0;
+	let ended = false;
+	while (offset + 512 <= archive.length) {
+		const header = archive.subarray(offset, offset + 512);
+		if (header.every((byte) => byte === 0)) { ended = true; break; }
+		entries += 1;
+		if (entries > MAX_CANDIDATE_ENTRIES) throw new Error("validated candidate archive contains too many entries");
+		const recordedChecksum = tarOctal(header.subarray(148, 156), "checksum");
+		let checksum = 0;
+		for (let index = 0; index < 512; index += 1) checksum += index >= 148 && index < 156 ? 0x20 : header[index];
+		if (checksum !== recordedChecksum) throw new Error("validated candidate archive header checksum mismatch");
+		const type = header[156];
+		if (![0, 0x30, 0x35].includes(type)) throw new Error("validated candidate archive contains a link or special filesystem entry");
+		const name = tarString(header.subarray(0, 100));
+		const prefix = tarString(header.subarray(345, 500));
+		const entry = prefix ? `${prefix}/${name}` : name;
+		if (Buffer.byteLength(entry, "utf8") > MAX_CANDIDATE_PATH_BYTES || !entry.startsWith("package/")) {
+			throw new Error("validated candidate contains an unsafe package archive path");
+		}
+		const relative = entry.slice("package/".length).replace(/\/$/u, "");
+		if ((!relative && type !== 0x35) || relative.includes("\\") || (relative && relative.split("/").some((part) => part === "." || part === ".." || !part))) {
+			throw new Error("validated candidate contains an unsafe package archive path");
+		}
+		const size = tarOctal(header.subarray(124, 136), "entry size");
+		if (type === 0x35 && size !== 0) throw new Error("validated candidate archive directory contains data");
+		if (size > MAX_CANDIDATE_ENTRY_BYTES) throw new Error("validated candidate archive entry exceeds the size limit");
+		totalBytes += size;
+		if (totalBytes > MAX_CANDIDATE_UNPACKED_BYTES) throw new Error("validated candidate archive content exceeds the size limit");
+		offset += 512 + Math.ceil(size / 512) * 512;
+		if (offset > archive.length) throw new Error("validated candidate archive is truncated");
+	}
+	if (!ended || entries === 0 || archive.subarray(offset).some((byte) => byte !== 0)) {
+		throw new Error("validated candidate archive has invalid termination");
+	}
+}
+
+export function extractReleaseCandidate(candidate, destination, runCommand = run) {
+	const environment = credentialFreeEnvironment();
+	const excludedRoots = [candidate.root, destination, ...userControlledPathRoots(process.cwd())];
+	const tar = runCommand === run
+		? trustedExecutableOnPath("tar", environment, excludedRoots, { requireRootOwnership: process.platform !== "win32" })
+		: "tar";
+	assertSafeCandidateArchive(candidate.tarball);
+	runCommand(tar, ["-xzf", candidate.tarball, "--strip-components", "1", "-C", destination], {
+		env: environment, stdio: "inherit",
+	});
+}
+
+export function verifyCandidateMatchesCommit(candidate, repo, commit, runCommand = run) {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "cc-candidate-source-"));
+	const source = path.join(root, "source");
+	const packed = path.join(root, "packed");
+	fs.mkdirSync(source, { mode: 0o700 });
+	fs.mkdirSync(packed, { mode: 0o700 });
+	try {
+		const resolved = resolveCommit(repo, commit, runCommand);
+		if (resolved !== commit) throw new Error("reviewed candidate commit does not resolve to the independently supplied SHA");
+		archiveRepository(repo, commit, source, runCommand);
+		const environment = credentialFreeEnvironment();
+		const npm = npmInvocation({ env: environment });
+		const npmInstallationSha256 = assertPinnedNpmInstallation(npm.prefixArgs[0]);
+		const version = runCommand(npm.command, [...npm.prefixArgs, "--version"], {
+			encoding: "utf8", env: environment, stdio: ["ignore", "pipe", "pipe"],
+		});
+		if (process.versions.node !== RELEASE_NODE_VERSION || String(version.stdout ?? "").trim() !== RELEASE_NPM_VERSION ||
+			npmInstallationSha256 !== releaseNpmInstallationSha256() || JSON.stringify(candidate.provenance.toolchain) !== JSON.stringify({
+				nodeVersion: RELEASE_NODE_VERSION, npmVersion: RELEASE_NPM_VERSION, npmInstallationSha256: RELEASE_NPM_INSTALLATION_SHA256,
+			})) {
+			throw new Error("candidate source verification requires the exact pinned Node/npm toolchain");
+		}
+		if (assertPinnedNpmInstallation(npm.prefixArgs[0]) !== npmInstallationSha256) {
+			throw new Error("candidate source verification npm installation changed before packing");
+		}
+		const result = runCommand(npm.command, [...npm.prefixArgs, "pack", "--ignore-scripts", "--json", "--pack-destination", packed], {
+			cwd: source, encoding: "utf8", env: environment, stdio: ["ignore", "pipe", "pipe"],
+		});
+		if (assertPinnedNpmInstallation(npm.prefixArgs[0]) !== npmInstallationSha256) {
+			throw new Error("candidate source verification npm installation changed while packing");
+		}
+		const metadata = JSON.parse(String(result.stdout ?? ""));
+		if (!Array.isArray(metadata) || metadata.length !== 1 || typeof metadata[0]?.filename !== "string") {
+			throw new Error("trusted commit did not produce exactly one package candidate");
+		}
+		const trustedTarball = path.join(packed, metadata[0].filename);
+		const digest = createHash("sha256").update(fs.readFileSync(trustedTarball)).digest("hex");
+		if (digest !== candidate.provenance.sha256) {
+			throw new Error("protected candidate does not exactly match the independently reviewed Git commit");
+		}
+		return true;
+	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+}
+
 export function installDependencies(releaseDir, runCommand = run, context = {}) {
-	const environment = { ...process.env, CC_SKIP_ADAPTER_INSTALL: "1", npm_config_global: "false" };
+	const nodeVersion = context.nodeVersion ?? process.versions.node;
+	if (!versionAtLeast(nodeVersion, "22.19.0")) throw new Error(`channel installation requires Node.js 22.19.0 or newer; found ${nodeVersion}`);
+	const lockFile = fs.existsSync(path.join(releaseDir, "npm-shrinkwrap.json")) ? "npm-shrinkwrap.json" : "package-lock.json";
+	let lock;
+	try { lock = JSON.parse(fs.readFileSync(path.join(releaseDir, lockFile), "utf8")); }
+	catch (error) { throw new Error(`release has no valid ${lockFile}`, { cause: error }); }
+	validateShrinkwrapProvenance(lock);
+	const environment = {
+		...credentialFreeEnvironment(process.env, context.platform ?? process.platform),
+		CC_SKIP_ADAPTER_INSTALL: "1",
+		npm_config_global: "false",
+	};
 	// A user's npm omit/optional defaults must not produce a release whose JS
 	// adapters exist but whose native Claude/Codex payloads are absent.
 	for (const name of ["npm_config_optional", "NPM_CONFIG_OPTIONAL", "npm_config_omit", "NPM_CONFIG_OMIT"]) {
@@ -209,68 +472,40 @@ export function installDependencies(releaseDir, runCommand = run, context = {}) 
 		env: environment,
 		execPath: context.execPath,
 	});
+	const authenticateNpm = context.assertPinnedNpmInstallation ?? assertPinnedNpmInstallation;
+	const npmInstallationSha256 = authenticateNpm(npm.prefixArgs[0]);
+	const versionResult = runCommand(npm.command, [...npm.prefixArgs, "--version"], {
+		encoding: "utf8", env: environment, stdio: ["ignore", "pipe", "inherit"],
+	});
+	const npmVersion = versionResult.status === 0 ? String(versionResult.stdout ?? "").trim() : "";
+	if (npmVersion !== "10.9.3") throw new Error(`channel installation requires exact npm 10.9.3; found ${npmVersion || "unavailable"}`);
+	if (authenticateNpm(npm.prefixArgs[0]) !== npmInstallationSha256) throw new Error("channel npm installation changed before dependency installation");
 	runCommand(npm.command, [...npm.prefixArgs, "ci", "--global=false", "--omit=dev", "--include=optional", "--no-audit", "--no-fund"], {
 		cwd: releaseDir,
 		env: environment,
 	});
-	const manifest = JSON.parse(fs.readFileSync(path.join(releaseDir, "package.json"), "utf8"));
-	const declared = { ...manifest.dependencies, ...manifest.optionalDependencies };
-	const missing = CHANNEL_ADAPTERS.filter((adapter) => !Object.hasOwn(declared, adapter.package));
-	if (missing.length === 0) return;
-	const fallback = ADAPTER_FALLBACK_VERSIONS[context.channel];
-	if (!fallback) throw new Error(`no adapter fallback versions are defined for ${context.channel}`);
-	const dependencies = Object.fromEntries(missing.map((adapter) => [adapter.package, fallback[adapter.package]]));
-	const adapterDir = path.join(releaseDir, ".cc-adapters");
-	fs.mkdirSync(adapterDir, { mode: 0o755 });
-	fs.writeFileSync(
-		path.join(adapterDir, "package.json"),
-		`${JSON.stringify({ private: true, dependencies }, null, 2)}\n`,
-		{ mode: 0o644 },
-	);
-	runCommand(
-		npm.command,
-		[
-			...npm.prefixArgs,
-			"install",
-			"--global=false",
-			"--omit=dev",
-			"--include=optional",
-			"--no-audit",
-			"--no-fund",
-		],
-		{ cwd: adapterDir, env: environment },
-	);
+	if (authenticateNpm(npm.prefixArgs[0]) !== npmInstallationSha256) throw new Error("channel npm installation changed during dependency installation");
+	return {
+		nodeVersion,
+		npmVersion,
+		npmInstallationSha256,
+	};
 }
 
-/**
- * npm is a JavaScript entrypoint wrapped by `npm.cmd` on Windows. Node's
- * shell-free spawn cannot execute that wrapper directly, so locate npm-cli.js
- * and run it with the same trusted Node executable that is running cc's
- * installer. POSIX keeps the ordinary `npm` lookup for compatibility with
- * package managers that provide their own launcher.
- */
+/** Locate npm beside the exact Node runtime already executing this installer. */
 export function npmInvocation(options = {}) {
-	const platform = options.platform ?? process.platform;
-	if (platform !== "win32") return { command: "npm", prefixArgs: [] };
-	const environment = options.env ?? process.env;
 	const execPath = path.resolve(options.execPath ?? process.execPath);
-	const pathDelimiter = platform === "win32" ? ";" : path.delimiter;
 	const candidates = [];
 	const add = (candidate) => {
 		if (typeof candidate !== "string" || !candidate.trim()) return;
 		const resolved = path.resolve(candidate.trim());
 		if (!candidates.includes(resolved)) candidates.push(resolved);
 	};
-	// Prefer npm shipped beside the selected Node. An inherited npm_execpath can
-	// point at the package manager that launched this script under a different
-	// Node installation (or, in tests, a different simulated platform).
+	// Never resolve npm through PATH or npm_execpath: those values are inherited
+	// attacker-controlled inputs. Standard Node distributions place npm in one
+	// of these locations under the same installation prefix as process.execPath.
 	add(path.join(path.dirname(execPath), "node_modules", "npm", "bin", "npm-cli.js"));
-	add(environment.npm_execpath);
-	add(environment.NPM_EXECPATH);
-	for (const directory of String(environment.PATH ?? environment.Path ?? "").split(pathDelimiter)) {
-		if (!directory) continue;
-		add(path.join(directory, "node_modules", "npm", "bin", "npm-cli.js"));
-	}
+	add(path.join(path.dirname(execPath), "..", "lib", "node_modules", "npm", "bin", "npm-cli.js"));
 	const cli = candidates.find((candidate) => {
 		try {
 			return path.basename(candidate).toLowerCase() === "npm-cli.js" && fs.statSync(candidate).isFile();
@@ -279,7 +514,7 @@ export function npmInvocation(options = {}) {
 		}
 	});
 	if (!cli) {
-		throw new Error("could not locate npm-cli.js; install npm alongside Node or set npm_execpath");
+		throw new Error("could not locate npm-cli.js beside the active Node installation");
 	}
 	return { command: execPath, prefixArgs: [cli] };
 }
@@ -383,31 +618,86 @@ function requireOptionalPackageIdentity(parentManifest, aliasName, packageDir) {
 export function inspectNativePayloads(releaseDir, options = {}) {
 	const platform = options.platform ?? process.platform;
 	const arch = options.arch ?? process.arch;
+	const strict = options.strict !== false;
 	const names = nativePlatformNames(platform, arch, options.libc);
+	const releaseManifest = JSON.parse(fs.readFileSync(path.join(releaseDir, "package.json"), "utf8"));
 	const roots = [
 		path.join(releaseDir, "node_modules"),
 		path.join(releaseDir, ".cc-adapters", "node_modules"),
 	];
+	const claudeAdapter = packageDirectoryInRoots(roots, "@agentclientprotocol/claude-agent-acp");
 	const claudeSdk = packageDirectoryInRoots(roots, "@anthropic-ai/claude-agent-sdk");
 	const codexCli = packageDirectoryInRoots(roots, "@openai/codex");
+	if (strict && !claudeAdapter) throw new Error("@agentclientprotocol/claude-agent-acp is not installed in this release");
 	if (!claudeSdk) throw new Error("@anthropic-ai/claude-agent-sdk is not installed in this release");
 	if (!codexCli) throw new Error("@openai/codex is not installed in this release");
+	const claudeAdapterManifest = claudeAdapter
+		? JSON.parse(fs.readFileSync(path.join(claudeAdapter.packageDir, "package.json"), "utf8"))
+		: undefined;
 	const claudeManifest = JSON.parse(fs.readFileSync(path.join(claudeSdk.packageDir, "package.json"), "utf8"));
 	const codexManifest = JSON.parse(fs.readFileSync(path.join(codexCli.packageDir, "package.json"), "utf8"));
+	const expectedClaudeVersion = releaseManifest.dependencies?.["@anthropic-ai/claude-agent-sdk"];
+	const expectedCodexVersion = releaseManifest.dependencies?.["@openai/codex"];
+	if (strict && (typeof expectedClaudeVersion !== "string" || claudeManifest.name !== "@anthropic-ai/claude-agent-sdk" || claudeManifest.version !== expectedClaudeVersion)) {
+		throw new Error(
+			`direct Claude Agent SDK mismatch: expected @anthropic-ai/claude-agent-sdk@${expectedClaudeVersion ?? "(missing pin)"}, ` +
+			`found ${claudeManifest.name ?? "unknown"}@${claudeManifest.version ?? "unknown"}`,
+		);
+	}
+	if (strict && (typeof expectedCodexVersion !== "string" || codexManifest.name !== "@openai/codex" || codexManifest.version !== expectedCodexVersion)) {
+		throw new Error(
+			`direct Codex CLI mismatch: expected @openai/codex@${expectedCodexVersion ?? "(missing pin)"}, ` +
+			`found ${codexManifest.name ?? "unknown"}@${codexManifest.version ?? "unknown"}`,
+		);
+	}
+	const adapterSdkVersion = claudeAdapterManifest?.dependencies?.["@anthropic-ai/claude-agent-sdk"];
+	if (strict && (typeof adapterSdkVersion !== "string" || !adapterSdkVersion)) {
+		throw new Error("@agentclientprotocol/claude-agent-acp does not pin @anthropic-ai/claude-agent-sdk");
+	}
+	const nestedAdapterSdk = strict ? packageDirectoryInRoots(
+		[path.join(claudeAdapter.packageDir, "node_modules")],
+		"@anthropic-ai/claude-agent-sdk",
+	) : undefined;
+	const adapterSdk = strict
+		? nestedAdapterSdk ?? (claudeManifest.version === adapterSdkVersion ? claudeSdk : undefined)
+		: claudeSdk;
+	if (!adapterSdk) {
+		throw new Error(`Claude ACP Agent SDK ${adapterSdkVersion} is not installed in the adapter resolution tree`);
+	}
+	const adapterSdkManifest = JSON.parse(fs.readFileSync(path.join(adapterSdk.packageDir, "package.json"), "utf8"));
+	if (strict && (adapterSdkManifest.name !== "@anthropic-ai/claude-agent-sdk" || adapterSdkManifest.version !== adapterSdkVersion)) {
+		throw new Error(
+			`Claude ACP Agent SDK mismatch: expected @anthropic-ai/claude-agent-sdk@${adapterSdkVersion}, ` +
+			`found ${adapterSdkManifest.name ?? "unknown"}@${adapterSdkManifest.version ?? "unknown"}`,
+		);
+	}
 	if (!Object.hasOwn(claudeManifest.optionalDependencies ?? {}, names.claude)) {
 		throw new Error(`${claudeManifest.name} does not declare ${names.claude}`);
+	}
+	if (strict && !Object.hasOwn(adapterSdkManifest.optionalDependencies ?? {}, names.claude)) {
+		throw new Error(`the Claude ACP Agent SDK does not declare ${names.claude}`);
 	}
 	if (!Object.hasOwn(codexManifest.optionalDependencies ?? {}, names.codex)) {
 		throw new Error(`${codexManifest.name} does not declare ${names.codex}`);
 	}
 	const claudeNative = packageDirectoryInRoots(roots, names.claude);
+	const adapterClaudeNative = strict ? packageDirectoryInRoots(
+		[path.join(adapterSdk.packageDir, "node_modules"), path.join(claudeAdapter.packageDir, "node_modules"), ...roots],
+		names.claude,
+	) : claudeNative;
 	const codexNative = packageDirectoryInRoots(roots, names.codex);
 	if (!claudeNative) throw new Error(`${names.claude} native payload is not installed`);
+	if (!adapterClaudeNative) throw new Error(`${names.claude} native payload for Claude ACP is not installed`);
 	if (!codexNative) throw new Error(`${names.codex} native payload is not installed`);
 	requireOptionalPackageIdentity(claudeManifest, names.claude, claudeNative.packageDir);
+	if (strict) requireOptionalPackageIdentity(adapterSdkManifest, names.claude, adapterClaudeNative.packageDir);
 	requireOptionalPackageIdentity(codexManifest, names.codex, codexNative.packageDir);
 	const claudeBinary = requireNativeFile(
 		path.join(claudeNative.packageDir, platform === "win32" ? "claude.exe" : "claude"),
+		platform,
+	);
+	const adapterClaudeBinary = requireNativeFile(
+		path.join(adapterClaudeNative.packageDir, platform === "win32" ? "claude.exe" : "claude"),
 		platform,
 	);
 	const vendorDir = path.join(codexNative.packageDir, "vendor");
@@ -424,17 +714,26 @@ export function inspectNativePayloads(releaseDir, options = {}) {
 			}
 		});
 	if (!codexBinary) throw new Error(`${names.codex} does not contain an executable ${codexBinaryName}`);
-	return { claude: { package: names.claude, binary: claudeBinary }, codex: { package: names.codex, binary: codexBinary } };
+	return {
+		claude: { package: names.claude, binary: claudeBinary },
+		claudeAcp: { package: names.claude, binary: adapterClaudeBinary },
+		codex: { package: names.codex, binary: codexBinary },
+	};
+}
+
+function releaseRequiresWorkflows(releaseDir, manifest) {
+	const declaredFiles = Array.isArray(manifest?.files) ? manifest.files : [];
+	return declaredFiles.some((entry) => String(entry).startsWith("src/workflows/")) ||
+		["src/workflows", "LICENSE-APACHE-2.0", "src/harness/terminal-safety.mjs"]
+			.some((relative) => fs.existsSync(path.join(releaseDir, relative)));
 }
 
 export function verifyRelease(releaseDir, runCommand = run) {
 	let manifest;
 	try { manifest = JSON.parse(fs.readFileSync(path.join(releaseDir, "package.json"), "utf8")); }
 	catch (error) { throw new Error("release has an invalid package.json", { cause: error }); }
-	const declaredFiles = Array.isArray(manifest?.files) ? manifest.files : [];
-	const requiresWorkflows = declaredFiles.some((entry) => String(entry).startsWith("src/workflows/")) ||
-		["src/workflows", "LICENSE-APACHE-2.0", "src/harness/terminal-safety.mjs"].some((relative) => fs.existsSync(path.join(releaseDir, relative)));
-	for (const relative of ["package.json", "package-lock.json", "src/cc.mjs", "src/pi-harness.mjs", ...(requiresWorkflows ? WORKFLOW_RELEASE_FILES : [])]) {
+	const requiresWorkflows = releaseRequiresWorkflows(releaseDir, manifest);
+	for (const relative of ["package.json", requiresWorkflows ? "npm-shrinkwrap.json" : "package-lock.json", ...(requiresWorkflows ? WORKFLOW_RELEASE_FILES : []), "src/cc.mjs", "src/pi-harness.mjs"]) {
 		let stat;
 		try { stat = fs.lstatSync(path.join(releaseDir, relative)); } catch (error) {
 			if (error?.code === "ENOENT") throw new Error(`release is missing ${relative}`);
@@ -442,27 +741,31 @@ export function verifyRelease(releaseDir, runCommand = run) {
 		}
 		if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`release is missing ${relative}`);
 	}
-	const adapters = CHANNEL_ADAPTERS.map((adapter) => inspectAdapter(releaseDir, adapter));
-	inspectNativePayloads(releaseDir);
+	const adapters = (requiresWorkflows ? CHANNEL_ADAPTERS : LEGACY_CHANNEL_ADAPTERS)
+		.map((adapter) => inspectAdapter(releaseDir, adapter));
+	inspectNativePayloads(releaseDir, { strict: requiresWorkflows });
+	const credentialFreeEnv = credentialFreeEnvironment();
+	const python = process.platform === "win32" ? undefined : trustedExecutableOnPath("python3", credentialFreeEnv, [releaseDir, ...userControlledPathRoots(process.cwd())]);
+	const executablePathName = Object.keys(credentialFreeEnv).find((name) => name.toLowerCase() === "path") ?? "PATH";
 	const env = {
-		...process.env,
-		PATH: [
+		...credentialFreeEnv,
+		[executablePathName]: [
 			path.join(releaseDir, "node_modules", ".bin"),
 			path.join(releaseDir, ".cc-adapters", "node_modules", ".bin"),
-			process.env.PATH ?? "",
+			credentialFreeEnv[executablePathName] ?? "",
 		].join(path.delimiter),
 		CC_SKIP_ADAPTER_INSTALL: "1",
 	};
 	if (process.platform !== "win32") {
 		try {
-			runCommand("python3", ["-I", "-c", "import ast"], { env, stdio: ["ignore", "ignore", "pipe"] });
+			runCommand(python, ["-I", "-c", "import ast"], { env: credentialFreeEnv, stdio: ["ignore", "ignore", "pipe"] });
 		} catch (error) {
 			throw new Error("channel release verification requires python3 with the standard-library ast module", { cause: error });
 		}
 	}
 	for (const file of runtimeSourceFiles(releaseDir)) {
 		if (file.endsWith(".mjs")) runCommand(process.execPath, ["--check", file], { env });
-		else if (process.platform !== "win32") runCommand("python3", ["-I", "-c", "import ast,sys; ast.parse(open(sys.argv[1], encoding='utf-8').read(), filename=sys.argv[1])", file], { env });
+		else if (process.platform !== "win32") runCommand(python, ["-I", "-c", "import ast,sys; ast.parse(open(sys.argv[1], encoding='utf-8').read(), filename=sys.argv[1])", file], { env: credentialFreeEnv });
 	}
 	runCommand(process.execPath, [path.join(releaseDir, "src", "cc.mjs"), "--help"], {
 		env,
@@ -477,29 +780,131 @@ function writeMetadata(releaseDir, metadata) {
 	});
 }
 
+const RELEASE_RUNTIME_MARKERS = new Set([".cc-channel.json", ".cc-unguarded-launch"]);
+
+function releaseContentDigest(releaseDir, options = {}) {
+	const modeMask = options.modeMask ?? 0o777;
+	const digest = createHash("sha256");
+	digest.update(`d\0.\0${fs.lstatSync(releaseDir).mode & modeMask}\0`);
+	const visit = (directory, prefix = "") => {
+		for (const entry of fs.readdirSync(directory, { withFileTypes: true }).sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0)) {
+			const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+			if (!prefix && RELEASE_RUNTIME_MARKERS.has(entry.name)) continue;
+			const file = path.join(directory, entry.name);
+			const stat = fs.lstatSync(file);
+			if (stat.isDirectory()) {
+				digest.update(`d\0${relative}\0${stat.mode & modeMask}\0`);
+				visit(file, relative);
+			} else if (stat.isFile()) {
+				digest.update(`f\0${relative}\0${stat.mode & modeMask}\0${stat.size}\0`);
+				digest.update(fs.readFileSync(file));
+			} else if (stat.isSymbolicLink()) {
+				digest.update(`l\0${relative}\0${fs.readlinkSync(file)}\0`);
+			} else {
+				throw new Error(`release contains an unsupported filesystem entry: ${relative}`);
+			}
+		}
+	};
+	visit(releaseDir);
+	return digest.digest("hex");
+}
+
+function verifyInstalledReleaseContent(releaseDir, commit, context = {}, operations = {}) {
+	let metadata;
+	try { metadata = JSON.parse(fs.readFileSync(path.join(releaseDir, ".cc-channel.json"), "utf8")); }
+	catch (error) { throw new Error(`release ${commit} has no valid channel metadata`, { cause: error }); }
+	if (metadata?.commit !== commit) throw new Error(`release ${commit} metadata identifies a different commit`);
+	if (metadata.contentManifestVersion === 1 && /^[0-9a-f]{64}$/u.test(metadata.contentSha256 ?? "")) {
+		if (releaseContentDigest(releaseDir) !== metadata.contentSha256) throw new Error(`release ${commit} differs from its installed immutable content manifest`);
+		return;
+	}
+	if (metadata.contentManifestVersion !== undefined || !context.repo) {
+		throw new Error(`release ${commit} has no supported immutable content manifest and must be rematerialized from its immutable Git commit before reuse or rollback`);
+	}
+	// Releases installed before content manifests existed are upgraded only after
+	// reproducing the exact Git snapshot and locked dependency closure. Comparing
+	// the complete installed tree prevents a missing metadata field from becoming
+	// a downgrade path for modified dependencies.
+	const staging = fs.mkdtempSync(path.join(path.dirname(releaseDir), `.legacy-verify-${commit.slice(0, 12)}-`));
+	try {
+		if (process.platform !== "win32") {
+			const releaseRootMode = fs.lstatSync(releaseDir).mode & 0o777;
+			if ((releaseRootMode & 0o022) !== 0) throw new Error(`legacy release ${commit} has an unsafe writable root directory mode`);
+			// The original installer requested 0755 but a restrictive caller umask may
+			// legitimately have removed group/other read and execute bits throughout
+			// npm's tree. Owner permissions and executable semantics must still match.
+			fs.chmodSync(staging, releaseRootMode);
+		}
+		(operations.archiveRepository ?? archiveRepository)(context.repo, commit, staging, operations.runCommand ?? run);
+		(operations.installDependencies ?? installDependencies)(staging, operations.runCommand ?? run, { channel: context.channel });
+		const adapters = (operations.verifyRelease ?? verifyRelease)(staging, operations.runCommand ?? run);
+		const legacyDigestOptions = process.platform === "win32" ? {} : { modeMask: 0o700 };
+		const expectedDigest = releaseContentDigest(staging, legacyDigestOptions);
+		if (releaseContentDigest(releaseDir, legacyDigestOptions) !== expectedDigest) {
+			throw new Error(`legacy release ${commit} differs from its exact Git snapshot and locked dependency closure`);
+		}
+		const installedDigest = releaseContentDigest(releaseDir);
+		atomicReplaceFile(path.join(releaseDir, ".cc-channel.json"), `${JSON.stringify({
+			...metadata,
+			contentManifestVersion: 1,
+			contentSha256: installedDigest,
+			manifestUpgradedAt: new Date().toISOString(),
+			adapters,
+		}, null, 2)}\n`, 0o444);
+	} finally {
+		fs.rmSync(staging, { recursive: true, force: true });
+	}
+}
+
 export function materializeRelease(context, operations = {}) {
-	const { repo, ref, commit, releaseDir, releasesDir, channel } = context;
-	if (fs.existsSync(releaseDir)) {
+	const { repo, ref, commit, releaseDir, releasesDir, channel, candidate } = context;
+	const existing = fs.existsSync(releaseDir);
+	if (existing) {
+		verifyInstalledReleaseContent(releaseDir, commit, { repo, channel }, operations);
+		if (candidate) {
+			const metadata = JSON.parse(fs.readFileSync(path.join(releaseDir, ".cc-channel.json"), "utf8"));
+			if (metadata.candidateSha256 !== candidate.provenance.sha256 || metadata.packMetadataSha256 !== candidate.provenance.packMetadataSha256) {
+				throw new Error(`release ${commit} was not materialized from the selected protected candidate`);
+			}
+		}
 		const adapters = (operations.verifyRelease ?? verifyRelease)(releaseDir, operations.runCommand ?? run);
 		return { releaseDir, adapters, reused: true };
 	}
 	fs.mkdirSync(releasesDir, { recursive: true, mode: 0o755 });
 	const staging = path.join(releasesDir, `.${commit}.staging-${process.pid}-${Date.now()}`);
-	fs.mkdirSync(staging, { mode: 0o755 });
+	fs.mkdirSync(staging, { mode: candidate ? 0o700 : 0o755 });
 	try {
-		(operations.archiveRepository ?? archiveRepository)(repo, commit, staging, operations.runCommand ?? run);
-		(operations.installDependencies ?? installDependencies)(staging, operations.runCommand ?? run, { channel });
+		if (candidate) {
+			const snapshot = (operations.snapshotCandidateTarball ?? snapshotCandidateTarball)(candidate, staging);
+			try {
+				(operations.extractReleaseCandidate ?? extractReleaseCandidate)({ ...candidate, tarball: snapshot }, staging, operations.runCommand ?? run);
+			} finally { fs.rmSync(snapshot, { force: true }); }
+			if (process.platform !== "win32") fs.chmodSync(staging, 0o755);
+		}
+		else (operations.archiveRepository ?? archiveRepository)(repo, commit, staging, operations.runCommand ?? run);
+		const toolchain = (operations.installDependencies ?? installDependencies)(staging, operations.runCommand ?? run, { channel });
 		const adapters = (operations.verifyRelease ?? verifyRelease)(staging, operations.runCommand ?? run);
+		const contentSha256 = releaseContentDigest(staging);
 		writeMetadata(staging, {
 			channel,
 			commit,
 			leaseProtocol: 1,
+			contentManifestVersion: 1,
 			ref,
+			...(candidate ? {
+				candidateSha256: candidate.provenance.sha256,
+				packMetadataSha256: candidate.provenance.packMetadataSha256,
+				validatedGates: candidate.validated.gates,
+			} : {}),
 			installedAt: new Date().toISOString(),
 			node: process.version,
+			toolchain,
+			contentSha256,
 			adapters,
 		});
+		syncTreeSync(staging);
 		fs.renameSync(staging, releaseDir);
+		syncDirectorySync(releasesDir);
 		return { releaseDir, adapters, reused: false };
 	} catch (error) {
 		fs.rmSync(staging, { recursive: true, force: true });
@@ -593,6 +998,8 @@ function prepareChannelRuntime(paths) {
  */
 export function renderChannelRunner() {
 	return `#!/usr/bin/env node
+import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -604,9 +1011,59 @@ if (!currentLink || !leasesDir) {
 	console.error("cc channel runner: missing channel runtime paths");
 	process.exit(1);
 }
+let channelProcessToken = process.env.CC_CHANNEL_PROCESS_TOKEN;
+let channelProcessPid = Number(process.env.CC_CHANNEL_PROCESS_PID);
+if (process.platform === "darwin" && (!/^[0-9a-f]{32}$/u.test(channelProcessToken ?? "") || channelProcessPid !== process.pid)) {
+	if (typeof process.execve !== "function") throw new Error("this Node runtime cannot establish a stable macOS channel process identity");
+	channelProcessToken = randomUUID().replaceAll("-", "");
+	channelProcessPid = process.pid;
+	process.execve(process.execPath, process.argv, {
+		...process.env, CC_CHANNEL_PROCESS_TOKEN: channelProcessToken, CC_CHANNEL_PROCESS_PID: String(channelProcessPid),
+	});
+	throw new Error("macOS channel runner re-exec unexpectedly returned");
+}
+if (!/^[0-9a-f]{32}$/u.test(channelProcessToken ?? "")) channelProcessToken = randomUUID().replaceAll("-", "");
+channelProcessPid = process.pid;
+process.env.CC_CHANNEL_PROCESS_TOKEN = channelProcessToken;
+process.env.CC_CHANNEL_PROCESS_PID = String(channelProcessPid);
 
 const guard = path.join(path.dirname(currentLink), ".launch-gc-lock");
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const processIdentity = (pid) => {
+	if (process.platform === "linux") {
+		try {
+			const stat = fs.readFileSync("/proc/" + pid + "/stat", "utf8");
+			const bootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+			const close = stat.lastIndexOf(")");
+			const fields = close >= 0 ? stat.slice(close + 2).trim().split(/\\s+/u) : [];
+			if (fields[19] && bootId) return "linux:" + bootId + ":" + fields[19];
+		} catch {}
+	}
+	if (process.platform === "win32") {
+		// No portable Node API exposes a PID creation identity on Windows. Do not
+		// trust module-autoloaded PowerShell/WMI output for a destructive lease.
+		return undefined;
+	}
+	if (process.platform === "darwin") {
+		if (pid === process.pid && channelProcessPid === pid && /^[0-9a-f]{32}$/u.test(channelProcessToken ?? "")) {
+			return "darwin-token:" + pid + ":" + channelProcessToken;
+		}
+		const tokenResult = spawnSync("/bin/ps", ["eww", "-p", String(pid), "-o", "command="], {
+			encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], shell: false, timeout: 5000,
+		});
+		const fields = tokenResult.status === 0 ? tokenResult.stdout.split(/\\s+/u) : [];
+		const token = fields.find((field) => /^CC_CHANNEL_PROCESS_TOKEN=[0-9a-f]{32}$/u.test(field))?.split("=")[1];
+		const ownerPid = Number(fields.find((field) => /^CC_CHANNEL_PROCESS_PID=\\d+$/u.test(field))?.split("=")[1]);
+		if (token && ownerPid === pid) return "darwin-token:" + pid + ":" + token;
+		return undefined;
+	}
+	const ps = fs.existsSync("/bin/ps") ? "/bin/ps" : "/usr/bin/ps";
+	const result = spawnSync(ps, ["-o", "lstart=", ...(process.platform === "darwin" ? ["-o", "command="] : []), "-p", String(pid)], {
+		encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], shell: false, timeout: 5000,
+	});
+	const started = result.status === 0 ? result.stdout.trim() : "";
+	return started ? "ps:" + started : undefined;
+};
 const releaseOwnedGuard = (token) => {
 	const owner = JSON.parse(fs.readFileSync(path.join(guard, "owner.json"), "utf8"));
 	if (owner?.token !== token) throw new Error("channel maintenance guard ownership changed");
@@ -614,6 +1071,8 @@ const releaseOwnedGuard = (token) => {
 };
 const acquireGuard = async () => {
 	const deadline = Date.now() + ${RUNTIME_LOCK_WAIT_MS};
+	const identity = processIdentity(process.pid);
+	if (!identity) throw new Error("cannot establish a unique channel-runner process identity on this platform");
 	for (;;) {
 		const token = process.pid + "-" + Date.now() + "-" + Math.random().toString(16).slice(2);
 		try {
@@ -621,7 +1080,7 @@ const acquireGuard = async () => {
 			try {
 				fs.writeFileSync(
 					path.join(guard, "owner.json"),
-					JSON.stringify({ pid: process.pid, token, startedAt: new Date().toISOString() }) + "\\n",
+					JSON.stringify({ pid: process.pid, token, processIdentityVersion: 2, processIdentity: identity, startedAt: new Date().toISOString() }) + "\\n",
 					{ flag: "wx", mode: 0o600 },
 				);
 			} catch (error) {
@@ -655,8 +1114,10 @@ try {
 	entrypoint = fs.realpathSync(path.join(current, "src", "cc.mjs"));
 	const leaseDir = path.join(leasesDir, releaseId);
 	fs.mkdirSync(leaseDir, { recursive: true, mode: 0o700 });
+	const leaseIdentity = processIdentity(process.pid);
+	if (!leaseIdentity) throw new Error("cannot establish a unique channel lease process identity on this platform");
 	const leasePath = path.join(leaseDir, "run-" + process.pid + "-" + Math.random().toString(16).slice(2));
-	fs.writeFileSync(leasePath, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }) + "\\n", { flag: "wx", mode: 0o600 });
+	fs.writeFileSync(leasePath, JSON.stringify({ pid: process.pid, processIdentityVersion: 2, processIdentity: leaseIdentity, startedAt: new Date().toISOString() }) + "\\n", { flag: "wx", mode: 0o600 });
 	lease = leasePath;
 	process.env.PATH = [
 		path.join(current, "node_modules", ".bin"),
@@ -821,37 +1282,45 @@ function releaseHasUnguardedMigrationMarker(releaseDir) {
 
 function atomicReplaceFile(file, data, mode = 0o755) {
 	fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o755 });
-	const temporary = path.join(path.dirname(file), `.${path.basename(file)}.tmp-${process.pid}-${Date.now()}`);
-	const displaced = path.join(path.dirname(file), `.${path.basename(file)}.old-${process.pid}-${Date.now()}`);
-	let displacedExisting = false;
 	try {
-		fs.writeFileSync(temporary, data, { flag: "wx", mode });
-		fs.chmodSync(temporary, mode);
-		// POSIX rename replaces a file atomically. Windows rename does not replace an
-		// existing destination, so first move the old launcher aside and restore it if
-		// installing the fully-written replacement fails.
-		if (process.platform === "win32" && fs.existsSync(file)) {
-			fs.renameSync(file, displaced);
-			displacedExisting = true;
-		}
+		const stat = fs.lstatSync(file);
+		if (stat.isFile() && !stat.isSymbolicLink() && Buffer.compare(fs.readFileSync(file), Buffer.from(data)) === 0 &&
+			(process.platform === "win32" || (stat.mode & 0o777) === mode)) return;
+	} catch (error) { if (error?.code !== "ENOENT") throw error; }
+	const temporary = path.join(path.dirname(file), `.${path.basename(file)}.tmp-${process.pid}-${Date.now()}`);
+	try {
+		const descriptor = fs.openSync(temporary, "wx", mode);
+		try { fs.writeFileSync(descriptor, data); fs.fchmodSync(descriptor, mode); fs.fsyncSync(descriptor); }
+		finally { fs.closeSync(descriptor); }
 		fs.renameSync(temporary, file);
-		if (displacedExisting) fs.rmSync(displaced, { force: true });
-		displacedExisting = false;
-	} catch (error) {
-		if (displacedExisting) {
-			try {
-				fs.rmSync(file, { force: true });
-				fs.renameSync(displaced, file);
-				displacedExisting = false;
-			} catch (restoreError) {
-				error.cause = restoreError;
-			}
-		}
-		throw error;
+		syncDirectorySync(path.dirname(file));
 	} finally {
 		fs.rmSync(temporary, { force: true });
-		if (!displacedExisting) fs.rmSync(displaced, { force: true });
 	}
+}
+
+function syncDirectorySync(directory) {
+	if (process.platform === "win32") return;
+	const descriptor = fs.openSync(directory, "r");
+	try { fs.fsyncSync(descriptor); }
+	finally { fs.closeSync(descriptor); }
+}
+
+function syncTreeSync(root) {
+	if (process.platform === "win32") return;
+	const visit = (directory) => {
+		for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+			const file = path.join(directory, entry.name);
+			if (entry.isDirectory()) visit(file);
+			else if (entry.isFile()) {
+				const descriptor = fs.openSync(file, "r");
+				try { fs.fsyncSync(descriptor); }
+				finally { fs.closeSync(descriptor); }
+			}
+		}
+		syncDirectorySync(directory);
+	};
+	visit(root);
 }
 
 function restorePath(file, snapshot, platform = process.platform) {
@@ -932,8 +1401,13 @@ function reapDeadChannelRuntimeLock(paths, options = {}) {
 	}
 	const pid = Number(owner?.pid);
 	const token = owner?.token;
-	if (!Number.isInteger(pid) || pid <= 0 || typeof token !== "string" || !token) return false;
-	if ((options.processIsAlive ?? localProcessIsAlive)(pid)) return false;
+	const recordedIdentity = owner?.processIdentity;
+	if (!Number.isInteger(pid) || pid <= 0 || typeof token !== "string" || !token ||
+		owner?.processIdentityVersion !== 2 || typeof recordedIdentity !== "string" || !recordedIdentity) return false;
+	if ((options.processIsAlive ?? localProcessIsAlive)(pid)) {
+		const currentIdentity = (options.processIdentity ?? installerProcessIdentity)(pid);
+		if (!currentIdentity || currentIdentity === recordedIdentity) return false;
+	}
 	const retired = `${paths.runtimeLockDir}.stale-${process.pid}-${Date.now()}`;
 	try {
 		fs.renameSync(paths.runtimeLockDir, retired);
@@ -953,6 +1427,8 @@ function reapDeadChannelRuntimeLock(paths, options = {}) {
 function acquireChannelRuntimeLock(paths, options = {}) {
 	fs.mkdirSync(paths.channelDir, { recursive: true, mode: 0o755 });
 	const deadline = Date.now() + (options.waitMs ?? RUNTIME_LOCK_WAIT_MS);
+	const processIdentity = (options.processIdentity ?? installerProcessIdentity)(process.pid);
+	if (!processIdentity) throw new Error("cannot establish a unique channel-maintenance process identity on this platform");
 	for (;;) {
 		const token = `${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 		try {
@@ -960,7 +1436,7 @@ function acquireChannelRuntimeLock(paths, options = {}) {
 			try {
 				fs.writeFileSync(
 					path.join(paths.runtimeLockDir, "owner.json"),
-					`${JSON.stringify({ pid: process.pid, token, startedAt: new Date().toISOString() })}\n`,
+					`${JSON.stringify({ pid: process.pid, token, processIdentityVersion: 2, processIdentity, startedAt: new Date().toISOString() })}\n`,
 					{ flag: "wx", mode: 0o600 },
 				);
 			} catch (error) {
@@ -1009,7 +1485,12 @@ function releaseLeaseIsActive(file, options = {}) {
 	if (stat.isSymbolicLink() || !stat.isFile()) return true;
 	try {
 		const lease = JSON.parse(fs.readFileSync(file, "utf8"));
-		if ((options.processIsAlive ?? localProcessIsAlive)(Number(lease?.pid))) return true;
+		const pid = Number(lease?.pid);
+		if ((options.processIsAlive ?? localProcessIsAlive)(pid)) {
+			if (lease?.processIdentityVersion !== 2 || typeof lease?.processIdentity !== "string" || !lease.processIdentity) return true;
+			const currentIdentity = (options.processIdentity ?? installerProcessIdentity)(pid);
+			if (!currentIdentity || currentIdentity === lease.processIdentity) return true;
+		}
 	} catch {
 		const age = (options.now ?? Date.now()) - stat.mtimeMs;
 		if (age < (options.launchGraceMs ?? LAUNCH_LEASE_GRACE_MS)) return true;
@@ -1184,13 +1665,19 @@ export function atomicReplaceLink(file, target, options = {}) {
 	try {
 		const linkTarget = platform === "win32" ? path.resolve(path.dirname(file), target) : target;
 		fs.symlinkSync(linkTarget, temporary, platform === "win32" ? "junction" : undefined);
-		if (platform === "win32" && fs.existsSync(file)) {
-			renameSync(file, displaced);
-			displacedExisting = true;
+		if (platform === "win32") {
+			let existing = false;
+			try { fs.lstatSync(file); existing = true; }
+			catch (error) { if (error?.code !== "ENOENT") throw error; }
+			if (existing) {
+				renameSync(file, displaced);
+				displacedExisting = true;
+			}
 		}
 		renameSync(temporary, file);
 		if (displacedExisting) fs.rmSync(displaced, { force: true, recursive: true });
 		displacedExisting = false;
+		syncDirectorySync(path.dirname(file));
 	} catch (error) {
 		if (displacedExisting) {
 			try {
@@ -1212,7 +1699,7 @@ function releaseTarget(paths, releaseDir) {
 	return path.relative(path.dirname(paths.currentLink), releaseDir);
 }
 
-export function promoteRelease(channel, paths, releaseDir, operations = {}) {
+export function promoteRelease(channel, paths, releaseDir, operations = {}, context = {}) {
 	const verify = operations.verifyRelease ?? verifyRelease;
 	verify(releaseDir, operations.runCommand ?? run);
 	// Treat `current` as trusted input only after confirming that it resolves to
@@ -1260,60 +1747,199 @@ export function promoteRelease(channel, paths, releaseDir, operations = {}) {
 		}
 		return;
 	}
-	let currentPublished = false;
+	// Persist the complete desired pointer state before either link changes. The
+	// same idempotent transaction is replayed after process death or power loss.
+	// This record also precedes first launcher publication, so a crash can never
+	// leave an unreclaimable installer lock beside a public command with no target.
+	atomicReplaceFile(path.join(paths.channelDir, ROLLBACK_TRANSACTION_FILE), `${JSON.stringify({
+		version: 1,
+		desiredCurrent: releaseTarget(paths, releaseDir),
+		desiredPrevious: priorCurrent.kind === "symlink" ? priorCurrent.target : null,
+	}, null, 2)}\n`, 0o600);
 	try {
-		// Publish the runtime and marked migration boundary before exposing the new
-		// current release. Every launcher created by this installer then resolves and
-		// leases under the shared guard.
 		atomicReplaceFile(paths.runner, renderChannelRunner());
 		atomicReplaceFile(paths.launcher, renderLauncher(channel, paths));
-		atomicReplaceLink(paths.currentLink, releaseTarget(paths, releaseDir));
-		currentPublished = true;
-		if (priorCurrent.kind === "symlink") atomicReplaceLink(paths.previousLink, priorCurrent.target);
-		else fs.rmSync(paths.previousLink, { force: true });
 	} catch (error) {
-		restorePath(paths.currentLink, priorCurrent);
-		restorePath(paths.previousLink, priorPrevious);
 		restorePath(paths.launcher, priorLauncher);
 		restorePath(paths.runner, priorRunner);
-		if (migrationMarkerCreated && !currentPublished) {
-			fs.rmSync(migrationMarkerPath(releaseDir), { force: true });
-		}
 		throw error;
 	}
+	completeRollbackTransaction(paths, { ...context, channel }, operations);
 }
 
-export function rollbackChannel(channel, paths, operations = {}) {
+function validateRollbackTarget(paths, target, context = {}, operations = {}) {
+	if (typeof target !== "string") throw new Error("rollback transaction contains an invalid release target");
+	const resolved = path.resolve(path.dirname(paths.currentLink), target);
+	if (path.dirname(resolved) !== path.resolve(paths.releasesDir) || !MANAGED_RELEASE_NAME.test(path.basename(resolved))) {
+		throw new Error("rollback transaction target is outside the channel release directory");
+	}
+	let physical;
+	try { physical = fs.realpathSync(resolved); }
+	catch (error) { throw new Error(`rollback transaction release is unavailable: ${path.basename(resolved)}`, { cause: error }); }
+	if (path.dirname(physical) !== fs.realpathSync(paths.releasesDir) || path.basename(physical) !== path.basename(resolved)) {
+		throw new Error("rollback transaction release does not resolve to its canonical channel directory");
+	}
+	verifyInstalledReleaseContent(physical, path.basename(physical), context, operations);
+	return { target, resolved: physical };
+}
+
+function completeRollbackTransaction(paths, context = {}, operations = {}) {
+	const file = path.join(paths.channelDir, ROLLBACK_TRANSACTION_FILE);
+	if (!fs.existsSync(file)) return false;
+	let transaction;
+	try { transaction = JSON.parse(fs.readFileSync(file, "utf8")); }
+	catch (error) { throw new Error("channel rollback transaction is invalid and requires manual inspection", { cause: error }); }
+	if (transaction?.version !== 1) throw new Error("channel rollback transaction has an unsupported version");
+	const desiredCurrent = validateRollbackTarget(paths, transaction.desiredCurrent, context, operations);
+	const desiredPrevious = transaction.desiredPrevious === null
+		? undefined
+		: validateRollbackTarget(paths, transaction.desiredPrevious, context, operations);
+	const releaseRuntimeLock = acquireChannelRuntimeLock(paths);
+	try {
+		atomicReplaceLink(paths.currentLink, desiredCurrent.target);
+		if (desiredPrevious) atomicReplaceLink(paths.previousLink, desiredPrevious.target);
+		else { fs.rmSync(paths.previousLink, { force: true, recursive: true }); syncDirectorySync(path.dirname(paths.previousLink)); }
+		readReleaseLink(paths.currentLink, paths.releasesDir);
+		if (desiredPrevious) readReleaseLink(paths.previousLink, paths.releasesDir);
+		fs.rmSync(file, { force: true });
+		syncDirectorySync(paths.channelDir);
+	} finally { releaseRuntimeLock(); }
+	return true;
+}
+
+export function rollbackChannel(channel, paths, operations = {}, context = {}) {
 	const current = readReleaseLink(paths.currentLink, paths.releasesDir);
 	const previous = readReleaseLink(paths.previousLink, paths.releasesDir);
+	verifyInstalledReleaseContent(previous.resolved, path.basename(previous.resolved), { ...context, channel }, operations);
+	verifyInstalledReleaseContent(current.resolved, path.basename(current.resolved), { ...context, channel }, operations);
 	(operations.verifyRelease ?? verifyRelease)(previous.resolved, operations.runCommand ?? run);
-	try {
-		atomicReplaceLink(paths.currentLink, previous.target);
-		atomicReplaceLink(paths.previousLink, current.target);
-	} catch (error) {
-		atomicReplaceLink(paths.currentLink, current.target);
-		throw error;
-	}
+	atomicReplaceFile(path.join(paths.channelDir, ROLLBACK_TRANSACTION_FILE), `${JSON.stringify({
+		version: 1,
+		desiredCurrent: previous.target,
+		desiredPrevious: current.target,
+	}, null, 2)}\n`, 0o600);
+	completeRollbackTransaction(paths, { ...context, channel }, operations);
 	return { channel, current: path.basename(previous.resolved), previous: path.basename(current.resolved) };
 }
 
-function acquireLock(paths) {
-	fs.mkdirSync(paths.channelDir, { recursive: true, mode: 0o755 });
-	try {
-		fs.mkdirSync(paths.lockDir, { mode: 0o700 });
-	} catch (error) {
-		if (error?.code === "EEXIST") throw new Error(`${paths.channelDir} is already being updated (remove ${paths.lockDir} if no installer is running)`);
-		throw error;
+function installerProcessIdentity(pid) {
+	if (!Number.isInteger(pid) || pid <= 0) return undefined;
+	if (process.platform === "linux") {
+		try {
+			const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+			const bootId = fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+			const close = stat.lastIndexOf(")");
+			const fields = close >= 0 ? stat.slice(close + 2).trim().split(/\s+/u) : [];
+			if (fields[19] && bootId) return `linux:${bootId}:${fields[19]}`;
+		} catch {}
 	}
-	try {
-		fs.writeFileSync(path.join(paths.lockDir, "owner.json"), `${JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() })}\n`, {
-			mode: 0o600,
+	if (process.platform === "win32") {
+		return undefined;
+	}
+	if (process.platform === "darwin") {
+		const tokenResult = spawnSync("/bin/ps", ["eww", "-p", String(pid), "-o", "command="], {
+			encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], shell: false, timeout: 5000,
 		});
+		const fields = tokenResult.status === 0 ? tokenResult.stdout.split(/\s+/u) : [];
+		const token = fields.find((field) => /^CC_CHANNEL_PROCESS_TOKEN=[0-9a-f]{32}$/u.test(field))?.split("=")[1];
+		const ownerPid = Number(fields.find((field) => /^CC_CHANNEL_PROCESS_PID=\d+$/u.test(field))?.split("=")[1]);
+		if (token && ownerPid === pid) return `darwin-token:${pid}:${token}`;
+	}
+	const ps = fs.existsSync("/bin/ps") ? "/bin/ps" : "/usr/bin/ps";
+	const result = spawnSync(ps, ["-o", "lstart=", ...(process.platform === "darwin" ? ["-o", "command="] : []), "-p", String(pid)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+	const started = result.status === 0 ? result.stdout.trim() : "";
+	return started ? `ps:${started}` : undefined;
+}
+
+function publishInstallerLock(paths) {
+	const processIdentity = installerProcessIdentity(process.pid);
+	if (!processIdentity) throw new Error("channel installer cannot establish a unique process identity on this platform");
+	const lockToken = randomUUID();
+	const claim = path.join(paths.channelDir, `.install-lock.claim-${process.pid}-${randomUUID()}`);
+	let published = false;
+	try {
+		fs.mkdirSync(claim, { mode: 0o700 });
+		const lockStat = fs.statSync(claim, { bigint: true });
+		const lockIdentity = { device: String(lockStat.dev), inode: String(lockStat.ino) };
+		const ownerFile = path.join(claim, "owner.json");
+		const descriptor = fs.openSync(ownerFile, "wx", 0o600);
+		try {
+			fs.writeFileSync(descriptor, `${JSON.stringify({
+				pid: process.pid, processIdentityVersion: 2, processIdentity, lockToken, lockIdentity,
+				startedAt: new Date().toISOString(),
+			})}\n`);
+			fs.fsyncSync(descriptor);
+		} finally { fs.closeSync(descriptor); }
+		syncDirectorySync(claim);
+		fs.renameSync(claim, paths.lockDir);
+		published = true;
+		syncDirectorySync(paths.channelDir);
+		return { lockToken, lockIdentity };
+	} finally {
+		if (!published) fs.rmSync(claim, { recursive: true, force: true });
+	}
+}
+
+export function acquireLock(paths) {
+	const priorProcessTitle = process.title;
+	if (process.platform === "darwin") process.title = `cc-install:${randomUUID().replaceAll("-", "").slice(0, 16)}`;
+	const restoreProcessTitle = () => { if (process.platform === "darwin") process.title = priorProcessTitle; };
+	let ownership;
+	let staleTombstone;
+	try {
+		fs.mkdirSync(paths.channelDir, { recursive: true, mode: 0o755 });
+		try { ownership = publishInstallerLock(paths); }
+		catch (error) {
+			if (!["EEXIST", "ENOTEMPTY"].includes(error?.code)) throw error;
+			let owner;
+			try { owner = JSON.parse(fs.readFileSync(path.join(paths.lockDir, "owner.json"), "utf8")); } catch {}
+			let alive = true;
+			if (Number.isInteger(owner?.pid) && owner.pid > 0) {
+				try { process.kill(owner.pid, 0); }
+				catch (probeError) { alive = probeError?.code !== "ESRCH"; }
+			}
+			if (alive && owner?.processIdentityVersion === 2 && owner?.processIdentity) {
+				const currentIdentity = installerProcessIdentity(owner.pid);
+				if (currentIdentity && owner.processIdentity !== currentIdentity) alive = false;
+			}
+			if (alive) throw new Error(`${paths.channelDir} is already being updated`);
+			staleTombstone = path.join(paths.channelDir, `.install-lock.stale-${process.pid}-${randomUUID()}`);
+			try { fs.renameSync(paths.lockDir, staleTombstone); }
+			catch (renameError) {
+				if (["ENOENT", "EEXIST"].includes(renameError?.code)) throw new Error(`${paths.channelDir} lock reclamation raced another installer; retry`);
+				throw renameError;
+			}
+			syncDirectorySync(paths.channelDir);
+			try { ownership = publishInstallerLock(paths); }
+			catch (publishError) {
+				if (!fs.existsSync(paths.lockDir)) {
+					try { fs.renameSync(staleTombstone, paths.lockDir); syncDirectorySync(paths.channelDir); staleTombstone = undefined; } catch {}
+				}
+				throw new Error(`${paths.channelDir} is already being updated`, { cause: publishError });
+			}
+			fs.rmSync(staleTombstone, { recursive: true, force: true });
+			staleTombstone = undefined;
+		}
+		const { lockToken, lockIdentity } = ownership;
+		return () => {
+			const releaseTombstone = path.join(paths.channelDir, `.install-lock.released-${process.pid}-${randomUUID()}`);
+			try {
+				const currentStat = fs.statSync(paths.lockDir, { bigint: true });
+				const owner = JSON.parse(fs.readFileSync(path.join(paths.lockDir, "owner.json"), "utf8"));
+				if (String(currentStat.dev) !== lockIdentity.device || String(currentStat.ino) !== lockIdentity.inode || owner?.lockToken !== lockToken) {
+					throw new Error("channel installer lock ownership changed before release");
+				}
+				fs.renameSync(paths.lockDir, releaseTombstone);
+				syncDirectorySync(paths.channelDir);
+				fs.rmSync(releaseTombstone, { recursive: true, force: true });
+				syncDirectorySync(paths.channelDir);
+			} finally { restoreProcessTitle(); }
+		};
 	} catch (error) {
-		fs.rmSync(paths.lockDir, { recursive: true, force: true });
+		if (staleTombstone) fs.rmSync(staleTombstone, { recursive: true, force: true });
+		restoreProcessTitle();
 		throw error;
 	}
-	return () => fs.rmSync(paths.lockDir, { recursive: true, force: true });
 }
 
 export function installChannel(channel, options = {}, operations = {}) {
@@ -1322,16 +1948,38 @@ export function installChannel(channel, options = {}, operations = {}) {
 	const paths = channelPaths(channel, options);
 	const releaseLock = acquireLock(paths);
 	try {
-		if (options.rollback) return rollbackChannel(channel, paths, operations);
 		const repo = path.resolve(options.repo || path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."));
-		const ref = options.ref || definition.defaultRef;
-		const commit = (operations.resolveCommit ?? resolveCommit)(repo, ref, operations.runCommand ?? run);
+		completeRollbackTransaction(paths, { repo, channel }, operations);
+		if (options.rollback) return rollbackChannel(channel, paths, operations, { repo });
+		let candidate;
+		let commit;
+		let ref;
+		if (options.candidateDir) {
+			commit = String(options.expectedCommit ?? "").toLowerCase();
+			if (!/^[0-9a-f]{40}$/u.test(commit)) {
+				throw new Error("protected candidate promotion requires --expected-commit with a full reviewed Git SHA");
+			}
+			candidate = verifyReleaseCandidate(options.candidateDir, commit, { requireValidated: true });
+			(operations.verifyCandidateMatchesCommit ?? verifyCandidateMatchesCommit)(
+				candidate, repo, commit, operations.runCommand ?? run,
+			);
+			if (process.env.CC_RELEASE_COMMIT && process.env.CC_RELEASE_COMMIT !== commit) {
+				throw new Error("CC_RELEASE_COMMIT does not match --expected-commit");
+			}
+			ref = `protected-candidate:${candidate.provenance.sha256}`;
+		} else {
+			if (process.env.CC_RELEASE_COMMIT) {
+				throw new Error("release promotion requires --candidate-dir with protected validation evidence");
+			}
+			ref = options.ref || definition.defaultRef;
+			commit = (operations.resolveCommit ?? resolveCommit)(repo, ref, operations.runCommand ?? run);
+		}
 		const releaseDir = path.join(paths.releasesDir, commit);
 		const materialized = materializeRelease(
-			{ repo, ref, commit, releaseDir, releasesDir: paths.releasesDir, channel },
+			{ repo, ref, commit, releaseDir, releasesDir: paths.releasesDir, channel, candidate },
 			operations,
 		);
-		promoteRelease(channel, paths, releaseDir, operations);
+		promoteRelease(channel, paths, releaseDir, operations, { repo });
 		const garbageCollection = (operations.pruneChannelReleases ?? pruneChannelReleases)(
 			channel,
 			paths,
