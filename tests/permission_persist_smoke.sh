@@ -10,6 +10,10 @@ if ! command -v tmux >/dev/null 2>&1; then
 fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TMUX_SOCKET="cc-permission-persist-$PPID-$$"
+tmux() {
+	command tmux -L "$TMUX_SOCKET" "$@"
+}
 PERSIST_SESSION="cc-permission-persist-$$"
 YOLO_SESSION="cc-permission-yolo-$$"
 REMEMBER_OFF_SESSION="cc-permission-remember-off-$$"

@@ -10,7 +10,7 @@ const IDENTITY_FAILURE_EXIT = 78;
 // sentinel. Any other supervisor status is therefore unambiguously a crash or
 // failed containment report, even if an uncaught exception happens to exit 1.
 const CONFIRMED_ACP_EXIT = 85;
-// The owning cc process grants five seconds before it force-kills this
+// The owning cc process grants 7.5 seconds before it force-kills this
 // supervisor. Report an unconfirmed descendant tree well before that outer
 // deadline; otherwise the parent could kill only this supervisor's process
 // group while the separately-grouped backend remains alive.
@@ -198,8 +198,14 @@ try {
 const tracked = new Map();
 const unidentified = new Set();
 const psPath = existsSync("/bin/ps") ? "/bin/ps" : "/usr/bin/ps";
+// Recent macOS releases can suppress process environments from `ps`, even for
+// same-user children. Probe the just-spawned child once while its launch token
+// is present; if unavailable, never perform the otherwise quadratic full-table
+// token scan. Direct-child/group continuity remains the ownership proof.
+const macEnvironmentTokensVisible = process.platform !== "darwin" || macProcessHasSupervisorToken(child.pid);
 let stopping = false;
 let trackingFailed = false;
+let trackingFailureDetail;
 let childProcessIdentity;
 let childProcessStarted;
 let childGroupGone = false;
@@ -225,24 +231,33 @@ function exitConfirmed(code, signal, errorCode) {
 
 function readProcessRows() {
 	if (!child.pid || !psPath || !existsSync(psPath)) return undefined;
-	const result = spawnSync(psPath, ["-axo", "pid=,ppid=,pgid=,lstart=,state=,comm="], {
-		encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], shell: false, timeout: 1000, maxBuffer: 4 * 1024 * 1024,
-		env: { ...process.env, LC_ALL: "C", LANG: "C", TZ: "UTC" },
-	});
-	if (result.error || result.status !== 0) return undefined;
-	return String(result.stdout).split("\n").map((line) => /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+\s+\S+\s+\d+\s+\d\d:\d\d:\d\d\s+\d{4})\s+(\S+)\s+(.*?)\s*$/u.exec(line))
-		.filter(Boolean).map((match) => ({ pid: Number(match[1]), ppid: Number(match[2]), pgid: Number(match[3]), started: match[4], state: match[5], command: match[6] }));
+	for (let attempt = 0; attempt < 2; attempt += 1) {
+		const result = spawnSync(psPath, ["-axo", "pid=,ppid=,pgid=,lstart=,state=,comm="], {
+			encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], shell: false, timeout: 1000, maxBuffer: 4 * 1024 * 1024,
+			env: { ...process.env, LC_ALL: "C", LANG: "C", TZ: "UTC" },
+		});
+		if (!result.error && result.status === 0) {
+			return String(result.stdout).split("\n").map((line) => /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+\s+\S+\s+\d+\s+\d\d:\d\d:\d\d\s+\d{4})\s+(\S+)\s+(.*?)\s*$/u.exec(line))
+				.filter(Boolean).map((match) => ({ pid: Number(match[1]), ppid: Number(match[2]), pgid: Number(match[3]), started: match[4], state: match[5], command: match[6] }));
+		}
+		// An owner signal targets the supervisor's process group and can interrupt a
+		// `ps` child which was already running while Node was blocked in spawnSync.
+		// The signal is delivered to JavaScript only after this stack unwinds; one
+		// immediate replacement probe is outside that already-delivered group signal.
+	}
+	return undefined;
 }
 
-function directChildRunningForOwnerShutdown() {
-	const rows = readProcessRows();
+function directChildRunningForOwnerShutdown(rowsOverride) {
+	const rows = rowsOverride === undefined ? readProcessRows() : rowsOverride;
 	const row = rows?.find((entry) => entry.pid === child.pid);
 	if (!row || row.ppid !== process.pid || row.state.startsWith("Z") || row.pgid !== child.pid) return false;
 	const currentIdentity = processIdentity(row);
 	if (!childProcessIdentity) {
 		// A reaped PID may be reused before Node dispatches the queued child-exit
-		// callback. Establish first ownership only from the per-launch token.
-		if (!currentIdentity || !hasSupervisorToken(row.pid)) return false;
+		// callback. `processIdentity()` accepts the root only while it is still this
+		// supervisor's live direct child and detached group leader.
+		if (!currentIdentity) return false;
 		childProcessIdentity = currentIdentity;
 		childProcessStarted = row.started;
 		return true;
@@ -271,13 +286,27 @@ function processIdentity(row, verifyParent = false) {
 			return `linux:${linuxBootId}:${startTicks}`;
 		} catch { return undefined; }
 	}
-	// macOS exposes only second-resolution start time through ps. The random
-	// inherited launch token adds a per-supervisor discriminator for the first
-	// observation, while excluding `comm` lets an observed process safely exec.
-	// Same-group continuity below retains an already-proven process if that exec
-	// also deliberately replaces its environment.
-	if (!hasSupervisorToken(row.pid)) return undefined;
-	return JSON.stringify([row.pid, row.pgid, row.started, supervisorProcessToken]);
+	// Modern macOS can suppress another process's environment even for the same
+	// user, so the inherited token is not a universally available root probe.
+	// The spawned root is nevertheless unambiguous while it remains our live
+	// direct child and its own detached process-group leader: no unrelated
+	// process can acquire this PPID, and a reaped `ps` helper inherits our group
+	// instead of the backend's numeric PGID. Bind that relationship to the
+	// kernel-reported start instant so an environment-scrubbing exec is safe.
+	if (row.pid === child.pid && row.ppid === process.pid && row.pgid === child.pid && !row.state.startsWith("Z")) {
+		return JSON.stringify(["mac-root", row.pid, row.pgid, row.started]);
+	}
+	// The random inherited token remains an additional discriminator for
+	// descendants on macOS versions which permit the process-table probe.
+	if (hasSupervisorToken(row.pid)) {
+		return JSON.stringify(["mac-token", row.pid, row.pgid, row.started, supervisorProcessToken]);
+	}
+	// Callers register this fallback only after proving the process is a live
+	// descendant through PPID closure. Revalidation binds its second-resolution
+	// start instant to both process group and executable. A later exec or an
+	// indistinguishable same-second PID reuse therefore fails closed instead of
+	// authorizing a signal to the changed process.
+	return JSON.stringify(["mac-lineage", row.pid, row.pgid, row.started, row.command]);
 }
 
 function hasSupervisorToken(pid) {
@@ -287,32 +316,54 @@ function hasSupervisorToken(pid) {
 				.includes(`CC_WORKFLOW_SUPERVISOR_TOKEN=${supervisorProcessToken}`);
 		} catch { return false; }
 	}
+	if (!macEnvironmentTokensVisible) return false;
+	return macProcessHasSupervisorToken(pid);
+}
+
+function macProcessHasSupervisorToken(pid) {
 	const tokenResult = spawnSync(psPath, ["eww", "-p", String(pid), "-o", "command="], {
 		encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], shell: false, timeout: 1000, maxBuffer: 1024 * 1024,
 	});
 	return tokenResult.status === 0 && tokenResult.stdout.includes(`CC_WORKFLOW_SUPERVISOR_TOKEN=${supervisorProcessToken}`);
 }
 
-function refreshDescendants(discoverTokenPeers = false) {
+function macLineageLifetimeContinues(previousIdentity, currentIdentity) {
+	if (process.platform !== "darwin") return false;
+	try {
+		const previous = JSON.parse(previousIdentity);
+		const current = JSON.parse(currentIdentity);
+		return previous?.[0] === "mac-lineage" && current?.[0] === "mac-lineage" &&
+			previous[1] === current[1] && previous[3] === current[3];
+	} catch { return false; }
+}
+
+function refreshDescendants(discoverTokenPeers = false, rowsOverride) {
 	if (trackingFailed) return false;
-	const rows = readProcessRows();
-	if (!rows) return false;
+	const rows = rowsOverride === undefined ? readProcessRows() : rowsOverride;
+	if (!rows) {
+		trackingFailureDetail ??= "process table could not be read";
+		return false;
+	}
 	const rowsByPid = new Map(rows.map((row) => [row.pid, row]));
 	const childRow = rowsByPid.get(child.pid);
-	if (childRow) {
+	if (childRow && !childRow.state.startsWith("Z")) {
 		const currentChildIdentity = processIdentity(childRow);
 		if (!childProcessIdentity && childRow.ppid !== process.pid) {
 			// Until the root is proven as this supervisor's live direct child, its
 			// numeric PID and inherited token are insufficient: a queued child-exit
 			// callback can race PID reuse. Never authorize that unrelated process group.
 			unidentified.add(child.pid);
+			trackingFailureDetail ??= `root ${child.pid} lost its direct-parent identity`;
 		} else if (!currentChildIdentity) {
 			// A process already proven by the per-launch token cannot leave and have
 			// its numeric PID/PGID reused before the direct-child exit callback reaps
 			// it. Keep that kernel group lease across an environment-scrubbing exec,
 			// but bind it to the observed start instant and revoke it on child exit.
 			if (!childProcessIdentity || childProcessStarted !== childRow.started || childRow.pgid !== child.pid ||
-				childGroupGone || naturalExitStatus !== undefined) unidentified.add(child.pid);
+				childGroupGone || naturalExitStatus !== undefined) {
+				unidentified.add(child.pid);
+				trackingFailureDetail ??= `root ${child.pid} could not be reidentified`;
+			}
 		}
 		else if (!childProcessIdentity) {
 			childProcessIdentity = currentChildIdentity;
@@ -320,11 +371,27 @@ function refreshDescendants(discoverTokenPeers = false) {
 		}
 		else if (currentChildIdentity !== childProcessIdentity) childGroupGone = true;
 	}
+	const lineageParents = new Set([child.pid, ...tracked.keys()]);
 	for (const [pid, recordedIdentity] of tracked) {
 		const row = rowsByPid.get(pid);
 		const currentIdentity = row ? processIdentity(row) : undefined;
-		if (!row || (currentIdentity && currentIdentity !== recordedIdentity)) tracked.delete(pid);
-		else if (!currentIdentity && (row.pgid !== child.pid || childGroupGone)) unidentified.add(pid);
+		if (!row || row.state.startsWith("Z")) tracked.delete(pid);
+		else if (currentIdentity && currentIdentity !== recordedIdentity) {
+			// A proven live child can call exec()/setsid() between process-table
+			// samples. While its PPID is still inside the already-proven lineage, keep
+			// the same PID/start lifetime and adopt the new executable/group tuple.
+			if (lineageParents.has(row.ppid) && macLineageLifetimeContinues(recordedIdentity, currentIdentity)) {
+				tracked.set(pid, currentIdentity);
+			} else {
+				tracked.delete(pid);
+				unidentified.add(pid);
+				trackingFailureDetail ??= `descendant ${pid} changed identity`;
+			}
+		}
+		else if (!currentIdentity && (row.pgid !== child.pid || childGroupGone)) {
+			unidentified.add(pid);
+			trackingFailureDetail ??= `descendant ${pid} could not be reidentified`;
+		}
 	}
 	const parents = new Set([child.pid, ...tracked.keys()]);
 	const discovered = [];
@@ -332,7 +399,7 @@ function refreshDescendants(discoverTokenPeers = false) {
 	while (changed) {
 		changed = false;
 		for (const row of rows) {
-			if (row.pid === process.pid || tracked.has(row.pid) || parents.has(row.pid) || !parents.has(row.ppid)) continue;
+			if (row.state.startsWith("Z") || row.pid === process.pid || tracked.has(row.pid) || parents.has(row.pid) || !parents.has(row.ppid)) continue;
 			discovered.push(row);
 			parents.add(row.pid);
 			changed = true;
@@ -343,9 +410,9 @@ function refreshDescendants(discoverTokenPeers = false) {
 	// the unguessable environment token inherited from this supervisor launch.
 	// This intentionally runs only at those lifecycle boundaries rather than on
 	// every poll, avoiding a process-table-wide environment probe at steady state.
-	if (discoverTokenPeers) {
+	if (discoverTokenPeers && macEnvironmentTokensVisible) {
 		for (const row of rows) {
-			if (row.pid === process.pid || row.pid === child.pid || tracked.has(row.pid) || parents.has(row.pid)) continue;
+			if (row.state.startsWith("Z") || row.pid === process.pid || row.pid === child.pid || tracked.has(row.pid) || parents.has(row.pid)) continue;
 			if (hasSupervisorToken(row.pid)) discovered.push(row);
 		}
 	}
@@ -355,7 +422,10 @@ function refreshDescendants(discoverTokenPeers = false) {
 		// Members which remain in the backend's original process group are owned
 		// by that still-live kernel group identity and are signalled as a group.
 		// Detached descendants require their own reuse-safe identity.
-		else if (row.pgid !== child.pid) unidentified.add(row.pid);
+		else if (row.pgid !== child.pid) {
+			unidentified.add(row.pid);
+			trackingFailureDetail ??= `new detached descendant ${row.pid} could not be identified`;
+		}
 	}
 	if (unidentified.size > 0) {
 		// A freshly observed descendant without a reuse-safe identity cannot be
@@ -368,14 +438,14 @@ function refreshDescendants(discoverTokenPeers = false) {
 	return true;
 }
 
-function verifiedChildGroupRows() {
+function verifiedChildGroupRows(rowsOverride) {
 	if (!child.pid || childGroupGone) return [];
 	if (trackingFailed) return undefined;
-	const rows = readProcessRows();
+	const rows = rowsOverride === undefined ? readProcessRows() : rowsOverride;
 	if (!rows) { trackingFailed = true; return undefined; }
 	let ownedMember = false;
 	for (const row of rows) {
-		if (row.pgid !== child.pid) continue;
+		if (row.pgid !== child.pid || row.state.startsWith("Z")) continue;
 		const recordedIdentity = row.pid === child.pid ? childProcessIdentity : tracked.get(row.pid);
 		const currentIdentity = row.pid === child.pid || recordedIdentity ? processIdentity(row) : undefined;
 		if (row.pid === child.pid && currentIdentity && !childProcessIdentity) {
@@ -420,8 +490,8 @@ function verifiedChildGroupRows() {
 	return rows;
 }
 
-function signalChildGroup(signal) {
-	const rows = verifiedChildGroupRows();
+function signalChildGroup(signal, rowsOverride) {
+	const rows = verifiedChildGroupRows(rowsOverride);
 	if (!rows || rows.length === 0) return false;
 	try { process.kill(-child.pid, signal); return true; }
 	catch (error) {
@@ -431,8 +501,8 @@ function signalChildGroup(signal) {
 	}
 }
 
-function childGroupAlive() {
-	const rows = verifiedChildGroupRows();
+function childGroupAlive(rowsOverride) {
+	const rows = verifiedChildGroupRows(rowsOverride);
 	if (!rows) return true;
 	if (rows.length === 0) return false;
 	try { process.kill(-child.pid, 0); return true; }
@@ -443,15 +513,25 @@ function childGroupAlive() {
 	}
 }
 
-function signalTracked(signal) {
-	const rows = readProcessRows();
+function signalTracked(signal, rowsOverride) {
+	const rows = rowsOverride === undefined ? readProcessRows() : rowsOverride;
 	if (!rows) { trackingFailed = true; return false; }
 	const rowsByPid = new Map(rows.map((row) => [row.pid, row]));
 	for (const [pid, recordedIdentity] of tracked) {
 		const row = rowsByPid.get(pid);
+		if (row?.state.startsWith("Z")) {
+			tracked.delete(pid);
+			continue;
+		}
 		const currentIdentity = row ? processIdentity(row) : undefined;
+		if (row && currentIdentity && currentIdentity !== recordedIdentity &&
+			(row.ppid === child.pid || tracked.has(row.ppid)) &&
+			macLineageLifetimeContinues(recordedIdentity, currentIdentity)) {
+			tracked.set(pid, currentIdentity);
+		}
+		const effectiveIdentity = tracked.get(pid);
 		if (row && !currentIdentity && row.pgid === child.pid && !childGroupGone) continue;
-		if (!row || currentIdentity !== recordedIdentity) {
+		if (!row || currentIdentity !== effectiveIdentity) {
 			tracked.delete(pid);
 			if (row && !currentIdentity) trackingFailed = true;
 			continue;
@@ -472,7 +552,13 @@ function fenceTrackingFailure() {
 
 function shutdown() {
 	if (stopping) return;
-	if (!preserveNaturalExit && naturalExitStatus === undefined && !directChildRunningForOwnerShutdown()) {
+	const startedAt = Date.now();
+	// One kernel snapshot must drive each shutdown phase. Re-reading the entire
+	// process table for the root, descendants, group, and detached children made
+	// the nominal deadline additive under a slow `ps`, allowing the owner to kill
+	// this supervisor before it could report or fence an unconfirmed backend.
+	const shutdownRows = readProcessRows() ?? null;
+	if (!preserveNaturalExit && naturalExitStatus === undefined && !directChildRunningForOwnerShutdown(shutdownRows)) {
 		// A signal/EOF can be dispatched before Node's already-queued child-exit
 		// callback. Do not let that event ordering relabel a pre-dead backend as an
 		// owner-driven shutdown with a clean attestation.
@@ -480,26 +566,27 @@ function shutdown() {
 	}
 	stopping = true;
 	clearInterval(descendantTimer);
-	const trackingReady = !trackingFailed && refreshDescendants(true);
-	signalChildGroup("SIGTERM");
-	signalTracked("SIGTERM");
+	const trackingReady = !trackingFailed && refreshDescendants(true, shutdownRows);
+	signalChildGroup("SIGTERM", shutdownRows);
+	signalTracked("SIGTERM", shutdownRows);
 	let forced = false;
-	const startedAt = Date.now();
 	const confirm = setInterval(() => {
-		const trackingConfirmed = refreshDescendants();
+		const confirmationRows = readProcessRows() ?? null;
+		const trackingConfirmed = refreshDescendants(false, confirmationRows);
 		if (!trackingReady || !trackingConfirmed) {
-			signalChildGroup("SIGKILL");
-			signalTracked("SIGKILL");
-			process.stderr.write("workflow worker descendant tracking failed during shutdown\n");
+			signalChildGroup("SIGKILL", confirmationRows);
+			signalTracked("SIGKILL", confirmationRows);
+			const detail = trackingFailureDetail ? `: ${trackingFailureDetail}` : "";
+			process.stderr.write(`workflow worker descendant tracking failed during shutdown${detail}\n`);
 			clearInterval(confirm);
 			process.exit(TRACKING_FAILURE_EXIT);
 		}
 		if (!forced && Date.now() - startedAt >= 750) {
 			forced = true;
-			signalTracked("SIGKILL");
-			signalChildGroup("SIGKILL");
+			signalTracked("SIGKILL", confirmationRows);
+			signalChildGroup("SIGKILL", confirmationRows);
 		}
-		if (!childGroupAlive() && tracked.size === 0) {
+		if (!childGroupAlive(confirmationRows) && tracked.size === 0) {
 			clearInterval(confirm);
 			if (rootExitedBeforeOwnerShutdown) {
 				process.stderr.write("workflow streaming backend exited before owner-driven shutdown\n");
@@ -529,7 +616,10 @@ for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(signal, shutdow
 if (!preserveNaturalExit || ownerStdin) {
 	process.stdin.on("end", shutdown);
 	process.stdin.on("error", shutdown);
-	if (preserveNaturalExit) process.stdin.resume();
+	// A piped readable remains paused when it has only an `end` listener. Start
+	// consuming the owner pipe in every mode where EOF is the lifetime signal;
+	// otherwise manager death can leave a streaming worker running indefinitely.
+	process.stdin.resume();
 }
 process.stdout.on("error", shutdown);
 process.stderr.on("error", shutdown);
@@ -568,14 +658,15 @@ child.once("close", (code, signal) => {
 		process.stderr.write("workflow worker exited before descendant containment could be observed\n");
 		process.exit(TRACKING_FAILURE_EXIT);
 	}
-	if (!refreshDescendants(true)) {
+	const closeRows = readProcessRows() ?? null;
+	if (!refreshDescendants(true, closeRows)) {
 		process.stderr.write("workflow worker descendant tracking failed before exit\n");
 		process.exit(TRACKING_FAILURE_EXIT);
 	}
-	if (preserveNaturalExit && tracked.size === 0 && !childGroupAlive()) {
+	if (preserveNaturalExit && tracked.size === 0 && !childGroupAlive(closeRows)) {
 		exitConfirmed(code, signal);
 	}
-	if (tracked.size > 0 || childGroupAlive()) { shutdown(); return; }
+	if (tracked.size > 0 || childGroupAlive(closeRows)) { shutdown(); return; }
 	exitConfirmed(code, signal);
 });
 if (preserveNaturalExit) child.stdin.end();

@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+stty_states_equal() {
+	local before="$1"
+	local after="$2"
+	cmp -s "$before" "$after" && return 0
+	[ "$(uname -s)" = "Darwin" ] || return 1
+	local normalized_before normalized_after
+	normalized_before="$(node -e 'const fs=require("fs");let s=fs.readFileSync(process.argv[1],"utf8").trim();s=s.replace(/lflag=([0-9a-f]+)/u,(_,h)=>`lflag=${(BigInt(`0x${h}`)&~0x20000000n).toString(16)}`);process.stdout.write(s)' "$before")"
+	normalized_after="$(node -e 'const fs=require("fs");let s=fs.readFileSync(process.argv[1],"utf8").trim();s=s.replace(/lflag=([0-9a-f]+)/u,(_,h)=>`lflag=${(BigInt(`0x${h}`)&~0x20000000n).toString(16)}`);process.stdout.write(s)' "$after")"
+	[ "$normalized_before" = "$normalized_after" ]
+}
+
 shopt -s nocasematch
 while IFS= read -r environment_name; do
 	environment_value="${!environment_name-}"
@@ -163,11 +174,11 @@ if command -v tmux >/dev/null 2>&1 && [ "$(uname -s)" != "MINGW" ]; then
 	fi
 	kill -KILL "$manager_pid"
 	for _ in {1..100}; do
-		if [ -s "$after" ] && cmp -s "$before" "$after"; then break; fi
+		if [ -s "$after" ] && stty_states_equal "$before" "$after"; then break; fi
 		sleep 0.05
 	done
-	cmp -s "$before" "$after" || {
-		echo "installed npm-bin cc failed to restore exact terminal state after SIGKILL" >&2
+	stty_states_equal "$before" "$after" || {
+		echo "installed npm-bin cc failed to restore exact terminal configuration after SIGKILL" >&2
 		exit 1
 	}
 	tmux -L "$TMUX_SOCKET" kill-session -t "$TMUX_SESSION" >/dev/null 2>&1 || true

@@ -107,6 +107,8 @@ expected_prompts_by_label = {
     "live worker one": "Return exactly LIVE_WORKER_ONE_OK and nothing else.",
     "live worker two": "Return exactly LIVE_WORKER_TWO_OK and nothing else.",
 }
+def routed_id(value):
+    return value.get("id") if isinstance(value, dict) else value
 evidence = {
     "version": 1,
     "exitStatus": int(exit_status),
@@ -123,7 +125,7 @@ evidence = {
         and len(set(ready_agent_ids)) == 2
         and set(ready_agent_ids) == set(queued_labels)
         and all(
-        event.get("model") == "gpt-5.6" and event.get("effort") == "high"
+        routed_id(event.get("model")) == "gpt-5.6-sol" and routed_id(event.get("effort")) == "high"
         for event in ready
     ),
     "parallelRoutingValidated": (
@@ -244,6 +246,15 @@ send_text() {
 	tmux_live send-keys -t "$SESSION" Enter
 }
 
+send_multiline() {
+	local buffer_name="cc-workflow-live-prompt-$$"
+	# Explicit bracketed paste keeps embedded newlines inside one composer turn;
+	# literal send-keys input would submit each line independently.
+	tmux_live set-buffer -b "$buffer_name" -- "$1"
+	tmux_live paste-buffer -p -d -b "$buffer_name" -t "$SESSION"
+	tmux_live send-keys -t "$SESSION" Enter
+}
+
 PROJECT="$SCRATCH/project"
 mkdir -p "$PROJECT"
 printf 'live workflow integration fixture\n' > "$PROJECT/README.md"
@@ -256,7 +267,7 @@ git -C "$PROJECT" commit -qm "live workflow fixture"
 CONFIG="$SCRATCH/config.json"
 SETTINGS="$SCRATCH/settings.json"
 printf '%s\n' '{"defaultAgent":"codex"}' > "$CONFIG"
-printf '%s\n' '{"workflowMode":"clone-only","workflowGlobalConcurrency":2,"workflowRunConcurrency":2,"workflowHarnessConcurrency":2,"agents":{"codex":{"config":{"approval_policy":"never","sandbox_mode":"danger-full-access"},"sessionDefaults":{"model":"gpt-5.6","effort":"high"}}}}' > "$SETTINGS"
+printf '%s\n' '{"workflowMode":"clone-only","workflowGlobalConcurrency":2,"workflowRunConcurrency":2,"workflowHarnessConcurrency":2,"agents":{"codex":{"config":{"approval_policy":"never","sandbox_mode":"danger-full-access"},"sessionDefaults":{"model":"gpt-5.6-sol","effort":"high"}}}}' > "$SETTINGS"
 
 command_line=""
 MODEL_KEY_FILE="$SCRATCH/model-api-key"
@@ -277,7 +288,7 @@ Use the Workflow tool now to launch this exact JavaScript dynamic workflow. Do n
 
 export const meta = {
   name: "live-gpt56-smoke",
-  description: "Authenticated GPT-5.6 dynamic workflow smoke",
+  description: "Authenticated GPT-5.6-Sol dynamic workflow smoke",
   phases: ["Live"],
 };
 
@@ -289,7 +300,7 @@ return results.join("\n");
 
 Use a concurrency of 2. After the tool reports that it launched, briefly acknowledge the launch and wait for cc's completion delivery.
 PROMPT
-send_text "$LIVE_PROMPT"
+send_multiline "$LIVE_PROMPT"
 wait_for_text "Run workflow" 9000
 tmux_live send-keys -t "$SESSION" Enter
 RUNS="$SCRATCH/workflow-state/workflow-runs"
@@ -310,8 +321,12 @@ fi
 EVIDENCE_STAGE="workflow-started"
 send_text "/workflows"
 wait_for_text "live-gpt56-smoke" 1800
+tmux_live send-keys -t "$SESSION" Enter
+wait_for_text "live-gpt56-smoke / phases" 1800
+tmux_live send-keys -t "$SESSION" Enter
 wait_for_text "live worker one" 9000
 wait_for_text "live worker two" 9000
+tmux_live send-keys -t "$SESSION" Escape Escape
 
 for ((index=0; index<9000; index+=1)); do
 	if grep -Fq '"type":"run_completed"' "$events_file"; then break; fi
@@ -351,7 +366,9 @@ outputs_by_label = {
 assert len(queued) == 2, queued
 assert set(queued_labels.values()) == {"live worker one", "live worker two"}, queued_labels
 assert {entry.get("agentId") for entry in ready} == set(queued_labels), ready
-assert all(entry.get("model") == "gpt-5.6" and entry.get("effort") == "high" for entry in ready), ready
+def routed_id(value):
+    return value.get("id") if isinstance(value, dict) else value
+assert all(routed_id(entry.get("model")) == "gpt-5.6-sol" and routed_id(entry.get("effort")) == "high" for entry in ready), ready
 assert queued_prompts_by_label == {
     "live worker one": "Return exactly LIVE_WORKER_ONE_OK and nothing else.",
     "live worker two": "Return exactly LIVE_WORKER_TWO_OK and nothing else.",
@@ -378,4 +395,4 @@ EVIDENCE_STAGE="delivery-confirmed"
 tmux_live send-keys -t "$SESSION" Escape
 tmux_live send-keys -t "$SESSION" C-d
 EVIDENCE_STAGE="passed"
-echo "live dynamic workflow E2E: model-authored launch, GPT-5.6 High clone routing, parallel workers, completion delivery, and TUI passed"
+echo "live dynamic workflow E2E: model-authored launch, GPT-5.6-Sol High clone routing, parallel workers, completion delivery, and TUI passed"

@@ -40,6 +40,9 @@ export const WORKFLOW_LIMITS = Object.freeze({
 	defaultScriptTimeoutMs: 2 * 60 * 60 * 1000,
 	maxScriptTimeoutMs: 24 * 60 * 60 * 1000,
 	heartbeatTimeoutMs: 5000,
+	// Each supervised Git child keeps the tighter bound below; a logical
+	// preview/apply/recovery operation runs several such children serially.
+	gitOperationTimeoutMs: 5 * 60 * 1000,
 	maxProjectedEvents: 10_000,
 	maxRetainedTools: 100,
 	maxHostEventBytes: 8 * 1024 * 1024,

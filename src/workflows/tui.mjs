@@ -1,5 +1,5 @@
 import { matchesKey } from "@mariozechner/pi-tui/dist/keys.js";
-import { truncateToWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui/dist/utils.js";
+import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@mariozechner/pi-tui/dist/utils.js";
 import { sanitizeUntrustedTerminalLine, sanitizeUntrustedTerminalText } from "../harness/terminal-safety.mjs";
 
 const ansi = {
@@ -30,6 +30,33 @@ function line(value, width) { return truncateToWidth(String(value), Math.max(1, 
 function wrapped(value, width) { return wrapTextWithAnsi(String(value), Math.max(1, width)); }
 const safe = (value) => sanitizeUntrustedTerminalText(value);
 const safeLine = (value) => sanitizeUntrustedTerminalLine(value);
+
+function wrappedIdentity(value, width, requestedPrefix = "  ") {
+	const maximumWidth = Math.max(1, width);
+	const prefix = visibleWidth(requestedPrefix) < maximumWidth ? requestedPrefix : "";
+	const capacity = Math.max(1, maximumWidth - visibleWidth(prefix));
+	const segments = safeLine(value).match(/.*?[\/._-]+|.+$/gu) ?? [""];
+	const rows = [];
+	let current = "";
+	const flush = () => {
+		if (!current) return;
+		rows.push(line(`${prefix}${current}`, maximumWidth));
+		current = "";
+	};
+	for (const segment of segments) {
+		if (visibleWidth(segment) <= capacity) {
+			if (current && visibleWidth(current) + visibleWidth(segment) > capacity) flush();
+			current += segment;
+			continue;
+		}
+		flush();
+		const hardWrapped = wrapped(segment, capacity);
+		for (const row of hardWrapped.slice(0, -1)) rows.push(line(`${prefix}${row}`, maximumWidth));
+		current = hardWrapped.at(-1) ?? "";
+	}
+	flush();
+	return rows.length > 0 ? rows : [line(prefix, maximumWidth)];
+}
 
 function compactBlockedExitNotice(width) {
 	if (width >= 29) return "Ctrl-D ×2 within 2s: force exit";
@@ -247,8 +274,8 @@ export class WorkflowPage {
 			}
 			if (!this.applyPreviewDisclosed) {
 				this.onNotice(this.applyPreviewNeedsResize
-					? "Resize the terminal to inspect the changed-file summary before applying this worktree."
-					: "Scroll with j/k until every target and changed-file identity has been displayed before applying this worktree.");
+					? "apply disabled: resize the terminal to inspect the changed-file summary before applying this worktree."
+					: "apply disabled: scroll with j/k until every target and changed-file identity has been displayed before applying this worktree.");
 				return true;
 			}
 			preview.pending = true;
@@ -402,7 +429,9 @@ export class WorkflowPage {
 			: this.noticeKind === "exit-hint" ? compactExitNotice(width) : ` Notice: ${this.notice ?? ""}`;
 		if (this.notice && height > 0 && height <= 3) {
 			const priorityNotice = wrapped(noticeText, width).map((row) => paint("yellow", row));
-			return [...priorityNotice, header].slice(0, Math.floor(height));
+			const frame = [...priorityNotice, header].slice(0, Math.floor(height));
+			while (frame.length < Math.floor(height)) frame.push("");
+			return frame;
 		}
 		const noticeCapacity = Math.max(0, Math.min(3, height - 3));
 		const noticeRows = this.notice && noticeCapacity > 0 ? wrapped(noticeText, width).slice(0, noticeCapacity)
@@ -546,9 +575,13 @@ export class WorkflowPage {
 	#renderApplyPreview(width) {
 		const preview = this.applyPreview;
 		if (!preview) return [line(paint("dim", "Apply preview is unavailable"), width)];
-		const targetRows = wrapped(` Target ${safeLine(preview.target.branch)}@${safeLine(preview.target.head)} · ${preview.bytes} patch bytes`, width).map((row) => paint("dim", row));
+		const targetRows = [
+			line(paint("dim", " Target"), width),
+			...wrappedIdentity(`${preview.target.branch}@${preview.target.head}`, width).map((row) => paint("dim", row)),
+			...wrapped(`${preview.bytes} patch bytes`, width).map((row) => paint("dim", row)),
+		];
 		const changedRows = preview.changedFiles?.length
-			? preview.changedFiles.flatMap((file) => wrapped(`  ${safeLine(file)}`, width))
+			? preview.changedFiles.flatMap((file) => wrappedIdentity(file, width))
 			: wrapped("  No changed-file summary", width).map((row) => paint("dim", row));
 		const truncatedRows = preview.patchTruncated || preview.changedFilesTruncated
 			? wrapped(preview.patchTruncated

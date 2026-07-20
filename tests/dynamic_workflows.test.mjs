@@ -50,6 +50,10 @@ process.once("exit", () => {
 const execFileAsync = promisify(execFile);
 const visibleLength = (value) => [...String(value).replace(/\x1b\[[0-?]*[ -/]*[@-~]/gu, "")].length;
 const runGit = (cwd, args) => execFileAsync("git", ["-C", cwd, ...args], { encoding: "utf8" });
+// Production grants a supervised adapter 7.5 seconds to attest process-tree
+// retirement. Hosted macOS process-table probes can consume most of that bound,
+// so leave event-delivery margin without weakening the Linux stress deadline.
+const supervisorTestDeadlineMs = process.platform === "darwin" ? 10_000 : 5_000;
 const exactRecoveryFields = (source, runDirectoryIdentity = { device: "unbound", inode: "unbound" }) => ({
 	recoveryExactVersion: 1, source, sourceHash: createHash("sha256").update(source).digest("hex"), args: null,
 	tokenBudget: null, requestedConcurrency: 1, effectiveConcurrency: 1,
@@ -243,7 +247,7 @@ if (process.platform !== "win32") {
 	fastDetachedSupervisor.stderr.on("data", (chunk) => { fastDetachedStderr += chunk; });
 	const fastDetachedExit = await Promise.race([
 		new Promise((resolve) => fastDetachedSupervisor.once("close", (code) => resolve(code))),
-		new Promise((_, reject) => setTimeout(() => reject(new Error("fast detached backend supervisor did not fail closed")), 5000)),
+		new Promise((_, reject) => setTimeout(() => reject(new Error("fast detached backend supervisor did not fail closed")), supervisorTestDeadlineMs)),
 	]);
 	const fastDetachedPid = Number(await fs.readFile(fastDetachedPidFile, "utf8"));
 	assert.equal(fastDetachedExit, 86, `a streaming backend root that disappears before owner shutdown cannot attest an unobservable detached tree: ${fastDetachedStderr}`);
@@ -288,8 +292,13 @@ if (process.platform !== "win32") {
 	assert.match(workerSupervisorSource, /row\.ppid !== process\.pid/u, "owner-driven shutdown attestation requires direct-parent continuity for the backend root");
 	assert.match(workerSupervisorSource, /childProcessStarted !== childRow\.started/u, "macOS tokenless root continuity remains bound to the token-proven process start instant");
 	assert.match(workerSupervisorSource, /childGroupGone \|\| naturalExitStatus !== undefined/u, "macOS tokenless root continuity is revoked as soon as the direct child exits and can be reaped");
+	assert.match(workerSupervisorSource, /const shutdownRows = readProcessRows\(\) \?\? null/u, "owner shutdown uses one bounded process-table snapshot for identity and signalling");
+	assert.match(workerSupervisorSource, /refreshDescendants\(false, confirmationRows\)/u, "each shutdown confirmation reuses one fresh process-table snapshot");
+	assert.match(workerSupervisorSource, /childGroupAlive\(confirmationRows\)/u, "shutdown liveness checks cannot add another process-table timeout to the confirmation phase");
 	assert.match(workerSupervisorSource, /errorCode/u, "pre-spawn backend failures use the supervisor's structured status channel");
 	assert.doesNotMatch(worktreesSource, /spawn git ENOENT/u, "Git spawn failures are never classified by a path-dependent stderr string");
+	assert.match(worktreesSource, /\["--no-optional-locks", "status"/u, "read-only worktree status cannot rewrite intent-to-add index metadata between preview and apply");
+	assert.match(worktreesSource, /\["--no-optional-locks", "diff"/u, "read-only worktree diffs cannot refresh the index behind a confirmed patch hash");
 	if (process.platform === "darwin") {
 		const scrubbedRootSupervisor = spawn(process.execPath, [
 			path.join(process.cwd(), "src", "workflows", "worker-supervisor.mjs"),
@@ -300,7 +309,7 @@ if (process.platform !== "win32") {
 		scrubbedRootSupervisor.stdin.end();
 		const scrubbedRootExit = await Promise.race([
 			scrubbedRootClosed,
-			new Promise((_, reject) => setTimeout(() => reject(new Error("environment-scrubbed root did not retire")), 5000)),
+			new Promise((_, reject) => setTimeout(() => reject(new Error("environment-scrubbed root did not retire")), supervisorTestDeadlineMs)),
 		]);
 		assert.equal(scrubbedRootExit, 85, "a token-proven macOS root retains its process-group identity after an environment-scrubbing exec");
 		const tokenlessPidFile = path.join(temporary, "tokenless-descendant.pid");
@@ -314,14 +323,13 @@ if (process.platform !== "win32") {
 			catch { await new Promise((resolve) => setTimeout(resolve, 10)); }
 		}
 		assert.ok(tokenlessPid > 0, "the macOS tokenless-descendant fixture started");
+		tokenlessSupervisor.stdin.end();
 		const tokenlessExit = await Promise.race([
 			new Promise((resolve) => tokenlessSupervisor.once("close", resolve)),
-			new Promise((_, reject) => setTimeout(() => reject(new Error("tokenless descendant did not immediately fence its workflow")), 5000)),
+			new Promise((_, reject) => setTimeout(() => reject(new Error("lineage-observed descendant did not retire with its workflow")), supervisorTestDeadlineMs)),
 		]);
-		assert.equal(tokenlessExit, 86, "a tokenless macOS descendant permanently fails containment confirmation");
-		assert.doesNotThrow(() => process.kill(tokenlessPid, 0), "the supervisor never risks signalling a PID whose process lifetime cannot be revalidated");
-		try { process.kill(-tokenlessPid, "SIGKILL"); }
-		catch { try { process.kill(tokenlessPid, "SIGKILL"); } catch { /* fixture already exited */ } }
+		assert.equal(tokenlessExit, 85, "a macOS descendant observed through live PPID lineage remains safely containable without environment visibility");
+		assert.throws(() => process.kill(tokenlessPid, 0), { code: "ESRCH" }, "the lineage-observed detached descendant is confirmed stopped");
 	}
 	const supervisedPidFile = path.join(temporary, "supervised-worker.pid");
 	const supervisedGrandchildPidFile = path.join(temporary, "supervised-worker-grandchild.pid");
@@ -344,7 +352,7 @@ if (process.platform !== "win32") {
 	await new Promise((resolve) => setTimeout(resolve, 100));
 	const supervisorClosed = new Promise((resolve) => supervisor.once("close", resolve));
 	supervisor.stdin.end();
-	await Promise.race([supervisorClosed, new Promise((_, reject) => setTimeout(() => reject(new Error("supervisor did not retire after parent pipe closed")), 5000))]);
+	await Promise.race([supervisorClosed, new Promise((_, reject) => setTimeout(() => reject(new Error("supervisor did not retire after parent pipe closed")), supervisorTestDeadlineMs))]);
 	let supervisedAlive = true;
 	for (let index = 0; index < 200 && supervisedAlive; index += 1) {
 		try { process.kill(supervisedPid, 0); await new Promise((resolve) => setTimeout(resolve, 10)); }
@@ -370,7 +378,7 @@ if (process.platform !== "win32") {
 	assert.ok(inheritedPipePid > 0);
 	await Promise.race([
 		new Promise((resolve) => inheritedPipeSupervisor.once("close", resolve)),
-		new Promise((_, reject) => setTimeout(() => reject(new Error("supervisor waited forever for inherited helper pipes after backend exit")), 5000)),
+		new Promise((_, reject) => setTimeout(() => reject(new Error("supervisor waited forever for inherited helper pipes after backend exit")), supervisorTestDeadlineMs)),
 	]);
 	let inheritedPipeAlive = true;
 	for (let index = 0; index < 200 && inheritedPipeAlive; index += 1) {
@@ -479,7 +487,7 @@ await boundedCaptureTerminal.stopAndWait();
 	await psNamedTerminal.stopAndWait();
 	assert.throws(() => process.kill(psNamedTerminalPid, 0), { code: "ESRCH" }, "a resistant ordinary terminal is force-killed even when it names itself ps");
 	const loaderIsolatedTerminal = new ManagedTerminal("loader-isolated-terminal", {
-		command: "/bin/true",
+		command: "/usr/bin/true",
 		cwd: temporary,
 		env: [{ name: "NODE_OPTIONS", value: "--definitely-not-a-real-node-option" }],
 	});
@@ -559,7 +567,7 @@ await boundedCaptureTerminal.stopAndWait();
 	preserveEofSupervisor.stdin.end();
 	await Promise.race([
 		preserveEofClosed,
-		new Promise((_, reject) => setTimeout(() => reject(new Error("preserve-exit supervisor ignored manager EOF")), 5000)),
+		new Promise((_, reject) => setTimeout(() => reject(new Error("preserve-exit supervisor ignored manager EOF")), supervisorTestDeadlineMs)),
 	]);
 	let preserveEofAlive = true;
 	try { process.kill(preserveEofPid, 0); }
@@ -2102,6 +2110,8 @@ phase("Review");
 const values = await parallel([() => agent("one"), () => agent("two", { model: "m2" })]);
 return values;`;
 assert.equal(WORKFLOW_LIMITS.maxJournalBytes + WORKFLOW_LIMITS.maxJournalMetaBytes < 128 * 1024 * 1024, true, "valid journal data plus terminal metadata always fit below the per-run startup reader budget");
+assert.equal(WORKFLOW_LIMITS.gitTimeoutMs, 2 * 60 * 1000, "each supervised Git child retains a tight two-minute hang bound");
+assert.equal(WORKFLOW_LIMITS.gitOperationTimeoutMs, 5 * 60 * 1000, "multi-command worktree operations have a separate bounded aggregate budget");
 assert.deepEqual(extractWorkflowMeta(source), { name: "review", description: "Review in parallel", phases: ["Review"] });
 assert.match(transformWorkflowSource(source), /async function __ccWorkflowMain/u);
 assert.throws(() => extractWorkflowMeta(`export const meta={name:(()=>"x")(),description:"x"}`), /pure object literal/u);
@@ -2917,6 +2927,14 @@ await assert.rejects(
 	/timed out acquiring workflow ownership lock/u,
 	"a dead manager PID alone cannot release a lock during the old supervisor shutdown grace window",
 );
+const startupDeadLock = path.join(temporary, "ownership", "startup-dead.lock");
+await fs.writeFile(startupDeadLock, `${JSON.stringify({ version: 1, token: "startup-dead", pid: 2_000_000_000, processStartMarker: "dead" })}\n`, { mode: 0o600 });
+const startupDeadObservedAt = Date.now();
+const releaseStartupDead = await acquireOwnershipLock(startupDeadLock, {
+	timeoutMs: 0, waitForDeadOwnerReclaim: true, ...shortDeadOwnerGrace,
+});
+assert.ok(Date.now() - startupDeadObservedAt >= 90, "startup may wait through dead-owner grace even when live-owner acquisition is non-blocking");
+await releaseStartupDead();
 await fs.utimes(recentDeadLock, new Date(Date.now() - 20_000), new Date(Date.now() - 20_000));
 const recentDeadObservedAt = Date.now();
 const releaseRecentDead = await acquireOwnershipLock(recentDeadLock, { timeoutMs: 2000, ...shortDeadOwnerGrace });
@@ -3511,7 +3529,7 @@ const stoppedGitIdentity = worktrees.repositoryIdentity(gitProject, {
 	gitPath: path.join(stoppedGitDirectory, "git"),
 });
 try {
-	for (let attempt = 0; attempt < 200 && !stoppedGitPid; attempt += 1) {
+	for (let attempt = 0; attempt < 1000 && !stoppedGitPid; attempt += 1) {
 		try { stoppedGitPid = Number(await fs.readFile(stoppedGitPidFile, "utf8")); }
 		catch { await new Promise((resolve) => setTimeout(resolve, 10)); }
 	}
@@ -4204,7 +4222,7 @@ const blockingGitStatus = worktrees.status(retained, {
 });
 const waitForBlockingGitDescendant = (pidFile, operation) => Promise.race([
 	(async () => {
-		for (let index = 0; index < 500; index += 1) {
+		for (let index = 0; index < 1000; index += 1) {
 			try { return Number(await fs.readFile(pidFile, "utf8")); }
 			catch { await new Promise((resolve) => setTimeout(resolve, 10)); }
 		}
@@ -5798,7 +5816,7 @@ const slowStopTask = await slowStopManager.start({
 }, { ...flexibleOrigin, adapterId: "slow-stop-origin", sessionId: "slow-stop-session" });
 while (!slowStopStarted) await new Promise((resolve) => setTimeout(resolve, 1));
 slowStopManager.stop(slowStopTask.taskId);
-await slowStopManager.stopAll();
+await slowStopManager.stopAll({ requireArchived: false });
 assert.equal(slowStopFinished, true, "manager shutdown waits for worker cancellation acknowledgement");
 
 const applyShutdownManager = new WorkflowManager({
@@ -6173,7 +6191,7 @@ journalFailureRun.journal.append = async () => { throw new Error("simulated jour
 journalFailureCall.onEvent({ type: "text", text: "trigger" });
 while (!["completed", "failed", "stopped"].includes(journalFailureManager.get(journalFailureTask.taskId).status)) await new Promise((resolve) => setTimeout(resolve, 5));
 assert.equal(journalFailureManager.get(journalFailureTask.taskId).status, "failed");
-await journalFailureManager.stopAll();
+await journalFailureManager.stopAll({ requireArchived: false });
 
 const archiveReleaseRetryManager = new WorkflowManager({
 	harnesses: {}, stateRoot: path.join(temporary, "archive-release-retry-manager"), registry,
@@ -6264,7 +6282,7 @@ assert.equal(toolFloodRun.error.code, "WORKFLOW_EVENT_LIMIT");
 assert.equal(toolFloodRun.agents[0].tools.length <= WORKFLOW_LIMITS.maxRetainedTools, true, "tool projections retain a fixed tail only");
 assert.equal(toolFloodAdapter.cancelled, true, "an abusive synchronous adapter event producer is cancelled at the host event bound");
 assert.equal(toolFloodManager.runs.get(toolFloodTask.taskId).journal.bytes < WORKFLOW_LIMITS.maxHostEventBytes, true, "large tool metadata is dropped before journal backlog allocation");
-await toolFloodManager.stopAll();
+await toolFloodManager.stopAll({ requireArchived: false });
 
 // Bounded compact summary and hierarchical task page use manager projections.
 const summary = new WorkflowTaskSummary(() => [{ ...completed, status: "running" }]);

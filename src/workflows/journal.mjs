@@ -480,7 +480,10 @@ export class WorkflowJournal {
 
 	append(event, options = {}) {
 		const operation = async () => {
-			if (!this.handle) throw new Error("workflow journal is not initialized");
+			if (!this.handle) {
+				const eventType = typeof event?.type === "string" ? event.type.slice(0, 128) : "unknown";
+				throw new Error(`workflow journal ${this.runId} at ${this.directory} is not initialized while appending ${eventType}`);
+			}
 			if (this.writeFailure) throw this.writeFailure;
 			const sequence = this.sequence + 1;
 			const hash = checksum(this.previousChecksum, sequence, event);

@@ -79,7 +79,9 @@ capture() {
 
 wait_for_text() {
 	local needle="$1"
-	for _ in {1..900}; do
+	local attempts="${2:-900}"
+	local attempt
+	for ((attempt = 0; attempt < attempts; attempt++)); do
 		if capture | grep -Fq "$needle"; then return 0; fi
 		sleep 0.1
 	done
@@ -140,7 +142,10 @@ wait_for_log_count() {
 	local log_file="$1"
 	local event="$2"
 	local expected="$3"
-	for _ in {1..300}; do
+	# The manager deliberately serializes repository mutations. Six worktree
+	# setups can therefore span several bounded five-minute operations on a
+	# loaded hosted Mac even though no individual Git child is hung.
+	for _ in {1..6000}; do
 		if [ "$(log_count "$log_file" "$event")" -ge "$expected" ]; then return 0; fi
 		sleep 0.1
 	done
@@ -195,7 +200,7 @@ while changed:
             changed = True
 commands = {pid: command for pid, _ppid, _started, command in rows}
 identities = {pid: started for pid, _ppid, started, _command in rows}
-managers = [pid for pid in descendants if (
+managers = [pid for pid in [root, *descendants] if (
     "cc-owner:" in commands.get(pid, "") or
     ("node " in commands.get(pid, "") and (
         "src/cc.mjs" in commands.get(pid, "") or "/node_modules/.bin/cc" in commands.get(pid, "")
@@ -248,9 +253,11 @@ if not signal_if_same(manager, manager_identity, signal.SIGKILL):
 for pid, started in owned.items():
     signal_if_same(pid, started, signal.SIGCONT)
 deadline = time.time() + 10
-while owned and time.time() < deadline:
+manager_live = True
+while (owned or manager_live) and time.time() < deadline:
     current = snapshot()
     current_identities = {pid: started for pid, _ppid, started, _command in current}
+    manager_live = current_identities.get(manager) == manager_identity
     live = {pid: started for pid, started in owned.items() if current_identities.get(pid) == started}
     # Continue following the known ownership tree while supervisors process
     # owner-pipe EOF; this catches descendants created during teardown itself.
@@ -262,14 +269,14 @@ while owned and time.time() < deadline:
                 live[pid] = started
                 changed = True
     owned = live
-    if owned:
+    if owned or manager_live:
         time.sleep(0.05)
-if owned:
+if owned or manager_live:
     latest = {pid: command for pid, _ppid, _started, command in snapshot()}
-    details = [(pid, latest.get(pid, commands.get(pid, ""))) for pid in owned]
+    details = [(pid, latest.get(pid, commands.get(pid, ""))) for pid in ([manager] if manager_live else []) + list(owned)]
     for pid, started in owned.items():
         signal_if_same(pid, started, signal.SIGKILL)
-    raise SystemExit(f"workflow descendants survived manager-only crash: {details}")
+    raise SystemExit(f"workflow manager or descendants survived manager-only crash: {details}")
 PY
 	tmux_e2e kill-session -t "$prior" >/dev/null 2>&1 || true
 	SESSION=""
@@ -294,9 +301,10 @@ write_config() {
 	local destination="$1"
 	local event_log="$2"
 	local delay="$3"
-	python3 - "$destination" "$ROOT/tests/fake_acp.py" "$event_log" "$delay" <<'PY'
+	local gate="${4:-}"
+	python3 - "$destination" "$ROOT/tests/fake_acp.py" "$event_log" "$delay" "$gate" <<'PY'
 import json, sys
-destination, fake, event_log, delay = sys.argv[1:]
+destination, fake, event_log, delay, gate = sys.argv[1:]
 agent = {
     "transport": "acp",
     "acp": {"command": "python3", "args": [fake]},
@@ -306,6 +314,8 @@ agent = {
         "FAKE_WORKFLOW_E2E_DELAY": delay,
     },
 }
+if gate:
+    agent["env"]["FAKE_WORKFLOW_E2E_GATE"] = gate
 config = {
     "defaultAgent": "cursor",
     "agents": {
@@ -316,7 +326,7 @@ config = {
             "env": {
                 **agent["env"],
                 "FAKE_ACP_AGENT_NAME": "@agentclientprotocol/codex-acp",
-                "FAKE_ACP_AGENT_VERSION": "1.1.2",
+                "FAKE_ACP_AGENT_VERSION": "1.1.4",
                 "FAKE_ACP_SESSION_ID": "random",
                 "FAKE_WORKFLOW_E2E_HARNESS": "codex",
             },
@@ -423,7 +433,7 @@ sleep 0.2
 tmux_e2e send-keys -t "$SESSION" Escape
 wait_without_text "cc workflows"
 wait_for_log_count "$FOUR_LOG" worker_end 4
-wait_for_text "orchestrator received workflow completion"
+wait_for_text "orchestrator received workflow completion" 6000
 send_text "/workflows"
 wait_for_text "four-way-project"
 tmux_e2e send-keys -t "$SESSION" Enter
@@ -465,7 +475,7 @@ printf '\n// stale overwrite fixture\n' >> "$SCRATCH/workflows/four-way-project.
 tmux_e2e send-keys -t "$SESSION" s
 wait_for_text "Save workflow"
 tmux_e2e send-keys -t "$SESSION" Enter
-wait_for_text "Overwrite existing personal workflow four-way-project"
+wait_for_text "Overwrite existing personal workflow file four-way-project.js"
 tmux_e2e send-keys -t "$SESSION" Enter
 for _ in {1..300}; do
 	if ! grep -Fq "stale overwrite fixture" "$SCRATCH/workflows/four-way-project.js"; then break; fi
@@ -497,11 +507,13 @@ wait_without_text "cc workflows"
 # apply the first agent's patch, then save the generated source at project scope.
 edit_starts_before="$(log_count "$FOUR_LOG" worker_start)"
 edit_ends_before="$(log_count "$FOUR_LOG" worker_end)"
+edit_completions_before="$(log_count "$FOUR_LOG" orchestrator_completion)"
 send_text "E2E_MODEL_WORKFLOW_EDIT|edit-way-project|modules/auth.txt,modules/billing.txt,modules/catalog.txt,modules/search.txt|clone|2"
 wait_for_text "Run workflow"
 tmux_e2e send-keys -t "$SESSION" Enter
 wait_for_log_count "$FOUR_LOG" worker_start "$((edit_starts_before + 4))"
 wait_for_log_count "$FOUR_LOG" worker_end "$((edit_ends_before + 4))"
+wait_for_log_count "$FOUR_LOG" orchestrator_completion "$((edit_completions_before + 1))"
 send_text "/workflows"
 wait_for_text "edit-way-project"
 tmux_e2e send-keys -t "$SESSION" Enter Enter
@@ -513,7 +525,9 @@ tmux_e2e send-keys -t "$SESSION" a
 wait_for_text "Apply retained changes"
 wait_for_text "modules/auth.txt"
 tmux_e2e send-keys -t "$SESSION" Enter
-for _ in {1..300}; do
+# A confirmed apply is one bounded multi-command worktree operation. Hosted
+# macOS can spend well beyond 30 seconds in its supervised Git/process probes.
+for _ in {1..6000}; do
 	if grep -Fq "workflow-applied-change" "$FOUR_PROJECT/modules/auth.txt"; then break; fi
 	sleep 0.1
 done
@@ -521,7 +535,7 @@ if ! grep -Fq "workflow-applied-change" "$FOUR_PROJECT/modules/auth.txt"; then
 	echo "Explicit TUI worktree apply did not update the target project" >&2
 	exit 1
 fi
-for _ in {1..300}; do
+for _ in {1..6000}; do
 	if grep -R -Fq '"appliedAt"' "$SCRATCH/workflow-state/workflow-runs" 2>/dev/null; then break; fi
 	sleep 0.1
 done
@@ -581,8 +595,10 @@ tmux_e2e send-keys -t "$SESSION" Enter
 wait_for_text "workflows clone only"
 wait_for_log_count "$FOUR_LOG" session_load "$((mode_loads_before + 2))"
 send_text "/workflow-mode disabled"
-# The command submits the exact argument; confirm only after the destructive
-# picker has rendered both its disclosed active-run count and selected action.
+# The first Enter accepts the slash-command completion; submit the exact
+# argument, then confirm only after the destructive picker discloses its count.
+sleep 0.2
+tmux_e2e send-keys -t "$SESSION" Enter
 wait_for_text "Stop 0 active workflows and disable workflows?"
 wait_for_text "›   Stop and disable"
 tmux_e2e send-keys -t "$SESSION" Enter
@@ -597,10 +613,11 @@ stop_session
 SIX_CONFIG="$SCRATCH/six-config.json"
 SIX_SETTINGS="$SCRATCH/six-settings.json"
 SIX_LOG="$SCRATCH/six-events.jsonl"
-# Leave enough work in flight to cover six real adapter process startups on a
-# loaded CI host; the overlap assertion is about scheduler concurrency, not
-# subprocess cold-start speed.
-write_config "$SIX_CONFIG" "$SIX_LOG" "12.0"
+SIX_GATE="$SCRATCH/six-workers.gate"
+# Worktree setup is deliberately serialized before adapters run. Gate the fake
+# turns after worker_start so the overlap assertion proves scheduler concurrency
+# independently of subprocess and supervised Git startup speed.
+write_config "$SIX_CONFIG" "$SIX_LOG" "1.2" "$SIX_GATE"
 printf '%s\n' '{"workflowMode":"flexible","workflowGlobalConcurrency":6,"workflowRunConcurrency":6,"workflowHarnessConcurrency":6,"agents":{"cursor":{"sessionDefaults":{"model":"fast","effort":"high"}}}}' > "$SIX_SETTINGS"
 start_session six "$SIX_PROJECT" "$SIX_CONFIG" "$SIX_SETTINGS" "$SCRATCH/six-state"
 wait_for_text "workflows flexible"
@@ -623,6 +640,7 @@ tmux_e2e send-keys -t "$SESSION" Down Down Down Down Down
 wait_for_text "› ● Analyze modules/web.txt"
 tmux_e2e send-keys -t "$SESSION" r
 wait_for_log_count "$SIX_LOG" worker_start 7
+touch "$SIX_GATE"
 wait_for_log_count "$SIX_LOG" worker_end 6
 tmux_e2e send-keys -t "$SESSION" Enter
 wait_for_text "Attempt 2"
@@ -639,7 +657,9 @@ tmux_e2e send-keys -t "$SESSION" Escape
 wait_for_text "enter phases"
 tmux_e2e send-keys -t "$SESSION" Escape
 wait_without_text "cc workflows"
-wait_for_text "orchestrator received workflow completion"
+# Completion delivery follows serialized retained-worktree finalization. Keep
+# its hosted observation window aligned with the bounded multi-worker setup.
+wait_for_text "orchestrator received workflow completion" 6000
 
 python3 - "$FOUR_LOG" "$SIX_LOG" "$DISABLED_LOG" <<'PY'
 import json, sys
@@ -706,7 +726,11 @@ mkdir -p "$RECOVERY_DIR"
 RECOVERY_CONFIG="$RECOVERY_DIR/config.json"
 RECOVERY_SETTINGS="$RECOVERY_DIR/settings.json"
 RECOVERY_LOG="$RECOVERY_DIR/events.jsonl"
-write_config "$RECOVERY_CONFIG" "$RECOVERY_LOG" "3.0"
+RECOVERY_GATE="$RECOVERY_DIR/workers.gate"
+# Gate every adapter turn after worker_start. The intentional manager crash
+# must exercise four live worker trees independently of serialized worktree
+# startup speed, then release all four recovered attempts together.
+write_config "$RECOVERY_CONFIG" "$RECOVERY_LOG" "1.2" "$RECOVERY_GATE"
 printf '%s\n' '{"workflowMode":"clone-only","workflowGlobalConcurrency":4,"workflowRunConcurrency":4,"workflowHarnessConcurrency":4,"agents":{"cursor":{"sessionDefaults":{"model":"fast","effort":"high"}}}}' > "$RECOVERY_SETTINGS"
 start_session recovery-crash "$FOUR_PROJECT" "$RECOVERY_CONFIG" "$RECOVERY_SETTINGS" "$RECOVERY_DIR/runtime"
 wait_for_log_count "$RECOVERY_LOG" session_new 1
@@ -714,6 +738,11 @@ send_text "E2E_MODEL_WORKFLOW|crash-recovery-project|modules/auth.txt,modules/bi
 wait_for_text "Run workflow"
 tmux_e2e send-keys -t "$SESSION" Enter
 wait_for_log_count "$RECOVERY_LOG" worker_start 4
+if [ "$(log_count "$RECOVERY_LOG" worker_end)" -ne 0 ]; then
+	echo "Crash-recovery workers completed before the manager-only crash" >&2
+	cat "$RECOVERY_LOG" >&2
+	exit 1
+fi
 crash_session
 start_session recovery-restart "$FOUR_PROJECT" "$RECOVERY_CONFIG" "$RECOVERY_SETTINGS" "$RECOVERY_DIR/runtime-restart"
 wait_for_log_count "$RECOVERY_LOG" session_new 6
@@ -727,10 +756,11 @@ tmux_e2e send-keys -t "$SESSION" c
 wait_for_text "Recovery of"
 tmux_e2e send-keys -t "$SESSION" Enter
 wait_for_log_count "$RECOVERY_LOG" worker_start 8
+touch "$RECOVERY_GATE"
 wait_for_log_count "$RECOVERY_LOG" worker_end 4
 tmux_e2e send-keys -t "$SESSION" Escape
 wait_without_text "cc workflows"
-wait_for_text "orchestrator received workflow completion"
+wait_for_text "orchestrator received workflow completion" 6000
 stop_session
 
 echo "dynamic workflow E2E: disabled baseline, model-authored MCP launch, 4/6-way execution, routing, lifecycle, save/overwrite, crash/recovery, and TUI passed"

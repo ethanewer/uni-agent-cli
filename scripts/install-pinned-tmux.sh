@@ -8,6 +8,14 @@ LIBEVENT_SHA256=92e6de1be9ec176428fd2367677e61ceffc2ee1cb119035037a27d346b0403bb
 BUILD_ROOT="$(mktemp -d -t cc-pinned-tmux.XXXXXX)"
 PREFIX="$BUILD_ROOT/prefix"
 mkdir -p "$PREFIX"
+if [ -x /usr/bin/clang ]; then
+	BUILD_CC=/usr/bin/clang
+elif [ -x /usr/bin/cc ]; then
+	BUILD_CC=/usr/bin/cc
+else
+	BUILD_CC="$(command -v cc)"
+fi
+[ -n "$BUILD_CC" ] && [ -x "$BUILD_CC" ]
 
 curl -fsSL "https://github.com/libevent/libevent/releases/download/release-${LIBEVENT_VERSION}/libevent-${LIBEVENT_VERSION}.tar.gz" -o "$BUILD_ROOT/libevent.tar.gz"
 curl -fsSL "https://github.com/tmux/tmux/releases/download/${TMUX_VERSION}/tmux-${TMUX_VERSION}.tar.gz" -o "$BUILD_ROOT/tmux.tar.gz"
@@ -17,15 +25,15 @@ printf '%s  %s\n' "$TMUX_SHA256" "$BUILD_ROOT/tmux.tar.gz" | shasum -a 256 -c -
 tar -xzf "$BUILD_ROOT/libevent.tar.gz" -C "$BUILD_ROOT"
 (
 	cd "$BUILD_ROOT/libevent-${LIBEVENT_VERSION}"
-	./configure --prefix="$PREFIX" --disable-shared --enable-static --disable-openssl
+	CC="$BUILD_CC" CC_FOR_BUILD="$BUILD_CC" ./configure --prefix="$PREFIX" --disable-shared --enable-static --disable-openssl
 	make -j2
 	make install
 )
 tar -xzf "$BUILD_ROOT/tmux.tar.gz" -C "$BUILD_ROOT"
 (
 	cd "$BUILD_ROOT/tmux-${TMUX_VERSION}"
-	PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" CPPFLAGS="-I$PREFIX/include" LDFLAGS="-L$PREFIX/lib" \
-		./configure --prefix="$PREFIX"
+	CC="$BUILD_CC" CC_FOR_BUILD="$BUILD_CC" PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig" CPPFLAGS="-I$PREFIX/include" LDFLAGS="-L$PREFIX/lib" \
+		./configure --prefix="$PREFIX" --disable-utf8proc
 	make -j2
 	make install
 )

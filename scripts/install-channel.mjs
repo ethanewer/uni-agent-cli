@@ -357,6 +357,7 @@ function assertSafeCandidateArchive(tarball) {
 	let entries = 0;
 	let totalBytes = 0;
 	let ended = false;
+	let deferredSpecialEntry = false;
 	while (offset + 512 <= archive.length) {
 		const header = archive.subarray(offset, offset + 512);
 		if (header.every((byte) => byte === 0)) { ended = true; break; }
@@ -367,28 +368,57 @@ function assertSafeCandidateArchive(tarball) {
 		for (let index = 0; index < 512; index += 1) checksum += index >= 148 && index < 156 ? 0x20 : header[index];
 		if (checksum !== recordedChecksum) throw new Error("validated candidate archive header checksum mismatch");
 		const type = header[156];
-		if (![0, 0x30, 0x35].includes(type)) throw new Error("validated candidate archive contains a link or special filesystem entry");
 		const name = tarString(header.subarray(0, 100));
 		const prefix = tarString(header.subarray(345, 500));
 		const entry = prefix ? `${prefix}/${name}` : name;
-		if (Buffer.byteLength(entry, "utf8") > MAX_CANDIDATE_PATH_BYTES || !entry.startsWith("package/")) {
-			throw new Error("validated candidate contains an unsafe package archive path");
-		}
-		const relative = entry.slice("package/".length).replace(/\/$/u, "");
-		if ((!relative && type !== 0x35) || relative.includes("\\") || (relative && relative.split("/").some((part) => part === "." || part === ".." || !part))) {
-			throw new Error("validated candidate contains an unsafe package archive path");
-		}
 		const size = tarOctal(header.subarray(124, 136), "entry size");
-		if (type === 0x35 && size !== 0) throw new Error("validated candidate archive directory contains data");
 		if (size > MAX_CANDIDATE_ENTRY_BYTES) throw new Error("validated candidate archive entry exceeds the size limit");
 		totalBytes += size;
 		if (totalBytes > MAX_CANDIDATE_UNPACKED_BYTES) throw new Error("validated candidate archive content exceeds the size limit");
-		offset += 512 + Math.ceil(size / 512) * 512;
-		if (offset > archive.length) throw new Error("validated candidate archive is truncated");
+		const nextOffset = offset + 512 + Math.ceil(size / 512) * 512;
+		if (nextOffset > archive.length) throw new Error("validated candidate archive is truncated");
+		if (type === 0x78) {
+			// BSD tar represents sparse files through a PAX record whose stored body
+			// can be tiny while extraction materializes the declared logical size.
+			// Inspect that bound before rejecting the unsupported metadata entry.
+			const pax = archive.subarray(offset + 512, offset + 512 + size).toString("utf8");
+			const sparseSize = /(?:^|\n)\d+ GNU\.sparse\.(?:realsize|size)=(\d+)\n/u.exec(pax)?.[1];
+			if (sparseSize) {
+				try {
+					if (BigInt(sparseSize) > BigInt(MAX_CANDIDATE_UNPACKED_BYTES)) {
+						throw new Error("validated candidate archive exceeds its expanded-size limit");
+					}
+				} catch (error) {
+					if (/expanded-size limit/u.test(error?.message ?? "")) throw error;
+					throw new Error("validated candidate archive contains invalid sparse-file metadata", { cause: error });
+				}
+			}
+			deferredSpecialEntry = true;
+			offset = nextOffset;
+			continue;
+		}
+		if (![0, 0x30, 0x35].includes(type)) throw new Error("validated candidate archive contains a link or special filesystem entry");
+		if (entry.split("/").some((part) => part.startsWith("._"))) {
+			deferredSpecialEntry = true;
+			offset = nextOffset;
+			continue;
+		}
+		const packageRootDirectory = entry === "package" && type === 0x35;
+		if (Buffer.byteLength(entry, "utf8") > MAX_CANDIDATE_PATH_BYTES ||
+			(!packageRootDirectory && !entry.startsWith("package/"))) {
+			throw new Error("validated candidate contains an unsafe package archive path");
+		}
+		const relative = packageRootDirectory ? "" : entry.slice("package/".length).replace(/\/$/u, "");
+		if ((!relative && type !== 0x35) || relative.includes("\\") || (relative && relative.split("/").some((part) => part === "." || part === ".." || !part))) {
+			throw new Error("validated candidate contains an unsafe package archive path");
+		}
+		if (type === 0x35 && size !== 0) throw new Error("validated candidate archive directory contains data");
+		offset = nextOffset;
 	}
 	if (!ended || entries === 0 || archive.subarray(offset).some((byte) => byte !== 0)) {
 		throw new Error("validated candidate archive has invalid termination");
 	}
+	if (deferredSpecialEntry) throw new Error("validated candidate archive contains a link or special filesystem entry");
 }
 
 export function extractReleaseCandidate(candidate, destination, runCommand = run) {
@@ -1880,9 +1910,15 @@ function publishInstallerLock(paths) {
 	}
 }
 
+// macOS may hide same-user process environments from ps, leaving the process
+// start instant plus command title as the portable cross-process identity. Keep
+// one random title for this installer lifetime: nested acquisition attempts must
+// observe the existing live owner, while another process gets a distinct token.
+const INSTALLER_PROCESS_TITLE = `cc-install:${randomUUID().replaceAll("-", "").slice(0, 16)}`;
+
 export function acquireLock(paths) {
 	const priorProcessTitle = process.title;
-	if (process.platform === "darwin") process.title = `cc-install:${randomUUID().replaceAll("-", "").slice(0, 16)}`;
+	if (process.platform === "darwin") process.title = INSTALLER_PROCESS_TITLE;
 	const restoreProcessTitle = () => { if (process.platform === "darwin") process.title = priorProcessTitle; };
 	let ownership;
 	let staleTombstone;

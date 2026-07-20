@@ -17,6 +17,7 @@ START_LOG = os.environ.get("FAKE_ACP_START_LOG")
 WORKFLOW_E2E = os.environ.get("FAKE_WORKFLOW_E2E") == "1"
 WORKFLOW_E2E_LOG = os.environ.get("FAKE_WORKFLOW_E2E_LOG")
 WORKFLOW_E2E_DELAY = float(os.environ.get("FAKE_WORKFLOW_E2E_DELAY", "1.2"))
+WORKFLOW_E2E_GATE = os.environ.get("FAKE_WORKFLOW_E2E_GATE")
 _fake_session_id = os.environ.get("FAKE_ACP_SESSION_ID", "fake-session")
 FAKE_SESSION_ID = str(uuid.uuid4()) if _fake_session_id == "random" else _fake_session_id
 SESSION_CWD = os.getcwd()
@@ -267,7 +268,18 @@ def request_many(requests):
     raise RuntimeError("stdin closed")
 
 
-def poll_cancel(duration):
+def poll_cancel(duration, gate=None):
+    while gate and not os.path.exists(gate):
+        readable, _, _ = select.select([sys.stdin], [], [], 0.05)
+        if not readable:
+            continue
+        raw = sys.stdin.readline()
+        if not raw:
+            return False
+        message = json.loads(raw)
+        if message.get("method") == "session/cancel":
+            return True
+        handle_message(message)
     deadline = time.monotonic() + duration
     while time.monotonic() < deadline:
         timeout = min(0.05, max(0, deadline - time.monotonic()))
@@ -546,12 +558,28 @@ def handle_prompt(message):
                 "title": f"{'Edit' if editing else 'Analyze'} {relative}",
             }},
         })
-        if poll_cancel(WORKFLOW_E2E_DELAY):
+        if poll_cancel(WORKFLOW_E2E_DELAY, WORKFLOW_E2E_GATE):
             workflow_e2e_record("worker_cancelled", prompt=prompt, relative=relative)
             send({"jsonrpc": "2.0", "id": request_id, "result": {"stopReason": "cancelled"}})
             return
-        with open(target, "r", encoding="utf-8") as source_file:
-            content = source_file.read().strip()
+        try:
+            with open(target, "r", encoding="utf-8") as source_file:
+                content = source_file.read().strip()
+        except FileNotFoundError:
+            # A model turn can fail without the ACP server process crashing. Keep
+            # the streaming backend alive so the workflow records an ordinary
+            # failed agent attempt and the supervisor can attest owner-driven
+            # shutdown instead of correctly fencing an unexplained backend exit.
+            message_text = f"E2E analysis target does not exist: {relative}"
+            workflow_e2e_record("worker_error", prompt=prompt, relative=relative, error=message_text)
+            send({
+                "jsonrpc": "2.0", "method": "session/update",
+                "params": {"sessionId": FAKE_SESSION_ID, "update": {
+                    "sessionUpdate": "tool_call_update", "toolCallId": "analyze-e2e", "status": "failed",
+                }},
+            })
+            send({"jsonrpc": "2.0", "id": request_id, "error": {"code": -32000, "message": message_text}})
+            return
         if editing:
             with open(target, "a", encoding="utf-8") as target_file:
                 target_file.write("workflow-applied-change\n")

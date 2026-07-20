@@ -20,7 +20,7 @@ if (process.platform !== "win32") {
 		PROJECT_PYTHON = trustedExecutableOnPath("python3", process.env, [
 			RELEASE_ROOT,
 			...userControlledPathRoots(process.cwd()),
-		]);
+		], { requireRootOwnership: true });
 	} catch { /* Project workflow I/O reports unavailability; personal/inline workflows remain usable. */ }
 }
 const WORKFLOW_IMPORT_INDEX_BYTES = 4 * 1024 * 1024;

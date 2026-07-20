@@ -331,7 +331,7 @@ export class AdapterWorkflowExecutor {
 					const cleanupTimer = setTimeout(() => cleanupController.abort(Object.assign(
 						new Error("Workflow worktree cleanup timed out"),
 						{ code: "WORKFLOW_WORKTREE_CLEANUP_TIMEOUT" },
-					)), WORKFLOW_LIMITS.gitTimeoutMs);
+					)), WORKFLOW_LIMITS.gitOperationTimeoutMs);
 					cleanupTimer.unref?.();
 					// Removal updates the same shared worktree registry and therefore
 					// uses the repository lock as setup and interactive apply operations.

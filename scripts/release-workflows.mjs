@@ -60,6 +60,10 @@ for (const [name, value] of Object.entries(credentialFreeEnv)) {
 	if (/^GIT_/iu.test(name) || /(?:key|token|secret|password|credential|auth)/iu.test(name) || /(?:^|_)pat(?:_|$)/iu.test(name) ||
 		/^npm_config_.*(?:auth|token|userconfig|globalconfig)/iu.test(name) || /[\r\n]/u.test(String(value ?? "")) || credentialBearingUrl(value)) delete credentialFreeEnv[name];
 }
+// CC_RELEASE_COMMIT is an assertion consumed by this outer verifier. Passing it
+// into ordinary regression fixtures would incorrectly turn every channel
+// installation they exercise into a protected-candidate promotion request.
+delete credentialFreeEnv.CC_RELEASE_COMMIT;
 const emptyNpmConfigDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "cc-release-npm-config-"));
 credentialFreeEnv.npm_config_userconfig = path.join(emptyNpmConfigDirectory, "user.npmrc");
 credentialFreeEnv.npm_config_globalconfig = path.join(emptyNpmConfigDirectory, "global.npmrc");

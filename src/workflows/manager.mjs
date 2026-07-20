@@ -461,7 +461,9 @@ export class WorkflowManager {
 				for (const candidate of missing) {
 					await ensureWorkflowPrivateDirectory(path.join(root, candidate.id));
 					try {
-						const release = await acquireWorkflowRunLease(this.stateRoot, candidate.id, { timeoutMs: 0 });
+						const release = await acquireWorkflowRunLease(this.stateRoot, candidate.id, {
+							timeoutMs: 0, waitForDeadOwnerReclaim: true,
+						});
 						preacquiredLeases.set(candidate.id, release);
 						recoveryLeases.push(release);
 						recoveryOwnedRunIds.add(candidate.id);
@@ -499,7 +501,11 @@ export class WorkflowManager {
 				const directory = path.join(root, candidate.name);
 				if (candidate.state !== "archived") {
 					let releaseLease;
-					try { releaseLease = preacquiredLeases.get(candidate.name) ?? await acquireWorkflowRunLease(this.stateRoot, candidate.name, { timeoutMs: 0 }); }
+					try {
+						releaseLease = preacquiredLeases.get(candidate.name) ?? await acquireWorkflowRunLease(this.stateRoot, candidate.name, {
+							timeoutMs: 0, waitForDeadOwnerReclaim: true,
+						});
+					}
 					catch (error) {
 						if (error?.code === "WORKFLOW_LOCK_TIMEOUT") { protectedRunIds.add(candidate.name); continue; }
 						throw error;
@@ -1675,8 +1681,8 @@ export class WorkflowManager {
 		const abortExternal = () => controller.abort(options?.signal?.reason ?? Object.assign(new Error("Workflow worktree operation cancelled"), { code: "WORKFLOW_WORKTREE_CANCELLED" }));
 		if (options?.signal?.aborted) abortExternal();
 		else options?.signal?.addEventListener("abort", abortExternal, { once: true });
-		const deadline = Date.now() + WORKFLOW_LIMITS.gitTimeoutMs;
-		const timer = setTimeout(() => controller.abort(Object.assign(new Error("Workflow worktree operation timed out"), { code: "WORKFLOW_GIT_TIMEOUT" })), WORKFLOW_LIMITS.gitTimeoutMs);
+		const deadline = Date.now() + WORKFLOW_LIMITS.gitOperationTimeoutMs;
+		const timer = setTimeout(() => controller.abort(Object.assign(new Error("Workflow worktree operation timed out"), { code: "WORKFLOW_GIT_TIMEOUT" })), WORKFLOW_LIMITS.gitOperationTimeoutMs);
 		timer.unref?.();
 		const task = Promise.resolve().then(() => operation(controller.signal, deadline));
 		const tracked = { controller, settled: task.then(() => undefined, () => undefined) };
@@ -1917,9 +1923,15 @@ export class WorkflowManager {
 			this.#requireRestart(run.commitAmbiguousError);
 			return false;
 		}
-		if (!run.execution && ["awaiting", "accepted", "committing", "published", "commit-cancelled"].includes(run.responseAcceptanceState)) {
-			void this.rollbackStart(id).catch((error) => this.#requireRestart(error));
-			return true;
+		if (!run.execution) {
+			if (["awaiting", "accepted", "committing", "published", "commit-cancelled"].includes(run.responseAcceptanceState)) {
+				void this.rollbackStart(id).catch((error) => this.#requireRestart(error));
+				return true;
+			}
+			// A rolled-back launch with failed durable cleanup owns no execution and
+			// has already closed its journal. Shutdown retries that cleanup directly;
+			// it must never append an ordinary run-stop record to the retired handle.
+			return false;
 		}
 		run.status = "stopping";
 		for (const agent of run.agents.values()) {
@@ -1935,7 +1947,17 @@ export class WorkflowManager {
 		for (const sandbox of run.sandboxes) sandbox.stop();
 		this.scheduler.cancelRun(id, "Workflow stopped");
 		this.#changed(run);
-		return this.#record(run, { type: "run_stop_requested", status: "stopped" }, true).then(
+		const persistStop = (async () => {
+			// Final delivery metadata and journal closure use the same lock. Joining
+			// that queue makes a synchronously accepted stop durable before close,
+			// including the narrow race after execution settles but before its final
+			// status is projected.
+			const releaseMetadata = await this.#acquireRunMetadata(run);
+			try { await this.#record(run, { type: "run_stop_requested", status: "stopped" }, true); }
+			finally { await releaseMetadata(); }
+			return true;
+		})();
+		return persistStop.then(
 			() => true,
 			(error) => {
 				this.#requireRestart(error);
@@ -1978,6 +2000,10 @@ export class WorkflowManager {
 		const unacceptedRuns = [...this.runs.values()].filter((run) => ["awaiting", "accepted", "committing", "published", "commit-cancelled", "commit-ambiguous"].includes(run.responseAcceptanceState) && !run.execution);
 		const unacceptedRollbacks = await Promise.allSettled(unacceptedRuns.map((run) => this.rollbackStart(run.id)));
 		const stopRequests = [...this.runs.values()].map((run) => Promise.resolve(this.stop(run.id)));
+		// Attach rejection handlers before awaiting rollback/pending-start phases;
+		// a fast durable stop failure must remain part of the final aggregate rather
+		// than becoming a temporarily unhandled rejection.
+		const stopRequestSettlement = Promise.allSettled(stopRequests);
 		await Promise.allSettled(pendingApprovals.map((pending) => pending.settled));
 		while (this.pendingStarts > 0) await new Promise((resolve) => setTimeout(resolve, 20));
 		const failedStartCleanupRuns = [...this.failedStartCleanups];
@@ -1995,7 +2021,7 @@ export class WorkflowManager {
 			while (!RUN_STATES.slice(4).includes(run.status)) await new Promise((resolve) => setTimeout(resolve, 20));
 			await run.execution;
 		}));
-		const stopRequestResults = await Promise.allSettled(stopRequests);
+		const stopRequestResults = await stopRequestSettlement;
 		await Promise.allSettled(worktreeOperations.map((operation) => operation.settled));
 		// Archiving may itself discover a transient lease-release failure. Alternate
 		// archive and global release retries until an entire pass is clean, and only
@@ -2035,9 +2061,12 @@ export class WorkflowManager {
 				});
 			}
 			const convergenceOnly = archiveRetryErrors.length === 0 && runSettlements.every((result) => result.status === "fulfilled") && stopRequestResults.every((result) => result.status === "fulfilled");
-			throw Object.assign(new AggregateError(failures, convergenceOnly
+			const shutdownMessage = convergenceOnly
 				? "workflow shutdown could not be confirmed stopped or release every ownership fence"
-				: "workflow shutdown could not durably archive every terminal run"), {
+				: convergenceErrors.length > 0
+					? "workflow shutdown left one or more unarchived runs and one or more process trees or ownership fences could not be confirmed stopped"
+					: "workflow shutdown left one or more unarchived runs after delivery convergence";
+			throw Object.assign(new AggregateError(failures, shutdownMessage), {
 				code: "WORKFLOW_ARCHIVE_INCOMPLETE",
 			});
 		}

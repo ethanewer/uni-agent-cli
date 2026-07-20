@@ -15,7 +15,11 @@ const GIT_OUTPUT_LIMIT = 32 * 1024 * 1024;
 const WORKER_TRACKING_FAILURE_EXIT = 86;
 const CHILD_ENVIRONMENT_MAX_BYTES = 1024 * 1024;
 const ORPHAN_RECOVERY_LIMIT = 2048;
-const ORPHAN_RECOVERY_TIMEOUT_MS = 30_000;
+// Reconciliation performs several independently supervised Git validations
+// under one aggregate deadline. Give that complete sequence the same bounded
+// budget as an ordinary Git operation so loaded macOS runners do not retain a
+// clean orphan merely because setup consumed the former 30-second allowance.
+const ORPHAN_RECOVERY_TIMEOUT_MS = WORKFLOW_LIMITS.gitOperationTimeoutMs;
 const ORPHAN_DISCOVERY_MAX_ENTRIES = 50_000;
 const APPLY_PATH_LIMIT = 10_000;
 const DISABLED_HOOKS_PATH = process.platform === "win32" ? "NUL" : "/dev/null";
@@ -220,13 +224,17 @@ async function git(cwd, args, options = {}) {
 		throw Object.assign(new Error("workflow Git descendant tracking is unavailable"), { code: "WORKFLOW_GIT_TREE_TRACKING_FAILED" });
 	}
 	const deadline = options.deadline ?? Date.now() + WORKFLOW_LIMITS.gitTimeoutMs;
+	const timeoutError = () => Object.assign(new Error(`workflow Git ${safeSegment(args[0] ?? "operation")} timed out`), {
+		code: "WORKFLOW_GIT_TIMEOUT",
+		operation: String(args[0] ?? "operation"),
+	});
 	let gitPath;
 	try { gitPath = options.gitPath ?? workflowGitExecutable(); }
 	catch (error) {
 		throw Object.assign(new Error(`workflow Git executable is not trusted: ${error.message}`), { code: "WORKFLOW_GIT_UNTRUSTED" });
 	}
 	let remaining = deadline - Date.now();
-	if (remaining <= 0) throw Object.assign(new Error("workflow Git operation timed out"), { code: "WORKFLOW_GIT_TIMEOUT" });
+	if (remaining <= 0) throw timeoutError();
 	let filterArguments = Array.isArray(options.filterArguments) ? options.filterArguments : [];
 	if (!Array.isArray(options.filterArguments) && options.skipFilterInspection !== true) {
 		const configuredKeys = await git(cwd, [
@@ -234,7 +242,7 @@ async function git(cwd, args, options = {}) {
 		], { ...options, skipFilterInspection: true, acceptedExitCodes: [0, 1], deadline });
 		filterArguments = filterNeutralizationArguments(configuredKeys);
 		remaining = deadline - Date.now();
-		if (remaining <= 0) throw Object.assign(new Error("workflow Git operation timed out"), { code: "WORKFLOW_GIT_TIMEOUT" });
+		if (remaining <= 0) throw timeoutError();
 	}
 	return await new Promise((resolve, reject) => {
 		const gitArguments = [
@@ -320,7 +328,7 @@ async function git(cwd, args, options = {}) {
 		};
 		const onAbort = () => terminate(options.signal.reason ?? Object.assign(new Error("workflow Git operation cancelled"), { name: "AbortError" }));
 		options.signal?.addEventListener("abort", onAbort, { once: true });
-		const timeout = setTimeout(() => terminate(Object.assign(new Error("workflow Git operation timed out"), { code: "WORKFLOW_GIT_TIMEOUT" })), Math.min(WORKFLOW_LIMITS.gitTimeoutMs, Math.max(1, remaining)));
+		const timeout = setTimeout(() => terminate(timeoutError()), Math.min(WORKFLOW_LIMITS.gitTimeoutMs, Math.max(1, remaining)));
 		timeout.unref?.();
 		const append = (chunks, chunk, stream) => {
 			if (stream === "stdout") stdoutBytes += chunk.length;
@@ -388,7 +396,7 @@ async function git(cwd, args, options = {}) {
 }
 
 function operationOptions(options = {}) {
-	return { ...options, deadline: options.deadline ?? Date.now() + WORKFLOW_LIMITS.gitTimeoutMs };
+	return { ...options, deadline: options.deadline ?? Date.now() + WORKFLOW_LIMITS.gitOperationTimeoutMs };
 }
 
 function rootIdentity(fingerprint) {
@@ -605,7 +613,7 @@ export class WorkflowWorktrees {
 				}),
 			});
 		} catch (validationError) {
-			const cleanup = pinnedFingerprintOperation({ deadline: Date.now() + WORKFLOW_LIMITS.gitTimeoutMs }, repositoryFingerprint);
+			const cleanup = pinnedFingerprintOperation({ deadline: Date.now() + WORKFLOW_LIMITS.gitOperationTimeoutMs }, repositoryFingerprint);
 			try {
 				await git(record.repository, ["worktree", "remove", "--force", record.directory], cleanup);
 				await this.#removeMarker(record);
@@ -622,11 +630,11 @@ export class WorkflowWorktrees {
 	async status(record, options = {}) {
 		const operation = operationOptions(options);
 		const { checkoutOperation } = await this.#validate(record, operation);
-		const porcelain = (await git(record.directory, ["status", "--porcelain=v1", "--untracked-files=all"], checkoutOperation)).trim();
+		const porcelain = (await git(record.directory, ["--no-optional-locks", "status", "--porcelain=v1", "--untracked-files=all"], checkoutOperation)).trim();
 		const head = (await git(record.directory, ["rev-parse", "HEAD"], checkoutOperation)).trim();
 		const headMoved = head !== record.base;
 		const committed = headMoved
-			? (await git(record.directory, ["diff", "--no-textconv", "--name-status", record.base, "HEAD", "--", "."], checkoutOperation)).trim()
+			? (await git(record.directory, ["--no-optional-locks", "diff", "--no-textconv", "--name-status", record.base, "HEAD", "--", "."], checkoutOperation)).trim()
 			: "";
 		const allChangedFiles = [
 			...(porcelain ? porcelain.split("\n") : []),
@@ -642,10 +650,10 @@ export class WorkflowWorktrees {
 		// Intent-to-add makes untracked files part of the binary patch without
 		// staging their contents or changing the checked-out files.
 		await git(record.directory, ["add", "-N", "--", "."], checkoutOperation);
-		const patchText = await git(record.directory, ["diff", "--binary", "--no-ext-diff", "--no-textconv", record.base, "--", "."], checkoutOperation);
+		const patchText = await git(record.directory, ["--no-optional-locks", "diff", "--binary", "--no-ext-diff", "--no-textconv", record.base, "--", "."], checkoutOperation);
 		const bytes = Buffer.byteLength(patchText, "utf8");
 		if (bytes === 0) throw new Error("retained workflow worktree has no changes to apply");
-		const stat = (await git(record.directory, ["diff", "--no-textconv", "--stat", record.base, "--", "."], checkoutOperation)).trim();
+		const stat = (await git(record.directory, ["--no-optional-locks", "diff", "--no-textconv", "--stat", record.base, "--", "."], checkoutOperation)).trim();
 		const target = await this.#targetState(repository, repositoryOperation);
 		const status = await this.status(record, operation);
 		const { changedFiles, changedFilesTruncated } = status;
@@ -961,7 +969,7 @@ export class WorkflowWorktrees {
 	}
 
 	async #changedPathNames(record, options) {
-		const output = await git(record.directory, ["diff", "--no-textconv", "--name-status", "-z", record.base, "--", "."], options);
+		const output = await git(record.directory, ["--no-optional-locks", "diff", "--no-textconv", "--name-status", "-z", record.base, "--", "."], options);
 		const fields = output.split("\0");
 		const names = [];
 		for (let index = 0; index < fields.length && fields[index];) {
@@ -1169,9 +1177,9 @@ export class WorkflowWorktrees {
 	async #targetState(repository, options = {}) {
 		const head = (await git(repository, ["rev-parse", "HEAD"], options)).trim();
 		const branch = (await git(repository, ["rev-parse", "--abbrev-ref", "HEAD"], options)).trim();
-		const status = await git(repository, ["status", "--porcelain=v1", "-z", "--untracked-files=all"], options);
-		const trackedDiff = await git(repository, ["diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD", "--", "."], options);
-		const stagedDiff = await git(repository, ["diff", "--cached", "--binary", "--no-ext-diff", "--no-textconv", "HEAD", "--", "."], options);
+		const status = await git(repository, ["--no-optional-locks", "status", "--porcelain=v1", "-z", "--untracked-files=all"], options);
+		const trackedDiff = await git(repository, ["--no-optional-locks", "diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD", "--", "."], options);
+		const stagedDiff = await git(repository, ["--no-optional-locks", "diff", "--cached", "--binary", "--no-ext-diff", "--no-textconv", "HEAD", "--", "."], options);
 		const untracked = (await git(repository, ["ls-files", "--others", "--exclude-standard", "-z"], options))
 			.split("\0").filter(Boolean).sort();
 		const untrackedHashes = [];

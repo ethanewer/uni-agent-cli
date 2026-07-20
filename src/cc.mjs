@@ -37,6 +37,17 @@ function restoreTerminalMode(state) {
 			timeout: 1_000,
 		});
 		if (restored.status !== 0) return false;
+		// macOS includes the transient PENDIN state in `stty -g`, but replaying
+		// the encoded state does not set that bit. Restore it explicitly when it
+		// was present in the shell snapshot so SIGKILL recovery is exact too.
+		const localFlags = /^gfmt1:.*(?:^|:)lflag=([0-9a-f]+)(?::|$)/u.exec(state)?.[1];
+		if (process.platform === "darwin" && localFlags &&
+			(BigInt(`0x${localFlags}`) & 0x20000000n) !== 0n) {
+			const pending = spawnSync("stty", ["pendin"], {
+				stdio: [tty ?? "inherit", "ignore", "ignore"], timeout: 1_000,
+			});
+			if (pending.status !== 0) return false;
+		}
 	} catch {
 		// Best effort only; setRawMode(false) below still restores ordinary launches.
 		return false;

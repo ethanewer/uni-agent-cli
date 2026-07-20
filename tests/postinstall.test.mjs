@@ -139,6 +139,7 @@ assert.match(launcher.split(/\r?\n/, 1)[0], /^#!\/usr\/bin\/env node$/u);
 assert.match(launcher, /Node\.js 22\.19\.0 or newer/u);
 assert.match(launcher, /const startupTerminalMode = inheritedTerminalMode \?\? captureTerminalMode\(\)/u, "the direct npm bin captures a restoration snapshot without the source shell wrapper");
 assert.match(workflowRelease, /const deterministicEnv = \{[\s\S]*\.\.\.credentialFreeEnv/u, "deterministic install gates use the credential-scrubbed environment");
+assert.match(workflowRelease, /delete credentialFreeEnv\.CC_RELEASE_COMMIT/u, "the outer release commit assertion cannot leak into ordinary channel installer regression fixtures");
 assert.match(workflowRelease, /key\|token\|secret\|password\|credential\|auth/u, "deterministic install gates scrub model, registry, and secret-shaped credentials");
 assert.match(workflowRelease, /credentialBearingUrl/u, "deterministic install gates scrub credentials embedded in registry or proxy URLs");
 assert.match(workflowRelease, /supplied workflow release candidate does not exactly match the reviewed checkout/u, "a supplied local candidate is content-bound to the reviewed checkout");
@@ -224,9 +225,20 @@ if (process.platform !== "win32") {
 			const result = spawnSync("git", args, { cwd: releaseFixture, encoding: "utf8" });
 			assert.equal(result.status, 0, result.stderr);
 		}
+		const releaseFixtureEnvironment = {
+			...process.env,
+			PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ""}`,
+		};
+		// This test itself runs inside the deterministic candidate gate. Do not let
+		// the outer release's immutable candidate/evidence paths become inputs to
+		// the nested, independently committed release fixture.
+		for (const name of [
+			"CC_RELEASE_COMMIT", "CC_RELEASE_NODE", "CC_RELEASE_NPM_CLI",
+			"CC_WORKFLOW_E2E_RESULT_PATH", "CC_WORKFLOW_E2E_TARBALL", "CC_WORKFLOW_RELEASE_DIR",
+		]) delete releaseFixtureEnvironment[name];
 		const localRelease = spawnSync(fixtureNode, [path.join(releaseFixture, "scripts", "release-workflows.mjs"), "live"], {
 			cwd: releaseFixture, encoding: "utf8",
-			env: { ...process.env, PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ""}`, CC_WORKFLOW_RELEASE_DIR: releaseEvidence },
+			env: { ...releaseFixtureEnvironment, CC_WORKFLOW_RELEASE_DIR: releaseEvidence },
 		});
 		assert.equal(localRelease.status, 0, localRelease.stderr);
 		for (const name of [
@@ -247,7 +259,7 @@ if (process.platform !== "win32") {
 
 		const invalidLive = spawnSync(fixtureNode, [path.join(releaseFixture, "scripts", "release-workflows.mjs"), "live"], {
 			cwd: releaseFixture, encoding: "utf8",
-			env: { ...process.env, PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ""}`, CC_WORKFLOW_RELEASE_DIR: invalidLiveEvidence, CC_FAKE_LIVE_INVALID: "1" },
+			env: { ...releaseFixtureEnvironment, CC_WORKFLOW_RELEASE_DIR: invalidLiveEvidence, CC_FAKE_LIVE_INVALID: "1" },
 		});
 		assert.notEqual(invalidLive.status, 0);
 		assert.match(invalidLive.stderr, /authenticated live evidence is incomplete or contradictory/u);
@@ -257,7 +269,7 @@ if (process.platform !== "win32") {
 
 		const failedDeterministic = spawnSync(fixtureNode, [path.join(releaseFixture, "scripts", "release-workflows.mjs"), "deterministic"], {
 			cwd: releaseFixture, encoding: "utf8",
-			env: { ...process.env, PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ""}`, CC_WORKFLOW_RELEASE_DIR: failedDeterministicEvidence, CC_FAKE_DETERMINISTIC_FAIL: "1" },
+			env: { ...releaseFixtureEnvironment, CC_WORKFLOW_RELEASE_DIR: failedDeterministicEvidence, CC_FAKE_DETERMINISTIC_FAIL: "1" },
 		});
 		assert.notEqual(failedDeterministic.status, 0);
 		const failedDeterministicResult = JSON.parse(fs.readFileSync(path.join(failedDeterministicEvidence, "dynamic-workflows-release-result.json"), "utf8"));
@@ -267,7 +279,7 @@ if (process.platform !== "win32") {
 		fs.writeFileSync(mismatchedCandidate, "not the reviewed checkout");
 		const failedCandidate = spawnSync(fixtureNode, [path.join(releaseFixture, "scripts", "release-workflows.mjs"), "deterministic"], {
 			cwd: releaseFixture, encoding: "utf8",
-			env: { ...process.env, PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ""}`, CC_WORKFLOW_RELEASE_DIR: failedCandidateEvidence, CC_WORKFLOW_E2E_TARBALL: mismatchedCandidate },
+			env: { ...releaseFixtureEnvironment, CC_WORKFLOW_RELEASE_DIR: failedCandidateEvidence, CC_WORKFLOW_E2E_TARBALL: mismatchedCandidate },
 		});
 		assert.notEqual(failedCandidate.status, 0);
 		assert.match(failedCandidate.stderr, /does not exactly match the reviewed checkout/u);
@@ -281,7 +293,7 @@ if (process.platform !== "win32") {
 		fs.writeFileSync(dirtyFile, "uncommitted release input");
 		const dirtyCheckout = spawnSync(fixtureNode, [path.join(releaseFixture, "scripts", "release-workflows.mjs"), "deterministic"], {
 			cwd: releaseFixture, encoding: "utf8",
-			env: { ...process.env, PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ""}`, CC_WORKFLOW_RELEASE_DIR: dirtyCheckoutEvidence },
+			env: { ...releaseFixtureEnvironment, CC_WORKFLOW_RELEASE_DIR: dirtyCheckoutEvidence },
 		});
 		fs.rmSync(dirtyFile);
 		assert.notEqual(dirtyCheckout.status, 0);
@@ -296,7 +308,7 @@ if (process.platform !== "win32") {
 		fs.writeFileSync(path.join(releaseFixture, "npm-shrinkwrap.json"), JSON.stringify(invalidReleaseShrinkwrap));
 		const invalidShrinkwrapRelease = spawnSync(fixtureNode, [path.join(releaseFixture, "scripts", "release-workflows.mjs"), "deterministic"], {
 			cwd: releaseFixture, encoding: "utf8",
-			env: { ...process.env, PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ""}`, CC_WORKFLOW_RELEASE_DIR: invalidShrinkwrapEvidence },
+			env: { ...releaseFixtureEnvironment, CC_WORKFLOW_RELEASE_DIR: invalidShrinkwrapEvidence },
 		});
 		assert.notEqual(invalidShrinkwrapRelease.status, 0);
 		assert.match(invalidShrinkwrapRelease.stderr, /approved registry provenance and SHA-512 integrity/u);

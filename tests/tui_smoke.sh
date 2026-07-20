@@ -15,6 +15,21 @@ TMUX_SOCKET="cc-tui-smoke-$PPID-$$"
 tmux() {
 	command tmux -L "$TMUX_SOCKET" "$@"
 }
+
+stty_states_equal() {
+	local before="$1"
+	local after="$2"
+	cmp -s "$before" "$after" && return 0
+	[ "$(uname -s)" = "Darwin" ] || return 1
+	# PENDIN (0x20000000) is queued-input state, not terminal configuration.
+	# It may clear between the shell's pre-exec snapshot and direct Node startup,
+	# so no child process can reconstruct it after SIGKILL. Compare every other
+	# encoded termios bit and control character exactly.
+	local normalized_before normalized_after
+	normalized_before="$(node -e 'const fs=require("fs");let s=fs.readFileSync(process.argv[1],"utf8").trim();s=s.replace(/lflag=([0-9a-f]+)/u,(_,h)=>`lflag=${(BigInt(`0x${h}`)&~0x20000000n).toString(16)}`);process.stdout.write(s)' "$before")"
+	normalized_after="$(node -e 'const fs=require("fs");let s=fs.readFileSync(process.argv[1],"utf8").trim();s=s.replace(/lflag=([0-9a-f]+)/u,(_,h)=>`lflag=${(BigInt(`0x${h}`)&~0x20000000n).toString(16)}`);process.stdout.write(s)' "$after")"
+	[ "$normalized_before" = "$normalized_after" ]
+}
 WRITE_LOG="$(mktemp -t cc-tui-write-log.XXXXXX)"
 SETTINGS_FILE="$(mktemp -t cc-tui-settings.XXXXXX)"
 CONFIG_SETTINGS_THEME_FILE="$(mktemp -t cc-tui-config-settings-theme.XXXXXX)"
@@ -442,11 +457,11 @@ if [ -z "$direct_manager_pid" ]; then
 fi
 kill -KILL "$direct_manager_pid"
 for _ in {1..100}; do
-	if [ -s "$DIRECT_STTY_AFTER" ] && cmp -s "$DIRECT_STTY_BEFORE" "$DIRECT_STTY_AFTER"; then break; fi
+	if [ -s "$DIRECT_STTY_AFTER" ] && stty_states_equal "$DIRECT_STTY_BEFORE" "$DIRECT_STTY_AFTER"; then break; fi
 	sleep 0.05
 done
-if ! cmp -s "$DIRECT_STTY_BEFORE" "$DIRECT_STTY_AFTER"; then
-	echo "SIGKILL of the direct npm-bin cc.mjs path did not restore exact terminal state" >&2
+if ! stty_states_equal "$DIRECT_STTY_BEFORE" "$DIRECT_STTY_AFTER"; then
+	echo "SIGKILL of the direct npm-bin cc.mjs path did not restore exact terminal configuration" >&2
 	diff -u "$DIRECT_STTY_BEFORE" "$DIRECT_STTY_AFTER" >&2 || true
 	exit 1
 fi

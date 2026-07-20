@@ -337,6 +337,7 @@ export async function acquireOwnershipLock(lockFile, options = {}) {
 	await retryPendingReclaimReleases();
 	await retryOwnershipLockReleases();
 	const deadline = Date.now() + (options.timeoutMs ?? 2 * 60 * 60 * 1000);
+	const waitForDeadOwnerReclaim = options.waitForDeadOwnerReclaim === true;
 	const testGrace = options[OWNERSHIP_LOCK_TEST_ONLY]?.deadOwnerGraceMs;
 	const deadOwnerGraceMs = Number.isSafeInteger(testGrace) && testGrace >= 1 && testGrace <= RECLAIM_DEAD_OWNER_GRACE_MS
 		? testGrace
@@ -386,7 +387,13 @@ export async function acquireOwnershipLock(lockFile, options = {}) {
 							), { code: "WORKFLOW_LOCK_UNCONFIRMED" });
 						}
 						const reclaimDirectory = `${resolved}.reclaim`;
-						const releaseReclaim = await acquireReclaimGate(reclaimDirectory, owner, deadline, options.signal);
+						// Startup history discovery must stay non-blocking for a genuinely
+						// live owner, but once death is proven it may wait through the full
+						// supervisor-fencing grace and reclaim the run in this same process.
+						const reclaimDeadline = waitForDeadOwnerReclaim
+							? Math.max(deadline, Date.now() + deadOwnerGraceMs + 1000)
+							: deadline;
+						const releaseReclaim = await acquireReclaimGate(reclaimDirectory, owner, reclaimDeadline, options.signal);
 						try {
 							const latest = await readLockOwner(resolved);
 							if (!await sameFile(latest.stat, occupied.stat) || latest.owner?.token !== occupied.owner?.token || !await ownerIsDemonstrablyDead(latest.owner, latest.stat)) continue;
@@ -394,7 +401,7 @@ export async function acquireOwnershipLock(lockFile, options = {}) {
 							// throughout a fresh grace interval so an old supervisor can finish its
 							// EOF-triggered backend-tree shutdown even when the lock itself is old.
 							const graceEndsAt = Date.now() + deadOwnerGraceMs;
-							await delay(Math.max(0, Math.min(graceEndsAt, deadline) - Date.now()), options.signal);
+							await delay(Math.max(0, Math.min(graceEndsAt, reclaimDeadline) - Date.now()), options.signal);
 							if (Date.now() < graceEndsAt) continue;
 							const confirmed = await readLockOwner(resolved);
 							if (confirmed.owner?.token === occupied.owner?.token && await sameFile(confirmed.stat, occupied.stat) && await ownerIsDemonstrablyDead(confirmed.owner, confirmed.stat)) {
@@ -409,6 +416,9 @@ export async function acquireOwnershipLock(lockFile, options = {}) {
 								} catch (claimError) {
 									if (claimError?.code !== "ENOENT") throw claimError;
 								}
+								// Permit the atomic link attempt that consumes the lock we just
+								// reclaimed even when the caller's ordinary timeout was zero.
+								attempted = false;
 							}
 						} finally { await finishReclaimRelease(releaseReclaim); }
 						continue;

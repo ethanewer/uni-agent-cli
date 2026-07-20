@@ -7,6 +7,10 @@ if ! command -v tmux >/dev/null 2>&1; then
 fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+TMUX_SOCKET="cc-permission-auto-$PPID-$$"
+tmux() {
+	command tmux -L "$TMUX_SOCKET" "$@"
+}
 BASELINE_SESSION="cc-permission-baseline-$$"
 DANGER_SESSION="cc-permission-danger-$$"
 SETTINGS_FILE="$(mktemp -t cc-perms-auto-settings-XXXXXX.json)"

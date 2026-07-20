@@ -33,6 +33,8 @@ import {
 } from "../scripts/install-channel.mjs";
 
 const PINNED_NPM_INSTALLATION_SHA256 = "930c1fa35e5525e3b60c584fc3709c7cf71d62134d66fdc88a6e0fe8fc72dc6d";
+const inheritedReleaseCommit = process.env.CC_RELEASE_COMMIT;
+delete process.env.CC_RELEASE_COMMIT;
 
 const installerSource = fs.readFileSync(new URL("../scripts/install-channel.mjs", import.meta.url), "utf8");
 assert.doesNotMatch(installerSource, /Get-CimInstance Win32_Process/u, "Windows coordination never trusts module-autoloaded CIM output for process identity");
@@ -85,6 +87,23 @@ assert.equal(parsedCandidate.expectedCommit, "a".repeat(40));
 assert.throws(() => parseArgs(["beta", "--candidate-dir", "/tmp/release"]), /requires --expected-commit/u);
 assert.throws(() => parseArgs(["beta", "--candidate-dir", "/tmp/release", "--ref", "HEAD"]), /cannot be combined/u);
 assert.throws(() => parseArgs(["unknown"]), /unknown channel/);
+
+{
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "cc-channel-protected-promotion-"));
+	const repo = path.join(root, "repo");
+	fs.mkdirSync(repo);
+	try {
+		process.env.CC_RELEASE_COMMIT = "a".repeat(40);
+		assert.throws(
+			() => installChannel("beta", { root: path.join(root, "state"), binDir: path.join(root, "bin"), repo }),
+			/release promotion requires --candidate-dir with protected validation evidence/u,
+			"a release-signoff process cannot promote an unprotected repository snapshot",
+		);
+	} finally {
+		delete process.env.CC_RELEASE_COMMIT;
+		fs.rmSync(root, { recursive: true, force: true });
+	}
+}
 
 if (process.platform !== "win32") {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "cc-channel-stale-installer-lock-"));
@@ -367,7 +386,7 @@ if (process.platform !== "win32") {
 }
 
 {
-	const paths = channelPaths("beta", { home: "/home/tester", env: {} });
+	const paths = channelPaths("beta", { home: "/home/tester", env: {}, platform: "linux" });
 	assert.equal(paths.root, path.resolve("/home/tester/.local/share/cc"));
 	assert.equal(paths.launcher, path.resolve("/home/tester/.local/bin/cc2"));
 	const state = betaStateEnvironment(paths);
@@ -381,10 +400,10 @@ if (process.platform !== "win32") {
 	}
 	assert.match(beta, /export CC_CHANNEL='beta'/);
 	assert.match(beta, /cc-channel-runner-protocol: 1/u);
-	for (const [name, value] of Object.entries(state)) assert.match(beta, new RegExp(`export ${name}='${value}'`));
+	for (const [name, value] of Object.entries(state)) assert.ok(beta.includes(`export ${name}='${value}'`));
 	assert.match(beta, /if \[ -z "\$\{CC_FORKS:-\}" \]/);
-	assert.match(beta, new RegExp(`export CC_FORKS='${paths.sharedForksPath}'`));
-	assert.match(beta, new RegExp(`export CC_FORKS_MIGRATE_FROM='${path.join(paths.channelDir, "state", "config", "forks.json")}'`));
+	assert.ok(beta.includes(`export CC_FORKS='${paths.sharedForksPath}'`));
+	assert.ok(beta.includes(`export CC_FORKS_MIGRATE_FROM='${path.join(paths.channelDir, "state", "config", "forks.json")}'`));
 	assert.match(beta, /CURRENT_LINK=/);
 	assert.match(beta, /channel-runner\.mjs' "\$CURRENT_LINK"/);
 	const channelRunner = renderChannelRunner();
@@ -397,7 +416,7 @@ if (process.platform !== "win32") {
 	assert.doesNotMatch(fs.readFileSync(new URL("../scripts/install-channel.mjs", import.meta.url), "utf8"), /localeCompare\(/u, "release manifest traversal is locale-independent");
 	assert.match(beta, /CC_NODE_PATH:-node/);
 
-	const stable = renderLauncher("stable", channelPaths("stable", { home: "/home/tester", env: {} }));
+	const stable = renderLauncher("stable", channelPaths("stable", { home: "/home/tester", env: {}, platform: "linux" }));
 	assert.match(stable, /export CC_CHANNEL='stable'/);
 	assert.doesNotMatch(stable, /CC_CONFIG=/);
 	assert.match(stable, /if \[ "\$\{CC_CHANNEL:-\}" = 'beta' \]/);
@@ -1490,4 +1509,5 @@ function makeDirectoryLink(target, link) {
 	}
 }
 
+if (inheritedReleaseCommit !== undefined) process.env.CC_RELEASE_COMMIT = inheritedReleaseCommit;
 console.log("channel installer tests passed");

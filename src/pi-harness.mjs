@@ -2941,9 +2941,10 @@ export class RootView {
 		while (slice.length < viewportH) slice.push("");
 		const frame = [this.headerLine(width, maxOffset, view.offset), ...slice, ...menuLines, ...queueLines, ...editorLines, ...statusLines];
 		// Never exceed the screen height — surplus rows would scroll into terminal
-		// scrollback (e.g. a tall permission menu on a short terminal). Keep the
-		// bottom (editor + status + cursor marker) visible.
-		return frame.length > rows ? frame.slice(frame.length - rows) : frame;
+		// scrollback (e.g. a tall permission menu on a short terminal). Preserve the
+		// frame head so the visible page/tab owner is never discarded while it still
+		// captures input; page-owned components bound their own lower content.
+		return frame.slice(0, rows);
 	}
 
 	headerLine(width, maxOffset, offset) {
@@ -7510,7 +7511,7 @@ export class HarnessApp {
 
 	activeAgentLaunchSpec(key = this.activeKey) {
 		if (key === this.activeKey && this.client?.launchSpec) return this.client.launchSpec;
-		return this.config.agents[key];
+		return this.config?.agents?.[key];
 	}
 
 	syncAgentAuthenticationState(key, adapter = this.client) {
