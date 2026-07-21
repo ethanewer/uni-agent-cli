@@ -62,7 +62,7 @@ for (const [name, value] of Object.entries(credentialFreeEnv)) {
 }
 // CC_RELEASE_COMMIT is an assertion consumed by this outer verifier. Passing it
 // into ordinary regression fixtures would incorrectly turn every channel
-// installation they exercise into a protected-candidate promotion request.
+// installation they exercise into a validated-candidate promotion request.
 delete credentialFreeEnv.CC_RELEASE_COMMIT;
 const emptyNpmConfigDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "cc-release-npm-config-"));
 credentialFreeEnv.npm_config_userconfig = path.join(emptyNpmConfigDirectory, "user.npmrc");

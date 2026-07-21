@@ -634,7 +634,7 @@ tmux_e2e send-keys -t "$SESSION" Enter
 wait_for_text "Analyze modules/api.txt"
 wait_for_text "Analyze modules/web.txt"
 # Adapter startup is intentionally serialized and can outlast the fake worker's
-# delay on slower CI hosts. Select the last-started worker explicitly so the
+# delay on slower hosts. Select the last-started worker explicitly so the
 # restart assertion never races the first worker completing.
 tmux_e2e send-keys -t "$SESSION" Down Down Down Down Down
 wait_for_text "› ● Analyze modules/web.txt"

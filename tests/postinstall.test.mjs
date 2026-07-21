@@ -43,31 +43,23 @@ try {
 	const verifier = fileURLToPath(new URL("../scripts/verify-release-candidate.mjs", import.meta.url));
 	const accepted = spawnSync(process.execPath, [verifier, candidateVerifierFixture, commit], { encoding: "utf8" });
 	assert.equal(accepted.status, 0, accepted.stderr);
-	const protectedValidation = {
+	const localValidation = {
 		...provenance,
 		validationToolchain: provenance.toolchain,
-		validationTools: {
-			tmuxVersion: "3.5a",
-			tmuxSourceSha256: "16216bd0877170dfcc64157085ba9013610b12b082548c7c9542cc0103198951",
-			libeventVersion: "2.1.12-stable",
-			libeventSourceSha256: "92e6de1be9ec176428fd2367677e61ceffc2ee1cb119035037a27d346b0403bb",
-			runnerImageVersion: "test-image",
-			runnerOsVersion: "15.0",
-		},
 		validated: true,
-		gates: ["disabled-package-smoke", "dynamic-workflows-release", "authenticated-live-release"],
+		gates: ["local-deterministic-release", "authenticated-live-release"],
 	};
-	fs.writeFileSync(path.join(candidateVerifierFixture, "dynamic-workflows-validated.json"), `${JSON.stringify(protectedValidation)}\n`);
+	fs.writeFileSync(path.join(candidateVerifierFixture, "dynamic-workflows-validated.json"), `${JSON.stringify(localValidation)}\n`);
 	assert.doesNotThrow(() => verifyReleaseCandidate(candidateVerifierFixture, commit, { requireValidated: true }));
-	const { validationToolchain: _missingValidationToolchain, ...missingValidationToolchain } = protectedValidation;
+	const { validationToolchain: _missingValidationToolchain, ...missingValidationToolchain } = localValidation;
 	fs.writeFileSync(path.join(candidateVerifierFixture, "dynamic-workflows-validated.json"), `${JSON.stringify(missingValidationToolchain)}\n`);
-	assert.throws(() => verifyReleaseCandidate(candidateVerifierFixture, commit, { requireValidated: true }), /protected validation evidence/u, "protected evidence must name the toolchain that ran validation");
+	assert.throws(() => verifyReleaseCandidate(candidateVerifierFixture, commit, { requireValidated: true }), /local validation evidence/u, "local evidence must name the toolchain that ran validation");
 	fs.writeFileSync(path.join(candidateVerifierFixture, "dynamic-workflows-validated.json"), `${JSON.stringify({
-		...protectedValidation,
+		...localValidation,
 		validationToolchain: { ...provenance.toolchain, npmVersion: "0.0.0" },
 	})}\n`);
-	assert.throws(() => verifyReleaseCandidate(candidateVerifierFixture, commit, { requireValidated: true }), /protected validation evidence/u, "protected evidence rejects a validation toolchain different from candidate provenance");
-	fs.writeFileSync(path.join(candidateVerifierFixture, "dynamic-workflows-validated.json"), `${JSON.stringify(protectedValidation)}\n`);
+	assert.throws(() => verifyReleaseCandidate(candidateVerifierFixture, commit, { requireValidated: true }), /local validation evidence/u, "local evidence rejects a validation toolchain different from candidate provenance");
+	fs.writeFileSync(path.join(candidateVerifierFixture, "dynamic-workflows-validated.json"), `${JSON.stringify(localValidation)}\n`);
 	fs.writeFileSync(path.join(candidateVerifierFixture, "dynamic-workflows-candidate.json"), Buffer.alloc(64 * 1024 + 1, 0x20));
 	assert.throws(
 		() => verifyReleaseCandidate(candidateVerifierFixture, commit),
@@ -129,12 +121,9 @@ assert.deepEqual(
 const launcher = fs.readFileSync(new URL(`../${packageJson.bin.cc}`, import.meta.url), "utf8");
 const workflowRelease = fs.readFileSync(new URL("../scripts/release-workflows.mjs", import.meta.url), "utf8");
 const releaseToolchain = fs.readFileSync(new URL("../scripts/release-toolchain.mjs", import.meta.url), "utf8");
-const releaseNodeBootstrap = fs.readFileSync(new URL("../scripts/bootstrap-release-node.sh", import.meta.url), "utf8");
 const liveWorkflowGate = fs.readFileSync(new URL("./dynamic_workflows_live_e2e.sh", import.meta.url), "utf8");
 const deterministicWorkflowGate = fs.readFileSync(new URL("./dynamic_workflows_e2e.sh", import.meta.url), "utf8");
 const packageInstallGate = fs.readFileSync(new URL("./package_install_smoke.sh", import.meta.url), "utf8");
-const releaseWorkflow = fs.readFileSync(new URL("../.github/workflows/dynamic-workflows-release.yml", import.meta.url), "utf8");
-const liveReleaseWorkflow = fs.readFileSync(new URL("../.github/workflows/dynamic-workflows-live-release.yml", import.meta.url), "utf8");
 assert.match(launcher.split(/\r?\n/, 1)[0], /^#!\/usr\/bin\/env node$/u);
 assert.match(launcher, /Node\.js 22\.19\.0 or newer/u);
 assert.match(launcher, /const startupTerminalMode = inheritedTerminalMode \?\? captureTerminalMode\(\)/u, "the direct npm bin captures a restoration snapshot without the source shell wrapper");
@@ -158,14 +147,6 @@ assert.match(workflowRelease, /CC_RELEASE_NPM_CLI: npmInvocation\.prefixArgs\[0\
 assert.match(workflowRelease, /trustedExecutableOnPath\("git"/u, "local provenance uses an authenticated absolute Git executable");
 assert.match(workflowRelease, /\["--no-replace-objects", "-C", repositoryRoot, \.\.\.args\]/u, "every local provenance Git operation disables replacement refs and binds the reviewed checkout");
 assert.match(workflowRelease, /\^GIT_/u, "release provenance removes inherited Git worktree, index, config, and repository overrides");
-assert.doesNotMatch(`${releaseWorkflow}\n${liveReleaseWorkflow}`, /actions\/setup-node/u, "protected release jobs do not execute npm through setup-node before authenticating it");
-assert.match(releaseWorkflow, /bootstrap-release-node\.sh/u, "every deterministic protected job uses the digest-pinned Node bootstrap");
-assert.match(liveReleaseWorkflow, /bootstrap-release-node\.sh/u, "the authenticated protected job uses the digest-pinned Node bootstrap");
-assert.match(releaseNodeBootstrap, /c0649af18e6a24f6fe5535a3e86b341dd49a8e71117c8b68bde973ef834f16f2/u, "the Linux release archive is pinned to its official SHA-256");
-assert.ok(
-	releaseNodeBootstrap.indexOf("release-workflows.mjs verify-toolchain") < releaseNodeBootstrap.indexOf('>> "$GITHUB_PATH"'),
-	"the complete npm installation is authenticated before the protected runtime enters PATH",
-);
 assert.match(workflowRelease, /dynamic-workflows-release-result\.json/u, "local release records deterministic and authenticated gate completion");
 assert.match(workflowRelease, /writeJsonAtomic\(result/u, "failed local gates atomically retain their release result");
 assert.match(workflowRelease, /if \(releaseDirectory\)/u, "candidate-preparation failures retain a result even before provenance is complete");
@@ -326,7 +307,7 @@ if (process.platform !== "win32") {
 		fs.rmSync(fakeBin, { recursive: true, force: true });
 	}
 }
-for (const gate of [liveWorkflowGate, deterministicWorkflowGate, packageInstallGate, releaseWorkflow]) {
+for (const gate of [liveWorkflowGate, deterministicWorkflowGate, packageInstallGate]) {
 	assert.match(gate, /shopt -s nocasematch/u, "shell release gates scrub arbitrarily mixed-case credential variable names");
 	assert.doesNotMatch(gate, /\*PAT\*/u, "PAT credential scrubbing does not accidentally erase PATH");
 	assert.match(gate, /PAT_\*\|\*_PAT/u, "PAT credential scrubbing covers delimited PAT variable names");
@@ -342,33 +323,9 @@ assert.match(liveWorkflowGate, /export OPENAI_API_KEY="\$model_api_key".*model_a
 assert.match(liveWorkflowGate, /evidence_status/u, "a successful live test fails if its release evidence cannot be written");
 assert.match(liveWorkflowGate, /completed_outputs_by_label == expected_outputs_by_label/u, "retained evidence binds each exact worker output to its queued identity");
 assert.match(liveWorkflowGate, /set\(ready_agent_ids\) == set\(queued_labels\)/u, "retained evidence binds model and effort readiness to both queued worker identities");
-assert.match(liveReleaseWorkflow, /authenticated live evidence is incomplete or contradictory/u, "protected validation independently checks the retained live evidence");
-assert.match(liveReleaseWorkflow, /evidence\.exitStatus===0.*evidence\.stage==="passed".*evidence\.deliveryState==="delivered"/u, "protected validation requires successful terminal evidence and delivery");
-assert.match(releaseWorkflow, /cd "\$\(dirname "\$TARBALL"\)" && sha256sum "\$\(basename "\$TARBALL"\)"/u, "protected checksum evidence records a portable tarball basename");
-assert.match(releaseWorkflow, /CC_WORKFLOW_RELEASE_DIR: \$\{\{ runner\.temp \}\}\/cc-deterministic-release/u, "protected deterministic gates retain their structured release result in a known directory");
-assert.match(releaseWorkflow, /dynamic-workflows-deterministic-release-\$\{\{ github\.sha \}\}/u, "protected deterministic evidence is uploaded independently of the authenticated gate");
-assert.match(releaseWorkflow, /node "\$NPM_CLI" pack/u, "protected packaging uses npm beside the verified Node runtime");
-assert.match(releaseWorkflow, /npmInstallationSha256/u, "protected candidate provenance binds the complete npm installation content");
-assert.match(releaseWorkflow, /verify-release-candidate\.mjs/u, "every protected candidate consumer verifies package identity against bound pack metadata");
-assert.match(releaseWorkflow, /dynamic-workflows-final-release:\s*\n\s+needs: \[package-candidate, disabled-package-smoke, dynamic-workflows-release, authenticated-live-release\]\s*\n\s+if: always\(\)/u, "the final required release check runs even when an upstream job fails or is skipped");
-assert.match(releaseWorkflow, /release gates did not all succeed/u, "the final required release check explicitly rejects every failed applicable prerequisite");
-assert.equal((releaseWorkflow.match(/node node_modules\/opencode-ai\/postinstall\.mjs/gu) ?? []).length, 2, "both protected jobs that run the ordinary suite materialize OpenCode after an ignore-scripts install");
-assert.doesNotMatch(releaseWorkflow, /secrets:\s*\n\s+OPENAI_API_KEY:/u, "the reusable authenticated gate does not require a repository-scoped secret pass-through");
-assert.match(liveReleaseWorkflow, /workflow_call: \{\}/u, "the reusable live gate receives its model key only from its protected environment");
-assert.match(liveReleaseWorkflow, /environment: dynamic-workflows-release/u, "the called authenticated job owns the protected environment that supplies its key");
-assert.match(liveReleaseWorkflow, /release-workflows\.mjs verify-toolchain/u, "authenticated validation independently verifies its exact release toolchain");
-assert.match(liveReleaseWorkflow, /validationToolchain/u, "authenticated evidence records the toolchain that ran the live gate");
-assert.doesNotMatch(`${releaseWorkflow}\n${liveReleaseWorkflow}`, /brew install tmux/u, "protected release gates never fetch a floating Homebrew tmux formula");
-assert.match(liveReleaseWorkflow, /validationTools/u, "authenticated evidence records pinned tmux sources and runner image identity");
-for (const workflow of [releaseWorkflow, liveReleaseWorkflow]) {
-	assert.doesNotMatch(workflow, /node-version: 22\s*$/mu, "release jobs never float across Node 22 toolchains");
-	assert.doesNotMatch(workflow, /node-version:/u, "release jobs never delegate pre-authentication runtime selection to setup-node");
-	assert.match(workflow, /bootstrap-release-node\.sh/u, "release jobs bootstrap the exact digest-pinned Node/npm toolchain");
-}
-for (const trustedRef of ["refs/heads/main", "refs/heads/workflows", "refs/heads/workflows-wip-2026-07-19"]) {
-	assert.match(releaseWorkflow, new RegExp(trustedRef, "u"), `the caller admits protected release secrets only for ${trustedRef}`);
-	assert.match(liveReleaseWorkflow, new RegExp(trustedRef, "u"), `the called job independently admits protected release secrets only for ${trustedRef}`);
-}
+assert.match(workflowRelease, /validateLiveEvidence\(liveResult\)/u, "local validation independently checks retained live evidence");
+assert.match(workflowRelease, /evidence\.exitStatus === 0.*evidence\.stage === "passed"/u, "local validation requires successful terminal evidence");
+assert.match(workflowRelease, /gates: \["local-deterministic-release", "authenticated-live-release"\]/u, "local release records both required macOS gates");
 assert.match(deterministicWorkflowGate, /"cc-owner:" in commands\.get\(pid, ""\)/u, "the manager-only crash fixture recognizes the manager's validated ownership process marker");
 assert.match(deterministicWorkflowGate, /pid=,ppid=,lstart=,command=/u, "the manager-only crash fixture binds every destructive signal to a process start identity");
 

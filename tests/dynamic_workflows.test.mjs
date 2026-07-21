@@ -655,7 +655,7 @@ assert.equal(resolveWorkflowMode({ workflowMode: "flexible" }, {}, "win32"), "di
 assert.equal(resolveWorkflowMode({ workflowMode: "flexible" }, {}, "linux"), "disabled", "unsupported platforms preserve the dormant Disabled boundary at startup");
 assert.equal(HarnessApp.prototype.workflowPlatformSupported(), process.platform === "darwin", "production workflow opt-in follows the actual host platform");
 // Enabled-mode state-machine tests inject the supported-platform capability so
-// Linux/Windows CI still exercises rollback, reload, and teardown paths. The
+// Linux portability runs still exercise rollback, reload, and teardown paths. The
 // startup assertions above retain the real unsupported-platform boundary.
 const productionWorkflowPlatformSupported = HarnessApp.prototype.workflowPlatformSupported;
 HarnessApp.prototype.workflowPlatformSupported = () => true;
@@ -4278,7 +4278,7 @@ assert.equal(sharedIdentityAdapterStarts, 0);
 assert.deepEqual(sharedIdentityScheduler.snapshot(), { active: 0, pending: 0, activeByRun: {}, activeByHarness: {} }, "cancelled shared identity lookup releases its scheduler lease");
 
 // Tiny workflow overlays are portable TUI behavior. Keep their safety coverage
-// before the macOS-only manager/sandbox section so Linux CI cannot mask a
+// before the macOS-only manager/sandbox section so Linux runs cannot mask a
 // renderer or input regression that would otherwise fail only in release CI.
 const portablePlain = (value) => String(value).replace(/\x1b\[[0-?]*[ -/]*[@-~]/gu, "");
 const portableTinyRun = {
@@ -4369,8 +4369,8 @@ portableFocusHost.endResize({ render: false });
 assert.equal(portableTinyPage.focused, true, "shrinking the terminal restores dashboard focus before the composer becomes invisible");
 
 // The remaining manager/executor cases intentionally cross the real OS sandbox
-// boundary. Linux CI has exercised all portable policy, persistence, registry,
-// schema, and TUI cases above; macOS release CI runs the complete section below.
+// boundary. Linux runs exercise all portable policy, persistence, registry,
+// schema, and TUI cases above; macOS release validation runs the complete section below.
 if (process.platform !== "darwin") {
 	HarnessApp.prototype.workflowPlatformSupported = productionWorkflowPlatformSupported;
 	process.umask(originalUmask);

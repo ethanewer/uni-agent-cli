@@ -116,8 +116,8 @@ evidence = {
     "status": status,
     "deliveryState": delivery_state,
     # Artifact evidence is strictly allowlisted. Model output, prompts, errors,
-    # environment values, and arbitrary event fields must remain only in masked
-    # Actions logs and can never be copied into a downloadable artifact.
+    # environment values, and arbitrary event fields are never copied into the
+    # retained local release evidence.
     "agentReadyCount": len(ready),
     "agentCompletedCount": sum(event.get("type") == "agent_completed" for event in records),
     "runCompletedCount": sum(event.get("type") == "run_completed" for event in records),
@@ -215,7 +215,7 @@ if [ -n "${CC_RELEASE_NPM_CLI:-}" ] || [ -n "${CC_RELEASE_NODE:-}" ]; then
 	release_npm --version >/dev/null
 	install_command=("$CC_RELEASE_NODE" "$CC_RELEASE_NPM_CLI")
 fi
-# Lifecycle scripts receive only this explicit environment. The protected model
+# Lifecycle scripts receive only this explicit environment. The model
 # key is already held in a non-exported shell variable and cannot reach npm or
 # any dependency postinstall before the one-use CLI launcher is constructed.
 /usr/bin/env -i "${install_environment[@]}" "${install_command[@]}" install --include=optional --no-audit --no-fund --foreground-scripts --dangerously-allow-all-scripts --prefix "$SCRATCH/installed" "$tarball" >"$SCRATCH/install.log" 2>&1

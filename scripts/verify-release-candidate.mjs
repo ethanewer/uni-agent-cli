@@ -101,22 +101,13 @@ export function verifyReleaseCandidate(directory, expectedCommit, options = {}) 
 	let validated;
 	if (options.requireValidated === true) {
 		const validatedFile = path.join(root, "dynamic-workflows-validated.json");
-		validated = JSON.parse(readBoundedFile(validatedFile, "protected validation evidence", MAX_VALIDATION_BYTES).toString("utf8"));
+		validated = JSON.parse(readBoundedFile(validatedFile, "local validation evidence", MAX_VALIDATION_BYTES).toString("utf8"));
 		const boundKeys = ["version", "commit", "tarball", "sha256", "name", "packageVersion", "packMetadataSha256", "toolchain"];
-		const expectedValidationTools = {
-			tmuxVersion: "3.5a",
-			tmuxSourceSha256: "16216bd0877170dfcc64157085ba9013610b12b082548c7c9542cc0103198951",
-			libeventVersion: "2.1.12-stable",
-			libeventSourceSha256: "92e6de1be9ec176428fd2367677e61ceffc2ee1cb119035037a27d346b0403bb",
-		};
 		if (validated?.validated !== true || !Array.isArray(validated.gates) ||
-			!["disabled-package-smoke", "dynamic-workflows-release", "authenticated-live-release"].every((gate) => validated.gates.includes(gate)) ||
+			!["local-deterministic-release", "authenticated-live-release"].every((gate) => validated.gates.includes(gate)) ||
 			JSON.stringify(validated.validationToolchain) !== JSON.stringify(provenance.toolchain) ||
-			Object.entries(expectedValidationTools).some(([key, value]) => validated.validationTools?.[key] !== value) ||
-			typeof validated.validationTools?.runnerImageVersion !== "string" || !validated.validationTools.runnerImageVersion ||
-			typeof validated.validationTools?.runnerOsVersion !== "string" || !validated.validationTools.runnerOsVersion ||
 			boundKeys.some((key) => JSON.stringify(validated[key]) !== JSON.stringify(provenance[key]))) {
-			fail("protected validation evidence is incomplete or names a different candidate");
+			fail("local validation evidence is incomplete or names a different candidate");
 		}
 	}
 	return { root, tarball, tarballName, provenance, validated };

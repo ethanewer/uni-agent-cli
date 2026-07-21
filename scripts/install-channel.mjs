@@ -95,7 +95,7 @@ Usage:
 Options:
   --ref <git-ref>   Override main (stable) or origin/ux-0711 (beta)
   --candidate-dir <path>
-                     Promote the protected validated candidate in this directory
+                     Promote the locally validated candidate in this directory
   --expected-commit <sha>
                      Independently anchor --candidate-dir to this reviewed commit
   --repo <path>     Source git repository (default: repository containing this script)
@@ -299,7 +299,7 @@ export function snapshotCandidateTarball(candidate, destination) {
 		source = fs.openSync(candidate.tarball, sourceFlags);
 		const before = fs.fstatSync(source, { bigint: true });
 		if (!before.isFile() || before.size > BigInt(MAX_CANDIDATE_BYTES)) {
-			throw new Error("protected candidate tarball is not a bounded regular file");
+			throw new Error("validated candidate tarball is not a bounded regular file");
 		}
 		target = fs.openSync(snapshot, "wx", 0o600);
 		const digest = createHash("sha256");
@@ -309,7 +309,7 @@ export function snapshotCandidateTarball(candidate, destination) {
 			const count = fs.readSync(source, buffer, 0, buffer.length, null);
 			if (count === 0) break;
 			total += count;
-			if (total > MAX_CANDIDATE_BYTES) throw new Error("protected candidate tarball exceeds the size limit");
+			if (total > MAX_CANDIDATE_BYTES) throw new Error("validated candidate tarball exceeds the size limit");
 			digest.update(buffer.subarray(0, count));
 			let offset = 0;
 			while (offset < count) offset += fs.writeSync(target, buffer, offset, count - offset);
@@ -318,7 +318,7 @@ export function snapshotCandidateTarball(candidate, destination) {
 		const after = fs.fstatSync(source, { bigint: true });
 		if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size || BigInt(total) !== before.size ||
 			digest.digest("hex") !== candidate.provenance.sha256) {
-			throw new Error("protected candidate changed while it was being pinned for extraction");
+			throw new Error("validated candidate changed while it was being pinned for extraction");
 		}
 		return snapshot;
 	} catch (error) {
@@ -471,7 +471,7 @@ export function verifyCandidateMatchesCommit(candidate, repo, commit, runCommand
 		const trustedTarball = path.join(packed, metadata[0].filename);
 		const digest = createHash("sha256").update(fs.readFileSync(trustedTarball)).digest("hex");
 		if (digest !== candidate.provenance.sha256) {
-			throw new Error("protected candidate does not exactly match the independently reviewed Git commit");
+			throw new Error("validated candidate does not exactly match the independently reviewed Git commit");
 		}
 		return true;
 	} finally {
@@ -894,7 +894,7 @@ export function materializeRelease(context, operations = {}) {
 		if (candidate) {
 			const metadata = JSON.parse(fs.readFileSync(path.join(releaseDir, ".cc-channel.json"), "utf8"));
 			if (metadata.candidateSha256 !== candidate.provenance.sha256 || metadata.packMetadataSha256 !== candidate.provenance.packMetadataSha256) {
-				throw new Error(`release ${commit} was not materialized from the selected protected candidate`);
+				throw new Error(`release ${commit} was not materialized from the selected validated candidate`);
 			}
 		}
 		const adapters = (operations.verifyRelease ?? verifyRelease)(releaseDir, operations.runCommand ?? run);
@@ -1993,7 +1993,7 @@ export function installChannel(channel, options = {}, operations = {}) {
 		if (options.candidateDir) {
 			commit = String(options.expectedCommit ?? "").toLowerCase();
 			if (!/^[0-9a-f]{40}$/u.test(commit)) {
-				throw new Error("protected candidate promotion requires --expected-commit with a full reviewed Git SHA");
+				throw new Error("validated candidate promotion requires --expected-commit with a full reviewed Git SHA");
 			}
 			candidate = verifyReleaseCandidate(options.candidateDir, commit, { requireValidated: true });
 			(operations.verifyCandidateMatchesCommit ?? verifyCandidateMatchesCommit)(
@@ -2002,10 +2002,10 @@ export function installChannel(channel, options = {}, operations = {}) {
 			if (process.env.CC_RELEASE_COMMIT && process.env.CC_RELEASE_COMMIT !== commit) {
 				throw new Error("CC_RELEASE_COMMIT does not match --expected-commit");
 			}
-			ref = `protected-candidate:${candidate.provenance.sha256}`;
+			ref = `validated-candidate:${candidate.provenance.sha256}`;
 		} else {
 			if (process.env.CC_RELEASE_COMMIT) {
-				throw new Error("release promotion requires --candidate-dir with protected validation evidence");
+				throw new Error("release promotion requires --candidate-dir with local validation evidence");
 			}
 			ref = options.ref || definition.defaultRef;
 			commit = (operations.resolveCommit ?? resolveCommit)(repo, ref, operations.runCommand ?? run);

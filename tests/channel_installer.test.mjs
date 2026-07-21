@@ -89,15 +89,15 @@ assert.throws(() => parseArgs(["beta", "--candidate-dir", "/tmp/release", "--ref
 assert.throws(() => parseArgs(["unknown"]), /unknown channel/);
 
 {
-	const root = fs.mkdtempSync(path.join(os.tmpdir(), "cc-channel-protected-promotion-"));
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "cc-channel-validated-promotion-"));
 	const repo = path.join(root, "repo");
 	fs.mkdirSync(repo);
 	try {
 		process.env.CC_RELEASE_COMMIT = "a".repeat(40);
 		assert.throws(
 			() => installChannel("beta", { root: path.join(root, "state"), binDir: path.join(root, "bin"), repo }),
-			/release promotion requires --candidate-dir with protected validation evidence/u,
-			"a release-signoff process cannot promote an unprotected repository snapshot",
+			/release promotion requires --candidate-dir with local validation evidence/u,
+			"a release-signoff process cannot promote an unvalidated repository snapshot",
 		);
 	} finally {
 		delete process.env.CC_RELEASE_COMMIT;
@@ -137,10 +137,10 @@ if (process.platform !== "win32") {
 		const candidate = {
 			root: path.join(root, "candidate"), tarball: path.join(root, "candidate", "cc.tgz"),
 			provenance: { sha256: "a".repeat(64), packMetadataSha256: "b".repeat(64) },
-			validated: { gates: ["disabled-package-smoke", "dynamic-workflows-release", "authenticated-live-release"] },
+			validated: { gates: ["local-deterministic-release", "authenticated-live-release"] },
 		};
 		const result = materializeRelease({
-			repo: root, ref: `protected-candidate:${candidate.provenance.sha256}`, commit,
+			repo: root, ref: `validated-candidate:${candidate.provenance.sha256}`, commit,
 			releaseDir, releasesDir, channel: "beta", candidate,
 		}, {
 			snapshotCandidateTarball(_selected, staging) {

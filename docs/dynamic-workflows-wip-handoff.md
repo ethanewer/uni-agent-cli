@@ -5,8 +5,8 @@ Snapshot branch: `workflows-wip-2026-07-19`
 This branch is a locally converged release candidate of the dynamic workflows
 implementation. Iteration 84 returned clean across all three review roles, and
 the exact-toolchain complete regression plus supplied-tarball install gates pass.
-The macOS deterministic/authenticated protected gates and channel promotion
-remain external release work.
+Final macOS validation and channel promotion are performed locally; this branch
+does not add or require hosted CI workflows.
 
 ## Upstream integration
 
@@ -94,10 +94,9 @@ cases found by the three independent review tracks. The latest fixes include:
 8. npm dependencies are exactly pinned and the shipped shrinkwrap requires
    `sha512` integrity for registry artifacts. Release automation packs once and
    reuses that immutable candidate through every gate.
-9. Protected release workflows support push and manual dispatch. Retained live
-   evidence contains fixed validation booleans and counts rather than raw
-   secret-bearing model output, and the candidate is re-downloaded after the
-   authenticated step before it is retained.
+9. Local release validation retains fixed booleans and counts rather than raw
+   secret-bearing model output, and every gate consumes the same immutable
+   candidate produced from the reviewed checkout.
 10. Commit rollback is single-flight, a sticky restart fence revokes every
     already-admitted launch, and a marker published during fencing remains
     durable while its source is aborted before execution.
@@ -111,8 +110,8 @@ cases found by the three independent review tracks. The latest fixes include:
 14. The authenticated driver unexports the model credential for pack, install,
     postinstall, Git, and evidence subprocesses, exposing it only to the tmux
     server that launches the installed CLI.
-15. The protected run emits validated commit/digest/package provenance only
-    after all cross-platform, macOS, and authenticated gates pass.
+15. The local release command emits validated commit/digest/package provenance
+    only after the portable, macOS, and authenticated gates pass.
 16. `/btw` close, backend-exit recovery, detached queue drains, and mutation
     recovery partition internal completion deliveries from human input. Only
     human prompts/commands can return to the main composer; completions retire
@@ -342,27 +341,25 @@ cases found by the three independent review tracks. The latest fixes include:
     published lock. Tiny pickers use an atomic width-fitting disabled label,
     while Ctrl-C visibly returns exact-source inspection to its approval.
     Local authenticated releases validate every retained evidence field before
-    publication, atomically retain failed-gate results, and protected checksum
+    publication, atomically retain failed-gate results, and candidate checksum
     files name the portable tarball basename.
 57. Mutation-lock release remains retryable through persistent-fence deletion
     and directory sync, while the macOS manager-only crash fixture recognizes
     the manager's validated ownership marker. Tiny exact-source views reserve a
     visible return affordance, workflow-page Ctrl-C feedback stays on the page,
     and source/apply round trips preserve detail scroll. Candidate-preparation
-    failures now retain atomic structured results, and protected deterministic
-    evidence is uploaded even when the authenticated gate cannot run.
+    failures now retain atomic structured results even when the authenticated
+    gate cannot run.
 58. Sticky subsystem restart fences now abort running as well as prepared
     workflows, stop their sandboxes, and cancel scheduler admission. The macOS
     manager-crash fixture binds follow-up signals to process start identities.
     Coalesced workflow/source navigation stays with the visible view, and an
     empty dashboard keeps Ctrl-C feedback visible. Dirty checkout and invalid
-    shrinkwrap failures retain structured release evidence. Protected jobs
-    explicitly materialize OpenCode after ignore-scripts installs, while the
-    authenticated reusable job consumes its key only from its own protected
-    environment.
-59. Both sides of the protected reusable release gate now allowlist only the
-    three reviewed release branches, preventing arbitrary manual-dispatch refs
-    from reaching environment secrets. Blocked Ctrl-D explanations stay inside
+    shrinkwrap failures retain structured release evidence. Local artifact
+    gates explicitly materialize OpenCode after ignore-scripts installs, while
+    the authenticated gate exposes its key only to the installed CLI.
+59. The local release gate keeps model credentials out of packing, dependency
+    installation, Git, and retained evidence. Blocked Ctrl-D explanations stay inside
     focused workflow/source views and describe the bounded force-exit gesture;
     one- through three-row dashboards prioritize Ctrl-C feedback over chrome.
 60. Blocked exits now remain visible above workflow modals, preserve an atomic
@@ -370,8 +367,8 @@ cases found by the three independent review tracks. The latest fixes include:
     tiny terminals cannot focus a hidden composer. Portable coverage runs
     before the macOS-only test boundary. Immutable channel installs resolve
     root-owned Git/tar tools and invoke npm beside the active Node runtime;
-    dangling Windows junctions are replaceable. An always-running aggregate CI
-    check rejects any failed applicable protected release prerequisite.
+    dangling Windows junctions are replaceable. The local release command
+    rejects any failed validation prerequisite.
 61. Windows trusted-tool lookup now applies `PATHEXT` and admits candidates only
     beneath protected system/program installation roots. Terminal shrink events
     restore dashboard focus before a composer disappears, and model-launch
@@ -389,18 +386,18 @@ cases found by the three independent review tracks. The latest fixes include:
     candidate/ancestor ACL must deny unprivileged replacement; installer and
     generated-runner identity probes also use loader-derived PowerShell and
     absolute POSIX `ps`. Coalesced ANSI navigation is tokenized atomically and
-    revalidates its interaction owner. Protected jobs pin Node 22.19.0, while
+    revalidates its interaction owner. Local releases pin Node 22.19.0, while
     authenticated npm lifecycle scripts run in an explicit empty, allowlisted
     environment before the model key is transferred to the CLI.
 64. Immutable channel resolution and archives disable Git replacement refs.
-    Local and protected release candidates enforce and record exact Node
+    Local release candidates enforce and record exact Node
     22.19.0/npm 10.9.3 toolchain provenance. Zero-row approvals cannot become
     selectable and one-/two-row normal-layout approvals own their visible
     viewport. Windows channel promotion and runner coordination now fail closed
     rather than using PowerShell to authenticate its own ACL or module-loaded
     CIM output as a PID-reuse boundary.
 65. Every local provenance Git command now uses a trusted absolute executable
-    with replacement objects disabled. Protected packaging, deterministic, and
+    with replacement objects disabled. Local packaging, deterministic, and
     authenticated consumers use npm beside exact Node and bind its CLI digest
     into candidate and validation evidence; channel materialization enforces
     its Node/npm floor and records the same toolchain identity. Lockfile root
@@ -411,16 +408,16 @@ cases found by the three independent review tracks. The latest fixes include:
     use that same guard and cannot choose a filtered option. Release gates pass
     an absolute Node/npm pair through installed-artifact tests, document the
     exact npm contract, and bind package name/version to hashed npm pack
-    metadata that every protected consumer independently verifies.
+    metadata that every candidate consumer independently verifies.
 67. Permission prompts require complete wrapped title/action disclosure and
     compact workflow summaries expose textual status. Installer stale-lock
     reclamation uses atomic rename ownership with exclusive token/inode release.
-    Protected promotion consumes the validated candidate tarball and records
-    its digest instead of rebuilding source from Git; macOS gates build tmux
-    3.5a and libevent 2.1.12 from digest-pinned sources rather than Homebrew.
-68. Iteration 79 made protected promotion independently anchor the reviewed
+    Validated promotion consumes the candidate tarball and records its digest
+    instead of rebuilding source from Git; macOS gates require a usable local
+    tmux installation.
+68. Iteration 79 made validated promotion independently anchor the reviewed
     commit and deterministically reproduce its npm tarball before accepting the
-    protected digest. The verified tarball is pinned through a no-follow
+    recorded digest. The verified tarball is pinned through a no-follow
     descriptor into private staging, archive links/special entries are rejected,
     completed release trees and their parent are fsynced, and replay state
     precedes first launcher publication. Complete dead installer owners are
@@ -447,16 +444,15 @@ cases found by the three independent review tracks. The latest fixes include:
     and selected `Stop and disable` row before confirming.
 71. Iteration 82 authenticates the complete npm installation before any npm
     code executes and rechecks it around version, pack, and install operations.
-    Protected validation now binds the exact validation toolchain; workflow
+    Local validation now binds the exact validation toolchain; workflow
     artifacts verify against their shipped shrinkwrap without requiring npm's
     excluded package lock; and the cross-platform matrix invokes npm through
     Bash on Windows. Disabled ordinary terminals retain their direct pre-
     workflow spawn path, while Git failure/cancellation fixtures inject exact
     test executables without weakening the trusted production resolver.
-72. Iteration 83 replaces `actions/setup-node` in protected jobs with official
-    Node archives pinned by platform SHA-256. The complete platform-specific
-    npm installation is authenticated before Node/npm enters the job path or
-    any npm code executes. Git pre-spawn failures now cross the supervisor's
+72. Iteration 83 made the local release entrypoint authenticate the complete
+    Node 22.19.0/npm 10.9.3 installation before any release npm command runs.
+    Git pre-spawn failures now cross the supervisor's
     structured status channel, so an absolute executable that disappears is
     reported as `ENOENT` without falsely fencing a repository mutation lock.
 
@@ -477,36 +473,29 @@ cases found by the three independent review tracks. The latest fixes include:
 Using the checksum-pinned official Node 22.19.0/npm 10.9.3 runtime, the complete
 `npm test` regression passes, including the portable workflow suite, settings,
 rollback E2Es, adapters, permissions, channel installer, postinstall, and shared
-TUI smoke. Workflow YAML, JavaScript/Python/shell syntax, shrinkwrap integrity,
+TUI smoke. JavaScript/Python/shell syntax, shrinkwrap integrity,
 and `git diff --check` pass. A single retained 91-file candidate was packed at
 SHA-256 `c39f134d509d342347957656b8912006f1263ceb5e72291f88614b24aa05fb72`;
 its clean-prefix supplied-tarball installation smoke passes from an empty cwd.
-The real Linux bootstrap passed, and both official Windows archives reproduce
-the reviewed Windows npm-installation digest.
+The portable Linux workflow and package checks passed. Windows is not fully
+supported and is outside this signoff.
 
 Earlier development runs exercised the installed-artifact deterministic and
-authenticated macOS paths, but those runs predate the final fixes and are not
-release evidence. Those protected gates remain in the release sequence below.
+authenticated macOS paths, but final evidence must always be regenerated for
+the exact commit being promoted.
 
-## Remaining external release work
+## Local release procedure
 
 Complete these after committing/publishing the reviewed tree:
 
-1. Run the deterministic installed-artifact gate on macOS:
-   `CC_WORKFLOW_E2E_TARBALL=/absolute/path/cc-0.1.0.tgz CC_WORKFLOW_E2E_REQUIRED=1 bash tests/dynamic_workflows_e2e.sh`.
-   It must pass the Disabled baseline, exact four-worker Clone Only route,
-   exact six-worker Flexible route, real overlap, TUI navigation/actions,
-   completion delivery, mode transitions, worktree behavior, and manager-only
-   crash cleanup.
-2. Run `npm run test:workflows:e2e:live` with real GPT-5.6 High against the same
-   retained tarball. Confirm two workers become ready before either completes,
-   exact model/effort routing, expected outputs, TUI projection, and delivery to
-   the originating orchestrator. Retain the result JSON and package digest.
-3. Monitor the protected gates after publishing. Retain the protected run's
-   re-downloaded tarball,
-   `dynamic-workflows-validated.json`, result, and digest as release evidence.
-4. Install the intended local channel from that exact retained protected
-   artifact with `--candidate-dir --expected-commit <reviewed-full-sha>` and
+1. With the exact Node 22.19.0/npm 10.9.3 toolchain, set an empty absolute
+   `CC_WORKFLOW_RELEASE_DIR` and run `npm run release:workflows` on macOS. It
+   runs the complete deterministic suite and the authenticated GPT-5.6-Sol High
+   installed-artifact E2E against one retained candidate.
+2. Retain `dynamic-workflows-validated.json`, the result JSON, candidate
+   provenance, checksum, pack metadata, and tarball as local release evidence.
+3. Install the intended local channel from that exact retained validated
+   candidate with `--candidate-dir --expected-commit <reviewed-full-sha>` and
    verify the installed `cc` shim. Do not
    target the unrelated public npm `cc` package. Any later source fix
    invalidates the candidate and restarts review and release gates.
@@ -527,11 +516,8 @@ Complete these after committing/publishing the reviewed tree:
   shutdown should report the termination failure while the real lock and its
   pre-armed owner-death marker remain published. Killing the owner does not
   clear that marker; a later process must require explicit manual recovery.
-- The protected push trigger names `workflows-wip-2026-07-19`, matching this
-  branch's published remote name. If that name changes, update the trigger or
-  use the checked-in manual dispatch before relying on the protected gate.
 - The authenticated test incurs real model usage and requires macOS, tmux,
-  Codex authentication/API credentials, and the protected release environment.
+  and Codex authentication/API credentials.
 
 ## Reference plan and provenance
 

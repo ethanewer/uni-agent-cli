@@ -6,18 +6,20 @@ A fast, low-latency `cc` CLI for driving **Claude Code**, **Codex**, and **Curso
 
 ## Install
 
-Install a protected, validated release candidate (requires Node 22.19.0+ with
-npm 10.9.3 installed beside that Node runtime, plus `git`). Download the
-`dynamic-workflows-live-release-<sha>` artifact retained by the protected run,
-check out that full SHA, and promote the exact tarball named by its validation
-evidence:
+Install a locally validated release candidate (requires the exact Node 22.19.0
+and npm 10.9.3 release toolchain, plus `git`, `python3`, and macOS `tmux`). Check
+out the reviewed full SHA, run the deterministic and authenticated macOS gates,
+then promote the exact tarball retained with their validation evidence:
 
 ```sh
 git clone https://github.com/ethanewer/uni-agent-cli.git
 export CC_RELEASE_COMMIT=<reviewed-full-commit-sha>
 git -C uni-agent-cli checkout --detach "$CC_RELEASE_COMMIT"
-node uni-agent-cli/scripts/install-channel.mjs stable \
-  --repo uni-agent-cli --candidate-dir /absolute/path/to/downloaded-release-artifact \
+export CC_WORKFLOW_RELEASE_DIR=/absolute/path/to/empty-release-evidence
+cd uni-agent-cli
+npm run release:workflows
+node scripts/install-channel.mjs stable \
+  --repo . --candidate-dir "$CC_WORKFLOW_RELEASE_DIR" \
   --expected-commit "$CC_RELEASE_COMMIT"
 ```
 
@@ -58,13 +60,13 @@ npm run install:channels
 
 That convenience command follows development refs and is not a release
 promotion command. Install a reviewed release candidate into beta from the
-protected artifact that contains its tarball, checksum, pack metadata,
+local evidence directory containing its tarball, checksum, pack metadata,
 candidate provenance, and `dynamic-workflows-validated.json`:
 
 ```sh
 export CC_RELEASE_COMMIT=<reviewed-full-commit-sha>
 node scripts/install-channel.mjs beta \
-  --candidate-dir /absolute/path/to/dynamic-workflows-live-release-$CC_RELEASE_COMMIT \
+  --candidate-dir /absolute/path/to/local-release-evidence \
   --expected-commit "$CC_RELEASE_COMMIT"
 ```
 
@@ -85,8 +87,8 @@ node scripts/install-channel.mjs stable --ref origin/main
 
 Development-ref installs archive the selected commit, so uncommitted
 working-tree changes are never included. Release promotion instead verifies
-and extracts the exact protected tarball, then builds and smoke-tests the
-complete release before an atomic channel switch. Releases and their private `node_modules`/ACP adapters
+and extracts the exact locally validated tarball, then builds and smoke-tests
+the complete release before an atomic channel switch. Releases and their private `node_modules`/ACP adapters
 live under `~/.local/share/cc/channels/<channel>/releases/<commit>`; the launchers
 are `~/.local/bin/cc` and `~/.local/bin/cc2`. Add `~/.local/bin` to `PATH` if it
 is not already there. Ordinary Windows package installs expose `cc.cmd`, but

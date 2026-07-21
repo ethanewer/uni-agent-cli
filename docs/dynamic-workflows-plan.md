@@ -1,7 +1,7 @@
 # Dynamic Workflows for `cc`
 
-Status: locally converged release candidate; protected macOS gates and channel
-promotion remain
+Status: locally converged release candidate; final local macOS validation and
+channel promotion remain
 
 Policy amendment: workflows are disabled by default. `/workflow-mode` persists
 one of `disabled`, `clone-only`, or `flexible` (`/workflows mode` is also
@@ -501,13 +501,12 @@ identity or path work and shared by every helper operation in that registry
 request. Timeout/revocation terminates the helper process group, escalates to
 SIGKILL, and resolves only after its exit is observed.
 
-Update `package.json.files`, the lockfile, and package verification so `src/workflows/**`, the MCP entry point, notices, required dependencies, the project MIT license, the Apache-2.0 license for vendored Pier/Terminal-Bench portions, and Pier's upstream NOTICE attribution ship in the npm artifact. The package SPDX expression declares both MIT and Apache-2.0. Provenance is pinned in `NOTICE`: open-dynamic-workflows records an exact commit and archive SHA-256, the Pier-derived code records the byte-matched `datacurve-pier` 0.2.0 source-distribution SHA-256, and the Terminal-Bench-derived ACP bridge records the exact upstream commit that preceded the vendoring date. The clean-prefix package smoke test runs lifecycle scripts, verifies required ACP/native components, imports and exercises the installed workflow runtime/dependencies, and invokes the generated bin shim rather than relying on repository-only files. The paid live GPT-5.6 E2E likewise packs and installs first, then drives that installed shim. A protected `workflow_dispatch` release environment runs the deterministic gates plus that authenticated test and retains its log artifact; `npm run release:workflows` is the corresponding local release command. Ubuntu and Windows CI jobs cover Disabled-mode clean installation and import the installed persisted-mode resolver to prove Flexible is forced to Disabled without static workflow imports, including invocation of the generated Windows `.cmd` shim, while macOS retains the mandatory execution/TUI gate. `/workflow` lists saved workflows when invoked without a name.
+Update `package.json.files`, the lockfile, and package verification so `src/workflows/**`, the MCP entry point, notices, required dependencies, the project MIT license, the Apache-2.0 license for vendored Pier/Terminal-Bench portions, and Pier's upstream NOTICE attribution ship in the npm artifact. The package SPDX expression declares both MIT and Apache-2.0. Provenance is pinned in `NOTICE`: open-dynamic-workflows records an exact commit and archive SHA-256, the Pier-derived code records the byte-matched `datacurve-pier` 0.2.0 source-distribution SHA-256, and the Terminal-Bench-derived ACP bridge records the exact upstream commit that preceded the vendoring date. The clean-prefix package smoke test runs lifecycle scripts, verifies required ACP/native components, imports and exercises the installed workflow runtime/dependencies, and invokes the generated bin shim rather than relying on repository-only files. The paid live GPT-5.6 E2E likewise packs and installs first, then drives that installed shim. `npm run release:workflows` runs the deterministic and authenticated macOS gates locally and retains their evidence. Linux runs the portable workflow suite and Disabled-mode package/install checks, while macOS additionally runs the mandatory execution/TUI gate. Windows is not fully supported and is outside this signoff. `/workflow` lists saved workflows when invoked without a name.
 
-The protected release job packs once and passes that exact tarball to every
-gate. After the authenticated job re-downloads the immutable candidate, a
-successful live result adds commit/digest/package provenance marking that
-artifact as validated. The retained artifact is protected release evidence for
-the private, protected-artifact-backed local-channel package. Promotion requires
+The local release command packs once and passes that exact tarball to every
+gate. A successful live result adds commit/digest/package provenance marking
+that artifact as validated. The retained directory is local release evidence
+for the private, validated-artifact-backed local-channel package. Promotion requires
 an independently supplied reviewed commit, deterministically repacks that exact
 Git object with the release npm toolchain, and accepts the retained tarball only
 when its digest matches. Extraction pins the verified bytes through a no-follow
@@ -617,7 +616,7 @@ Adapt the reference tests for metadata, determinism, hooks, pipeline behavior, s
    `npm run test:release`, whose mandatory workflow E2E fails rather than skips
    when the macOS `sandbox-exec` execution platform is unavailable and which
    also runs the complete regression/TUI/channel/package gates.
-6. A live external-harness smoke is a release validation step after zero-token tests pass. `npm run test:workflows:e2e:live` is the explicit authenticated GPT-5.6/Codex entry point; the protected push/manual release environment runs it because it depends on a credential and incurs model usage. The package is private and promoted through immutable protected-candidate local channels, not the unrelated public npm `cc` name.
+6. A live external-harness smoke is a release validation step after zero-token tests pass. `npm run test:workflows:e2e:live` is the explicit authenticated GPT-5.6/Codex entry point, and `npm run release:workflows` runs it after the deterministic gates because it depends on a credential and incurs model usage. The package is private and promoted through immutable locally validated candidates, not the unrelated public npm `cc` name.
 
 ## Implementation order
 
