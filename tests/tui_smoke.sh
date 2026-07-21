@@ -19,15 +19,25 @@ tmux() {
 stty_states_equal() {
 	local before="$1"
 	local after="$2"
-	cmp -s "$before" "$after" && return 0
-	[ "$(uname -s)" = "Darwin" ] || return 1
+	[ "$(< "$before")" = "$(< "$after")" ] && return 0
+	case "$OSTYPE" in darwin*) ;; *) return 1 ;; esac
 	# PENDIN (0x20000000) is queued-input state, not terminal configuration.
 	# It may clear between the shell's pre-exec snapshot and direct Node startup,
 	# so no child process can reconstruct it after SIGKILL. Compare every other
 	# encoded termios bit and control character exactly.
 	local normalized_before normalized_after
-	normalized_before="$(node -e 'const fs=require("fs");let s=fs.readFileSync(process.argv[1],"utf8").trim();s=s.replace(/lflag=([0-9a-f]+)/u,(_,h)=>`lflag=${(BigInt(`0x${h}`)&~0x20000000n).toString(16)}`);process.stdout.write(s)' "$before")"
-	normalized_after="$(node -e 'const fs=require("fs");let s=fs.readFileSync(process.argv[1],"utf8").trim();s=s.replace(/lflag=([0-9a-f]+)/u,(_,h)=>`lflag=${(BigInt(`0x${h}`)&~0x20000000n).toString(16)}`);process.stdout.write(s)' "$after")"
+	normalize_darwin_stty_state() {
+		local file="$1" state flags normalized_flags
+		IFS= read -r state < "$file" || return 1
+		case "$state" in *:lflag=*:*) ;; *) return 1 ;; esac
+		flags="${state#*:lflag=}"
+		flags="${flags%%:*}"
+		case "$flags" in ''|*[!0-9a-f]*) return 1 ;; esac
+		printf -v normalized_flags '%x' "$((16#$flags & ~0x20000000))"
+		printf '%s' "${state/:lflag=$flags:/:lflag=$normalized_flags:}"
+	}
+	normalized_before="$(normalize_darwin_stty_state "$before")"
+	normalized_after="$(normalize_darwin_stty_state "$after")"
 	[ "$normalized_before" = "$normalized_after" ]
 }
 WRITE_LOG="$(mktemp -t cc-tui-write-log.XXXXXX)"
