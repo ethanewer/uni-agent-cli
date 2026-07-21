@@ -16,29 +16,29 @@ tmux() {
 	command tmux -L "$TMUX_SOCKET" "$@"
 }
 
-stty_states_equal() {
+wait_for_stty_states_equal() {
 	local before="$1"
 	local after="$2"
-	[ "$(< "$before")" = "$(< "$after")" ] && return 0
-	case "$OSTYPE" in darwin*) ;; *) return 1 ;; esac
-	# PENDIN (0x20000000) is queued-input state, not terminal configuration.
-	# It may clear between the shell's pre-exec snapshot and direct Node startup,
-	# so no child process can reconstruct it after SIGKILL. Compare every other
-	# encoded termios bit and control character exactly.
-	local normalized_before normalized_after
-	normalize_darwin_stty_state() {
-		local file="$1" state flags normalized_flags
-		IFS= read -r state < "$file" || return 1
-		case "$state" in *:lflag=*:*) ;; *) return 1 ;; esac
-		flags="${state#*:lflag=}"
-		flags="${flags%%:*}"
-		case "$flags" in ''|*[!0-9a-f]*) return 1 ;; esac
-		printf -v normalized_flags '%x' "$((16#$flags & ~0x20000000))"
-		printf '%s' "${state/:lflag=$flags:/:lflag=$normalized_flags:}"
-	}
-	normalized_before="$(normalize_darwin_stty_state "$before")"
-	normalized_after="$(normalize_darwin_stty_state "$after")"
-	[ "$normalized_before" = "$normalized_after" ]
+	# Use one waiter process for the whole poll. On Darwin, PENDIN (0x20000000)
+	# is queued-input state rather than terminal configuration, so compare every
+	# other encoded termios bit and control character exactly.
+	node -e '
+		const fs = require("node:fs");
+		const [beforePath, afterPath] = process.argv.slice(1);
+		const deadline = Date.now() + 5_000;
+		const waiter = new Int32Array(new SharedArrayBuffer(4));
+		const read = (file) => { try { return fs.readFileSync(file, "utf8").trim(); } catch { return undefined; } };
+		const normalize = (state) => process.platform === "darwin" && state !== undefined
+			? state.replace(/lflag=([0-9a-f]+)/u, (_, hex) => `lflag=${(BigInt(`0x${hex}`) & ~0x20000000n).toString(16)}`)
+			: state;
+		do {
+			const before = read(beforePath);
+			const after = read(afterPath);
+			if (before !== undefined && after !== undefined && normalize(before) === normalize(after)) process.exit(0);
+			Atomics.wait(waiter, 0, 0, 50);
+		} while (Date.now() < deadline);
+		process.exit(1);
+	' "$before" "$after"
 }
 WRITE_LOG="$(mktemp -t cc-tui-write-log.XXXXXX)"
 SETTINGS_FILE="$(mktemp -t cc-tui-settings.XXXXXX)"
@@ -366,6 +366,23 @@ for startup_launcher in "./src/cc" "node src/cc.mjs"; do
 	: > "$WRITE_LOG"
 done
 
+# Reproduce the launch-command echo itself through a persistent shell. PENDIN
+# remains set between the first command list item and cc's initial terminal read;
+# the shell should echo this uniquely named command only once.
+tmux new-session -d -s "$SESSION" -x 100 -y 30 "cd $ROOT_Q && exec sh"
+tmux send-keys -l -t "$SESSION" "cc_launch_echo_probe() { $PANE_ENV PI_TUI_WRITE_LOG=$WRITE_LOG_Q CC_CONFIG=tests/fake_config.json CC_SETTINGS=$SETTINGS_FILE_Q CC_BACKGROUND_CONNECT_DELAY_MS=0 CC_TEST_STARTUP_IMPORT_DELAY_MS=800 ./src/cc fake; }"
+tmux send-keys -t "$SESSION" Enter
+sleep 0.1
+tmux send-keys -t "$SESSION" C-l
+sleep 0.1
+tmux clear-history -t "$SESSION"
+tmux send-keys -l -t "$SESSION" "stty pendin; cc_launch_echo_probe"
+tmux send-keys -t "$SESSION" Enter
+wait_for_text "Space to record"
+assert_exact_scrollback_count "cc_launch_echo_probe" 1
+stop_session
+: > "$WRITE_LOG"
+
 # An external termination can land after the shell has disabled canonical echo
 # but before the full app installs its signal handlers. Return to a persistent
 # parent shell and inspect its functional termios flags so this path can never
@@ -466,11 +483,7 @@ if [ -z "$direct_manager_pid" ]; then
 	exit 1
 fi
 kill -KILL "$direct_manager_pid"
-for _ in {1..100}; do
-	if [ -s "$DIRECT_STTY_AFTER" ] && stty_states_equal "$DIRECT_STTY_BEFORE" "$DIRECT_STTY_AFTER"; then break; fi
-	sleep 0.05
-done
-if ! stty_states_equal "$DIRECT_STTY_BEFORE" "$DIRECT_STTY_AFTER"; then
+if ! wait_for_stty_states_equal "$DIRECT_STTY_BEFORE" "$DIRECT_STTY_AFTER"; then
 	echo "SIGKILL of the direct npm-bin cc.mjs path did not restore exact terminal configuration" >&2
 	diff -u "$DIRECT_STTY_BEFORE" "$DIRECT_STTY_AFTER" >&2 || true
 	exit 1

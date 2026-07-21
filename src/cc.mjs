@@ -93,7 +93,7 @@ function beginStartupInputGuard(enabled) {
 	const inheritedTerminalMode = process.env.CC_STARTUP_STTY_STATE;
 	const startupTerminalMode = inheritedTerminalMode ?? captureTerminalMode();
 	startTerminalRestoreMonitor(startupTerminalMode);
-	let listening = true;
+	let listening = false;
 	let restored = false;
 	let terminating = false;
 	const startupSignalHandlers = new Map();
@@ -102,18 +102,20 @@ function beginStartupInputGuard(enabled) {
 		startupSignalHandlers.clear();
 	};
 	const onData = (data) => chunks.push(Buffer.isBuffer(data) ? Buffer.from(data) : String(data));
-	process.stdin.on("data", onData);
 	try {
-		// The shell launcher enters cbreak/no-echo before doing any prepaint work.
-		// Once this listener owns all pending bytes, restore the exact prior mode
-		// synchronously and let Node enter raw mode from that clean baseline. Pi can
-		// then restore normally without carrying an stty operation into shutdown.
-		restoreInheritedTerminalMode();
+		// A data listener starts stdin flowing immediately. Enter raw/no-echo mode
+		// first so its initial read cannot make macOS reprocess and echo PENDIN input
+		// from the shell's just-submitted command. The kernel retains bytes received
+		// before the listener is attached, so this ordering does not lose input.
 		process.stdin.setRawMode(true);
+		delete process.env.CC_STARTUP_STTY_STATE;
+		process.stdin.on("data", onData);
+		listening = true;
 		process.stdin.resume();
 	} catch {
-		process.stdin.removeListener("data", onData);
-		restoreInheritedTerminalMode();
+		if (listening) process.stdin.removeListener("data", onData);
+		restoreTerminalMode(startupTerminalMode);
+		delete process.env.CC_STARTUP_STTY_STATE;
 		return undefined;
 	}
 	const guard = {
