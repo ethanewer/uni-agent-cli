@@ -135,20 +135,26 @@ async function main() {
 	seedServer = undefined;
 
 	const replayed = [];
+	let reusedTranscript;
 	const connection = {
 		agentInfo: { name: "@agentclientprotocol/codex-acp", version: "1.1.4" },
 		sessionId: sourceSessionId,
 		async initialize() {},
-		getSessionInfo() { return { capabilities: { loadSession: true } }; },
-		async loadSession(sessionId, options = {}) {
+		getSessionInfo() {
+			return { capabilities: { loadSession: true, sessionCapabilities: { resume: {} } } };
+		},
+		async resumeSession(sessionId, options = {}) {
 			// A zero-turn fork is discoverable by another Codex process only while
 			// the forking app-server still owns it. This mirrors codex-acp's live
-			// session/load and proves the production pre-teardown handoff boundary.
+			// session/resume and proves the production pre-teardown handoff boundary.
 			inspectServer = await LiveCodexAppServer.start(invocation, environment);
 			const loaded = await inspectServer.request("thread/resume", { threadId: sessionId });
 			assert.deepEqual(loaded.thread.turns.map((turn) => turn.id), [earlierTurnId]);
 			this.sessionId = sessionId;
 			await options.beforeReplay?.({ sessionId });
+		},
+		async loadSession() {
+			assert.fail("a reusable TUI transcript must not stream the full history");
 		},
 		stop() {},
 	};
@@ -171,10 +177,21 @@ async function main() {
 		} },
 	});
 	await adapter.connect({ cwd: root, createSession: false });
-	const result = await adapter.rewindCheckpoint(selectedTurnId, "conversation");
+	const result = await adapter.rewindCheckpoint(selectedTurnId, "conversation", {
+		preserveTranscript: true,
+		canReuseTranscript: () => true,
+		beforeReplay: (_response, replay) => {
+			reusedTranscript = replay;
+			return true;
+		},
+	});
 	assert.notEqual(result.sessionId, sourceSessionId);
 	assert.equal(connection.sessionId, result.sessionId);
-	assert.deepEqual(replayed, [{ type: "user_text", text: "selected prompt retained without response" }]);
+	assert.deepEqual(reusedTranscript, {
+		reuseCurrentTranscript: true,
+		replayText: ["selected prompt retained without response"],
+	});
+	assert.deepEqual(replayed, []);
 
 	const child = await inspectServer.request("thread/read", { threadId: result.sessionId, includeTurns: true });
 	assert.deepEqual(child.thread.turns.map((turn) => turn.id), [earlierTurnId]);

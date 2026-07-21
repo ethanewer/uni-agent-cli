@@ -1462,9 +1462,11 @@ await (async () => {
 	app.closeCurrentAssistantText = () => {};
 	app.refreshCodexThreadStateSnapshot = () => {};
 	app.flushPromptQueue = async () => {};
+	app.checkpointTranscriptIdentitySafe = true;
 	await app.sendPrompt("design it", { promptParts: [{ type: "image", data: "img", mimeType: "image/png" }] });
 	assert.match(sent[0][0].text, /planning mode/i);
 	assert.equal(sent[0][1].type, "image");
+	assert.equal(app.checkpointTranscriptIdentitySafe, false, "rewritten backend prompts require authoritative checkpoint replay");
 })();
 
 // Busy plan commands reserve their images in the deferred entry.

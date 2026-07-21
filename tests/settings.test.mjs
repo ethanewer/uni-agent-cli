@@ -4184,6 +4184,59 @@ assert.equal(rewriteFullScreenClear(`${fullClear}rendered`, { fullClearReplaceme
 assert.equal(rewriteFullScreenClear(`before\x1b[3Jafter`), "beforeafter");
 
 {
+	const writes = [];
+	let replacement;
+	let renders = 0;
+	const app = Object.create(HarnessApp.prototype);
+	app.ui = {
+		previousLines: ["discarded conversation"],
+		maxLinesRendered: 1,
+		previousViewportTop: 0,
+		hardwareCursorRow: 0,
+		cursorRow: 0,
+		terminal: {
+			useFullClearReplacementOnce(value) { replacement = value; },
+			write(value) { writes.push(value); },
+		},
+		requestRender() { renders += 1; },
+	};
+	app.forceFullRepaint({ clearScrollback: true });
+	assert.equal(replacement, fullClear);
+	assert.deepEqual(writes, [`${fullClear}\x1b7`]);
+	assert.deepEqual(app.ui.previousLines, []);
+	assert.equal(renders, 1);
+}
+
+{
+	// Scrollback removal consumes the one-shot native clear. The same write must
+	// save a fresh home-position anchor so the forced renderer clear cannot restore
+	// the cursor location from the discarded transcript.
+	const originalWrite = ProcessTerminal.prototype.write;
+	const writes = [];
+	ProcessTerminal.prototype.write = (data) => writes.push(data);
+	try {
+		const terminal = createHarnessTerminal();
+		const app = Object.create(HarnessApp.prototype);
+		app.ui = {
+			previousLines: ["discarded conversation"],
+			maxLinesRendered: 1,
+			previousViewportTop: 0,
+			hardwareCursorRow: 7,
+			cursorRow: 7,
+			terminal,
+			requestRender() { terminal.write(`${fullClear}rendered`); },
+		};
+		app.forceFullRepaint({ clearScrollback: true });
+		assert.deepEqual(writes, [
+			`${fullClear}\x1b7`,
+			"\x1b8\x1b[J\x1b7rendered",
+		]);
+	} finally {
+		ProcessTerminal.prototype.write = originalWrite;
+	}
+}
+
+{
 	let replacement;
 	const app = Object.create(HarnessApp.prototype);
 	app.ui = {

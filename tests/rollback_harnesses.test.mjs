@@ -86,6 +86,10 @@ function fakeConnection({ name, sessionId, failLoad = false, clearSessionOnLoadF
 			this.sessionId = next;
 			await options.beforeReplay?.({ sessionId: next });
 		},
+		async resumeSession(next, options = {}) {
+			this.sessionId = next;
+			await options.beforeReplay?.({ sessionId: next });
+		},
 		stop() {},
 	};
 }
@@ -158,7 +162,20 @@ async function runFakeCodexTransaction(requests, onRequest, options = {}) {
 	await adapter.connect({ createSession: false });
 	assert.deepEqual(adapter.capabilities.checkpointModes, ["conversation"]);
 	assert.deepEqual(await adapter.listCheckpoints(), { checkpoints: [{ id: codexTurn, summary: "Implement rollback" }] });
-	assert.equal((await adapter.rewindCheckpoint(codexTurn, "conversation")).sessionId, codexChild);
+	assert.ok(adapter.checkpointSnapshot);
+	adapter.discardCheckpointSnapshot();
+	assert.equal(adapter.checkpointSnapshot, undefined, "a dismissed picker can release its complete thread history");
+	assert.deepEqual(await adapter.listCheckpoints(), { checkpoints: [{ id: codexTurn, summary: "Implement rollback" }] });
+	const readsBeforeRewind = appServerCalls.filter((call) => call.method === "thread/read").length;
+	let preservedReplay;
+	assert.equal((await adapter.rewindCheckpoint(codexTurn, "conversation", {
+		preserveTranscript: true,
+		canReuseTranscript: () => true,
+		beforeReplay: (_response, replay) => {
+			preservedReplay = replay;
+			return true;
+		},
+	})).sessionId, codexChild);
 	assert.equal(connection.sessionId, codexChild);
 	assert.equal(appServerCalls.find((call) => call.method === "thread/fork").params.lastTurnId, codexTurn);
 	assert.deepEqual(appServerCalls.find((call) => call.method === "thread/rollback").params, {
@@ -170,9 +187,94 @@ async function runFakeCodexTransaction(requests, onRequest, options = {}) {
 		role: "user",
 		content: [{ type: "input_text", text: "Implement rollback" }],
 	}]);
-	assert.deepEqual(replayed, [{ type: "user_text", text: "Implement rollback" }]);
+	assert.deepEqual(preservedReplay, {
+		reuseCurrentTranscript: true,
+		replayText: ["Implement rollback"],
+	});
+	assert.deepEqual(replayed, [], "a reused TUI transcript does not receive duplicate replay events");
+	assert.equal(appServerCalls.filter((call) => call.method === "thread/read").length, readsBeforeRewind, "rewind reuses the latest picker snapshot");
 	assert.equal(recorded.length, 1);
 	await assert.rejects(() => adapter.rewindCheckpoint(codexTurn, "code"), /does not support code/u);
+	await adapter.stopAndWait();
+}
+
+// session/resume is optional. A compatible backend that advertises only
+// session/load must use the authoritative replay path even when the TUI itself
+// could reuse its current transcript.
+{
+	const connection = fakeConnection({ name: "@agentclientprotocol/codex-acp", sessionId: codexSource });
+	connection.getSessionInfo = () => ({
+		capabilities: { loadSession: true, sessionCapabilities: { list: {} } },
+	});
+	let loadCalls = 0;
+	let resumeCalls = 0;
+	connection.loadSession = async (next, options = {}) => {
+		loadCalls += 1;
+		connection.sessionId = next;
+		await options.beforeReplay?.({ sessionId: next });
+	};
+	connection.resumeSession = async () => { resumeCalls += 1; };
+	const adapter = new CodexAdapter("codex", CodexAdapter.defaultAgentConfig, {}, {
+		connectionFactory: () => connection,
+		services: { codex: {
+			acquireForkOperationLock: async () => () => {},
+			resolveCodexInvocation: () => ({ command: "codex-test", args: [] }),
+			runCodexAppServerRequests: async (_invocation, requests, _agent, options) => await runFakeCodexTransaction(requests, async (request) => {
+				if (request.method === "thread/read") return codexRead;
+				if (request.method === "thread/fork") return { thread: { id: codexChild, ephemeral: false, forkedFromId: codexSource } };
+				if (request.method === "thread/rollback") return { thread: { id: codexChild, turns: [] } };
+				if (request.method === "thread/inject_items") return {};
+				throw new Error(`unexpected method ${request.method}`);
+			}, options),
+			recordForkId: () => {},
+			forgetForkIds: () => {},
+		} },
+	});
+	await adapter.connect({ createSession: false });
+	await adapter.rewindCheckpoint(codexTurn, "conversation", {
+		preserveTranscript: true,
+		canReuseTranscript: () => true,
+		beforeReplay: () => true,
+	});
+	assert.equal(resumeCalls, 0);
+	assert.equal(loadCalls, 1);
+	await adapter.stopAndWait();
+}
+
+// If the source transcript changes after the preflight reuse check, reset it
+// before authoritative replay. A replay failure must not leave source history
+// visible while the connection points at the committed checkpoint branch.
+{
+	const replayCalls = [];
+	const connection = fakeConnection({ name: "@agentclientprotocol/codex-acp", sessionId: codexSource });
+	connection.loadSession = async () => { throw new Error("fallback replay failed"); };
+	const adapter = new CodexAdapter("codex", CodexAdapter.defaultAgentConfig, {}, {
+		connectionFactory: () => connection,
+		services: { codex: {
+			acquireForkOperationLock: async () => () => {},
+			resolveCodexInvocation: () => ({ command: "codex-test", args: [] }),
+			runCodexAppServerRequests: async (_invocation, requests, _agent, options) => await runFakeCodexTransaction(requests, async (request) => {
+				if (request.method === "thread/read") return codexRead;
+				if (request.method === "thread/fork") return { thread: { id: codexChild, ephemeral: false, forkedFromId: codexSource } };
+				if (request.method === "thread/rollback") return { thread: { id: codexChild, turns: [] } };
+				if (request.method === "thread/inject_items") return {};
+				throw new Error(`unexpected method ${request.method}`);
+			}, options),
+			recordForkId: () => {},
+			forgetForkIds: () => {},
+		} },
+	});
+	await adapter.connect({ createSession: false });
+	await assert.rejects(() => adapter.rewindCheckpoint(codexTurn, "conversation", {
+		preserveTranscript: true,
+		canReuseTranscript: () => true,
+		beforeReplay: (_response, replay) => {
+			replayCalls.push(replay?.reuseCurrentTranscript === true ? "reuse" : "reset");
+			return false;
+		},
+	}), /fallback replay failed/u);
+	assert.deepEqual(replayCalls, ["reuse", "reset"]);
+	assert.equal(connection.sessionId, codexChild);
 	await adapter.stopAndWait();
 }
 

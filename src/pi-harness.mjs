@@ -126,6 +126,7 @@ import {
 	CHECKPOINTS_LIST_METHOD,
 	CHECKPOINT_REWIND_METHOD,
 	checkpointModesForCapabilities,
+	checkpointSummary,
 	formatCheckpointRewindResult,
 	normalizeCheckpointListResponse,
 	normalizeCheckpointRewindResponse,
@@ -3665,8 +3666,8 @@ export class AcpClient {
 		return await this.request("session/delete", { sessionId });
 	}
 
-	async resumeSession(sessionId) {
-		return await this.switchSession("session/resume", this.sessionRequestParams({ sessionId }), sessionId);
+	async resumeSession(sessionId, options = {}) {
+		return await this.switchSession("session/resume", this.sessionRequestParams({ sessionId }), sessionId, options);
 	}
 
 	async switchSession(method, params, targetSessionId = undefined, options = {}) {
@@ -4827,6 +4828,10 @@ export class HarnessApp {
 		this.currentToolSummary = undefined;
 		this.pendingUserEchoes = [];
 		this.pendingUnsendPrompt = undefined;
+		// Fast checkpoint trimming is safe only while every backend prompt has a
+		// one-to-one rendered user message with the same text. Hidden workflow
+		// deliveries and display aliases deliberately violate that identity.
+		this.checkpointTranscriptIdentitySafe = true;
 		this.codexThreadStateSnapshot = undefined;
 		this.lastInputClearSource = undefined;
 		this.lastKnownEditorText = "";
@@ -5278,7 +5283,19 @@ export class HarnessApp {
 	// clear (a relative cursor restore) would leave stale rows on screen.
 	forceFullRepaint(options = {}) {
 		const ui = this.ui;
-		ui.terminal.write("\x1b[2J\x1b[H");
+		if (options.clearScrollback === true) {
+			// Natural-flow transcript rows that have already scrolled above the TUI's
+			// viewport cannot be removed by Pi's differential renderer. A successful
+			// conversation rewind is the one transition where retaining those rows is
+			// actively misleading: they no longer describe the model's context.
+			ui.terminal.useFullClearReplacementOnce?.(PI_TUI_FULL_CLEAR);
+			// The actual clear moves the cursor home. Save that new anchor before the
+			// forced render: its own full-clear sequence is rewritten through DECRC,
+			// which must not restore the cursor position from the discarded transcript.
+			ui.terminal.write(`${PI_TUI_FULL_CLEAR}\x1b7`);
+		} else {
+			ui.terminal.write("\x1b[2J\x1b[H");
+		}
 		ui.previousLines = [];
 		ui.maxLinesRendered = 0;
 		ui.previousViewportTop = 0;
@@ -7252,7 +7269,10 @@ export class HarnessApp {
 		const pendingUserEcho = this.trackPendingUserEcho(text);
 		// A locally-answered identity question never reaches the backend, so it
 		// must not forfeit the pre-conversation local /cd path.
-		if (!localIdentityResponse(text, options.promptParts)) this.conversationStarted = true;
+		if (!localIdentityResponse(text, options.promptParts)) {
+			this.conversationStarted = true;
+			if (displayText !== text) this.checkpointTranscriptIdentitySafe = false;
+		}
 		const transcriptEntry = this.addUserMessage(displayText, { compactCommand: options.compactCommand });
 		this.armPendingUnsendPrompt({
 			text,
@@ -7733,7 +7753,13 @@ export class HarnessApp {
 					...(Array.isArray(options.promptParts) ? options.promptParts : [{ type: "text", text }]),
 				];
 			}
-			const result = await client.prompt(this.promptForActiveCapabilities(backendText, backendParts));
+			const backendPayload = this.promptForActiveCapabilities(backendText, backendParts);
+			// Alias/hidden checks happen when the prompt enters the local transcript,
+			// but capability expansion and plan fallback happen only here. Any payload
+			// other than the original plain string means the rendered prompt is not an
+			// exact representation of Codex history, so checkpoint reuse must replay.
+			if (backendPayload !== text) this.checkpointTranscriptIdentitySafe = false;
+			const result = await client.prompt(backendPayload);
 			if (this.client === client) this.noticeForStopReason(result?.stopReason);
 		} catch (error) {
 			promptFailure = error;
@@ -7852,7 +7878,12 @@ export class HarnessApp {
 					continue;
 				}
 				const pendingUserEcho = this.trackPendingUserEcho(prompt.text);
-				if (!localIdentityResponse(prompt.text, prompt.promptParts)) this.conversationStarted = true;
+				if (!localIdentityResponse(prompt.text, prompt.promptParts)) {
+					this.conversationStarted = true;
+					if (prompt.internal || (prompt.displayText ?? prompt.text) !== prompt.text) {
+						this.checkpointTranscriptIdentitySafe = false;
+					}
+				}
 				const transcriptEntry = prompt.internal ? undefined : this.addUserMessage(prompt.displayText ?? prompt.text, { compactCommand: prompt.compactCommand });
 				if (!prompt.internal) {
 					this.armPendingUnsendPrompt({
@@ -9850,6 +9881,7 @@ export class HarnessApp {
 		}
 		const context = this.captureActiveAgentContext({ includeClient: true });
 		const sourceSessionId = context.client?.sessionId;
+		const discardCheckpointSnapshot = () => context.client?.discardCheckpointSnapshot?.();
 		if (!sourceSessionId || context.client?.capabilities?.checkpoints !== true) {
 			this.addNotice("This agent does not advertise checkpoint support");
 			return false;
@@ -9867,10 +9899,12 @@ export class HarnessApp {
 				? this.previousClearedSession
 				: undefined;
 			if (result.checkpoints.length === 0 && !previousSession) {
+				discardCheckpointSnapshot();
 				this.addNotice("No user-message checkpoints are available in this session");
 				return false;
 			}
 			if (!this.canOpenAsyncPicker()) {
+				discardCheckpointSnapshot();
 				this.addNotice("Checkpoints loaded, but another interaction is active. Run /rewind again.");
 				return false;
 			}
@@ -9889,22 +9923,30 @@ export class HarnessApp {
 			}
 			this.openSelection("Rewind to checkpoint", entries, async (entry) => {
 				this.closeMenu();
-				if (!entry || !this.isCheckpointContextActive(context, sourceSessionId)) return;
+				if (!entry || !this.isCheckpointContextActive(context, sourceSessionId)) {
+					discardCheckpointSnapshot();
+					return;
+				}
 				if (this.busy || this.sessionSwitchInProgress || this.btwThread) {
+					discardCheckpointSnapshot();
 					this.addNotice("The session changed while the checkpoint picker was open; run /rewind again");
 					return;
 				}
 				if (entry.previousSession) {
+					discardCheckpointSnapshot();
 					await this.resumeSelectedSession({
 						sessionId: entry.previousSession.sessionId,
 						title: "Previous session",
 					}, { displayText: entry.label });
 					return;
 				}
-				this.openCheckpointModeSelection(context, sourceSessionId, entry.value, displayText);
+				if (!this.openCheckpointModeSelection(context, sourceSessionId, entry.value, displayText)) {
+					discardCheckpointSnapshot();
+				}
 			});
 			return true;
 		} catch (error) {
+			discardCheckpointSnapshot();
 			if (this.isActiveAgentContext(context)) this.addError(`Could not load checkpoints: ${error.message ?? error}`);
 			return false;
 		} finally {
@@ -9918,7 +9960,11 @@ export class HarnessApp {
 	}
 
 	openCheckpointModeSelection(context, sourceSessionId, checkpoint, displayText = "/rewind") {
-		if (!this.isCheckpointContextActive(context, sourceSessionId)) return false;
+		const discardCheckpointSnapshot = () => context.client?.discardCheckpointSnapshot?.();
+		if (!this.isCheckpointContextActive(context, sourceSessionId)) {
+			discardCheckpointSnapshot();
+			return false;
+		}
 		const availableModes = checkpointModesForCapabilities(context.client?.capabilities);
 		const entries = [
 			{
@@ -9938,13 +9984,21 @@ export class HarnessApp {
 			},
 		].filter((entry) => availableModes.includes(entry.value));
 		if (entries.length === 0) {
+			discardCheckpointSnapshot();
 			this.addNotice("This agent does not advertise a usable checkpoint rewind mode");
 			return false;
 		}
 		this.openSelection("What should be rewound?", entries, async (entry) => {
 			this.closeMenu();
-			if (!entry || !this.isCheckpointContextActive(context, sourceSessionId)) return;
-			await this.applyCheckpointRewind(context, sourceSessionId, checkpoint, entry.value, displayText);
+			if (!entry || !this.isCheckpointContextActive(context, sourceSessionId)) {
+				discardCheckpointSnapshot();
+				return;
+			}
+			try {
+				await this.applyCheckpointRewind(context, sourceSessionId, checkpoint, entry.value, displayText);
+			} finally {
+				discardCheckpointSnapshot();
+			}
 		});
 		return true;
 	}
@@ -9998,16 +10052,35 @@ export class HarnessApp {
 		this.ui.requestRender();
 		let switched = false;
 		let restored = false;
-		const commitView = () => {
+		const commitView = (_response, replay = undefined) => {
 			if (switched || !this.isActiveAgentContext(context)) return;
+			// A workflow dashboard may own the alternate screen while its composer is
+			// used for /undo. Return to the normal buffer before clearing scrollback so
+			// discarded conversation rows cannot reappear when the dashboard closes.
+			if (this.workflowPage) this.closeWorkflowPage();
+			if (replay?.reuseCurrentTranscript === true) {
+				const reused = this.rewindConversationView(checkpoint, displayText, replay.replayText);
+				if (!reused) return false;
+				switched = true;
+				this.clearLiveBackendCommands(context.key);
+				this.updateAutocomplete();
+				this.forceFullRepaint({ clearScrollback: true });
+				return true;
+			}
 			switched = true;
 			this.clearLiveBackendCommands(context.key);
 			this.resetConversationView();
 			this.addCommandMessage(slashPromptDisplay(displayText, checkpoint.summary));
 			this.updateAutocomplete();
+			this.forceFullRepaint({ clearScrollback: true });
+			return true;
 		};
 		try {
-			const result = await client.rewindCheckpoint(checkpoint.id, mode, { beforeReplay: commitView });
+			const result = await client.rewindCheckpoint(checkpoint.id, mode, {
+				beforeReplay: commitView,
+				preserveTranscript: true,
+				canReuseTranscript: (replay) => this.canRewindConversationView(checkpoint, replay?.replayText),
+			});
 			if (!this.isActiveAgentContext(context)) return false;
 			if (!client.sessionId || sameSessionId(client.sessionId, sourceSessionId)) {
 				throw new Error("the harness did not switch to a distinct checkpoint branch");
@@ -11266,6 +11339,7 @@ export class HarnessApp {
 
 	resetConversationView() {
 		this.conversationStarted = false;
+		this.checkpointTranscriptIdentitySafe = true;
 		this.chat.clear();
 		this.currentAssistantText = undefined;
 		this.currentToolSummary = undefined;
@@ -11274,6 +11348,50 @@ export class HarnessApp {
 		this.pendingUnsendPrompt = undefined;
 		this.pendingPromptDisplay = undefined;
 		this.lastAssistantText = "";
+	}
+
+	checkpointConversationIndex(checkpoint, replayText = []) {
+		if (this.checkpointTranscriptIdentitySafe === false) return -1;
+		const children = this.chat?.children;
+		if (!Array.isArray(children)) return -1;
+		const exactText = Array.isArray(replayText) ? replayText.join("") : "";
+		const exactMatches = [];
+		const summaryMatches = [];
+		for (let index = 0; index < children.length; index += 1) {
+			const child = children[index];
+			if (!(child instanceof MutableUserMessage)) continue;
+			if (exactText && child.text === exactText) exactMatches.push(index);
+			if (checkpointSummary(child.text) === checkpoint.summary) summaryMatches.push(index);
+		}
+		// A duplicate prompt is a real ambiguity because checkpoint ids do not exist
+		// in rendered components. Likewise, when exact replay text is available, a
+		// summary-only match cannot prove a message boundary: ACP may have merged
+		// adjacent user-only turns into one mutable component. Fall back to the
+		// authoritative history replay instead of trimming at a guessed occurrence.
+		const matches = exactText ? exactMatches : summaryMatches;
+		return matches.length === 1 ? matches[0] : -1;
+	}
+
+	canRewindConversationView(checkpoint, replayText = []) {
+		return this.checkpointConversationIndex(checkpoint, replayText) >= 0;
+	}
+
+	rewindConversationView(checkpoint, displayText, replayText = []) {
+		const children = this.chat?.children;
+		if (!Array.isArray(children)) return false;
+		const checkpointIndex = this.checkpointConversationIndex(checkpoint, replayText);
+		if (checkpointIndex < 0) return false;
+
+		// Reuse the already-rendered source transcript through the selected user
+		// message. The native Codex rollback retains exactly this prefix and removes
+		// that message's answer, so no ACP history stream is needed to reconstruct it.
+		const retained = children.slice(0, checkpointIndex + 1);
+		this.resetConversationView();
+		this.addCommandMessage(slashPromptDisplay(displayText, checkpoint.summary));
+		this.chat.addChild(new Spacer(1));
+		for (const child of retained) this.chat.addChild(child);
+		this.conversationStarted = true;
+		return true;
 	}
 
 	async ensureConnected(options = {}) {

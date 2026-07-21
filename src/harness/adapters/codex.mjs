@@ -162,7 +162,17 @@ export class CodexAdapter extends BaseAcpAdapter {
 	}
 
 	async afterConnectionsRetired() {
+		this.checkpointSnapshot = undefined;
 		this.releaseAllLiveLeases();
+	}
+
+	async prompt(prompt) {
+		this.checkpointSnapshot = undefined;
+		return await super.prompt(prompt);
+	}
+
+	discardCheckpointSnapshot() {
+		this.checkpointSnapshot = undefined;
 	}
 
 	async newSession(options = {}) {
@@ -249,7 +259,13 @@ export class CodexAdapter extends BaseAcpAdapter {
 			[{ method: "thread/read", params: codexCheckpointReadParams(this.sessionId) }],
 			this.launchSpec,
 		);
-		return codexCheckpointsFromThreadRead(response, options);
+		const checkpoints = codexCheckpointsFromThreadRead(response, options);
+		// The picker prevents turns and session transitions while it is open, and the
+		// live-session lease prevents another cc process from mutating this thread.
+		// Retain the exact snapshot so the selected rewind does not launch a second
+		// app-server merely to read the same history again.
+		this.checkpointSnapshot = { sessionId: this.canonicalSessionId(this.sessionId), response };
+		return checkpoints;
 	}
 
 	async rewindCheckpoint(checkpointId, mode, options = {}) {
@@ -262,41 +278,57 @@ export class CodexAdapter extends BaseAcpAdapter {
 		let runRequests;
 		let handoffPromise;
 		let promoted = false;
+		let reusedTranscript = false;
+		let rollbackPlan;
 		try {
 			if (!sourceSessionId) throw new Error("Codex session is not ready");
 			const resolveInvocation = this.codexService("resolveCodexInvocation");
 			runRequests = this.codexService("runCodexAppServerRequests");
 			invocation = resolveInvocation(this.launchSpec);
 			if (!invocation) throw new Error("a compatible Codex CLI is required for rollback");
-			const [readResponse] = await runRequests(
-				invocation,
-				[{ method: "thread/read", params: codexCheckpointReadParams(sourceSessionId) }],
-				this.launchSpec,
+			const snapshot = this.checkpointSnapshot;
+			this.checkpointSnapshot = undefined;
+			if (snapshot?.sessionId === sourceSessionId) {
+				rollbackPlan = codexCheckpointRollbackPlan(snapshot.response, checkpointId, {
+					readLocalImage: (filePath) => fs.readFileSync(filePath),
+				});
+			}
+			const requests = [];
+			if (!rollbackPlan) {
+				requests.push(
+					{ method: "thread/read", params: codexCheckpointReadParams(sourceSessionId) },
+					(results) => {
+						rollbackPlan = codexCheckpointRollbackPlan(results.at(-1), checkpointId, {
+							readLocalImage: (filePath) => fs.readFileSync(filePath),
+						});
+						return { method: "thread/fork", params: codexCheckpointForkParams(sourceSessionId, rollbackPlan.turnId) };
+					},
+				);
+			} else {
+				requests.push({ method: "thread/fork", params: codexCheckpointForkParams(sourceSessionId, rollbackPlan.turnId) });
+			}
+			requests.push(
+				(results) => {
+					forked = codexPersistentForkSession(results.at(-1), sourceSessionId);
+					return { method: "thread/rollback", params: { threadId: forked.sessionId, numTurns: 1 } };
+				},
+				(results) => {
+					assertCodexCheckpointTurnRemoved(results.at(-1), rollbackPlan);
+					return {
+						method: "thread/inject_items",
+						params: { threadId: forked.sessionId, items: rollbackPlan.injectionItems },
+					};
+				},
 			);
-			const rollbackPlan = codexCheckpointRollbackPlan(readResponse, checkpointId, {
-				readLocalImage: (filePath) => fs.readFileSync(filePath),
-			});
 			await runRequests(
 				invocation,
-				[
-					{ method: "thread/fork", params: codexCheckpointForkParams(sourceSessionId, rollbackPlan.turnId) },
-					(results) => {
-						forked = codexPersistentForkSession(results[0], sourceSessionId);
-						return { method: "thread/rollback", params: { threadId: forked.sessionId, numTurns: 1 } };
-					},
-					(results) => {
-						assertCodexCheckpointTurnRemoved(results[1], rollbackPlan);
-						return {
-							method: "thread/inject_items",
-							params: { threadId: forked.sessionId, items: rollbackPlan.injectionItems },
-						};
-					},
-				],
+				requests,
 				this.launchSpec,
 				{
 					// The persistent zero-turn fork exists only while this app-server owns
-					// it. session/load is therefore the commit boundary: its successful
-					// return proves the independent live ACP backend adopted the rolled-back
+					// it. session/resume (or the compatibility session/load fallback) is
+					// therefore the commit boundary: its successful return proves the
+					// independent live ACP backend adopted the rolled-back
 					// history, including injected input, before this temporary owner exits.
 					// After that transfer the live backend, rather than this process's final
 					// storage flush, is authoritative for the child session.
@@ -306,21 +338,59 @@ export class CodexAdapter extends BaseAcpAdapter {
 							this.codexService("recordForkId")(forked.sessionId, sourceSessionId, { required: true });
 							this.acquireLiveLease(forked.sessionId, connection);
 							const beforeReplay = options.beforeReplay;
-							await super.loadSession(forked.sessionId, {
-								...options,
-								beforeReplay: async (response) => {
-									this.promoteLiveLease(forked.sessionId, connection);
-									promoted = true;
-									await beforeReplay?.(response);
-								},
-							});
+							const canReuseTranscript = options.canReuseTranscript;
+							const sessionOptions = { ...options };
+							delete sessionOptions.preserveTranscript;
+							delete sessionOptions.canReuseTranscript;
+							const resumeAdvertised = Boolean(
+								connection?.getSessionInfo?.()?.capabilities?.sessionCapabilities?.resume,
+							);
+							const reuseEligible = options.preserveTranscript === true &&
+								typeof beforeReplay === "function" &&
+								typeof canReuseTranscript === "function" &&
+								resumeAdvertised &&
+								typeof connection?.resumeSession === "function" &&
+								await canReuseTranscript({ replayText: rollbackPlan.replayText }) === true;
+							if (
+								reuseEligible
+							) {
+								await connection.resumeSession(forked.sessionId, {
+									...sessionOptions,
+									beforeReplay: async (response) => {
+										this.promoteLiveLease(forked.sessionId, connection);
+										promoted = true;
+										reusedTranscript = await beforeReplay(response, {
+											reuseCurrentTranscript: true,
+											replayText: rollbackPlan.replayText,
+										}) === true;
+										// Reuse eligibility is checked before session/resume commits. If
+										// the transcript changes in that narrow window, establish the
+										// authoritative empty replay view before attempting session/load;
+										// a load failure must never leave the source transcript attached
+										// to the already-adopted checkpoint branch.
+										if (!reusedTranscript) await beforeReplay(response);
+									},
+								});
+							}
+							if (!reusedTranscript) {
+								await super.loadSession(forked.sessionId, {
+									...sessionOptions,
+									beforeReplay: async (response) => {
+										this.promoteLiveLease(forked.sessionId, connection);
+										promoted = true;
+										await beforeReplay?.(response);
+									},
+								});
+							}
 							if (!promoted) this.promoteLiveLease(forked.sessionId, connection);
 						})();
 						return handoffPromise;
 					},
 				},
 			);
-			for (const text of rollbackPlan.replayText) this.host.onEvent?.({ type: "user_text", text });
+			if (!reusedTranscript) {
+				for (const text of rollbackPlan.replayText) this.host.onEvent?.({ type: "user_text", text });
+			}
 			return normalizeCheckpointRewindResponse({ ok: true, mode, sessionId: forked.sessionId });
 		} catch (error) {
 			// Third-party host services may not use cc's transaction helper. Preserve

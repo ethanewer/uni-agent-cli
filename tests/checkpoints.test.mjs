@@ -4,6 +4,7 @@ import {
 	CHECKPOINT_FILE_CHANGE_LIMIT,
 	CHECKPOINT_PATH_MAX_BYTES,
 	checkpointModesForCapabilities,
+	checkpointSummary,
 	checkpointsFromSessionMessages,
 	formatCheckpointRewindResult,
 	normalizeCheckpointListResponse,
@@ -20,7 +21,7 @@ import {
 import { BaseAcpAdapter } from "../src/harness/acp-base.mjs";
 import { ClaudeAdapter } from "../src/harness/adapters/claude.mjs";
 import { capabilitiesFromWire, checkAdapterConformance } from "../src/harness/interface.mjs";
-import { AcpClient, HarnessApp, localSlashCommands } from "../src/pi-harness.mjs";
+import { AcpClient, HarnessApp, assistantResponseTexts, localSlashCommands } from "../src/pi-harness.mjs";
 
 assert.deepEqual(parseCheckpointListParams({ sessionId: "session", limit: 20 }), { sessionId: "session", limit: 20 });
 assert.deepEqual(parseCheckpointRewindParams({ sessionId: "session", checkpointId: "message", mode: "both" }), {
@@ -324,6 +325,69 @@ await (async () => {
 	assert.equal(app.sessionSwitchInProgress, false);
 })();
 
+// A workflow dashboard owns the alternate screen even while its composer can
+// submit /undo. The committed rewind must restore the normal buffer before the
+// scrollback clear, otherwise closing the dashboard reveals discarded context.
+await (async () => {
+	const order = [];
+	const definition = { label: "Fake" };
+	const client = {
+		sessionId: "source",
+		exited: false,
+		async rewindCheckpoint(_checkpointId, _mode, options) {
+			this.sessionId = "checkpoint-child";
+			options.beforeReplay?.(undefined, { reuseCurrentTranscript: true, replayText: ["Start"] });
+			throw new Error("stop after committed view");
+		},
+	};
+	const app = Object.create(HarnessApp.prototype);
+	Object.assign(app, {
+		activeKey: "fake",
+		transport: "acp",
+		activeAgentGeneration: 0,
+		config: { agents: { fake: definition } },
+		client,
+		ready: true,
+		busy: false,
+		btwThread: undefined,
+		workflowPage: {},
+		workflowPageOwnsAlternateScreen: true,
+		workflowApprovalSourceView: undefined,
+		menuHandle: undefined,
+		editor: {},
+		sessionSwitchInProgress: false,
+		selectionActionInProgress: true,
+		configUpdateTokens: new Set(),
+		configUpdateCount: 0,
+		statusState: "",
+		ui: {
+			terminal: { exitAlternateScreen() { order.push("exit alternate"); } },
+			setFocus() {},
+			requestRender() {},
+		},
+		updateSpinner() {},
+		clearLiveBackendCommands() {},
+		updateAutocomplete() {},
+		rewindConversationView() { order.push("rewind view"); return true; },
+		forceFullRepaint(options = {}) {
+			order.push(options.clearScrollback ? "clear normal scrollback" : "repaint");
+		},
+		addNotice() {},
+		addError() {},
+	});
+	const context = app.captureActiveAgentContext({ includeClient: true });
+	assert.equal(
+		await app.applyCheckpointRewind(context, "source", { id: "checkpoint-1", summary: "Start" }, "conversation"),
+		false,
+	);
+	assert.deepEqual(order.slice(0, 4), [
+		"exit alternate",
+		"repaint",
+		"rewind view",
+		"clear normal scrollback",
+	]);
+})();
+
 const catalogApp = Object.create(HarnessApp.prototype);
 Object.assign(catalogApp, {
 	activeKey: "fake",
@@ -416,6 +480,13 @@ assert.equal(committedTransport.sessionId, "failed-fork");
 const pickerApp = Object.create(HarnessApp.prototype);
 let picker;
 let selectedMode;
+let discardedModeSnapshots = 0;
+const pickerContext = {
+	client: {
+		capabilities: { checkpoints: true, checkpointModes: ["both", "conversation", "code"] },
+		discardCheckpointSnapshot() { discardedModeSnapshots += 1; },
+	},
+};
 Object.assign(pickerApp, {
 	busy: false,
 	btwThread: undefined,
@@ -425,19 +496,28 @@ Object.assign(pickerApp, {
 	closeMenu() {},
 	applyCheckpointRewind: async (_context, _sessionId, _checkpoint, mode) => { selectedMode = mode; },
 });
-assert.equal(pickerApp.openCheckpointModeSelection({
-	client: { capabilities: { checkpoints: true, checkpointModes: ["both", "conversation", "code"] } },
-}, "source", { id: "checkpoint-1", summary: "Start" }), true);
+assert.equal(pickerApp.openCheckpointModeSelection(
+	pickerContext,
+	"source",
+	{ id: "checkpoint-1", summary: "Start" },
+), true);
 assert.equal(picker.title, "What should be rewound?");
 assert.deepEqual(picker.entries.map((entry) => entry.value), ["both", "conversation", "code"]);
 await picker.onSelect(picker.entries[1]);
 assert.equal(selectedMode, "conversation");
+assert.equal(discardedModeSnapshots, 1, "the snapshot is released after the mode action settles");
 
-assert.equal(pickerApp.openCheckpointModeSelection({
-	client: { capabilities: { checkpoints: true, checkpointModes: ["conversation"] } },
-}, "source", { id: "checkpoint-1", summary: "Start" }), true);
+pickerContext.client.capabilities.checkpointModes = ["conversation"];
+assert.equal(pickerApp.openCheckpointModeSelection(
+	pickerContext,
+	"source",
+	{ id: "checkpoint-1", summary: "Start" },
+), true);
 assert.deepEqual(picker.entries.map((entry) => entry.value), ["conversation"]);
+await picker.onSelect(undefined);
+assert.equal(discardedModeSnapshots, 2, "dismissing the mode picker releases the snapshot");
 
+let discardedFirstPickerSnapshots = 0;
 const firstPickerClient = {
 	capabilities: { checkpoints: true },
 	sessionId: "source",
@@ -450,6 +530,7 @@ const firstPickerClient = {
 			],
 		};
 	},
+	discardCheckpointSnapshot() { discardedFirstPickerSnapshots += 1; },
 };
 const firstPickerApp = Object.create(HarnessApp.prototype);
 let firstPicker;
@@ -483,6 +564,8 @@ Object.assign(firstPickerApp, {
 assert.equal(await firstPickerApp.openCheckpointRewind(), true);
 assert.equal(firstPicker.title, "Rewind to checkpoint");
 assert.deepEqual(firstPicker.entries.map((entry) => entry.value.id), ["latest", "older"]);
+await firstPicker.onSelect(undefined);
+assert.equal(discardedFirstPickerSnapshots, 1, "dismissing the checkpoint picker releases its history snapshot");
 
 let resumedPrevious;
 firstPickerApp.previousClearedSession = { key: "fake", sessionId: "before-clear" };
@@ -492,6 +575,7 @@ assert.equal(await firstPickerApp.openCheckpointRewind(), true);
 assert.equal(firstPicker.entries[0].previousSession.sessionId, "before-clear");
 assert.equal(firstPicker.entries[0].label, "/resume before-clear (previous session)");
 await firstPicker.onSelect(firstPicker.entries[0]);
+assert.equal(discardedFirstPickerSnapshots, 2, "choosing the previous cleared session releases the checkpoint snapshot");
 assert.deepEqual(resumedPrevious, {
 	session: { sessionId: "before-clear", title: "Previous session" },
 	options: { displayText: "/resume before-clear (previous session)" },
@@ -512,5 +596,71 @@ Object.assign(sideApp, {
 assert.equal(await sideApp.openCheckpointRewind("", "rewind", { targetThread: side }), false);
 assert.equal(await sideApp.openCheckpointRewind("", "undo", { targetThread: side }), false);
 assert.ok(sideOutput.some((line) => line.includes("only from the main session")));
+
+// Codex can resume the rolled-back branch without serially replaying its entire
+// history when the current TUI already contains that exact prefix. Trimming at
+// the selected user message removes its answer and every descendant locally.
+{
+	const app = Object.create(HarnessApp.prototype);
+	Object.assign(app, {
+		chat: {
+			children: [],
+			addChild(child) { this.children.push(child); },
+			clear() { this.children = []; },
+		},
+		ui: { terminal: { rows: 24 } },
+		currentAssistantText: undefined,
+		currentToolSummary: undefined,
+		currentUserText: undefined,
+		pendingUserEchoes: [],
+		lastAssistantText: "",
+	});
+	app.addUserMessage("Earlier request");
+	app.appendAssistantText("Earlier answer retained");
+	app.closeCurrentAssistantText();
+	app.addUserMessage("Selected request");
+	app.appendAssistantText("Selected answer removed");
+	app.closeCurrentAssistantText();
+	app.addUserMessage("Descendant request removed");
+	app.appendAssistantText("Descendant answer removed");
+	app.closeCurrentAssistantText();
+	assert.equal(app.canRewindConversationView(
+		{ summary: "Selected request" },
+		["Selected request"],
+	), true);
+	assert.equal(app.rewindConversationView(
+		{ summary: "Selected request" },
+		"/undo",
+		["Selected request"],
+	), true);
+	assert.deepEqual(assistantResponseTexts(app.chat), ["Earlier answer retained"]);
+	assert.equal(app.chat.children.some((child) => child.text === "Selected request"), true);
+	assert.equal(app.chat.children.some((child) => child.text === "Selected answer removed"), false);
+	assert.equal(app.chat.children.some((child) => child.text === "Descendant request removed"), false);
+	assert.equal(app.conversationStarted, true);
+	app.checkpointTranscriptIdentitySafe = false;
+	assert.equal(app.canRewindConversationView(
+		{ summary: "Selected request" },
+		["Selected request"],
+	), false, "hidden or display-aliased prompts require authoritative replay");
+	app.checkpointTranscriptIdentitySafe = true;
+	app.addUserMessage("Selected request");
+	assert.equal(app.canRewindConversationView(
+		{ summary: "Selected request" },
+		["Selected request"],
+	), false);
+	assert.equal(app.rewindConversationView(
+		{ summary: "Selected request" },
+		"/undo",
+		["Selected request"],
+	), false, "duplicate prompts fall back to the authoritative backend replay");
+	const summaryPrefix = "x".repeat(300);
+	app.chat.children = [];
+	app.addUserMessage(`${summaryPrefix}\ndescendant prompt`);
+	assert.equal(app.canRewindConversationView(
+		{ summary: checkpointSummary(summaryPrefix) },
+		[summaryPrefix],
+	), false, "a truncated summary cannot replace an exact replay boundary");
+}
 
 console.log("checkpoint tests passed");
